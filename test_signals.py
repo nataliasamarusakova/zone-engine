@@ -466,3 +466,35 @@ def test_latest_signal_selection_uses_score_only_on_same_bar():
     ]
     selected = run_once._select_latest_signal(recent)
     assert selected["score"] == 80.0
+
+
+def test_signal_latest_bar_requires_exact_timestamp_and_pine_direction():
+    import run_once
+    base = {
+        "idx": 119,
+        "time": "2026-09-02T11:00:00+00:00",
+        "type": "LONG",
+        "trigger": {"buy": True, "sell": False},
+    }
+    ok, reason = run_once._signal_matches_latest_bar(base, 119, "2026-09-02T11:00:00+00:00")
+    assert ok and reason == "ok"
+
+    stale = dict(base, time="2024-06-17T02:00:00+00:00")
+    ok, reason = run_once._signal_matches_latest_bar(stale, 119, "2026-09-02T11:00:00+00:00")
+    assert not ok and reason == "signal_time_not_latest"
+
+    wrong_direction = dict(base, type="SHORT")
+    ok, reason = run_once._signal_matches_latest_bar(wrong_direction, 119, "2026-09-02T11:00:00+00:00")
+    assert not ok and reason == "direction_not_equal_to_pine_trigger"
+
+
+def test_signal_latest_bar_rejects_nonlatest_index():
+    import run_once
+    signal = {
+        "idx": 118,
+        "time": "2026-09-02T11:00:00+00:00",
+        "type": "SHORT",
+        "trigger": {"buy": False, "sell": True},
+    }
+    ok, reason = run_once._signal_matches_latest_bar(signal, 119, "2026-09-02T12:00:00+00:00")
+    assert not ok and reason == "signal_idx_not_latest"

@@ -54,6 +54,10 @@ SCAN_BATCH_PAUSE_SEC = max(0.0, float(os.environ.get("SCAN_BATCH_PAUSE_SEC", "0.
 BINANCE_ASSET_CLASSES = {x.strip().upper() for x in os.environ.get("BINANCE_ASSET_CLASSES", "CRYPTO,EQUITY").split(",") if x.strip()}
 MAX_MARKET_SPREAD_PCT = float(os.environ.get("MAX_MARKET_SPREAD_PCT", "1.50"))
 RECONCILIATION_MAX_SECONDS = float(os.environ.get("RECONCILIATION_MAX_SECONDS", "45"))
+# Live execution requires the signal timestamp to be exactly the latest closed 1H bar.
+# Also reject stale market data so a symbol with an old/delisted Binance series cannot
+# masquerade as a fresh signal merely because its DataFrame index is zero-based.
+MAX_DATA_STALENESS_HOURS = float(os.environ.get("MAX_DATA_STALENESS_HOURS", "2.0"))
 
 
 def _append_jsonl(path: Path, obj: dict[str, Any]) -> None:
@@ -121,6 +125,36 @@ def _select_latest_signal(signals: list[dict[str, Any]]) -> dict[str, Any] | Non
         key=lambda s: (int(s["idx"]), float(s.get("score", 0.0))),
     )
 
+
+
+def _signal_matches_latest_bar(signal: dict[str, Any], latest_closed_idx: int, latest_closed_time: str | None) -> tuple[bool, str]:
+    """Strict live-execution identity check for the signal bar.
+
+    A signal is executable only when its index AND timestamp are exactly the latest
+    closed 1H bar. This prevents a stale/incorrect timestamp from masquerading as
+    a fresh signal merely because the DataFrame index is the last row.
+    """
+    try:
+        signal_idx = int(signal["idx"])
+    except (KeyError, TypeError, ValueError):
+        return False, "invalid_signal_idx"
+    if signal_idx != int(latest_closed_idx):
+        return False, "signal_idx_not_latest"
+    signal_time = signal.get("time")
+    if signal_time is None or latest_closed_time is None:
+        return False, "missing_signal_or_latest_time"
+    try:
+        if pd.Timestamp(signal_time) != pd.Timestamp(latest_closed_time):
+            return False, "signal_time_not_latest"
+    except Exception:
+        return False, "invalid_signal_time"
+    trigger = signal.get("trigger") or {}
+    pine_buy = bool(trigger.get("buy"))
+    pine_sell = bool(trigger.get("sell"))
+    expected = "LONG" if pine_buy and not pine_sell else "SHORT" if pine_sell and not pine_buy else None
+    if expected != str(signal.get("type", "")).upper():
+        return False, "direction_not_equal_to_pine_trigger"
+    return True, "ok"
 
 def _private_layer_ready() -> bool:
     ready = credentials_available()
@@ -565,8 +599,50 @@ def main() -> None:
             latest_price = float(df["close"].iloc[-1])
             bingx_price = _bingx_last_price(contract)
             latest_closed_idx = len(df) - 1
+            latest_closed_time = pd.Timestamp(df["timestamp"].iloc[-1])
+            now_utc = pd.Timestamp.now(tz="UTC")
+            data_age_hours = max(0.0, (now_utc - latest_closed_time).total_seconds() / 3600.0)
+
+            # Never treat an old Binance series as current just because its last
+            # row happens to have index len(df)-1. This specifically protects against
+            # stale/delisted symbols such as historical-only series.
+            if data_age_hours > MAX_DATA_STALENESS_HOURS:
+                log.warning(
+                    "[DATA_STALE_REJECT] %s | latest_closed_time=%s age_hours=%.2f allowed_hours=%.2f",
+                    symbol, latest_closed_time.isoformat(), data_age_hours, MAX_DATA_STALENESS_HOURS,
+                )
+                return {
+                    "symbol": symbol,
+                    "current_price": latest_price,
+                    "binance_price": latest_price,
+                    "bingx_price": bingx_price,
+                    "market_spread_pct": None,
+                    "market_source": source_name,
+                    "binance_symbol": binance_symbol,
+                    "asset_class": meta.get("asset_class", "UNKNOWN"),
+                    "price_position": _price_position(latest_price, demand, supply),
+                    "fresh_signal": "—",
+                    "active_demand": len(demand),
+                    "active_supply": len(supply),
+                    "zones": {"demand": demand, "supply": supply},
+                    "last_signal_count": 0,
+                    "latest_closed_idx": int(latest_closed_idx),
+                    "latest_closed_time": latest_closed_time.isoformat(),
+                    "signals": [],
+                    "error": f"stale_1h_data:{data_age_hours:.2f}h>{MAX_DATA_STALENESS_HOURS:.2f}h",
+                }
+
             min_signal_idx = latest_closed_idx - max(0, MAX_SIGNAL_AGE_BARS)
             recent = [s for s in signals if min_signal_idx <= int(s["idx"]) <= latest_closed_idx]
+
+            # For live execution, timestamp equality is a mandatory invariant.
+            # With EXECUTION_MAX_SIGNAL_AGE_BARS=0 the accepted signal must be on
+            # the latest closed bar; this extra check prevents index-only false positives.
+            if recent:
+                recent = [
+                    s for s in recent
+                    if pd.Timestamp(s["time"]) == latest_closed_time
+                ]
             for sig in recent:
                 sig["score"] = score_zone_signal(sig)
 
@@ -614,7 +690,7 @@ def main() -> None:
                 "zones": {"demand": demand, "supply": supply},
                 "last_signal_count": len(recent),
                 "latest_closed_idx": int(latest_closed_idx),
-                "latest_closed_time": df["timestamp"].iloc[-1].isoformat(),
+                "latest_closed_time": latest_closed_time.isoformat(),
                 "signals": recent,
             }
         except Exception as exc:
@@ -719,12 +795,22 @@ def main() -> None:
         if latest_closed_idx is None:
             log.warning("[EXEC_REJECT_NO_LATEST] %s %s | latest_closed_idx unavailable", signal["symbol"], signal["type"])
             continue
+        latest_closed_time = latest_time_by_symbol.get(symbol_key)
         signal_age = int(latest_closed_idx) - int(signal["idx"])
         signal["execution_age_bars"] = int(signal_age)
         signal["latest_closed_idx"] = int(latest_closed_idx)
-        signal["latest_closed_time"] = latest_time_by_symbol.get(symbol_key)
+        signal["latest_closed_time"] = latest_closed_time
         if signal_age > EXECUTION_MAX_SIGNAL_AGE_BARS:
-            log.info("[EXEC_REJECT_AGE] %s %s | signal_idx=%s signal_time=%s latest_closed_idx=%s latest_closed_time=%s age_bars=%s allowed=%s", signal["symbol"], signal["type"], signal.get("idx"), signal.get("time"), latest_closed_idx, latest_time_by_symbol.get(symbol_key), signal_age, EXECUTION_MAX_SIGNAL_AGE_BARS)
+            log.info("[EXEC_REJECT_AGE] %s %s | signal_idx=%s signal_time=%s latest_closed_idx=%s latest_closed_time=%s age_bars=%s allowed=%s", signal["symbol"], signal["type"], signal.get("idx"), signal.get("time"), latest_closed_idx, latest_closed_time, signal_age, EXECUTION_MAX_SIGNAL_AGE_BARS)
+            continue
+        matches_latest, reject_reason = _signal_matches_latest_bar(signal, latest_closed_idx, latest_closed_time)
+        if not matches_latest:
+            log.warning(
+                "[EXEC_REJECT_LATEST_BAR] %s %s | reason=%s signal_idx=%s signal_time=%s latest_closed_idx=%s latest_closed_time=%s age_bars=%s pine_buy=%s pine_sell=%s",
+                signal["symbol"], signal["type"], reject_reason, signal.get("idx"), signal.get("time"),
+                latest_closed_idx, latest_closed_time, signal_age,
+                (signal.get("trigger") or {}).get("buy"), (signal.get("trigger") or {}).get("sell"),
+            )
             continue
         bx = get_contract(signal["symbol"])
         bx_symbol = str((bx or {}).get("symbol", signal["symbol"])).upper()
