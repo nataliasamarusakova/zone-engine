@@ -25,12 +25,17 @@ SWING_LEN = 10
 ZONE_HISTORY = 20
 BOX_WIDTH = 2.5
 RR_RATIO = 3.0
-TP1_R = float(os.environ.get("TP1_R", "0.5"))
-TP2_R = float(os.environ.get("TP2_R", "1.0"))
+TP1_R = float(os.environ.get("TP1_R", "0.5"))  # fallback only
+TP2_R = float(os.environ.get("TP2_R", "1.0"))  # fallback only
 TP1_FRACTION = 0.50
 TP2_FRACTION = 0.50
 ZONE_SL_ATR_BUFFER = float(os.environ.get("ZONE_SL_ATR_BUFFER", "0.10"))
 REQUIRE_ZONE_TOUCH = os.environ.get("REQUIRE_ZONE_TOUCH", "true").lower() == "true"
+TP1_OBSTACLE_FRACTION = float(os.environ.get("TP1_OBSTACLE_FRACTION", "0.50"))
+TP2_OBSTACLE_FRACTION = float(os.environ.get("TP2_OBSTACLE_FRACTION", "0.90"))
+TP_OBSTACLE_BUFFER_ATR = float(os.environ.get("TP_OBSTACLE_BUFFER_ATR", "0.10"))
+TP_MAX_R = float(os.environ.get("TP_MAX_R", "1.50"))
+TP_MIN_R = float(os.environ.get("TP_MIN_R", "0.50"))
 
 MIN_BARS = 70
 
@@ -453,9 +458,13 @@ def _zone_context(zone: dict[str, Any], current_idx: int, df: pd.DataFrame) -> d
 
 def _find_directional_zone(direction: str, cur_l: float, cur_h: float, cur_c: float, demand: list[dict[str, Any]], supply: list[dict[str, Any]]) -> dict[str, Any] | None:
     if direction == "LONG":
-        candidates = [z for z in demand if cur_l <= float(z["top"]) * 1.003 and cur_c >= float(z["btm"])]
+        # Exact zone-touch geometry: the candle must actually reach the
+        # Demand zone. No 0.3% proximity expansion.
+        candidates = [z for z in demand if cur_l <= float(z["top"]) and cur_c >= float(z["btm"])]
     else:
-        candidates = [z for z in supply if cur_h >= float(z["btm"]) * 0.997 and cur_c <= float(z["top"])]
+        # Exact zone-touch geometry: the candle must actually reach the
+        # Supply zone. No 0.3% proximity expansion.
+        candidates = [z for z in supply if cur_h >= float(z["btm"]) and cur_c <= float(z["top"])]
     return candidates[0] if candidates else None
 
 
@@ -614,16 +623,122 @@ def compute_ajay_trigger(df: pd.DataFrame, mode: Literal["historical", "live"] =
     return _attach_exact_alternate_series(out, mode=mode)
 
 
+def _nearest_opposing_level(
+    direction: str,
+    entry: float,
+    active_demand: list[dict[str, Any]],
+    active_supply: list[dict[str, Any]],
+    df: pd.DataFrame,
+    current_idx: int,
+) -> dict[str, Any] | None:
+    """Find the nearest structural obstacle in the profit direction.
+
+    Primary source is the opposite Demand/Supply zone. If none exists, use the
+    most recent confirmed swing level from the same 10/10 pivot structure.
+    """
+    candidates: list[dict[str, Any]] = []
+    if direction == "LONG":
+        for z in active_supply:
+            level = _safe_num(z.get("btm"), 0.0)
+            if level > entry:
+                candidates.append({"price": level, "source": "supply_zone", "zone": dict(z)})
+        # confirmed pivot highs only; the pivot must be fully confirmed before i
+        for p in range(max(SWING_LEN, current_idx - 120), current_idx - SWING_LEN + 1):
+            h = _safe_num(df.loc[p, "high"], 0.0)
+            if h <= entry:
+                continue
+            if all(h >= _safe_num(df.loc[p-k, "high"], 0.0) for k in range(1, SWING_LEN + 1)) and all(
+                h >= _safe_num(df.loc[p+k, "high"], 0.0) for k in range(1, SWING_LEN + 1)
+            ):
+                candidates.append({"price": h, "source": "pivot_high", "pivot_idx": p})
+        if not candidates:
+            return None
+        return min(candidates, key=lambda x: float(x["price"]))
+
+    for z in active_demand:
+        level = _safe_num(z.get("top"), 0.0)
+        if 0 < level < entry:
+            candidates.append({"price": level, "source": "demand_zone", "zone": dict(z)})
+    for p in range(max(SWING_LEN, current_idx - 120), current_idx - SWING_LEN + 1):
+        l = _safe_num(df.loc[p, "low"], 0.0)
+        if l >= entry or l <= 0:
+            continue
+        if all(l <= _safe_num(df.loc[p-k, "low"], 0.0) for k in range(1, SWING_LEN + 1)) and all(
+            l <= _safe_num(df.loc[p+k, "low"], 0.0) for k in range(1, SWING_LEN + 1)
+        ):
+            candidates.append({"price": l, "source": "pivot_low", "pivot_idx": p})
+    if not candidates:
+        return None
+    return max(candidates, key=lambda x: float(x["price"]))
+
+
+def _targets_from_nearest_obstacle(
+    direction: str,
+    entry: float,
+    stop: float,
+    atr: float,
+    obstacle: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Place small targets before the nearest support/resistance obstacle."""
+    risk = abs(entry - stop)
+    if risk <= 0 or entry <= 0:
+        return None
+    if obstacle is None:
+        # Deterministic fallback only when no structural obstacle exists.
+        tp2 = entry + TP2_R * risk if direction == "LONG" else entry - TP2_R * risk
+        tp1 = entry + TP1_R * risk if direction == "LONG" else entry - TP1_R * risk
+        return {
+            "tp1": tp1,
+            "tp2": tp2,
+            "tp1_rr": abs(tp1 - entry) / risk,
+            "tp2_rr": abs(tp2 - entry) / risk,
+            "target_source": "atr_rr_fallback",
+            "obstacle_price": None,
+            "obstacle_source": None,
+        }
+
+    level = float(obstacle["price"])
+    buffer = max(float(atr) * TP_OBSTACLE_BUFFER_ATR, entry * 0.0002)
+    if direction == "LONG":
+        usable_distance = level - buffer - entry
+        if usable_distance <= 0:
+            return None
+        tp2_distance = usable_distance * TP2_OBSTACLE_FRACTION
+        tp2_distance = min(tp2_distance, TP_MAX_R * risk)
+        tp1_distance = tp2_distance * TP1_OBSTACLE_FRACTION
+        tp1 = entry + tp1_distance
+        tp2 = entry + tp2_distance
+    else:
+        usable_distance = entry - (level + buffer)
+        if usable_distance <= 0:
+            return None
+        tp2_distance = usable_distance * TP2_OBSTACLE_FRACTION
+        tp2_distance = min(tp2_distance, TP_MAX_R * risk)
+        tp1_distance = tp2_distance * TP1_OBSTACLE_FRACTION
+        tp1 = entry - tp1_distance
+        tp2 = entry - tp2_distance
+
+    tp1_rr = abs(tp1 - entry) / risk
+    tp2_rr = abs(tp2 - entry) / risk
+    if tp2_rr < TP_MIN_R or tp1_rr <= 0 or tp2_rr <= tp1_rr:
+        return None
+    return {
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp1_rr": tp1_rr,
+        "tp2_rr": tp2_rr,
+        "target_source": "nearest_opposing_structure",
+        "obstacle_price": level,
+        "obstacle_source": obstacle.get("source"),
+    }
+
+
 def generate_zone_signals(
     df: pd.DataFrame,
     symbol: str = "",
     mode: Literal["historical", "live"] = "live",
 ) -> tuple[pd.DataFrame, list[dict], list[dict], list[dict]]:
-    """Ajay R5.41 strategy core plus Supply/Demand context.
-
-    The strategy trigger is ONLY the ALMA crossover from the supplied Pine.
-    Zones are reconstructed independently and used for context/SL planning.
-    """
+    """Zone-first strategy: trade fresh Demand/Supply touches, no ALMA required."""
     df = _drop_incomplete_1h(df)
     if len(df) < MIN_BARS:
         return df, [], [], []
@@ -634,8 +749,10 @@ def generate_zone_signals(
     df["body_atr"] = (df["close"] - df["open"]).abs() / df["atr50"].replace(0, np.nan)
     df["range_atr"] = (df["high"] - df["low"]) / df["atr50"].replace(0, np.nan)
 
+    # Keep ALMA columns available for diagnostics/backward-compatible analytics,
+    # but they are deliberately NOT an entry condition in this version.
     df = _attach_exact_alternate_series(df, mode=mode)
-    _, _, _, _, snapshots = _pine_zone_walk(df)
+    _, _, _, _, _ = _pine_zone_walk(df)
 
     active_supply: list[dict[str, Any]] = []
     active_demand: list[dict[str, Any]] = []
@@ -667,66 +784,59 @@ def generate_zone_signals(
         close = float(df.loc[i, "close"])
         active_supply = [z for z in active_supply if close < float(z["top"])]
         active_demand = [z for z in active_demand if close > float(z["btm"])]
-
-        direction = "LONG" if bool(df.loc[i, "pine_buy"]) else "SHORT" if bool(df.loc[i, "pine_sell"]) else None
-        if not direction:
-            continue
-
         cur_l, cur_h, cur_c, cur_o = map(float, [df.loc[i, "low"], df.loc[i, "high"], df.loc[i, "close"], df.loc[i, "open"]])
-        trade_zone = _find_directional_zone(direction, cur_l, cur_h, cur_c, active_demand, active_supply)
-        context_zone = trade_zone or _nearest_zone(direction, cur_c, active_demand, active_supply)
 
-        # Production entry model: Ajay ALMA supplies direction, but the trade
-        # must originate from the corresponding Demand/Supply zone. No ATR
-        # fallback entry is allowed in zone mode.
-        if REQUIRE_ZONE_TOUCH and trade_zone is None:
+        demand_zone = _find_directional_zone("LONG", cur_l, cur_h, cur_c, active_demand, active_supply)
+        supply_zone = _find_directional_zone("SHORT", cur_l, cur_h, cur_c, active_demand, active_supply)
+        if demand_zone is not None and supply_zone is not None:
+            # Ambiguous overlap: do not guess a direction.
+            continue
+        direction = "LONG" if demand_zone is not None else "SHORT" if supply_zone is not None else None
+        trade_zone = demand_zone if direction == "LONG" else supply_zone
+        if direction is None or trade_zone is None:
             continue
 
-        stop = risk = tp1 = tp2 = risk_pct = None
-        sl_source = None
-        if trade_zone is not None:
-            zone_top = float(trade_zone["top"])
-            zone_bottom = float(trade_zone["btm"])
-            sl_buffer = ZONE_SL_ATR_BUFFER * atr
-            if direction == "LONG":
-                stop = zone_bottom - sl_buffer
-                risk = cur_c - stop
-            else:
-                stop = zone_top + sl_buffer
-                risk = stop - cur_c
-            sl_source = "zone_boundary_plus_atr_buffer"
+        # Fresh touch only: previous close must have been outside the zone.
+        prev_close = float(df.loc[i - 1, "close"])
+        if direction == "LONG":
+            if not (prev_close > float(trade_zone["top"]) and cur_l <= float(trade_zone["top"]) and cur_c >= float(trade_zone["btm"])):
+                continue
         else:
-            # Optional compatibility mode only. Strict production defaults to
-            # REQUIRE_ZONE_TOUCH=true, so this branch is normally unreachable.
-            fallback_risk = max(FALLBACK_SL_ATR_MULTIPLIER * atr, cur_c * 0.0001)
-            if direction == "LONG":
-                stop = cur_c - fallback_risk
-                risk = fallback_risk
-            else:
-                stop = cur_c + fallback_risk
-                risk = fallback_risk
-            sl_source = "atr_fallback"
+            if not (prev_close < float(trade_zone["btm"]) and cur_h >= float(trade_zone["btm"]) and cur_c <= float(trade_zone["top"])):
+                continue
 
-        if risk is not None and risk > 0 and cur_c > 0:
-            risk_pct = (risk / cur_c) * 100.0
-            tp1 = cur_c + TP1_R * risk if direction == "LONG" else cur_c - TP1_R * risk
-            tp2 = cur_c + TP2_R * risk if direction == "LONG" else cur_c - TP2_R * risk
+        zone_top = float(trade_zone["top"])
+        zone_bottom = float(trade_zone["btm"])
+        sl_buffer = ZONE_SL_ATR_BUFFER * atr
+        if direction == "LONG":
+            stop = zone_bottom - sl_buffer
+            risk = cur_c - stop
         else:
-            stop = risk = tp1 = tp2 = risk_pct = None
+            stop = zone_top + sl_buffer
+            risk = stop - cur_c
+        if risk <= 0:
+            continue
+
+        obstacle = _nearest_opposing_level(direction, cur_c, active_demand, active_supply, df, i)
+        targets = _targets_from_nearest_obstacle(direction, cur_c, stop, atr, obstacle)
+        if targets is None:
+            continue
+        tp1 = float(targets["tp1"])
+        tp2 = float(targets["tp2"])
+        tp1_rr = float(targets["tp1_rr"])
+        tp2_rr = float(targets["tp2_rr"])
+        risk_pct = (risk / cur_c) * 100.0
 
         avg_vol = _safe_num(df.loc[i, "vol_sma20"], 0.0)
         vol_ratio = (_safe_num(df.loc[i, "volume"]) / avg_vol) if avg_vol > 0 else None
         event_ts = int(df.loc[i, "timestamp"].timestamp() * 1000)
-        zone_start = int(context_zone["start"]) if context_zone is not None else None
+        zone_start = int(trade_zone["start"])
         event_id = _make_event_id(symbol or "UNKNOWN", direction, event_ts, zone_start, cur_c)
-        zone_ctx = {}
-        if context_zone:
-            zone_ctx = {
-                **context_zone,
-                **_zone_context(context_zone, i, df),
-                "kind": "DEMAND" if direction == "LONG" else "SUPPLY",
-            }
-
+        zone_ctx = {
+            **trade_zone,
+            **_zone_context(trade_zone, i, df),
+            "kind": "DEMAND" if direction == "LONG" else "SUPPLY",
+        }
         signals.append(
             {
                 "event_id": event_id,
@@ -735,36 +845,40 @@ def generate_zone_signals(
                 "type": direction,
                 "symbol": symbol.upper(),
                 "entry": cur_c,
-                "sl": round(stop, 8) if stop is not None else None,
-                "tp1": round(tp1, 8) if tp1 is not None else None,
-                "tp2": round(tp2, 8) if tp2 is not None else None,
-                "risk_pct": round(risk_pct, 4) if risk_pct is not None else None,
-                "risk_abs": round(risk, 8) if risk is not None else None,
-                "rr_ratio": RR_RATIO,
-                "strategy": "Ajay R5.41",
+                "sl": round(stop, 8),
+                "tp1": round(tp1, 8),
+                "tp2": round(tp2, 8),
+                "risk_pct": round(risk_pct, 4),
+                "risk_abs": round(risk, 8),
+                "tp1_rr": round(tp1_rr, 4),
+                "tp2_rr": round(tp2_rr, 4),
+                "rr_ratio": round(tp2_rr, 4),
+                "strategy": "Demand/Supply Zone First",
                 "trigger": {
-                    "type": "ALMA_CROSS",
-                    "basis_type": ALMA_BASIS_TYPE,
-                    "basis_len": ALMA_BASIS_LEN,
-                    "offset": ALMA_OFFSET,
-                    "sigma": ALMA_SIGMA,
+                    "type": "ZONE_TOUCH",
+                    "alma_required": False,
                     "alternate_timeframe": "8h",
                     "mode": mode,
-                    "buy": bool(df.loc[i, "pine_buy"]),
-                    "sell": bool(df.loc[i, "pine_sell"]),
-                    "alma_close_alt": float(df.loc[i, "alma_close_alt"]),
-                    "alma_open_alt": float(df.loc[i, "alma_open_alt"]),
-                    "signal_bar_timestamp": df.loc[i, "timestamp"].isoformat(),
+                    "zone_touch": True,
+                    "zone_entry_rule": "fresh_touch_from_outside",
                 },
                 "zone": zone_ctx,
+                "target": {
+                    "source": targets["target_source"],
+                    "obstacle_source": targets["obstacle_source"],
+                    "obstacle_price": targets["obstacle_price"],
+                    "tp1_fraction_to_tp2": TP1_OBSTACLE_FRACTION,
+                    "tp2_fraction_to_obstacle": TP2_OBSTACLE_FRACTION,
+                    "obstacle_buffer_atr": TP_OBSTACLE_BUFFER_ATR,
+                    "tp_max_r": TP_MAX_R,
+                },
                 "risk_model": {
-                    "sl_source": sl_source,
-                    "zone_sl_buffer_atr": ZONE_SL_ATR_BUFFER if trade_zone is not None else None,
-                    "fallback_atr_multiplier": FALLBACK_SL_ATR_MULTIPLIER if sl_source == "atr_fallback" else None,
+                    "sl_source": "zone_boundary_plus_atr_buffer",
+                    "zone_sl_buffer_atr": ZONE_SL_ATR_BUFFER,
                 },
                 "confirmation": {
-                    "alma_cross": True,
-                    "zone_touch": trade_zone is not None,
+                    "alma_cross": False,
+                    "zone_touch": True,
                     "volume_ratio": round(vol_ratio, 3) if vol_ratio is not None else None,
                     "candle_body_atr": round(_safe_num(df.loc[i, "body_atr"]), 3),
                     "range_atr": round(_safe_num(df.loc[i, "range_atr"]), 3),
@@ -777,14 +891,11 @@ def generate_zone_signals(
 
     return df, active_supply, active_demand, signals
 
-
 def score_zone_signal(signal: dict[str, Any]) -> float:
-    """Research-only score; never changes the Ajay trigger."""
+    """Research-only setup score; never changes the zone entry trigger."""
     confirmation = signal.get("confirmation", {})
     zone = signal.get("zone", {})
     score = 50.0
-    if confirmation.get("alma_cross"):
-        score += 20.0
     if confirmation.get("zone_touch"):
         score += 10.0
     vol_ratio = _safe_num(confirmation.get("volume_ratio"), 0.0)
