@@ -193,8 +193,8 @@ def reconcile_all_open_positions() -> None:
         if not tp_levels:
             risk_pct = max(stop_loss_pct, 0.05)
             tp_levels = [
-                {"leg": "tp1", "pnl_pct": risk_pct * 1.5, "close_fraction": 0.50},
-                {"leg": "tp2", "pnl_pct": risk_pct * 3.0, "close_fraction": 0.50},
+                {"leg": "tp1", "pnl_pct": risk_pct * TP1_R, "close_fraction": 0.50},
+                {"leg": "tp2", "pnl_pct": risk_pct * TP2_R, "close_fraction": 0.50},
             ]
 
         # Never recreate a TP leg already confirmed as executed. After TP1 the

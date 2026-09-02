@@ -60,7 +60,7 @@ def test_long_tp_ordering_and_rr():
     }
     assert signal["tp1"] < signal["tp2"]
     assert RR_RATIO == 3.0
-    assert TP1_R == 1
+    assert TP1_R == 1.0
     assert TP2_R == 2.0
     assert score_zone_signal(signal) >= 70
 
@@ -286,3 +286,20 @@ def test_execute_emergency_closes_when_protection_fails(monkeypatch):
     result = run_once.execute_new_position(signal)
     assert result["status"] == "opened_then_emergency_closed"
     assert closed.get("called") is True
+
+
+def test_open_client_order_id_is_unique():
+    from event_engine import bingx
+    a = bingx._new_open_client_order_id("ALT-USDT", "ZONE_TEST")
+    b = bingx._new_open_client_order_id("ALT-USDT", "ZONE_TEST")
+    assert a != b
+    assert len(a) <= 32
+    assert len(b) <= 32
+
+
+def test_tp_constants_are_one_and_two_r():
+    from event_engine.signals import TP1_R, TP2_R, TP1_FRACTION, TP2_FRACTION
+    assert TP1_R == 1.0
+    assert TP2_R == 2.0
+    assert TP1_FRACTION == 0.50
+    assert TP2_FRACTION == 0.50
