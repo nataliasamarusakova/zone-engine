@@ -59,7 +59,7 @@ def _load_active_trades() -> dict[str, dict]:
                 t.setdefault("be_last_error", None)
                 t.setdefault("tp_mode", "single_tp" if len(t.get("tp_orders", [])) == 1 else "multi_tp")
                 t.setdefault("effective_tp_levels", t.get("tp_levels", []))
-                t.setdefault("effective_weighted_rr", t.get("planned_weighted_rr", 1.05))
+                t.setdefault("effective_weighted_rr", t.get("planned_weighted_rr", 0.75))
                 normalized[str(event_id)] = t
             return normalized
         log.error("[TRACKER] Invalid state: %s is not a JSON object", ACTIVE_TRADES_PATH)
@@ -140,7 +140,7 @@ def update_active_trade_protection(
             if tp_mode:
                 trade["tp_mode"] = tp_mode
             if effective_weighted_rr is not None:
-                trade["effective_weighted_rr"] = _safe_float(effective_weighted_rr, 1.05)
+                trade["effective_weighted_rr"] = _safe_float(effective_weighted_rr, 0.75)
             trade["protection_last_updated_ts"] = int(time.time() * 1000)
             _save_active_trades(trades)
             return True
@@ -153,22 +153,22 @@ def _extract_setup_metrics(setup: dict | None) -> dict[str, Any]:
         return {
             "planned_risk_pct": None,
             "planned_target_rr": None,
-            "planned_weighted_rr": 1.05,
+            "planned_weighted_rr": 0.75,
             "entry_reference": None,
             "invalidation_price": None,
             "target_price": None,
             "tp_levels": [],
             "effective_tp_levels": [],
-            "effective_weighted_rr": 1.05,
+            "effective_weighted_rr": 0.75,
             "tp_mode": "multi_tp",
         }
 
     return {
         "planned_risk_pct": _safe_float(setup.get("risk_pct"), 0.0) if setup.get("risk_pct") is not None else None,
         "planned_target_rr": _safe_float(setup.get("target_rr"), 0.0) if setup.get("target_rr") is not None else None,
-        "planned_weighted_rr": _safe_float(setup.get("planned_weighted_rr", 1.05), 1.05),
+        "planned_weighted_rr": _safe_float(setup.get("planned_weighted_rr", 0.75), 0.75),
         "effective_tp_levels": setup.get("effective_tp_levels") if isinstance(setup.get("effective_tp_levels"), list) else [],
-        "effective_weighted_rr": _safe_float(setup.get("effective_weighted_rr", setup.get("planned_weighted_rr", 1.05)), 1.05),
+        "effective_weighted_rr": _safe_float(setup.get("effective_weighted_rr", setup.get("planned_weighted_rr", 0.75)), 0.75),
         "tp_mode": str(setup.get("tp_mode", "multi_tp")),
         "entry_reference": _safe_float(setup.get("entry_reference"), 0.0) if setup.get("entry_reference") is not None else None,
         "invalidation_price": _safe_float(setup.get("invalidation_price"), 0.0) if setup.get("invalidation_price") is not None else None,

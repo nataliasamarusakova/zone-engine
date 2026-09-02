@@ -25,10 +25,12 @@ SWING_LEN = 10
 ZONE_HISTORY = 20
 BOX_WIDTH = 2.5
 RR_RATIO = 3.0
-TP1_R = 1.0
-TP2_R = 2.0
+TP1_R = float(os.environ.get("TP1_R", "0.5"))
+TP2_R = float(os.environ.get("TP2_R", "1.0"))
 TP1_FRACTION = 0.50
 TP2_FRACTION = 0.50
+ZONE_SL_ATR_BUFFER = float(os.environ.get("ZONE_SL_ATR_BUFFER", "0.10"))
+REQUIRE_ZONE_TOUCH = os.environ.get("REQUIRE_ZONE_TOUCH", "true").lower() == "true"
 
 MIN_BARS = 70
 
@@ -674,22 +676,28 @@ def generate_zone_signals(
         trade_zone = _find_directional_zone(direction, cur_l, cur_h, cur_c, active_demand, active_supply)
         context_zone = trade_zone or _nearest_zone(direction, cur_c, active_demand, active_supply)
 
+        # Production entry model: Ajay ALMA supplies direction, but the trade
+        # must originate from the corresponding Demand/Supply zone. No ATR
+        # fallback entry is allowed in zone mode.
+        if REQUIRE_ZONE_TOUCH and trade_zone is None:
+            continue
+
         stop = risk = tp1 = tp2 = risk_pct = None
         sl_source = None
         if trade_zone is not None:
+            zone_top = float(trade_zone["top"])
+            zone_bottom = float(trade_zone["btm"])
+            sl_buffer = ZONE_SL_ATR_BUFFER * atr
             if direction == "LONG":
-                stop = float(trade_zone["btm"]) - 0.3 * atr
+                stop = zone_bottom - sl_buffer
                 risk = cur_c - stop
             else:
-                stop = float(trade_zone["top"]) + 0.3 * atr
+                stop = zone_top + sl_buffer
                 risk = stop - cur_c
-            sl_source = "zone"
+            sl_source = "zone_boundary_plus_atr_buffer"
         else:
-            # Pine's strategy.entry() does not require a Demand/Supply touch.
-            # Therefore a valid ALMA signal must remain a valid production signal
-            # even when there is no directional zone on the trigger bar. Use a
-            # deterministic ATR stop only for risk construction; the zone itself
-            # remains context, not an entry gate.
+            # Optional compatibility mode only. Strict production defaults to
+            # REQUIRE_ZONE_TOUCH=true, so this branch is normally unreachable.
             fallback_risk = max(FALLBACK_SL_ATR_MULTIPLIER * atr, cur_c * 0.0001)
             if direction == "LONG":
                 stop = cur_c - fallback_risk
@@ -751,6 +759,7 @@ def generate_zone_signals(
                 "zone": zone_ctx,
                 "risk_model": {
                     "sl_source": sl_source,
+                    "zone_sl_buffer_atr": ZONE_SL_ATR_BUFFER if trade_zone is not None else None,
                     "fallback_atr_multiplier": FALLBACK_SL_ATR_MULTIPLIER if sl_source == "atr_fallback" else None,
                 },
                 "confirmation": {
