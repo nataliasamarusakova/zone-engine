@@ -42,6 +42,7 @@ KLINE_PATH = "/openApi/swap/v3/quote/klines"
 ORDER_PATH = "/openApi/swap/v2/trade/order"
 POSITION_PATH = os.environ.get("BINGX_POSITIONS_PATH", "/openApi/swap/v2/user/positions")
 LEVERAGE_PATH = "/openApi/swap/v2/trade/leverage"
+POSITION_MODE_PATH = "/openApi/swap/v1/positionSide/dual"
 OPEN_ORDERS_PATH = "/openApi/swap/v2/trade/openOrders"
 
 CACHE = {
@@ -51,6 +52,7 @@ CACHE = {
 }
 TTL = 3600
 SERVER_TIME_OFFSET_MS = 0
+_POSITION_MODE_CACHE: dict[str, Any] = {"ts": 0.0, "dual": None}
 
 # Requests Session is not used concurrently across scan worker threads.
 # Public scan requests get one Session per worker thread, each with a small bounded
@@ -98,32 +100,35 @@ def credentials_available() -> bool:
     key, secret = get_credentials()
     return bool(key and secret)
 
+def _canonical_params(params: dict[str, Any]) -> str:
+    """BingX canonical signing string: ASCII-sort keys; values are not URL encoded."""
+    return "&".join(f"{key}={params[key]}" for key in sorted(params))
+
+
 def _sign(params: dict[str, Any]) -> str:
     _, secret_key = get_credentials()
-    qs = urlencode(params)
-    return hmac.new(secret_key.encode(), qs.encode(), hashlib.sha256).hexdigest()
+    canonical = _canonical_params(params)
+    return hmac.new(secret_key.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def _apply_request_timestamp(params: dict[str, Any]) -> None:
+def _apply_request_timestamp(params: dict[str, Any]) -> str:
     params.pop("signature", None)
-    params["timestamp"] = str(int(time.time() * 1000) + SERVER_TIME_OFFSET_MS)
-    params["signature"] = _sign(params)
+    params["timestamp"] = int(time.time() * 1000) + SERVER_TIME_OFFSET_MS
+    signature = _sign(params)
+    params["signature"] = signature
+    return signature
 
 
-def _update_server_time_offset(response: requests.Response) -> bool:
-    global SERVER_TIME_OFFSET_MS
-    date_header = response.headers.get("Date")
-    if not date_header:
-        return False
-    try:
-        server_ms = int(parsedate_to_datetime(date_header).timestamp() * 1000)
-    except (TypeError, ValueError, OverflowError):
-        return False
+def _base_urls() -> list[str]:
+    primary = BASE_URL
+    if primary.endswith(".com"):
+        fallback = primary[:-4] + ".pro"
+        return [primary, fallback] if fallback != primary else [primary]
+    return [primary]
 
-    local_ms = int(time.time() * 1000)
-    SERVER_TIME_OFFSET_MS = server_ms - local_ms
-    log.warning("[BINGX] Time sync offset_ms=%d", SERVER_TIME_OFFSET_MS)
-    return True
+
+def _is_network_error(exc: Exception) -> bool:
+    return isinstance(exc, (requests.Timeout, requests.ConnectionError))
 
 
 def _request(
@@ -142,44 +147,72 @@ def _request(
         request_timeout = 10.0
     request_timeout = max(1.0, min(request_timeout, 60.0))
     session = SESSION if retryable else _get_fast_session()
-    headers = {}
-    max_timestamp_retries = 1 if signed else 0
 
-    api_key, secret_key = get_credentials()
-    if signed:
-        if not api_key or not secret_key:
+    try:
+        source_key_required = True
+        api_key, secret_key = get_credentials()
+        if signed and (not api_key or not secret_key):
             return {"code": -1, "msg": "missing BingX credentials"}
-        headers["X-BX-APIKEY"] = api_key
 
-    for attempt in range(max_timestamp_retries + 1):
-        request_params = dict(base_params)
-        if signed:
-            _apply_request_timestamp(request_params)
+        last_error: Exception | None = None
+        for base_url in _base_urls():
+            for attempt in range(2 if signed else 1):
+                request_params = dict(base_params)
+                headers = {"X-SOURCE-KEY": "BX-AI-SKILL"} if source_key_required else {}
+                if signed:
+                    _apply_request_timestamp(request_params)
+                    headers["X-BX-APIKEY"] = api_key
 
-        try:
-            response = session.request(
-                method=method,
-                url=BASE_URL + path,
-                params=request_params,
-                headers=headers,
-                timeout=request_timeout,
-            )
-            payload = response.json()
-        except Exception as exc:
-            return {"code": -1, "msg": str(exc)}
+                signature = str(request_params.get("signature", "")) if signed else ""
+                wire_params = dict(request_params)
 
-        try:
-            code = int(payload.get("code"))
-        except (TypeError, ValueError, AttributeError):
-            code = None
+                try:
+                    if method.upper() == "POST":
+                        # BingX signs the sorted, unencoded canonical form and accepts
+                        # the signed form fields as application/x-www-form-urlencoded.
+                        wire_params.pop("signature", None)
+                        if signed:
+                            wire_params["signature"] = signature
+                        response = session.request(
+                            method=method,
+                            url=base_url + path,
+                            data=wire_params,
+                            headers=headers,
+                            timeout=request_timeout,
+                        )
+                    else:
+                        response = session.request(
+                            method=method,
+                            url=base_url + path,
+                            params=wire_params,
+                            headers=headers,
+                            timeout=request_timeout,
+                        )
+                    payload = response.json()
+                except Exception as exc:
+                    last_error = exc
+                    if retryable and _is_network_error(exc) and base_url != _base_urls()[-1]:
+                        log.warning("[BINGX] Network failure on %s; trying fallback domain: %s", base_url, exc)
+                        break
+                    return {"code": -1, "msg": str(exc)}
 
-        if signed and code == 109400 and attempt < max_timestamp_retries and _update_server_time_offset(response):
-            continue
+                try:
+                    code = int(payload.get("code"))
+                except (TypeError, ValueError, AttributeError):
+                    code = None
 
-        return payload
+                # Keep one timestamp retry for signed requests after syncing from
+                # the server's Date header.
+                if signed and code == 109400 and attempt == 0:
+                    if _update_server_time_offset(response):
+                        continue
 
-    return {"code": -1, "msg": "request retry exhausted"}
+                return payload
 
+        return {"code": -1, "msg": str(last_error) if last_error else "request failed"}
+    except Exception as exc:
+        log.exception("[BINGX] Request wrapper failure: %s %s", method, path)
+        return {"code": -1, "msg": str(exc)}
 
 def refresh_contracts() -> dict[str, Any]:
     resp = _request("GET", CONTRACTS_PATH, signed=False)
@@ -379,14 +412,49 @@ def fetch_klines(
     return deduped
 
 
-def _set_leverage(bx_symbol: str, leverage: int, direction: str = "LONG") -> bool:
-    d = direction.upper() if direction else "LONG"
-    sides = (d, "BOTH") if d in {"LONG", "SHORT"} else ("BOTH",)
+def get_position_mode(*, force_refresh: bool = False, timeout_sec: float | None = None) -> str:
+    """Return BingX position mode: HEDGE or ONE_WAY. Never guess on API failure."""
+    override = os.environ.get("BINGX_POSITION_MODE", "").strip().upper()
+    if override in {"HEDGE", "ONE_WAY"} and os.environ.get("BINGX_POSITION_MODE_OVERRIDE", "false").strip().lower() == "true":
+        return override
 
-    for side in sides:
-        resp = _request("POST", LEVERAGE_PATH, {"symbol": bx_symbol, "side": side, "leverage": str(leverage)})
-        if resp.get("code") == 0:
-            return True
+    now = time.time()
+    cached = _POSITION_MODE_CACHE.get("dual")
+    if not force_refresh and cached in (True, False) and now - float(_POSITION_MODE_CACHE.get("ts", 0.0)) < 300:
+        return "HEDGE" if cached else "ONE_WAY"
+
+    resp = _request("GET", POSITION_MODE_PATH, {}, signed=True, timeout_sec=timeout_sec, retryable=False)
+    if resp.get("code") != 0:
+        raise RuntimeError(f"position mode query failed: code={resp.get('code')} msg={resp.get('msg')}")
+    data = resp.get("data") or {}
+    dual = data.get("dualSidePosition")
+    if isinstance(dual, str):
+        dual = dual.strip().lower() == "true"
+    if not isinstance(dual, bool):
+        raise RuntimeError(f"position mode response missing dualSidePosition: {data}")
+    _POSITION_MODE_CACHE.update({"ts": now, "dual": dual})
+    mode = "HEDGE" if dual else "ONE_WAY"
+    log.info("[BINGX] Position mode=%s", mode)
+    return mode
+
+
+def position_side_param(direction: str, *, force_refresh: bool = False) -> str:
+    direction = str(direction).upper()
+    if direction not in {"LONG", "SHORT"}:
+        raise ValueError(f"invalid direction={direction}")
+    return direction if get_position_mode(force_refresh=force_refresh) == "HEDGE" else "BOTH"
+
+
+def _set_leverage(bx_symbol: str, leverage: int, direction: str = "LONG") -> bool:
+    try:
+        side = position_side_param(direction)
+    except Exception as exc:
+        log.error("[BINGX] Cannot determine position mode before leverage: %s", exc)
+        return False
+    resp = _request("POST", LEVERAGE_PATH, {"symbol": bx_symbol, "side": side, "leverage": str(leverage)})
+    if resp.get("code") == 0:
+        return True
+    log.error("[BINGX] Leverage failed: side=%s code=%s msg=%s", side, resp.get("code"), resp.get("msg"))
     return False
 
 
@@ -541,18 +609,23 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
         return {"status": "error", "error": f"failed to set leverage={leverage} for {direction}", "symbol": bx, "leverage": leverage}
 
     side = "BUY" if direction == "LONG" else "SELL"
+    try:
+        position_side = position_side_param(direction)
+    except Exception as exc:
+        return {"status": "error", "error": f"position_mode_query_failed: {exc}", "symbol": bx}
     client_order_id = _new_open_client_order_id(bx, trade_id)
 
     params = {
         "symbol": bx,
         "side": side,
-        "positionSide": direction,
+        "positionSide": position_side,
         "type": "MARKET",
         "quantity": f"{qty:.{prec}f}",
         "clientOrderId": client_order_id,
     }
 
     response = _request("POST", ORDER_PATH, params)
+    log.info("[BINGX] OPEN order response: symbol=%s direction=%s positionSide=%s code=%s msg=%s", bx, direction, position_side, response.get("code") if isinstance(response, dict) else None, response.get("msg") if isinstance(response, dict) else None)
 
     if isinstance(response, dict) and response.get("code") != 0:
         # Audit P1-4 (order idempotency): a transport-level failure (-1) leaves
@@ -940,7 +1013,7 @@ def ensure_directional_protection(
         params = {
             "symbol": bx_symbol,
             "side": "SELL" if direction == "LONG" else "BUY",
-            "positionSide": direction,
+            "positionSide": position_side_param(direction),
             "type": "STOP_MARKET",
             "stopPrice": _format_price(sl_price, price_precision),
             "quantity": _format_qty(position_qty, precision),
@@ -1096,7 +1169,7 @@ def ensure_directional_protection(
             market_params = {
                 "symbol": bx_symbol,
                 "side": "SELL" if direction == "LONG" else "BUY",
-                "positionSide": direction,
+                "positionSide": position_side_param(direction),
                 "type": "MARKET",
                 "quantity": _format_qty(tp_qty, precision),
                 "clientOrderId": client_order_id,
@@ -1123,7 +1196,7 @@ def ensure_directional_protection(
         params = {
             "symbol": bx_symbol,
             "side": "SELL" if direction == "LONG" else "BUY",
-            "positionSide": direction,
+            "positionSide": position_side_param(direction),
             "type": "TAKE_PROFIT_MARKET",
             "stopPrice": _format_price(tp_price, price_precision),
             "quantity": _format_qty(tp_qty, precision),

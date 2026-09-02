@@ -83,5 +83,6 @@ def format_signal(event: dict[str, Any], setup: dict[str, Any] | None = None, ex
             f"Status: <code>{_esc(execution.get('status'))}</code>",
             f"Order: <code>{_esc((execution.get('order') or {}).get('order_id') or (execution.get('order') or {}).get('client_order_id'))}</code>",
             f"Protection: <code>{_esc((execution.get('protection') or {}).get('status'))}</code>",
+            f"Error: <code>{_esc(execution.get('error') or (execution.get('order') or {}).get('error'))}</code>",
         ]
     return "\n".join(lines)
