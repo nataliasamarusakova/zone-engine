@@ -850,6 +850,7 @@ def generate_zone_signals(
                 "tp2": round(tp2, 8),
                 "risk_pct": round(risk_pct, 4),
                 "risk_abs": round(risk, 8),
+                "atr": round(float(atr), 8),
                 "tp1_rr": round(tp1_rr, 4),
                 "tp2_rr": round(tp2_rr, 4),
                 "rr_ratio": round(tp2_rr, 4),
