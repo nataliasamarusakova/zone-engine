@@ -46,6 +46,8 @@ MAX_TRADES_PER_CYCLE = int(os.environ.get("MAX_TRADES_PER_CYCLE", "5"))
 MAX_SCAN_SYMBOLS = int(os.environ.get("MAX_SCAN_SYMBOLS", "0"))
 KLINE_LIMIT_1H = int(os.environ.get("KLINE_LIMIT_1H", "120"))
 MAX_SIGNAL_AGE_BARS = int(os.environ.get("MAX_SIGNAL_AGE_BARS", "0"))
+# Production execution is strict by default: only the latest closed 1H bar may open a trade.
+EXECUTION_MAX_SIGNAL_AGE_BARS = int(os.environ.get("EXECUTION_MAX_SIGNAL_AGE_BARS", "0"))
 SCAN_WORKERS = max(1, int(os.environ.get("SCAN_WORKERS", "12")))
 SCAN_BATCH_SIZE = max(SCAN_WORKERS, int(os.environ.get("SCAN_BATCH_SIZE", "48")))
 SCAN_BATCH_PAUSE_SEC = max(0.0, float(os.environ.get("SCAN_BATCH_PAUSE_SEC", "0.10")))
@@ -611,6 +613,8 @@ def main() -> None:
                 "active_supply": len(supply),
                 "zones": {"demand": demand, "supply": supply},
                 "last_signal_count": len(recent),
+                "latest_closed_idx": int(latest_closed_idx),
+                "latest_closed_time": df["timestamp"].iloc[-1].isoformat(),
                 "signals": recent,
             }
         except Exception as exc:
@@ -660,11 +664,19 @@ def main() -> None:
             elif result.get("price_position") == "CONTRACT_NOT_FOUND":
                 log.warning("[COIN_SKIP] %s | contract not found in BingX cache", symbol)
             else:
-                log.debug(
-                    "[COIN] %s | price=%s | %s | fresh=%s | demand=%d | supply=%d",
-                    symbol, result["current_price"], result["price_position"], result["fresh_signal"],
-                    result["active_demand"], result["active_supply"],
+                # Log only active symbols: a current Pine signal or a price inside
+                # an active Demand/Supply zone. Inactive "outside zones" symbols
+                # are intentionally omitted from runtime logs.
+                is_active = (
+                    result.get("fresh_signal") not in {None, "—"}
+                    or result.get("price_position") in {"🟢 В зоне DEMAND", "🔴 В зоне SUPPLY"}
                 )
+                if is_active:
+                    log.info(
+                        "[ACTIVE] %s | price=%s | %s | signal=%s | demand=%d | supply=%d",
+                        symbol, result["current_price"], result["price_position"], result["fresh_signal"],
+                        result["active_demand"], result["active_supply"],
+                    )
 
         scanned = min(batch_start + len(batch), total)
         log.info("[SCAN_PROGRESS] %d/%d symbols | batch=%d | workers=%d", scanned, total, len(batch), min(SCAN_WORKERS, len(batch)))
@@ -678,16 +690,42 @@ def main() -> None:
         total, scan_errors, scan_skips, len(fresh_signals), time.time() - started,
     )
 
-    # Keep one best fresh signal per symbol/direction and block existing exposure.
-    by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    # Execution safety: choose exactly ONE signal per symbol, namely the newest
+    # Pine ALMA crossover bar. Never allow an older SHORT to compete with a newer
+    # LONG (or vice versa) because of score sorting.
+    latest_by_symbol: dict[str, dict[str, Any]] = {}
     for signal in fresh_signals:
-        key = (signal["symbol"], signal["type"])
-        previous = by_key.get(key)
-        if previous is None or (int(signal["idx"]), float(signal.get("score", 0.0))) > (int(previous["idx"]), float(previous.get("score", 0.0))):
-            by_key[key] = signal
+        symbol_key = str(signal["symbol"]).upper()
+        previous = latest_by_symbol.get(symbol_key)
+        candidate_key = (int(signal["idx"]), float(signal.get("score", 0.0)))
+        previous_key = (int(previous["idx"]), float(previous.get("score", 0.0))) if previous else None
+        if previous is None or candidate_key > previous_key:
+            latest_by_symbol[symbol_key] = signal
 
     executable: list[dict[str, Any]] = []
-    for signal in by_key.values():
+    latest_index_by_symbol = {
+        str(r.get("symbol", "")).upper(): r.get("latest_closed_idx")
+        for r in scan_rows
+        if r.get("latest_closed_idx") is not None
+    }
+    latest_time_by_symbol = {
+        str(r.get("symbol", "")).upper(): r.get("latest_closed_time")
+        for r in scan_rows
+        if r.get("latest_closed_time") is not None
+    }
+    for signal in latest_by_symbol.values():
+        symbol_key = str(signal["symbol"]).upper()
+        latest_closed_idx = latest_index_by_symbol.get(symbol_key)
+        if latest_closed_idx is None:
+            log.warning("[EXEC_REJECT_NO_LATEST] %s %s | latest_closed_idx unavailable", signal["symbol"], signal["type"])
+            continue
+        signal_age = int(latest_closed_idx) - int(signal["idx"])
+        signal["execution_age_bars"] = int(signal_age)
+        signal["latest_closed_idx"] = int(latest_closed_idx)
+        signal["latest_closed_time"] = latest_time_by_symbol.get(symbol_key)
+        if signal_age > EXECUTION_MAX_SIGNAL_AGE_BARS:
+            log.info("[EXEC_REJECT_AGE] %s %s | signal_idx=%s signal_time=%s latest_closed_idx=%s latest_closed_time=%s age_bars=%s allowed=%s", signal["symbol"], signal["type"], signal.get("idx"), signal.get("time"), latest_closed_idx, latest_time_by_symbol.get(symbol_key), signal_age, EXECUTION_MAX_SIGNAL_AGE_BARS)
+            continue
         bx = get_contract(signal["symbol"])
         bx_symbol = str((bx or {}).get("symbol", signal["symbol"])).upper()
         key = (bx_symbol, signal["type"])
@@ -697,7 +735,9 @@ def main() -> None:
         if key in open_keys or opposite in open_keys:
             continue
         executable.append(signal)
-    executable.sort(key=lambda x: (-float(x["score"]), -int(x["idx"])))
+
+    # Safety ordering: newest signal bar first; score only breaks ties.
+    executable.sort(key=lambda x: (-int(x["idx"]), -float(x.get("score", 0.0))))
 
     executed = 0
     for signal in executable[:MAX_TRADES_PER_CYCLE]:
@@ -718,6 +758,15 @@ def main() -> None:
             })
             _send_signal(signal, blocked)
             continue
+        log.warning(
+            "[EXEC_SIGNAL] symbol=%s direction=%s signal_idx=%s signal_time=%s age_bars=%s "
+            "pine_buy=%s pine_sell=%s alma_close=%s alma_open=%s event_id=%s",
+            signal.get("symbol"), signal.get("type"), signal.get("idx"), signal.get("time"),
+            signal.get("execution_age_bars", 0),
+            (signal.get("trigger") or {}).get("buy"), (signal.get("trigger") or {}).get("sell"),
+            (signal.get("trigger") or {}).get("alma_close_alt"), (signal.get("trigger") or {}).get("alma_open_alt"),
+            signal.get("event_id"),
+        )
         execution = execute_new_position(signal)
         execution_status = str(execution.get("status", ""))
         if execution_status in {"skipped_min_qty", "skipped_invalid_setup"}:
@@ -733,9 +782,16 @@ def main() -> None:
         if str(execution.get("status")) == "opened_protected":
             executed += 1
 
-    # Save the exact table + detailed rows for later tuning/backtesting.
-    table = save_scan(scan_rows, fresh_signals, duration_sec=time.time() - started, scan_id=scan_id)
-    log.info("\n%s", table)
+    # Persist the complete scan for analytics/backtesting, but do not dump the
+    # full inactive-symbol table into runtime logs. Runtime logs contain active
+    # symbols only.
+    save_scan(scan_rows, fresh_signals, duration_sec=time.time() - started, scan_id=scan_id)
+    active_log_rows = [
+        r for r in scan_rows
+        if r.get("fresh_signal") not in {None, "—"}
+        or r.get("price_position") in {"🟢 В зоне DEMAND", "🔴 В зоне SUPPLY"}
+    ]
+    log.info("[ACTIVE_SUMMARY] active_symbols=%d signals=%d", len(active_log_rows), len(fresh_signals))
     log.info("[DONE] symbols=%d fresh_signals=%d executed=%d duration=%.1fs", len(scan_rows), len(fresh_signals), executed, time.time() - started)
 
 
