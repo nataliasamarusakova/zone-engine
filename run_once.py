@@ -45,7 +45,7 @@ MARGIN_USDT = float(os.environ.get("BINGX_MARGIN_USDT", "1"))
 MAX_TRADES_PER_CYCLE = int(os.environ.get("MAX_TRADES_PER_CYCLE", "5"))
 MAX_SCAN_SYMBOLS = int(os.environ.get("MAX_SCAN_SYMBOLS", "0"))
 KLINE_LIMIT_1H = int(os.environ.get("KLINE_LIMIT_1H", "120"))
-MAX_SIGNAL_AGE_BARS = int(os.environ.get("MAX_SIGNAL_AGE_BARS", "3"))
+MAX_SIGNAL_AGE_BARS = int(os.environ.get("MAX_SIGNAL_AGE_BARS", "0"))
 SCAN_WORKERS = max(1, int(os.environ.get("SCAN_WORKERS", "12")))
 SCAN_BATCH_SIZE = max(SCAN_WORKERS, int(os.environ.get("SCAN_BATCH_SIZE", "48")))
 SCAN_BATCH_PAUSE_SEC = max(0.0, float(os.environ.get("SCAN_BATCH_PAUSE_SEC", "0.10")))
@@ -108,6 +108,16 @@ def get_scan_symbols() -> list[str]:
 
 def _log_coin_skip(symbol: str, reason: str) -> None:
     log.warning("[COIN_SKIP] %s | %s", symbol, reason)
+
+
+def _select_latest_signal(signals: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Choose the newest signal bar; score is only a same-bar tie-breaker."""
+    if not signals:
+        return None
+    return max(
+        signals,
+        key=lambda s: (int(s["idx"]), float(s.get("score", 0.0))),
+    )
 
 
 def _private_layer_ready() -> bool:
@@ -552,7 +562,9 @@ def main() -> None:
             df, supply, demand, signals = generate_zone_signals(pd.DataFrame(bars), symbol=symbol, mode="live")
             latest_price = float(df["close"].iloc[-1])
             bingx_price = _bingx_last_price(contract)
-            recent = [s for s in signals if int(s["idx"]) >= len(df) - MAX_SIGNAL_AGE_BARS]
+            latest_closed_idx = len(df) - 1
+            min_signal_idx = latest_closed_idx - max(0, MAX_SIGNAL_AGE_BARS)
+            recent = [s for s in signals if min_signal_idx <= int(s["idx"]) <= latest_closed_idx]
             for sig in recent:
                 sig["score"] = score_zone_signal(sig)
 
@@ -570,7 +582,10 @@ def main() -> None:
             if spread_pct is not None and spread_pct > MAX_MARKET_SPREAD_PCT:
                 log.warning("[MARKET_SPREAD] %s | Binance=%.12g | BingX=%.12g | spread=%.4f%% > %.4f%%", symbol, latest_price, bingx_price, spread_pct, MAX_MARKET_SPREAD_PCT)
                 recent = []
-            latest_signal = max(recent, key=lambda s: (float(s.get("score", 0)), int(s.get("idx", 0)))) if recent else None
+            # Signal freshness is controlled by MAX_SIGNAL_AGE_BARS, but the
+            # executable candidate must always be the newest signal bar. Score is
+            # only a tie-breaker for multiple signals on the same bar.
+            latest_signal = _select_latest_signal(recent)
             if not latest_signal and spread_pct is not None and spread_pct > MAX_MARKET_SPREAD_PCT:
                 fresh_text = f"BLOCKED_SPREAD>{MAX_MARKET_SPREAD_PCT:.2f}%"
             else:
@@ -668,7 +683,7 @@ def main() -> None:
     for signal in fresh_signals:
         key = (signal["symbol"], signal["type"])
         previous = by_key.get(key)
-        if previous is None or (float(signal["score"]), int(signal["idx"])) > (float(previous["score"]), int(previous["idx"])):
+        if previous is None or (int(signal["idx"]), float(signal.get("score", 0.0))) > (int(previous["idx"]), float(previous.get("score", 0.0))):
             by_key[key] = signal
 
     executable: list[dict[str, Any]] = []

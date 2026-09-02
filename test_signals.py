@@ -414,3 +414,55 @@ def test_pine_zone_records_are_exposed_for_comparison():
     result = compute_pine_zone_records(df)
     assert set(result) == {"supply", "demand", "supply_bos", "demand_bos"}
     assert isinstance(result["supply"], list)
+
+
+def test_no_zone_signal_gets_atr_fallback_geometry(monkeypatch):
+    import numpy as np
+    import pandas as pd
+    from event_engine import signals as sig
+
+    monkeypatch.setattr(sig, "FALLBACK_SL_ATR_MULTIPLIER", 1.5)
+    n = 120
+    ts = pd.date_range("2026-01-01", periods=n, freq="h", tz="UTC")
+    close = np.linspace(100.0, 120.0, n)
+    open_ = close.copy()
+    open_[40:] += 0.5
+    high = np.maximum(open_, close) + 0.5
+    low = np.minimum(open_, close) - 0.5
+    volume = np.full(n, 1000.0)
+    df = pd.DataFrame({"timestamp": ts, "open": open_, "high": high, "low": low, "close": close, "volume": volume})
+    out = sig.compute_ajay_trigger(df, mode="live")
+    # Force a deterministic ALMA trigger on the last bar so this test isolates
+    # risk geometry rather than depending on market-shaped synthetic crossings.
+    out.loc[:, "pine_buy"] = False
+    out.loc[:, "pine_sell"] = False
+    out.loc[out.index[-1], "pine_buy"] = True
+    out2, supply, demand, emitted = sig.generate_zone_signals(out, symbol="TEST-USDT", mode="live")
+    assert emitted, "forced latest-bar ALMA signal must be emitted"
+    latest = emitted[-1]
+    assert latest["confirmation"]["zone_touch"] is False
+    assert latest["risk_model"]["sl_source"] == "atr_fallback"
+    assert latest["sl"] is not None
+    assert latest["tp1"] is not None
+    assert latest["tp2"] is not None
+    assert latest["risk_pct"] > 0
+
+
+def test_latest_signal_selection_prefers_newest_bar_over_score():
+    import run_once
+    recent = [
+        {"idx": 99, "score": 100.0},
+        {"idx": 100, "score": 10.0},
+    ]
+    selected = run_once._select_latest_signal(recent)
+    assert selected["idx"] == 100
+
+
+def test_latest_signal_selection_uses_score_only_on_same_bar():
+    import run_once
+    recent = [
+        {"idx": 100, "score": 75.0},
+        {"idx": 100, "score": 80.0},
+    ]
+    selected = run_once._select_latest_signal(recent)
+    assert selected["score"] == 80.0
