@@ -431,13 +431,17 @@ def test_no_zone_signal_gets_atr_fallback_geometry(monkeypatch):
     low = np.minimum(open_, close) - 0.5
     volume = np.full(n, 1000.0)
     df = pd.DataFrame({"timestamp": ts, "open": open_, "high": high, "low": low, "close": close, "volume": volume})
-    out = sig.compute_ajay_trigger(df, mode="live")
-    # Force a deterministic ALMA trigger on the last bar so this test isolates
-    # risk geometry rather than depending on market-shaped synthetic crossings.
-    out.loc[:, "pine_buy"] = False
-    out.loc[:, "pine_sell"] = False
-    out.loc[out.index[-1], "pine_buy"] = True
-    out2, supply, demand, emitted = sig.generate_zone_signals(out, symbol="TEST-USDT", mode="live")
+    # Force a deterministic ALMA trigger inside generate_zone_signals so this test
+    # isolates risk geometry rather than depending on market-shaped crossings.
+    original_attach = sig._attach_exact_alternate_series
+    def forced_attach(frame, mode="live"):
+        out = original_attach(frame, mode=mode)
+        out.loc[:, "pine_buy"] = False
+        out.loc[:, "pine_sell"] = False
+        out.loc[out.index[-1], "pine_buy"] = True
+        return out
+    monkeypatch.setattr(sig, "_attach_exact_alternate_series", forced_attach)
+    out2, supply, demand, emitted = sig.generate_zone_signals(df, symbol="TEST-USDT", mode="live")
     assert emitted, "forced latest-bar ALMA signal must be emitted"
     latest = emitted[-1]
     assert latest["confirmation"]["zone_touch"] is False
@@ -498,3 +502,53 @@ def test_signal_latest_bar_rejects_nonlatest_index():
     }
     ok, reason = run_once._signal_matches_latest_bar(signal, 119, "2026-09-02T12:00:00+00:00")
     assert not ok and reason == "signal_idx_not_latest"
+
+
+def test_live_mode_uses_confirmed_htf_for_previous_bars_and_developing_only_on_latest():
+    """Only the latest closed chart bar may see the developing current 8H value."""
+    import pandas as pd
+    from event_engine.signals import compute_ajay_trigger
+
+    ts = pd.date_range("2026-08-30 00:00:00", periods=20, freq="1h", tz="UTC")
+    opens = [10.0] * 20
+    closes = [10.0] * 16 + [10.0, 10.0, 10.0, 20.0]
+    df = pd.DataFrame({
+        "timestamp": ts,
+        "open": opens,
+        "high": [max(o, c) + 0.1 for o, c in zip(opens, closes)],
+        "low": [min(o, c) - 0.1 for o, c in zip(opens, closes)],
+        "close": closes,
+        "volume": [1.0] * len(ts),
+    })
+    out = compute_ajay_trigger(df, mode="live")
+
+    # Current 8H bucket is 16:00-19:00. Its previous 1H bars are historical and
+    # therefore must use the confirmed ALMA from the preceding 08:00-15:00 bucket.
+    assert out.loc[16, "alma_close_alt"] == out.loc[16, "alma_open_alt"] == 10.0
+    assert out.loc[17, "alma_close_alt"] == out.loc[17, "alma_open_alt"] == 10.0
+    assert out.loc[18, "alma_close_alt"] == out.loc[18, "alma_open_alt"] == 10.0
+    # Only the latest closed 1H bar uses the developing current 8H value.
+    assert out.loc[19, "alma_close_alt"] > out.loc[19, "alma_open_alt"]
+    assert bool(out.loc[19, "pine_buy"]) is True
+
+
+def test_trigger_recompute_is_safe_on_already_enriched_dataframe():
+    """generate_zone_signals may receive a dataframe already enriched by a trigger pass."""
+    import pandas as pd
+    from event_engine.signals import compute_ajay_trigger, generate_zone_signals
+
+    ts = pd.date_range("2026-01-01", periods=120, freq="1h", tz="UTC")
+    close = pd.Series(100.0 + (pd.RangeIndex(120).to_numpy() * 0.01))
+    df = pd.DataFrame({
+        "timestamp": ts,
+        "open": close,
+        "high": close + 0.2,
+        "low": close - 0.2,
+        "close": close,
+        "volume": 1000.0,
+    })
+    enriched = compute_ajay_trigger(df, mode="live")
+    out, _, _, _ = generate_zone_signals(enriched, symbol="TEST-USDT", mode="live")
+    assert "pine_buy" in out.columns
+    assert "pine_sell" in out.columns
+    assert len(out) == len(enriched)
