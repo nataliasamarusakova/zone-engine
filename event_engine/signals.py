@@ -245,62 +245,83 @@ def _aggregate_8h(df_1h: pd.DataFrame) -> pd.DataFrame:
 
 
 def _attach_exact_alternate_series(df: pd.DataFrame, mode: Literal["historical", "live"] = "live") -> pd.DataFrame:
-    """Build the 8H alternate series used by reso().
+    """Build the 8H alternate series used by Pine's ``reso()``.
 
-    historical:
-      Reproduces request.security(... lookahead_on) on historical chart bars:
-      an 8H value is visible from the FIRST 1H bar of that 8H interval.
+    Historical mode reproduces the historical ``lookahead_on`` mapping.
 
-    live:
-      Reconstructs the current 8H developing bar at each closed 1H bar. This is
-      the non-lookahead execution form suitable for the bot.
+    Live mode reproduces the important Pine execution distinction for the latest
+    realtime chart bar: historical chart bars receive only confirmed HTF values,
+    while the current chart bar may receive the developing HTF value. For the
+    current 8H bucket, therefore, every *previous* 1H bar uses the last confirmed
+    8H ALMA and only the latest closed 1H bar uses the developing 8H ALMA.
     """
     out = _normalize_1h(df)
     tf = _aggregate_8h(out)
     tf["alma_close"] = calc_alma(tf["close"], ALMA_BASIS_LEN, ALMA_OFFSET, ALMA_SIGMA)
     tf["alma_open"] = calc_alma(tf["open"], ALMA_BASIS_LEN, ALMA_OFFSET, ALMA_SIGMA)
 
+    # Allow callers/tests to pass a dataframe that was already enriched by a
+    # previous trigger computation. Recompute trigger columns from raw OHLCV.
+    out = out.drop(
+        columns=["alma_close_alt", "alma_open_alt", "pine_buy", "pine_sell", "alternate_mode"],
+        errors="ignore",
+    ).copy()
     out["_bucket"] = out["timestamp"].dt.floor("8h")
 
     if mode == "historical":
         mapping = tf.set_index("bucket")[["alma_close", "alma_open"]]
         out = out.join(mapping, on="_bucket")
-        out.rename(
-            columns={"alma_close": "alma_close_alt", "alma_open": "alma_open_alt"},
-            inplace=True,
-        )
+        out.rename(columns={"alma_close": "alma_close_alt", "alma_open": "alma_open_alt"}, inplace=True)
         out["alternate_mode"] = "historical_lookahead_on"
     else:
+        # Start with the normal historical request.security mapping.
         tf_idx = tf.set_index("bucket")
-        prev_close = tf_idx["close"].shift(1)
-        prev_open = tf_idx["open"].shift(1)
-        # For ALMA length=2, current partial 8H bar + previous completed 8H bar.
-        m = ALMA_OFFSET * (ALMA_BASIS_LEN - 1)
-        s = ALMA_BASIS_LEN / ALMA_SIGMA
-        weights = np.array(
-            [math.exp(-((i - m) ** 2) / (2.0 * s * s)) for i in range(ALMA_BASIS_LEN)],
-            dtype=float,
-        )
-        weights /= weights.sum()
+        mapping = tf_idx[["alma_close", "alma_open"]]
+        out = out.join(mapping, on="_bucket")
+        out.rename(columns={"alma_close": "alma_close_alt", "alma_open": "alma_open_alt"}, inplace=True)
 
-        joined = pd.DataFrame(
-            {
-                "tf_open": tf_idx["open"],
-                "tf_close": tf_idx["close"],
-                "prev_tf_open": prev_open,
-                "prev_tf_close": prev_close,
-            }
-        )
-        out = out.join(joined, on="_bucket")
-        out["alma_close_alt"] = weights[0] * out["prev_tf_close"] + weights[1] * out["close"]
-        out["alma_open_alt"] = weights[0] * out["prev_tf_open"] + weights[1] * out["tf_open"]
+        latest_bucket = out["_bucket"].iloc[-1]
+        current_tf = tf_idx.loc[latest_bucket]
+        previous_buckets = tf_idx.loc[tf_idx.index < latest_bucket]
+
+        # If the current bucket has a confirmed predecessor, historical bars
+        # inside the current bucket must see that predecessor, not the developing
+        # current HTF value. This is the key difference from the previous Python
+        # implementation, which compared two developing states inside one 8H bar.
+        if not previous_buckets.empty:
+            prev_tf = previous_buckets.iloc[-1]
+            confirmed_prev_close = float(prev_tf["close"])
+            confirmed_prev_open = float(prev_tf["open"])
+            # Pine ta.alma(length=2): weight[0] applies to the older sample and
+            # weight[1] to the newer sample.
+            m = ALMA_OFFSET * (ALMA_BASIS_LEN - 1)
+            sigma_scale = ALMA_BASIS_LEN / ALMA_SIGMA
+            weights = np.array(
+                [
+                    math.exp(-((i - m) ** 2) / (2.0 * sigma_scale * sigma_scale))
+                    for i in range(ALMA_BASIS_LEN)
+                ],
+                dtype=float,
+            )
+            weights /= weights.sum()
+
+            developing_close = weights[0] * confirmed_prev_close + weights[1] * float(current_tf["close"])
+            developing_open = weights[0] * confirmed_prev_open + weights[1] * float(current_tf["open"])
+
+            current_bucket_mask = out["_bucket"].eq(latest_bucket)
+            # All prior chart bars in the current HTF bucket are historical at the
+            # moment the latest 1H bar closes; they see only the last confirmed HTF
+            # ALMA. The latest bar alone receives the developing HTF value.
+            prev_confirmed_alma_close = float(prev_tf["alma_close"])
+            prev_confirmed_alma_open = float(prev_tf["alma_open"])
+            out.loc[current_bucket_mask, "alma_close_alt"] = prev_confirmed_alma_close
+            out.loc[current_bucket_mask, "alma_open_alt"] = prev_confirmed_alma_open
+            out.loc[out.index[-1], "alma_close_alt"] = developing_close
+            out.loc[out.index[-1], "alma_open_alt"] = developing_open
+
         out["alternate_mode"] = "live_safe"
 
-    out.drop(
-        columns=["_bucket", "tf_open", "tf_close", "prev_tf_open", "prev_tf_close"],
-        inplace=True,
-        errors="ignore",
-    )
+    out.drop(columns=["_bucket"], inplace=True, errors="ignore")
     out["pine_buy"] = (
         (out["alma_close_alt"] > out["alma_open_alt"])
         & (out["alma_close_alt"].shift(1) <= out["alma_open_alt"].shift(1))
