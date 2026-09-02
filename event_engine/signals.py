@@ -718,8 +718,11 @@ def generate_zone_signals(
                     "sigma": ALMA_SIGMA,
                     "alternate_timeframe": "8h",
                     "mode": mode,
-                    "buy": direction == "LONG",
-                    "sell": direction == "SHORT",
+                    "buy": bool(df.loc[i, "pine_buy"]),
+                    "sell": bool(df.loc[i, "pine_sell"]),
+                    "alma_close_alt": float(df.loc[i, "alma_close_alt"]),
+                    "alma_open_alt": float(df.loc[i, "alma_open_alt"]),
+                    "signal_bar_timestamp": df.loc[i, "timestamp"].isoformat(),
                 },
                 "zone": zone_ctx,
                 "risk_model": {
