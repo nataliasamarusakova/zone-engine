@@ -17,28 +17,28 @@
     "tp_orders": [
       {
         "leg": "tp1",
-        "status": "created",
+        "status": "already_exists",
         "order_id": "2095195433307037696",
-        "client_order_id": "EVT_F8C03A4D2189AF29_TP1",
-        "price": 0.013233127425000001,
+        "client_order_id": "evt_f8c03a4d2189af29_tp1",
+        "price": 0.01323,
         "qty": 374.0,
         "pnl_pct": 0.87545
       },
       {
         "leg": "tp2",
-        "status": "created",
+        "status": "already_exists",
         "order_id": "2095195434523385856",
-        "client_order_id": "EVT_F8C03A4D2189AF29_TP2",
-        "price": 0.01311625485,
+        "client_order_id": "evt_f8c03a4d2189af29_tp2",
+        "price": 0.01312,
         "qty": 373.0,
         "pnl_pct": 1.7509
       }
     ],
     "sl_order": {
-      "status": "created",
+      "status": "already_exists",
       "order_id": "2095195430144532480",
-      "client_order_id": "EVT_F8C03A4D2189AF29_SL",
-      "stop_price": 0.013583745150000002,
+      "client_order_id": "evt_f8c03a4d2189af29_sl",
+      "stop_price": 0.01358,
       "qty": 747.0
     },
     "hit_legs": [],
@@ -47,9 +47,9 @@
     "be_required": false,
     "be_last_error": null,
     "peak_pnl_pct": 0.0,
-    "mae_pct": 0.0,
-    "max_drawdown_pct": 0.0,
-    "current_pnl_pct": 0.0,
+    "mae_pct": -0.1498127340823909,
+    "max_drawdown_pct": -0.1498127340823909,
+    "current_pnl_pct": -0.1498127340823909,
     "score": 90.0,
     "event_type": "SUPPLY_ALMA_CROSS",
     "timeframe": "1h",
@@ -173,9 +173,22 @@
         "price": 0.01311625485
       }
     ],
-    "effective_tp_levels": [],
+    "effective_tp_levels": [
+      {
+        "leg": "tp1",
+        "pnl_pct": 0.87545,
+        "close_fraction": 0.500669344042838,
+        "qty": 374.0
+      },
+      {
+        "leg": "tp2",
+        "pnl_pct": 1.7509,
+        "close_fraction": 0.499330655957162,
+        "qty": 373.0
+      }
+    ],
     "tp_mode": "multi_tp",
-    "effective_weighted_rr": 0.75,
+    "effective_weighted_rr": 0.749665327978581,
     "tp_filled_qty": {},
     "realized_pnl_qty": 0.0,
     "realized_pnl_weighted_sum": 0.0,
@@ -188,7 +201,10 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1788368493221
+    "last_observation_ts": 1788368739128,
+    "last_exchange_avg_price": 0.01335,
+    "current_position_qty": 747.0,
+    "protection_last_updated_ts": 1788368746281
   },
   "ZONE_D6A632B97B190C0604288AE0": {
     "event_id": "ZONE_D6A632B97B190C0604288AE0",
@@ -208,28 +224,28 @@
     "tp_orders": [
       {
         "leg": "tp1",
-        "status": "created",
+        "status": "already_exists",
         "order_id": "2095195447722860544",
-        "client_order_id": "EVT_4296A3CB533169C9_TP1",
-        "price": 0.049773459529999994,
+        "client_order_id": "evt_4296a3cb533169c9_tp1",
+        "price": 0.04977,
         "qty": 99.46,
         "pnl_pct": 0.9089
       },
       {
         "leg": "tp2",
-        "status": "created",
+        "status": "already_exists",
         "order_id": "2095195448914042880",
-        "client_order_id": "EVT_4296A3CB533169C9_TP2",
-        "price": 0.04931691906,
+        "client_order_id": "evt_4296a3cb533169c9_tp2",
+        "price": 0.04932,
         "qty": 99.46,
         "pnl_pct": 1.8178
       }
     ],
     "sl_order": {
-      "status": "created",
+      "status": "already_exists",
       "order_id": "2095195444468080640",
-      "client_order_id": "EVT_4296A3CB533169C9_SL",
-      "stop_price": 0.051143080939999995,
+      "client_order_id": "evt_4296a3cb533169c9_sl",
+      "stop_price": 0.05114,
       "qty": 198.92
     },
     "hit_legs": [],
@@ -237,10 +253,10 @@
     "be_activation_ts": null,
     "be_required": false,
     "be_last_error": null,
-    "peak_pnl_pct": 0.0,
-    "mae_pct": 0.0,
-    "max_drawdown_pct": 0.0,
-    "current_pnl_pct": 0.0,
+    "peak_pnl_pct": 0.13935894883534478,
+    "mae_pct": -0.0796336850487862,
+    "max_drawdown_pct": -0.17917579135974482,
+    "current_pnl_pct": 0.03981684252438619,
     "score": 85.0,
     "event_type": "SUPPLY_ALMA_CROSS",
     "timeframe": "1h",
@@ -364,7 +380,20 @@
         "price": 0.04931691906
       }
     ],
-    "effective_tp_levels": [],
+    "effective_tp_levels": [
+      {
+        "leg": "tp1",
+        "pnl_pct": 0.9089,
+        "close_fraction": 0.5,
+        "qty": 99.46
+      },
+      {
+        "leg": "tp2",
+        "pnl_pct": 1.8178,
+        "close_fraction": 0.5,
+        "qty": 99.46
+      }
+    ],
     "tp_mode": "multi_tp",
     "effective_weighted_rr": 0.75,
     "tp_filled_qty": {},
@@ -379,6 +408,9 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1788368496655
+    "last_observation_ts": 1788368739128,
+    "last_exchange_avg_price": 0.05023,
+    "current_position_qty": 198.92,
+    "protection_last_updated_ts": 1788368747412
   }
 }
