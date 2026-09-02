@@ -10,6 +10,7 @@ import math
 import os
 import time
 import threading
+import uuid
 from email.utils import parsedate_to_datetime
 from decimal import (
     Decimal,
@@ -596,8 +597,11 @@ def _trade_digest(trade_id: str) -> str:
 
 
 def _new_open_client_order_id(bx_symbol: str, trade_id: str) -> str:
-    digest = hashlib.sha256(f"{bx_symbol}:{trade_id}".encode()).hexdigest().upper()[:24]
-    return f"EVT_OPEN_{digest}"
+    # ENTRY ids must be unique for every new order attempt. Idempotency is
+    # provided by the position check before POST, not by reusing a client ID.
+    nonce = uuid.uuid4().hex.upper()[:12]
+    digest = hashlib.sha256(f"{bx_symbol}:{trade_id}:{nonce}".encode()).hexdigest().upper()[:10]
+    return f"EVT_OPEN_{digest}_{nonce}"
 
 
 def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dict:
