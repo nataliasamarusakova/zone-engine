@@ -444,7 +444,6 @@ def main() -> None:
             recent = [s for s in signals if int(s["idx"]) >= len(df) - MAX_SIGNAL_AGE_BARS]
             for sig in recent:
                 sig["score"] = score_zone_signal(sig)
-            recent = [s for s in recent if float(s["score"]) >= MIN_SIGNAL_SCORE]
 
             # Only validate BingX live price when a fresh signal exists. This keeps
             # the full-market scan on Binance while spending a small number of extra
