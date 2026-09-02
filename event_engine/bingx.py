@@ -25,8 +25,6 @@ from urllib3.util.retry import Retry
 
 log = logging.getLogger("event_engine.bingx")
 
-API_KEY = os.environ.get("BINGX_API_KEY", "").strip()
-SECRET_KEY = os.environ.get("BINGX_SECRET_KEY", "").strip()
 BASE_URL = os.environ.get("BINGX_BASE_URL", "https://open-api-vst.bingx.com").rstrip("/")
 MARGIN_USDT = float(os.environ.get("BINGX_MARGIN_USDT", "1"))
 LEVERAGE = int(os.environ.get("BINGX_LEVERAGE", "10"))
@@ -78,9 +76,19 @@ SESSION.mount("https://", _adapter)
 SESSION.mount("http://", _adapter)
 
 
+def get_credentials() -> tuple[str, str]:
+    """Read private BingX credentials at call time, not only at module import."""
+    return os.environ.get("BINGX_API_KEY", "").strip(), os.environ.get("BINGX_SECRET_KEY", "").strip()
+
+
+def credentials_available() -> bool:
+    key, secret = get_credentials()
+    return bool(key and secret)
+
 def _sign(params: dict[str, Any]) -> str:
+    _, secret_key = get_credentials()
     qs = urlencode(params)
-    return hmac.new(SECRET_KEY.encode(), qs.encode(), hashlib.sha256).hexdigest()
+    return hmac.new(secret_key.encode(), qs.encode(), hashlib.sha256).hexdigest()
 
 
 def _apply_request_timestamp(params: dict[str, Any]) -> None:
@@ -124,10 +132,11 @@ def _request(
     headers = {}
     max_timestamp_retries = 1 if signed else 0
 
+    api_key, secret_key = get_credentials()
     if signed:
-        if not API_KEY or not SECRET_KEY:
+        if not api_key or not secret_key:
             return {"code": -1, "msg": "missing BingX credentials"}
-        headers["X-BX-APIKEY"] = API_KEY
+        headers["X-BX-APIKEY"] = api_key
 
     for attempt in range(max_timestamp_retries + 1):
         request_params = dict(base_params)
@@ -185,7 +194,8 @@ def contracts() -> dict[str, dict]:
         return CACHE["data"]
     try:
         return refresh_contracts()
-    except Exception:
+    except Exception as exc:
+        log.error("[BINGX] contracts fetch failed: %s", exc)
         return CACHE["data"]
 
 
@@ -326,6 +336,7 @@ def fetch_klines(
 
         out.append(
             {
+                "timestamp": open_time,
                 "open_time": open_time,
                 "close_time": close_time,
                 "open": open_price,

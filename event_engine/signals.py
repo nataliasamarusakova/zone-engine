@@ -79,7 +79,11 @@ def generate_zone_signals(df: pd.DataFrame, symbol: str = "") -> tuple[pd.DataFr
 
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    timestamp_series = df["timestamp"]
+    if pd.api.types.is_numeric_dtype(timestamp_series):
+        df["timestamp"] = pd.to_datetime(timestamp_series, unit="ms", utc=True, errors="coerce")
+    else:
+        df["timestamp"] = pd.to_datetime(timestamp_series, utc=True, errors="coerce")
     df = df.dropna(subset=["timestamp", "open", "high", "low", "close", "volume"]).reset_index(drop=True)
     n = len(df)
     if n < SWING_LEN * 2 + 5:
