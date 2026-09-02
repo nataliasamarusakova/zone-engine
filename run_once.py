@@ -29,7 +29,7 @@ from event_engine.bingx import (
     open_market,
     wait_for_position_fill_directional,
 )
-from event_engine.signals import TP1_R, TP2_R, generate_zone_signals, score_zone_signal
+from event_engine.signals import SWING_LEN, TP1_R, TP2_R, generate_zone_signals, score_zone_signal
 from event_engine.telegram import format_signal, send as send_tg
 from event_engine.tracker import register_active_trade, update_active_trades, update_active_trade_protection
 

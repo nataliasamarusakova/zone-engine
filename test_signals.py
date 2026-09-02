@@ -735,3 +735,12 @@ def test_directional_zone_requires_actual_candle_touch_without_padding():
     assert _find_directional_zone("LONG", 110.0, 112.0, 111.0, demand, supply) == demand[0]
     assert _find_directional_zone("SHORT", 118.0, 119.0, 119.0, demand, supply) is None
     assert _find_directional_zone("SHORT", 118.0, 120.0, 119.5, demand, supply) == supply[0]
+
+
+def test_run_once_import_regression():
+    # run_once.py uses SWING_LEN for its per-symbol minimum-history guard.
+    # Keep this import-level test so a refactor cannot leave the constant out
+    # of the run_once module namespace and fail every scanned symbol.
+    import importlib
+    module = importlib.import_module("run_once")
+    assert module.SWING_LEN == 10
