@@ -57,7 +57,7 @@ def format_signal(event: dict[str, Any], setup: dict[str, Any] | None = None, ex
         "",
         f"Score: <b>{_esc(f'{score:.0f}/100' if score is not None else event.get('score'))}</b>",
         f"Zone: <b>{_esc(zone.get('kind'))}</b>",
-        f"Signal: <code>HMA 5/13 CROSS + ZONE TOUCH</code>",
+        f"Signal: <code>Ajay R5.41 · ALMA(2) · 8H alternate TF</code>",
         f"Entry reference: <code>{_esc(event.get('entry'))}</code>",
         f"SL: <code>{_esc(event.get('sl'))}</code>",
         f"TP1: <code>{_esc(event.get('tp1'))}</code> (1.0R / 50%)",

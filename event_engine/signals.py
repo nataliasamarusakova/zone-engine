@@ -2,12 +2,26 @@ from __future__ import annotations
 
 import hashlib
 import math
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
 
+# =============================================================================
+# Ajay R5.41 — parameters copied from the supplied Pine source
+# =============================================================================
+ALMA_TIMEFRAME_MINUTES = 480  # 1H chart * intRes(8) = 480m = 8H
+ALMA_TIMEFRAME_HOURS = 8
+ALMA_BASIS_TYPE = "ALMA"
+ALMA_BASIS_LEN = 2
+ALMA_SIGMA = 5.0
+ALMA_OFFSET = 0.85
+DELAY_OFFSET = 0
+USE_ALTERNATE_SIGNALS = True
+INT_RES = 8
+
 SWING_LEN = 10
+ZONE_HISTORY = 20
 BOX_WIDTH = 2.5
 RR_RATIO = 3.0
 TP1_R = 1.0
@@ -15,40 +29,7 @@ TP2_R = 2.0
 TP1_FRACTION = 0.50
 TP2_FRACTION = 0.50
 
-
-def _wma(series: pd.Series, length: int) -> pd.Series:
-    length = max(1, int(length))
-    weights = np.arange(1, length + 1, dtype=float)
-    denom = weights.sum()
-    return series.rolling(length, min_periods=length).apply(lambda x: float(np.dot(x, weights) / denom), raw=True)
-
-
-def calc_hma(series: pd.Series, length: int) -> pd.Series:
-    half = max(1, length // 2)
-    sqrt_len = max(1, int(round(math.sqrt(length))))
-    return _wma(2.0 * _wma(series, half) - _wma(series, length), sqrt_len)
-
-
-def _atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
-    prev_close = df["close"].shift(1)
-    tr = pd.concat(
-        [
-            df["high"] - df["low"],
-            (df["high"] - prev_close).abs(),
-            (df["low"] - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    return tr.rolling(length, min_periods=length).mean().bfill()
-
-
-def _make_event_id(symbol: str, direction: str, timestamp: int, zone_start: int, entry: float) -> str:
-    raw = f"ZONE:{symbol.upper()}:{direction.upper()}:{timestamp}:{zone_start}:{entry:.12f}"
-    return "ZONE_" + hashlib.sha256(raw.encode()).hexdigest().upper()[:24]
-
-
-def _zone_age(start_idx: int, current_idx: int) -> int:
-    return max(0, int(current_idx) - int(start_idx))
+MIN_BARS = 70
 
 
 def _safe_num(value: Any, default: float = 0.0) -> float:
@@ -59,186 +40,532 @@ def _safe_num(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _zone_context(zone: dict, current_idx: int, df: pd.DataFrame) -> dict[str, Any]:
+def _wilder_rma(series: pd.Series, length: int) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce").astype(float)
+    out = pd.Series(np.nan, index=s.index, dtype=float)
+    if len(s) < length:
+        return out
+    first = s.iloc[:length].mean()
+    out.iloc[length - 1] = first
+    alpha = 1.0 / float(length)
+    for i in range(length, len(s)):
+        prev = out.iloc[i - 1]
+        value = s.iloc[i]
+        out.iloc[i] = prev + alpha * (value - prev) if pd.notna(value) else prev
+    return out
+
+
+def calc_atr(df: pd.DataFrame, length: int) -> pd.Series:
+    prev_close = df["close"].shift(1)
+    tr = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - prev_close).abs(),
+            (df["low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return _wilder_rma(tr, length).bfill()
+
+
+
+
+def _wma(series: pd.Series, length: int) -> pd.Series:
+    length = max(1, int(length))
+    weights = np.arange(1, length + 1, dtype=float)
+    numeric = pd.to_numeric(series, errors="coerce").astype(float)
+    return numeric.rolling(length, min_periods=length).apply(
+        lambda x: float(np.dot(x, weights) / weights.sum()), raw=True
+    )
+
+
+def calc_hma(series: pd.Series, length: int) -> pd.Series:
+    """Legacy helper retained only for backwards-compatible tests; not used by Ajay trigger."""
+    length = max(1, int(length))
+    half = max(1, length // 2)
+    sqrt_len = max(1, int(round(math.sqrt(length))))
+    return _wma(2.0 * _wma(series, half) - _wma(series, length), sqrt_len)
+
+
+def calc_alma(series: pd.Series, length: int = 2, offset: float = 0.85, sigma: float = 5.0) -> pd.Series:
+    """Port of TradingView ta.alma() with the Pine defaults from Ajay R5.41."""
+    length = max(1, int(length))
+    numeric = pd.to_numeric(series, errors="coerce").astype(float)
+    if length == 1:
+        return numeric.copy()
+    m = float(offset) * (length - 1)
+    s = length / max(float(sigma), 1e-12)
+    weights = np.array(
+        [math.exp(-((i - m) ** 2) / (2.0 * s * s)) for i in range(length)],
+        dtype=float,
+    )
+    weights /= weights.sum()
+    return numeric.rolling(length, min_periods=length).apply(
+        lambda x: float(np.dot(x, weights)), raw=True
+    )
+
+
+def _ema(series: pd.Series, length: int) -> pd.Series:
+    numeric = pd.to_numeric(series, errors="coerce").astype(float)
+    return numeric.ewm(span=int(length), adjust=False, min_periods=1).mean()
+
+
+def compute_pine_keltner_channels(df: pd.DataFrame) -> pd.DataFrame:
+    """Reproduce the eight visible channel lines from Ajay R5.41.
+
+    Pine: ta.kc(close, 80, multiplier), followed by ta.ema(..., 50).
+    """
+    out = _normalize_1h(df)
+    prev_close = out["close"].shift(1)
+    tr = pd.concat([
+        out["high"] - out["low"],
+        (out["high"] - prev_close).abs(),
+        (out["low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    basis = _ema(out["close"], 80)
+    span = _ema(tr, 80)
+    bands = {}
+    for name, mult in (("kc1", 10.5), ("kc2", 9.5), ("kc3", 8.0), ("kc4", 3.0)):
+        upper = _ema(basis + span * mult, 50)
+        lower = _ema(basis - span * mult, 50)
+        bands[f"{name}_upper"] = upper
+        bands[f"{name}_lower"] = lower
+    return pd.DataFrame(bands, index=out.index)
+
+
+def _make_event_id(symbol: str, direction: str, timestamp: int, zone_start: int | None, entry: float) -> str:
+    raw = f"AJAY_R541:{symbol.upper()}:{direction.upper()}:{timestamp}:{zone_start if zone_start is not None else -1}:{entry:.12f}"
+    return "ZONE_" + hashlib.sha256(raw.encode()).hexdigest().upper()[:24]
+
+
+def _normalize_1h(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy().reset_index(drop=True)
+    required = {"timestamp", "open", "high", "low", "close", "volume"}
+    missing = required - set(out.columns)
+    if missing:
+        raise ValueError(f"Missing candle columns: {sorted(missing)}")
+    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
+    for col in ["open", "high", "low", "close", "volume"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    out = out.dropna(subset=["timestamp", "open", "high", "low", "close", "volume"])
+    out = out.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
+    return out
+
+
+def _drop_incomplete_1h(df: pd.DataFrame, now: pd.Timestamp | None = None) -> pd.DataFrame:
+    """Ajay strategy has calc_on_every_tick=false; use only closed chart bars."""
+    out = _normalize_1h(df)
+    if out.empty:
+        return out
+    now = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now).tz_convert("UTC")
+    last_ts = out["timestamp"].iloc[-1]
+    # Binance timestamp is candle-open time. A 1H bar is complete one hour after start.
+    if last_ts + pd.Timedelta(hours=1) > now:
+        out = out.iloc[:-1].reset_index(drop=True)
+    return out
+
+
+def _aggregate_8h(df_1h: pd.DataFrame) -> pd.DataFrame:
+    x = _normalize_1h(df_1h)
+    x["bucket"] = x["timestamp"].dt.floor("8h")
+    g = x.groupby("bucket", sort=True, observed=True)
+    tf = g.agg(
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        volume=("volume", "sum"),
+        bars=("close", "size"),
+        last_ts=("timestamp", "last"),
+    ).reset_index()
+    return tf
+
+
+def _attach_exact_alternate_series(df: pd.DataFrame, mode: Literal["historical", "live"] = "live") -> pd.DataFrame:
+    """Build the 8H alternate series used by reso().
+
+    historical:
+      Reproduces request.security(... lookahead_on) on historical chart bars:
+      an 8H value is visible from the FIRST 1H bar of that 8H interval.
+
+    live:
+      Reconstructs the current 8H developing bar at each closed 1H bar. This is
+      the non-lookahead execution form suitable for the bot.
+    """
+    out = _normalize_1h(df)
+    tf = _aggregate_8h(out)
+    tf["alma_close"] = calc_alma(tf["close"], ALMA_BASIS_LEN, ALMA_OFFSET, ALMA_SIGMA)
+    tf["alma_open"] = calc_alma(tf["open"], ALMA_BASIS_LEN, ALMA_OFFSET, ALMA_SIGMA)
+
+    out["_bucket"] = out["timestamp"].dt.floor("8h")
+
+    if mode == "historical":
+        mapping = tf.set_index("bucket")[["alma_close", "alma_open"]]
+        out = out.join(mapping, on="_bucket")
+        out.rename(
+            columns={"alma_close": "alma_close_alt", "alma_open": "alma_open_alt"},
+            inplace=True,
+        )
+        out["alternate_mode"] = "historical_lookahead_on"
+    else:
+        tf_idx = tf.set_index("bucket")
+        prev_close = tf_idx["close"].shift(1)
+        prev_open = tf_idx["open"].shift(1)
+        # For ALMA length=2, current partial 8H bar + previous completed 8H bar.
+        m = ALMA_OFFSET * (ALMA_BASIS_LEN - 1)
+        s = ALMA_BASIS_LEN / ALMA_SIGMA
+        weights = np.array(
+            [math.exp(-((i - m) ** 2) / (2.0 * s * s)) for i in range(ALMA_BASIS_LEN)],
+            dtype=float,
+        )
+        weights /= weights.sum()
+
+        joined = pd.DataFrame(
+            {
+                "tf_open": tf_idx["open"],
+                "tf_close": tf_idx["close"],
+                "prev_tf_open": prev_open,
+                "prev_tf_close": prev_close,
+            }
+        )
+        out = out.join(joined, on="_bucket")
+        out["alma_close_alt"] = weights[0] * out["prev_tf_close"] + weights[1] * out["close"]
+        out["alma_open_alt"] = weights[0] * out["prev_tf_open"] + weights[1] * out["tf_open"]
+        out["alternate_mode"] = "live_safe"
+
+    out.drop(
+        columns=["_bucket", "tf_open", "tf_close", "prev_tf_open", "prev_tf_close"],
+        inplace=True,
+        errors="ignore",
+    )
+    out["pine_buy"] = (
+        (out["alma_close_alt"] > out["alma_open_alt"])
+        & (out["alma_close_alt"].shift(1) <= out["alma_open_alt"].shift(1))
+    ).fillna(False)
+    out["pine_sell"] = (
+        (out["alma_close_alt"] < out["alma_open_alt"])
+        & (out["alma_close_alt"].shift(1) >= out["alma_open_alt"].shift(1))
+    ).fillna(False)
+    return out
+
+
+def _pine_overlap_check(new_poi: float, zones: list[dict[str, Any]], atr: float) -> bool:
+    """Literal behavior of the supplied Pine f_check_overlapping()."""
+    if not zones:
+        return True
+    atr_threshold = atr * 2.0
+    okay = True
+    for zone in zones:
+        top = float(zone["top"])
+        bottom = float(zone["btm"])
+        poi = (top + bottom) / 2.0
+        upper = poi + atr_threshold
+        lower = poi - atr_threshold
+        if new_poi >= lower and new_poi <= upper:
+            okay = False
+            break
+        else:
+            okay = True
+    return okay
+
+
+def _build_zone(top_or_bottom: float, box_type: int, atr: float, start: int) -> dict[str, Any]:
+    buffer = atr * (BOX_WIDTH / 10.0)
+    if box_type == 1:
+        top = top_or_bottom
+        bottom = top - buffer
+    else:
+        bottom = top_or_bottom
+        top = bottom + buffer
+    return {
+        "top": top,
+        "btm": bottom,
+        "poi": (top + bottom) / 2.0,
+        "start": int(start),
+    }
+
+
+def _pine_zone_walk(df: pd.DataFrame) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    supply: list[dict[str, Any]] = []
+    demand: list[dict[str, Any]] = []
+    supply_bos: list[dict[str, Any]] = []
+    demand_bos: list[dict[str, Any]] = []
+    snapshots: list[dict[str, Any]] = []
+
+    n = len(df)
+    for i in range(SWING_LEN * 2, n):
+        p = i - SWING_LEN
+        h = float(df.loc[p, "high"])
+        l = float(df.loc[p, "low"])
+        atr = max(float(df.loc[i, "atr50"]), 1e-12)
+
+        is_ph = all(h >= float(df.loc[p-k, "high"]) for k in range(1, SWING_LEN+1)) and all(
+            h >= float(df.loc[p+k, "high"]) for k in range(1, SWING_LEN+1)
+        )
+        is_pl = all(l <= float(df.loc[p-k, "low"]) for k in range(1, SWING_LEN+1)) and all(
+            l <= float(df.loc[p+k, "low"]) for k in range(1, SWING_LEN+1)
+        )
+
+        # Pine is if swing_high, else if swing_low.
+        if is_ph:
+            zone = _build_zone(h, 1, atr, p)
+            if _pine_overlap_check(zone["poi"], supply, atr):
+                supply.insert(0, zone)
+                del supply[ZONE_HISTORY:]
+        elif is_pl:
+            zone = _build_zone(l, -1, atr, p)
+            if _pine_overlap_check(zone["poi"], demand, atr):
+                demand.insert(0, zone)
+                del demand[ZONE_HISTORY:]
+
+        close = float(df.loc[i, "close"])
+        # Logical representation of f_sd_to_bos(): broken boxes are removed
+        # from the active list and an immutable BOS record is retained for plots/logs.
+        kept_supply = []
+        for z in supply:
+            if close >= float(z["top"]):
+                supply_bos.append({**z, "break_idx": i, "break_time": df.loc[i, "timestamp"].isoformat(), "type": "SUPPLY_BOS"})
+            else:
+                kept_supply.append(z)
+        supply = kept_supply
+
+        kept_demand = []
+        for z in demand:
+            if close <= float(z["btm"]):
+                demand_bos.append({**z, "break_idx": i, "break_time": df.loc[i, "timestamp"].isoformat(), "type": "DEMAND_BOS"})
+            else:
+                kept_demand.append(z)
+        demand = kept_demand
+
+        snapshots.append(
+            {
+                "idx": i,
+                "time": df.loc[i, "timestamp"].isoformat(),
+                "supply": [dict(z) for z in supply],
+                "demand": [dict(z) for z in demand],
+            }
+        )
+
+    return supply, demand, supply_bos, demand_bos, snapshots
+
+
+def _zone_context(zone: dict[str, Any], current_idx: int, df: pd.DataFrame) -> dict[str, Any]:
     start = int(zone["start"])
     move_idx = min(start + 6, current_idx)
     base = _safe_num(df.loc[start, "close"])
     end_close = _safe_num(df.loc[move_idx, "close"])
-    atr = max(_safe_num(df.loc[start, "atr"], 0.0), 1e-12)
-    impulse_atr = abs(end_close - base) / atr
-    age = _zone_age(start, current_idx)
-    return {"start_idx": start, "age_bars": age, "impulse_atr": round(impulse_atr, 3)}
+    atr = max(_safe_num(df.loc[start, "atr50"], 0.0), 1e-12)
+    return {
+        "start_idx": start,
+        "age_bars": max(0, current_idx - start),
+        "impulse_atr": round(abs(end_close - base) / atr, 3),
+    }
 
 
-def generate_zone_signals(df: pd.DataFrame, symbol: str = "") -> tuple[pd.DataFrame, list[dict], list[dict], list[dict]]:
-    df = df.copy().reset_index(drop=True)
-    required = {"timestamp", "open", "high", "low", "close", "volume"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing candle columns: {sorted(missing)}")
-
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    timestamp_series = df["timestamp"]
-    if pd.api.types.is_numeric_dtype(timestamp_series):
-        df["timestamp"] = pd.to_datetime(timestamp_series, unit="ms", utc=True, errors="coerce")
+def _find_directional_zone(direction: str, cur_l: float, cur_h: float, cur_c: float, demand: list[dict[str, Any]], supply: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if direction == "LONG":
+        candidates = [z for z in demand if cur_l <= float(z["top"]) * 1.003 and cur_c >= float(z["btm"])]
     else:
-        df["timestamp"] = pd.to_datetime(timestamp_series, utc=True, errors="coerce")
-    df = df.dropna(subset=["timestamp", "open", "high", "low", "close", "volume"]).reset_index(drop=True)
-    n = len(df)
-    if n < SWING_LEN * 2 + 5:
+        candidates = [z for z in supply if cur_h >= float(z["btm"]) * 0.997 and cur_c <= float(z["top"])]
+    return candidates[0] if candidates else None
+
+
+def _nearest_zone(direction: str, cur_c: float, demand: list[dict[str, Any]], supply: list[dict[str, Any]]) -> dict[str, Any] | None:
+    zones = demand if direction == "LONG" else supply
+    return min(zones, key=lambda z: abs(cur_c - float(z["poi"])), default=None)
+
+
+def compute_pine_zone_records(df: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
+    """Return historical Supply/Demand box lifetimes and BOS records for plotting."""
+    x = _normalize_1h(df)
+    if len(x) < MIN_BARS:
+        return {"supply": [], "demand": [], "supply_bos": [], "demand_bos": []}
+    x["atr50"] = calc_atr(x, 50)
+    supply, demand, supply_bos, demand_bos, snapshots = _pine_zone_walk(x)
+    records: dict[str, dict[tuple, dict[str, Any]]] = {"supply": {}, "demand": {}}
+    for snap in snapshots:
+        idx = int(snap["idx"])
+        for kind, key in (("supply", "supply"), ("demand", "demand")):
+            for z in snap[key]:
+                ident = (kind, int(z["start"]), round(float(z["top"]), 12), round(float(z["btm"]), 12))
+                rec = records[kind].get(ident)
+                if rec is None:
+                    rec = {**z, "kind": kind.upper(), "active_from_idx": idx, "end_idx": None}
+                    records[kind][ident] = rec
+    for bos in supply_bos:
+        ident = ("supply", int(bos["start"]), round(float(bos["top"]), 12), round(float(bos["btm"]), 12))
+        if ident in records["supply"]:
+            records["supply"][ident]["end_idx"] = int(bos["break_idx"])
+    for bos in demand_bos:
+        ident = ("demand", int(bos["start"]), round(float(bos["top"]), 12), round(float(bos["btm"]), 12))
+        if ident in records["demand"]:
+            records["demand"][ident]["end_idx"] = int(bos["break_idx"])
+    return {
+        "supply": list(records["supply"].values()),
+        "demand": list(records["demand"].values()),
+        "supply_bos": supply_bos,
+        "demand_bos": demand_bos,
+    }
+
+
+def compute_ajay_trigger(df: pd.DataFrame, mode: Literal["historical", "live"] = "live") -> pd.DataFrame:
+    """Return 1H data with Ajay R5.41 alternate-timeframe ALMA trigger fields."""
+    out = _drop_incomplete_1h(df)
+    return _attach_exact_alternate_series(out, mode=mode)
+
+
+def generate_zone_signals(
+    df: pd.DataFrame,
+    symbol: str = "",
+    mode: Literal["historical", "live"] = "live",
+) -> tuple[pd.DataFrame, list[dict], list[dict], list[dict]]:
+    """Ajay R5.41 strategy core plus Supply/Demand context.
+
+    The strategy trigger is ONLY the ALMA crossover from the supplied Pine.
+    Zones are reconstructed independently and used for context/SL planning.
+    """
+    df = _drop_incomplete_1h(df)
+    if len(df) < MIN_BARS:
         return df, [], [], []
 
-    df["atr"] = _atr(df, 14)
-    tr = pd.concat(
-        [
-            df["high"] - df["low"],
-            (df["high"] - df["close"].shift(1)).abs(),
-            (df["low"] - df["close"].shift(1)).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    df["atr50"] = tr.rolling(50, min_periods=1).mean().bfill()
-    df["fast_ma"] = calc_hma(df["close"], 5)
-    df["slow_ma"] = calc_hma(df["close"], 13)
+    df["atr50"] = calc_atr(df, 50)
+    df["atr30"] = calc_atr(df, 30)
     df["vol_sma20"] = df["volume"].rolling(20, min_periods=5).mean().bfill()
-    df["body_atr"] = (df["close"] - df["open"]).abs() / df["atr"].replace(0, np.nan)
-    df["range_atr"] = (df["high"] - df["low"]) / df["atr"].replace(0, np.nan)
+    df["body_atr"] = (df["close"] - df["open"]).abs() / df["atr50"].replace(0, np.nan)
+    df["range_atr"] = (df["high"] - df["low"]) / df["atr50"].replace(0, np.nan)
 
-    active_supply: list[dict] = []
-    active_demand: list[dict] = []
-    signals: list[dict] = []
+    df = _attach_exact_alternate_series(df, mode=mode)
+    _, _, _, _, snapshots = _pine_zone_walk(df)
 
-    for i in range(SWING_LEN * 2, n):
-        p_idx = i - SWING_LEN
-        h = float(df.loc[p_idx, "high"])
-        l = float(df.loc[p_idx, "low"])
-        buf = max(float(df.loc[p_idx, "atr50"]) * (BOX_WIDTH / 10.0), 1e-12)
+    active_supply: list[dict[str, Any]] = []
+    active_demand: list[dict[str, Any]] = []
+    signals: list[dict[str, Any]] = []
 
-        if all(h >= float(df.loc[p_idx - k, "high"]) for k in range(1, SWING_LEN + 1)) and all(
-            h >= float(df.loc[p_idx + k, "high"]) for k in range(1, SWING_LEN + 1)
-        ):
-            active_supply.append({"top": h, "btm": h - buf, "poi": h - buf / 2.0, "start": p_idx})
+    for i in range(SWING_LEN * 2, len(df)):
+        p = i - SWING_LEN
+        h = float(df.loc[p, "high"])
+        l = float(df.loc[p, "low"])
+        atr = max(float(df.loc[i, "atr50"]), 1e-12)
 
-        if all(l <= float(df.loc[p_idx - k, "low"]) for k in range(1, SWING_LEN + 1)) and all(
-            l <= float(df.loc[p_idx + k, "low"]) for k in range(1, SWING_LEN + 1)
-        ):
-            active_demand.append({"top": l + buf, "btm": l, "poi": l + buf / 2.0, "start": p_idx})
+        is_ph = all(h >= float(df.loc[p-k, "high"]) for k in range(1, SWING_LEN+1)) and all(
+            h >= float(df.loc[p+k, "high"]) for k in range(1, SWING_LEN+1)
+        )
+        is_pl = all(l <= float(df.loc[p-k, "low"]) for k in range(1, SWING_LEN+1)) and all(
+            l <= float(df.loc[p+k, "low"]) for k in range(1, SWING_LEN+1)
+        )
+        if is_ph:
+            zone = _build_zone(h, 1, atr, p)
+            if _pine_overlap_check(zone["poi"], active_supply, atr):
+                active_supply.insert(0, zone)
+                del active_supply[ZONE_HISTORY:]
+        elif is_pl:
+            zone = _build_zone(l, -1, atr, p)
+            if _pine_overlap_check(zone["poi"], active_demand, atr):
+                active_demand.insert(0, zone)
+                del active_demand[ZONE_HISTORY:]
 
-        current_close = float(df.loc[i, "close"])
-        active_supply = [s for s in active_supply[-4:] if current_close <= float(s["top"])]
-        active_demand = [d for d in active_demand[-4:] if current_close >= float(d["btm"])]
+        close = float(df.loc[i, "close"])
+        active_supply = [z for z in active_supply if close < float(z["top"])]
+        active_demand = [z for z in active_demand if close > float(z["btm"])]
 
-        cur_l = float(df.loc[i, "low"])
-        cur_h = float(df.loc[i, "high"])
-        cur_c = current_close
-        cur_o = float(df.loc[i, "open"])
-        c_atr = max(float(df.loc[i, "atr"]), 1e-12)
+        direction = "LONG" if bool(df.loc[i, "pine_buy"]) else "SHORT" if bool(df.loc[i, "pine_sell"]) else None
+        if not direction:
+            continue
 
-        fast = df.loc[i, "fast_ma"]
-        slow = df.loc[i, "slow_ma"]
-        fast_prev = df.loc[i - 1, "fast_ma"]
-        slow_prev = df.loc[i - 1, "slow_ma"]
-        bull_cross = bool(pd.notna(fast) and pd.notna(slow) and pd.notna(fast_prev) and pd.notna(slow_prev) and fast > slow and fast_prev <= slow_prev)
-        bear_cross = bool(pd.notna(fast) and pd.notna(slow) and pd.notna(fast_prev) and pd.notna(slow_prev) and fast < slow and fast_prev >= slow_prev)
+        cur_l, cur_h, cur_c, cur_o = map(float, [df.loc[i, "low"], df.loc[i, "high"], df.loc[i, "close"], df.loc[i, "open"]])
+        trade_zone = _find_directional_zone(direction, cur_l, cur_h, cur_c, active_demand, active_supply)
+        context_zone = trade_zone or _nearest_zone(direction, cur_c, active_demand, active_supply)
 
-        near_demand = [d for d in active_demand if cur_l <= float(d["top"]) * 1.003 and cur_c >= float(d["btm"])]
-        if near_demand and bull_cross:
-            zone = near_demand[-1]
-            sl = round(float(zone["btm"]) - 0.3 * c_atr, 8)
-            risk = max(cur_c - sl, 1e-12)
-            tp1 = round(cur_c + TP1_R * risk, 8)
-            tp2 = round(cur_c + TP2_R * risk, 8)
-            event_id = _make_event_id(symbol or "UNKNOWN", "LONG", int(df.loc[i, "timestamp"].timestamp() * 1000), int(zone["start"]), cur_c)
-            vol_ratio = cur_vol = None
-            avg_vol = _safe_num(df.loc[i, "vol_sma20"], 0.0)
-            if avg_vol > 0:
-                cur_vol = _safe_num(df.loc[i, "volume"])
-                vol_ratio = cur_vol / avg_vol
-            signals.append(
-                {
-                    "event_id": event_id,
-                    "idx": i,
-                    "time": df.loc[i, "timestamp"].isoformat(),
-                    "type": "LONG",
-                    "symbol": symbol.upper(),
-                    "entry": cur_c,
-                    "sl": sl,
-                    "tp1": tp1,
-                    "tp2": tp2,
-                    "risk_pct": round((risk / cur_c) * 100.0, 4),
-                    "risk_abs": risk,
-                    "rr_ratio": RR_RATIO,
-                    "zone": {**zone, **_zone_context(zone, i, df), "kind": "DEMAND"},
-                    "confirmation": {
-                        "hma_cross": True,
-                        "volume_ratio": round(vol_ratio, 3) if vol_ratio is not None else None,
-                        "candle_body_atr": round(_safe_num(df.loc[i, "body_atr"]), 3),
-                        "range_atr": round(_safe_num(df.loc[i, "range_atr"]), 3),
-                        "bullish_candle": cur_c >= cur_o,
-                    },
-                    "source_bar_close": cur_c,
-                }
-            )
+        stop = risk = tp1 = tp2 = risk_pct = None
+        if trade_zone is not None:
+            if direction == "LONG":
+                stop = float(trade_zone["btm"]) - 0.3 * atr
+                risk = cur_c - stop
+                tp1 = cur_c + TP1_R * risk
+                tp2 = cur_c + TP2_R * risk
+            else:
+                stop = float(trade_zone["top"]) + 0.3 * atr
+                risk = stop - cur_c
+                tp1 = cur_c - TP1_R * risk
+                tp2 = cur_c - TP2_R * risk
+            if risk > 0 and cur_c > 0:
+                risk_pct = (risk / cur_c) * 100.0
+            else:
+                stop = risk = tp1 = tp2 = risk_pct = None
 
-        near_supply = [s for s in active_supply if cur_h >= float(s["btm"]) * 0.997 and cur_c <= float(s["top"])]
-        if near_supply and bear_cross:
-            zone = near_supply[-1]
-            sl = round(float(zone["top"]) + 0.3 * c_atr, 8)
-            risk = max(sl - cur_c, 1e-12)
-            tp1 = round(cur_c - TP1_R * risk, 8)
-            tp2 = round(cur_c - TP2_R * risk, 8)
-            event_id = _make_event_id(symbol or "UNKNOWN", "SHORT", int(df.loc[i, "timestamp"].timestamp() * 1000), int(zone["start"]), cur_c)
-            vol_ratio = None
-            avg_vol = _safe_num(df.loc[i, "vol_sma20"], 0.0)
-            if avg_vol > 0:
-                vol_ratio = _safe_num(df.loc[i, "volume"]) / avg_vol
-            signals.append(
-                {
-                    "event_id": event_id,
-                    "idx": i,
-                    "time": df.loc[i, "timestamp"].isoformat(),
-                    "type": "SHORT",
-                    "symbol": symbol.upper(),
-                    "entry": cur_c,
-                    "sl": sl,
-                    "tp1": tp1,
-                    "tp2": tp2,
-                    "risk_pct": round((risk / cur_c) * 100.0, 4),
-                    "risk_abs": risk,
-                    "rr_ratio": RR_RATIO,
-                    "zone": {**zone, **_zone_context(zone, i, df), "kind": "SUPPLY"},
-                    "confirmation": {
-                        "hma_cross": True,
-                        "volume_ratio": round(vol_ratio, 3) if vol_ratio is not None else None,
-                        "candle_body_atr": round(_safe_num(df.loc[i, "body_atr"]), 3),
-                        "range_atr": round(_safe_num(df.loc[i, "range_atr"]), 3),
-                        "bearish_candle": cur_c <= cur_o,
-                    },
-                    "source_bar_close": cur_c,
-                }
-            )
+        avg_vol = _safe_num(df.loc[i, "vol_sma20"], 0.0)
+        vol_ratio = (_safe_num(df.loc[i, "volume"]) / avg_vol) if avg_vol > 0 else None
+        event_ts = int(df.loc[i, "timestamp"].timestamp() * 1000)
+        zone_start = int(context_zone["start"]) if context_zone is not None else None
+        event_id = _make_event_id(symbol or "UNKNOWN", direction, event_ts, zone_start, cur_c)
+        zone_ctx = {}
+        if context_zone:
+            zone_ctx = {
+                **context_zone,
+                **_zone_context(context_zone, i, df),
+                "kind": "DEMAND" if direction == "LONG" else "SUPPLY",
+            }
+
+        signals.append(
+            {
+                "event_id": event_id,
+                "idx": i,
+                "time": df.loc[i, "timestamp"].isoformat(),
+                "type": direction,
+                "symbol": symbol.upper(),
+                "entry": cur_c,
+                "sl": round(stop, 8) if stop is not None else None,
+                "tp1": round(tp1, 8) if tp1 is not None else None,
+                "tp2": round(tp2, 8) if tp2 is not None else None,
+                "risk_pct": round(risk_pct, 4) if risk_pct is not None else None,
+                "risk_abs": round(risk, 8) if risk is not None else None,
+                "rr_ratio": RR_RATIO,
+                "strategy": "Ajay R5.41",
+                "trigger": {
+                    "type": "ALMA_CROSS",
+                    "basis_type": ALMA_BASIS_TYPE,
+                    "basis_len": ALMA_BASIS_LEN,
+                    "offset": ALMA_OFFSET,
+                    "sigma": ALMA_SIGMA,
+                    "alternate_timeframe": "8h",
+                    "mode": mode,
+                    "buy": direction == "LONG",
+                    "sell": direction == "SHORT",
+                },
+                "zone": zone_ctx,
+                "confirmation": {
+                    "alma_cross": True,
+                    "zone_touch": trade_zone is not None,
+                    "volume_ratio": round(vol_ratio, 3) if vol_ratio is not None else None,
+                    "candle_body_atr": round(_safe_num(df.loc[i, "body_atr"]), 3),
+                    "range_atr": round(_safe_num(df.loc[i, "range_atr"]), 3),
+                    "bullish_candle": cur_c >= cur_o,
+                    "bearish_candle": cur_c <= cur_o,
+                },
+                "source_bar_close": cur_c,
+            }
+        )
 
     return df, active_supply, active_demand, signals
 
 
 def score_zone_signal(signal: dict[str, Any]) -> float:
+    """Research-only score; never changes the Ajay trigger."""
     confirmation = signal.get("confirmation", {})
     zone = signal.get("zone", {})
-    score = 60.0
-    if confirmation.get("hma_cross"):
+    score = 50.0
+    if confirmation.get("alma_cross"):
+        score += 20.0
+    if confirmation.get("zone_touch"):
         score += 10.0
     vol_ratio = _safe_num(confirmation.get("volume_ratio"), 0.0)
-    if vol_ratio >= 1.5:
+    if vol_ratio >= 2.0:
         score += 10.0
     elif vol_ratio >= 1.2:
         score += 5.0
-    body_atr = _safe_num(confirmation.get("candle_body_atr"), 0.0)
-    if body_atr >= 0.8:
+    body = _safe_num(confirmation.get("candle_body_atr"), 0.0)
+    if body >= 0.8:
         score += 5.0
-    age = int(zone.get("age_bars", 9999) or 9999)
-    if age <= 36:
+    if int(zone.get("age_bars", 9999) or 9999) <= 36:
         score += 5.0
-    if _safe_num(zone.get("impulse_atr"), 0.0) >= 1.0:
-        score += 10.0
     return min(score, 100.0)
