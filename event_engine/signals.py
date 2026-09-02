@@ -159,11 +159,53 @@ def _normalize_1h(df: pd.DataFrame) -> pd.DataFrame:
     missing = required - set(out.columns)
     if missing:
         raise ValueError(f"Missing candle columns: {sorted(missing)}")
-    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
+
+    raw_ts = out["timestamp"]
+    # Exchange APIs in this project return epoch milliseconds.  Calling
+    # pd.to_datetime() without a unit silently interprets those integers as
+    # nanoseconds, turning 2026 timestamps into dates around 1970.
+    # Preserve already-datetime values, otherwise infer the epoch unit from
+    # the magnitude of numeric timestamps.
+    if pd.api.types.is_datetime64_any_dtype(raw_ts):
+        out["timestamp"] = pd.to_datetime(raw_ts, utc=True, errors="coerce")
+    else:
+        numeric_ts = pd.to_numeric(raw_ts, errors="coerce")
+        numeric_ratio = float(numeric_ts.notna().mean()) if len(numeric_ts) else 0.0
+        if numeric_ratio >= 0.99:
+            finite = numeric_ts.dropna().abs()
+            magnitude = float(finite.median()) if not finite.empty else 0.0
+            if magnitude >= 1e17:
+                unit = "ns"
+            elif magnitude >= 1e14:
+                unit = "us"
+            elif magnitude >= 1e11:
+                unit = "ms"
+            elif magnitude >= 1e8:
+                unit = "s"
+            else:
+                unit = None
+            if unit is not None:
+                out["timestamp"] = pd.to_datetime(numeric_ts, unit=unit, utc=True, errors="coerce")
+            else:
+                out["timestamp"] = pd.to_datetime(raw_ts, utc=True, errors="coerce")
+        else:
+            out["timestamp"] = pd.to_datetime(raw_ts, utc=True, errors="coerce")
+
     for col in ["open", "high", "low", "close", "volume"]:
         out[col] = pd.to_numeric(out[col], errors="coerce")
     out = out.dropna(subset=["timestamp", "open", "high", "low", "close", "volume"])
     out = out.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
+
+    # A 1H candle sequence compressed into milliseconds is always a malformed
+    # timestamp conversion, not valid market data. Fail loudly instead of
+    # allowing all candles to land in one 8H bucket and suppress signals.
+    if len(out) >= 3:
+        deltas = out["timestamp"].diff().dropna()
+        if not deltas.empty and deltas.median() < pd.Timedelta(minutes=30):
+            raise ValueError(
+                "Invalid 1H timestamp spacing after normalization: "
+                f"median_delta={deltas.median()}"
+            )
     return out
 
 
