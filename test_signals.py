@@ -42,13 +42,15 @@ def test_zone_signal_schema():
         assert s["symbol"] == "TEST-USDT"
         assert s["type"] in {"LONG", "SHORT"}
         assert s["entry"] > 0
-        assert s["sl"] > 0
-        assert s["tp1"] > 0
-        assert s["tp2"] > 0
-        assert s["risk_pct"] > 0
+        if s["sl"] is not None:
+            assert s["sl"] > 0
+            assert s["tp1"] > 0
+            assert s["tp2"] > 0
+            assert s["risk_pct"] > 0
         assert s["event_id"].startswith("ZONE_")
-        assert s["zone"]["kind"] in {"DEMAND", "SUPPLY"}
-        assert s["confirmation"]["hma_cross"] is True
+        if s["zone"]:
+            assert s["zone"]["kind"] in {"DEMAND", "SUPPLY"}
+        assert s["confirmation"]["alma_cross"] is True
 
 
 def test_long_tp_ordering_and_rr():
@@ -56,7 +58,7 @@ def test_long_tp_ordering_and_rr():
         "symbol": "TEST-USDT", "type": "LONG", "entry": 100.0, "sl": 95.0,
         "tp1": 107.5, "tp2": 115.0, "risk_pct": 5.0,
         "zone": {"kind": "DEMAND", "age_bars": 10, "impulse_atr": 2.0},
-        "confirmation": {"hma_cross": True, "volume_ratio": 1.5, "candle_body_atr": 1.0},
+        "confirmation": {"alma_cross": True, "zone_touch": True, "volume_ratio": 1.5, "candle_body_atr": 1.0},
     }
     assert signal["tp1"] < signal["tp2"]
     assert RR_RATIO == 3.0
@@ -70,7 +72,7 @@ def test_short_tp_ordering():
         "symbol": "TEST-USDT", "type": "SHORT", "entry": 100.0, "sl": 105.0,
         "tp1": 92.5, "tp2": 85.0, "risk_pct": 5.0,
         "zone": {"kind": "SUPPLY", "age_bars": 20, "impulse_atr": 1.5},
-        "confirmation": {"hma_cross": True, "volume_ratio": 1.2, "candle_body_atr": 0.8},
+        "confirmation": {"alma_cross": True, "zone_touch": True, "volume_ratio": 1.2, "candle_body_atr": 0.8},
     }
     assert signal["tp1"] > signal["tp2"]
     assert score_zone_signal(signal) >= 70
@@ -303,3 +305,89 @@ def test_tp_constants_are_one_and_two_r():
     assert TP2_R == 2.0
     assert TP1_FRACTION == 0.50
     assert TP2_FRACTION == 0.50
+
+
+def test_alma_parameters_match_ajay_r541_defaults():
+    from event_engine import signals
+    assert signals.ALMA_TIMEFRAME_HOURS == 8
+    assert signals.ALMA_BASIS_TYPE == "ALMA"
+    assert signals.ALMA_BASIS_LEN == 2
+    assert signals.ALMA_SIGMA == 5
+    assert signals.ALMA_OFFSET == 0.85
+    assert signals.USE_ALTERNATE_SIGNALS is True
+
+
+def test_generate_signals_uses_alma_cross_not_hma_cross():
+    import numpy as np
+    import pandas as pd
+    from event_engine.signals import generate_zone_signals
+
+    n = 120
+    ts = pd.date_range("2026-01-01", periods=n, freq="1h", tz="UTC")
+    # Construct a rising sequence whose 8H ALMA close/open relationship crosses.
+    close = np.linspace(100.0, 140.0, n)
+    open_ = close.copy()
+    open_[32:] -= 0.8
+    high = np.maximum(open_, close) + 1.0
+    low = np.minimum(open_, close) - 1.0
+    volume = np.full(n, 1000.0)
+    df = pd.DataFrame({"timestamp": ts, "open": open_, "high": high, "low": low, "close": close, "volume": volume})
+    out, _, _, signals = generate_zone_signals(df, symbol="TEST-USDT")
+    assert "alma_close_alt" in out.columns
+    assert "alma_open_alt" in out.columns
+    assert "pine_buy" in out.columns
+    assert "pine_sell" in out.columns
+    # This is an implementation contract: any emitted signal must be ALMA-triggered.
+    for signal in signals:
+        assert signal["strategy"] == "Ajay R5.41"
+        assert signal["trigger"]["type"] == "ALMA_CROSS"
+        assert signal["confirmation"]["alma_cross"] is True
+
+
+def test_historical_lookahead_8h_series_is_constant_inside_bucket():
+    from event_engine.signals import compute_ajay_trigger
+    n = 32
+    ts = pd.date_range("2026-01-01 00:00", periods=n, freq="h", tz="UTC")
+    close = np.arange(100.0, 100.0 + n)
+    open_ = close - 0.25
+    high = np.maximum(open_, close) + 0.5
+    low = np.minimum(open_, close) - 0.5
+    volume = np.ones(n)
+    df = pd.DataFrame({"timestamp": ts, "open": open_, "high": high, "low": low, "close": close, "volume": volume})
+    out = compute_ajay_trigger(df, mode="historical")
+    first_bucket = out[out["timestamp"].dt.floor("8h") == pd.Timestamp("2026-01-01 08:00", tz="UTC")]
+    vals = first_bucket["alma_close_alt"].dropna().round(10).unique()
+    assert len(vals) == 1
+
+
+def test_live_trigger_uses_explicit_live_mode():
+    from event_engine.signals import compute_ajay_trigger
+    n = 32
+    ts = pd.date_range("2026-01-01 00:00", periods=n, freq="h", tz="UTC")
+    close = np.linspace(100.0, 120.0, n)
+    open_ = close - 0.2
+    high = close + 0.5
+    low = close - 0.5
+    volume = np.ones(n)
+    df = pd.DataFrame({"timestamp": ts, "open": open_, "high": high, "low": low, "close": close, "volume": volume})
+    out = compute_ajay_trigger(df, mode="live")
+    assert set(out["alternate_mode"].dropna().unique()) == {"live_safe"}
+
+
+def test_pine_keltner_visual_series_schema():
+    from event_engine.signals import compute_pine_keltner_channels
+    df = _candles(120)
+    out = compute_pine_keltner_channels(df)
+    assert set(out.columns) == {
+        "kc1_upper", "kc1_lower", "kc2_upper", "kc2_lower",
+        "kc3_upper", "kc3_lower", "kc4_upper", "kc4_lower",
+    }
+    assert len(out) == len(df)
+
+
+def test_pine_zone_records_are_exposed_for_comparison():
+    from event_engine.signals import compute_pine_zone_records
+    df = _candles(180)
+    result = compute_pine_zone_records(df)
+    assert set(result) == {"supply", "demand", "supply_bos", "demand_bos"}
+    assert isinstance(result["supply"], list)

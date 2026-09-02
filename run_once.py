@@ -46,7 +46,6 @@ MAX_TRADES_PER_CYCLE = int(os.environ.get("MAX_TRADES_PER_CYCLE", "5"))
 MAX_SCAN_SYMBOLS = int(os.environ.get("MAX_SCAN_SYMBOLS", "0"))
 KLINE_LIMIT_1H = int(os.environ.get("KLINE_LIMIT_1H", "120"))
 MAX_SIGNAL_AGE_BARS = int(os.environ.get("MAX_SIGNAL_AGE_BARS", "3"))
-MIN_SIGNAL_SCORE = float(os.environ.get("MIN_SIGNAL_SCORE", "70"))
 SCAN_WORKERS = max(1, int(os.environ.get("SCAN_WORKERS", "12")))
 SCAN_BATCH_SIZE = max(SCAN_WORKERS, int(os.environ.get("SCAN_BATCH_SIZE", "48")))
 SCAN_BATCH_PAUSE_SEC = max(0.0, float(os.environ.get("SCAN_BATCH_PAUSE_SEC", "0.10")))
@@ -242,7 +241,7 @@ def _load_active_trades_file() -> dict[str, dict]:
 def _build_setup(signal: dict[str, Any]) -> dict[str, Any]:
     risk_pct = float(signal["risk_pct"])
     return {
-        "strategy": "DEMAND_SUPPLY_SMART_MONEY",
+        "strategy": "Ajay R5.41",
         "signal_price": float(signal["entry"]),
         "entry_reference": float(signal["entry"]),
         "invalidation_price": float(signal["sl"]),
@@ -413,7 +412,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         qty=qty,
         tp_orders=protection.get("tp_orders", []),
         sl_result=protection.get("sl_result", {}),
-        event_type=f"{setup['zone'].get('kind', 'ZONE')}_HMA_CROSS",
+        event_type=f"{setup['zone'].get('kind', 'ZONE')}_ALMA_CROSS",
         timeframe="1h",
         score=float(signal.get("score", 0.0)),
         setup={**setup, "protection_status": protection.get("status"), "protection_result": protection},
@@ -521,6 +520,7 @@ def main() -> None:
 
     def scan_one(symbol: str) -> dict[str, Any]:
         """Public-market scan for one symbol. Safe to run concurrently."""
+        source_name = "unknown"
         try:
             contract = get_contract(symbol)
             meta = analysis_meta.get(symbol, {})
@@ -549,13 +549,12 @@ def main() -> None:
                     "error": f"insufficient_1h_candles:{len(bars)}<{min_bars}", "signals": [],
                 }
 
-            df, supply, demand, signals = generate_zone_signals(pd.DataFrame(bars), symbol=symbol)
+            df, supply, demand, signals = generate_zone_signals(pd.DataFrame(bars), symbol=symbol, mode="live")
             latest_price = float(df["close"].iloc[-1])
             bingx_price = _bingx_last_price(contract)
             recent = [s for s in signals if int(s["idx"]) >= len(df) - MAX_SIGNAL_AGE_BARS]
             for sig in recent:
                 sig["score"] = score_zone_signal(sig)
-            recent = [s for s in recent if float(s["score"]) >= MIN_SIGNAL_SCORE]
 
             # Only validate BingX live price when a fresh signal exists. This keeps
             # the full-market scan on Binance while spending a small number of extra
