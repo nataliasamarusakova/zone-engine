@@ -60,8 +60,8 @@ def test_long_tp_ordering_and_rr():
     }
     assert signal["tp1"] < signal["tp2"]
     assert RR_RATIO == 3.0
-    assert TP1_R == 1.5
-    assert TP2_R == 3.0
+    assert TP1_R == 1
+    assert TP2_R == 2.0
     assert score_zone_signal(signal) >= 70
 
 
