@@ -13,10 +13,10 @@ from urllib3.util.retry import Retry
 
 log = logging.getLogger("event_engine.binance")
 
-BASE_URL = os.environ.get("BINANCE_MARKET_BASE_URL", "https://fapi.binance.com").rstrip("/")
-EXCHANGE_INFO_PATH = "/fapi/v1/exchangeInfo"
-KLINES_PATH = "/fapi/v1/klines"
-TICKER_24H_PATH = "/fapi/v1/ticker/24hr"
+BASE_URL = os.environ.get("BINANCE_MARKET_BASE_URL", "https://data-api.binance.vision").rstrip("/")
+EXCHANGE_INFO_PATH = "/api/v3/exchangeInfo"
+KLINES_PATH = "/api/v3/klines"
+TICKER_24H_PATH = "/api/v3/ticker/24hr"
 
 _CACHE: dict[str, Any] = {"ts": 0.0, "symbols": {}, "raw": []}
 _CACHE_TTL = max(60, int(os.environ.get("BINANCE_EXCHANGE_INFO_TTL_SEC", "1800")))
@@ -71,8 +71,6 @@ def refresh_exchange_info() -> dict[str, dict[str, Any]]:
             continue
         if str(item.get("quoteAsset", "")).upper() != "USDT":
             continue
-        if str(item.get("contractType", "")).upper() != "PERPETUAL":
-            continue
         symbols[symbol] = item
     _CACHE.update(ts=time.time(), symbols=symbols, raw=raw)
     log.info("[BINANCE] Active USDT perpetual symbols=%d", len(symbols))
@@ -105,6 +103,29 @@ def classify_asset(info: dict[str, Any]) -> str:
         return "CRYPTO"
     return "UNKNOWN"
 
+
+
+def classify_bingx_contract(contract: dict[str, Any] | None) -> str:
+    if not isinstance(contract, dict):
+        return "UNKNOWN"
+    parts: list[str] = []
+    for key in ("underlyingType", "underlyingSubType", "category", "type", "tradeType", "businessType", "displayName", "symbol"):
+        value = contract.get(key)
+        if isinstance(value, (list, tuple)):
+            parts.extend(str(x) for x in value)
+        elif value is not None:
+            parts.append(str(value))
+    text = " ".join(parts).upper()
+    symbol = str(contract.get("symbol", "")).upper()
+    tradfi = any(token in text for token in ("TRADFI", "STOCK", "EQUITY", "SHARE"))
+    non_equity = any(token in text for token in ("FOREX", "COMMODITY", "METAL", "ENERGY", "OIL", "GOLD", "SILVER", "NATURAL GAS", "INDEX", "INDICES", "CURRENCY"))
+    if symbol.startswith(("NCFX", "NCCO")):
+        non_equity = True
+    if tradfi and not non_equity:
+        return "EQUITY"
+    if non_equity:
+        return "UNKNOWN"
+    return "CRYPTO"
 
 def get_symbol_info(symbol: str) -> dict[str, Any] | None:
     return symbols().get(normalize_symbol(symbol))
@@ -159,7 +180,7 @@ def fetch_klines(symbol: str, interval: str = "1h", limit: int = 120, *, retryab
                 "close_time": int(row[6]) if len(row) > 6 else None,
                 "quote_volume": float(row[7]) if len(row) > 7 else None,
                 "trade_count": int(row[8]) if len(row) > 8 and str(row[8]).isdigit() else None,
-                "source": "binance_futures",
+                "source": "binance_spot",
                 "binance_symbol": bsym,
             }
         )

@@ -30,7 +30,7 @@ def _line(row: dict[str, Any]) -> str:
         f"Монета={row.get('symbol')} | Цена={row.get('current_price')} | "
         f"Положение={row.get('price_position')} | Сигнал={row.get('fresh_signal', '—')} | "
         f"DEMAND={row.get('active_demand', 0)} | SUPPLY={row.get('active_supply', 0)} | "
-        f"Source={row.get('market_source', 'binance_futures')} | "
+        f"Source={row.get('market_source', 'binance_spot')} | "
         f"Binance={row.get('binance_price')} | BingX={row.get('bingx_price')} | "
         f"Spread={row.get('market_spread_pct')}% | Asset={row.get('asset_class', 'UNKNOWN')}"
     )
