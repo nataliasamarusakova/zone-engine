@@ -8,6 +8,8 @@ from event_engine.signals import (
     TP1_R,
     TP2_R,
     calc_hma,
+    calc_alma,
+    compute_ajay_trigger,
     generate_zone_signals,
     score_zone_signal,
 )
@@ -644,3 +646,30 @@ def test_execution_candidate_filter_rejects_same_index_wrong_timestamp():
     latest_time = pd.Timestamp("2026-09-02T11:00:00+00:00")
     sig = {"idx": 98, "time": "2024-06-17T02:00:00+00:00", "type": "SHORT"}
     assert not (int(sig["idx"]) == 98 and pd.Timestamp(sig["time"]) == latest_time)
+
+
+def test_alma_matches_tradingview_celo_log_example():
+    # TradingView Pine log for CELO at 2026-09-02 00:00 shows:
+    # previous 8H close = 0.07321, current 8H close = 0.07767,
+    # ALMA(2, offset=0.85, sigma=5) = 0.0772200813.
+    series = pd.Series([0.07321, 0.07767], dtype=float)
+    out = calc_alma(series, length=2, offset=0.85, sigma=5.0)
+    assert abs(float(out.iloc[-1]) - 0.0772200813) < 1e-10
+
+
+def test_live_mode_changes_only_current_8h_bucket():
+    ts = pd.date_range("2026-09-01 00:00:00", periods=24, freq="h", tz="UTC")
+    close = np.linspace(100.0, 123.0, 24)
+    open_ = close - 0.5
+    high = close + 1.0
+    low = close - 1.0
+    volume = np.full(24, 1000.0)
+    df = pd.DataFrame({"timestamp": ts, "open": open_, "high": high, "low": low, "close": close, "volume": volume})
+    out = compute_ajay_trigger(df, mode="live")
+    # First 8H bucket is historical/final and therefore flat across its 1H bars.
+    assert out.loc[8:15, "alma_close_alt"].nunique() == 1
+    assert out.loc[8:15, "alma_open_alt"].nunique() == 1
+    # Current 8H bucket is developing: close ALMA tracks the latest 1H close.
+    assert out.loc[16:23, "alma_close_alt"].nunique() > 1
+    # Current 8H open is fixed throughout the bucket.
+    assert out.loc[16:23, "alma_open_alt"].nunique() == 1

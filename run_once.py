@@ -48,6 +48,9 @@ KLINE_LIMIT_1H = int(os.environ.get("KLINE_LIMIT_1H", "120"))
 MAX_SIGNAL_AGE_BARS = int(os.environ.get("MAX_SIGNAL_AGE_BARS", "0"))
 # Production execution is strict by default: only the latest closed 1H bar may open a trade.
 EXECUTION_MAX_SIGNAL_AGE_BARS = int(os.environ.get("EXECUTION_MAX_SIGNAL_AGE_BARS", "0"))
+PINE_SIGNAL_MODE = os.environ.get("PINE_SIGNAL_MODE", "historical").strip().lower()
+if PINE_SIGNAL_MODE not in {"historical", "live"}:
+    raise ValueError("PINE_SIGNAL_MODE must be historical or live")
 SCAN_WORKERS = max(1, int(os.environ.get("SCAN_WORKERS", "12")))
 SCAN_BATCH_SIZE = max(SCAN_WORKERS, int(os.environ.get("SCAN_BATCH_SIZE", "48")))
 SCAN_BATCH_PAUSE_SEC = max(0.0, float(os.environ.get("SCAN_BATCH_PAUSE_SEC", "0.10")))
@@ -547,7 +550,7 @@ def main() -> None:
     analysis_meta = {str(item["bingx_symbol"]): item for item in analysis_universe}
     crypto_n = sum(1 for x in analysis_universe if str(x.get("asset_class")).upper() == "CRYPTO")
     equity_n = sum(1 for x in analysis_universe if str(x.get("asset_class")).upper() == "EQUITY")
-    log.info("[SCAN] Eligible symbols: %d | crypto=%d equity=%d", len(symbols), crypto_n, equity_n)
+    log.info("[SCAN] Eligible symbols: %d | crypto=%d equity=%d | pine_mode=%s", len(symbols), crypto_n, equity_n, PINE_SIGNAL_MODE)
     if not symbols:
         log.error("[SCAN] No eligible symbols for signal scan")
 
@@ -595,7 +598,7 @@ def main() -> None:
                     "error": f"insufficient_1h_candles:{len(bars)}<{min_bars}", "signals": [],
                 }
 
-            df, supply, demand, signals = generate_zone_signals(pd.DataFrame(bars), symbol=symbol, mode="live")
+            df, supply, demand, signals = generate_zone_signals(pd.DataFrame(bars), symbol=symbol, mode=PINE_SIGNAL_MODE)
             latest_price = float(df["close"].iloc[-1])
             bingx_price = _bingx_last_price(contract)
             latest_closed_idx = len(df) - 1
