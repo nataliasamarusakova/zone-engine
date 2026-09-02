@@ -374,16 +374,122 @@ def _cleanup_engine_protection(symbol: str, direction: str) -> dict[str, Any]:
         result["status"] = "partial" if result["cancelled"] else "error"
     return result
 
+def _rebase_protection_after_fill(signal: dict[str, Any], avg_price: float) -> dict[str, Any]:
+    """Recalculate zone-based SL/TP from the *actual* market fill.
+
+    A market order can fill materially away from the signal/reference candle close.
+    Never submit stale absolute targets derived from the pre-fill reference price.
+    """
+    direction = str(signal["type"]).upper()
+    entry = float(avg_price)
+    zone = signal.get("zone") if isinstance(signal.get("zone"), dict) else {}
+    target = signal.get("target") if isinstance(signal.get("target"), dict) else {}
+    atr = float(signal.get("atr", 0.0) or 0.0)
+    if entry <= 0:
+        raise ValueError("actual fill price must be positive")
+
+    zone_top = float(zone.get("top")) if zone.get("top") is not None else None
+    zone_bottom = float(zone.get("btm")) if zone.get("btm") is not None else None
+    if zone_top is None or zone_bottom is None:
+        raise ValueError("zone boundaries unavailable for post-fill protection")
+
+    sl_buffer = max(atr * float(os.environ.get("ZONE_SL_ATR_BUFFER", "0.10")), entry * 0.0002)
+    if direction == "LONG":
+        zone_stop = zone_bottom - sl_buffer
+        sl = zone_stop if zone_stop < entry else entry - sl_buffer
+    else:
+        zone_stop = zone_top + sl_buffer
+        sl = zone_stop if zone_stop > entry else entry + sl_buffer
+
+    risk = abs(entry - sl)
+    if risk <= 0:
+        raise ValueError("post-fill risk is non-positive")
+
+    obstacle = target.get("obstacle_price")
+    try:
+        obstacle = float(obstacle) if obstacle is not None else None
+    except (TypeError, ValueError):
+        obstacle = None
+
+    obstacle_buffer = max(atr * float(os.environ.get("TP_OBSTACLE_BUFFER_ATR", "0.10")), entry * 0.0002)
+    tp1_r = float(os.environ.get("TP1_R", "0.5"))
+    tp2_r = float(os.environ.get("TP2_R", "1.0"))
+    tp_min_r = float(os.environ.get("TP_MIN_R", "0.50"))
+    tp_max_r = float(os.environ.get("TP_MAX_R", "1.50"))
+    tp1_fraction = float(os.environ.get("TP1_OBSTACLE_FRACTION", "0.50"))
+    tp2_fraction = float(os.environ.get("TP2_OBSTACLE_FRACTION", "0.90"))
+
+    target_source = "atr_rr_fallback_after_fill"
+    if obstacle is not None:
+        if direction == "LONG" and obstacle > entry + obstacle_buffer:
+            usable = obstacle - obstacle_buffer - entry
+        elif direction == "SHORT" and obstacle < entry - obstacle_buffer:
+            usable = entry - obstacle_buffer - obstacle
+        else:
+            usable = -1.0
+        if usable > 0:
+            tp2_distance = min(usable * tp2_fraction, tp_max_r * risk)
+            tp1_distance = tp2_distance * tp1_fraction
+            if tp2_distance / risk >= tp_min_r and tp1_distance > 0 and tp2_distance > tp1_distance:
+                target_source = "nearest_opposing_structure_after_fill"
+            else:
+                tp2_distance = 0.0
+        else:
+            tp2_distance = 0.0
+    else:
+        tp2_distance = 0.0
+
+    if tp2_distance <= 0:
+        tp1_distance = tp1_r * risk
+        tp2_distance = tp2_r * risk
+        if tp2_distance <= tp1_distance:
+            tp2_distance = max(tp1_distance * 2.0, risk)
+
+    if direction == "LONG":
+        tp1 = entry + tp1_distance
+        tp2 = entry + tp2_distance
+    else:
+        tp1 = entry - tp1_distance
+        tp2 = entry - tp2_distance
+
+    return {
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "risk_abs": risk,
+        "risk_pct": (risk / entry) * 100.0,
+        "tp1_rr": abs(tp1 - entry) / risk,
+        "tp2_rr": abs(tp2 - entry) / risk,
+        "target_source": target_source,
+        "obstacle_price": obstacle,
+    }
+
+
 def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     symbol = str(signal["symbol"])
     direction = str(signal["type"]).upper()
     event_id = str(signal["event_id"])
     entry_price = float(signal["entry"])
 
+    # Validate the planned setup before making any network call or opening a position.
     valid, reason = _validate_trade_geometry(signal)
     if not valid:
         log.warning("[EXEC_SKIPPED] %s %s | invalid_setup | %s", symbol, direction, reason)
         return {"status": "skipped_invalid_setup", "error": reason, "symbol": symbol, "direction": direction}
+
+    # Do not open first and discover that the trigger-order endpoint is unavailable.
+    # BingX can temporarily disable this endpoint under its trigger-frequency rule;
+    # in that state there must be NO market entry because mandatory protection cannot
+    # be installed/verified safely.
+    try:
+        protection_preflight = get_open_protection_directional(symbol, direction)
+    except Exception as exc:
+        protection_preflight = {"status": "error", "error": str(exc)}
+    if protection_preflight.get("status") != "ok":
+        reason = str(protection_preflight.get("error", "protection endpoint unavailable"))
+        log.error("[EXEC_BLOCKED_PROTECTION_PRECHECK] %s %s | %s", symbol, direction, reason)
+        return {"status": "blocked_protection_preflight", "symbol": symbol, "direction": direction, "error": reason}
 
     setup = _build_setup(signal)
     order = open_market(symbol, direction, entry_price, event_id)
@@ -398,16 +504,24 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
 
     avg_price = float(position["avgPrice"])
     qty = abs(float(position["positionAmt"]))
-    # Keep the zone-derived absolute SL/TP structure after the real fill.
-    # Convert the absolute target prices into percentages only because the
-    # BingX protection helper accepts percentage distances.
-    sl_price = float(signal["sl"])
-    tp1_price = float(signal["tp1"])
-    tp2_price = float(signal["tp2"])
-    actual_risk_abs = abs(avg_price - sl_price)
-    actual_risk_pct = (actual_risk_abs / avg_price) * 100.0 if avg_price > 0 else 0.0
-    tp1_pnl_pct = (abs(tp1_price - avg_price) / avg_price) * 100.0 if avg_price > 0 else 0.0
-    tp2_pnl_pct = (abs(tp2_price - avg_price) / avg_price) * 100.0 if avg_price > 0 else 0.0
+    # Recalculate ALL absolute protection levels from the real market fill.
+    # Never submit targets computed from the stale signal/reference close.
+    try:
+        rebased = _rebase_protection_after_fill(signal, avg_price)
+    except Exception as exc:
+        reason = f"post-fill protection rebase failed: {exc}"
+        log.critical("[SAFETY_CLOSE] %s %s | %s", symbol, direction, reason)
+        close_result = close_position_market(symbol, direction, qty, trade_id=event_id)
+        cleanup = _cleanup_engine_protection(symbol, direction)
+        return {"status": "opened_then_emergency_closed", "error": reason, "order": order, "position": position, "close": close_result, "protection_cleanup": cleanup, "executed_signal": dict(signal)}
+
+    sl_price = float(rebased["sl"])
+    tp1_price = float(rebased["tp1"])
+    tp2_price = float(rebased["tp2"])
+    actual_risk_abs = float(rebased["risk_abs"])
+    actual_risk_pct = float(rebased["risk_pct"])
+    tp1_pnl_pct = (abs(tp1_price - avg_price) / avg_price) * 100.0
+    tp2_pnl_pct = (abs(tp2_price - avg_price) / avg_price) * 100.0
     actual_signal = dict(signal)
     actual_signal.update({
         "entry": avg_price,
@@ -416,15 +530,20 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         "tp2": tp2_price,
         "risk_pct": actual_risk_pct,
         "risk_abs": actual_risk_abs,
-        "tp1_rr": (tp1_pnl_pct / actual_risk_pct) if actual_risk_pct > 0 else 0.0,
-        "tp2_rr": (tp2_pnl_pct / actual_risk_pct) if actual_risk_pct > 0 else 0.0,
+        "tp1_rr": float(rebased["tp1_rr"]),
+        "tp2_rr": float(rebased["tp2_rr"]),
+        "target": {
+            **(signal.get("target") if isinstance(signal.get("target"), dict) else {}),
+            "source": rebased["target_source"],
+            "obstacle_price": rebased.get("obstacle_price"),
+        },
     })
     valid, reason = _validate_trade_geometry(actual_signal)
     if not valid:
         log.critical("[SAFETY_CLOSE] %s %s | invalid post-fill protection geometry | %s", symbol, direction, reason)
         close_result = close_position_market(symbol, direction, qty, trade_id=event_id)
         cleanup = _cleanup_engine_protection(symbol, direction)
-        return {"status": "opened_then_emergency_closed", "error": reason, "order": order, "position": position, "close": close_result, "protection_cleanup": cleanup}
+        return {"status": "opened_then_emergency_closed", "error": reason, "order": order, "position": position, "close": close_result, "protection_cleanup": cleanup, "executed_signal": actual_signal}
 
     setup["entry_reference"] = avg_price
     setup["invalidation_price"] = sl_price
@@ -436,6 +555,12 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         {"leg": "tp2", "pnl_pct": tp2_pnl_pct, "close_fraction": 0.50, "price": tp2_price},
     ]
     setup["target_price"] = tp2_price
+
+    log.info(
+        "[EXEC_POST_FILL_REBASED] %s %s | fill=%s sl=%s tp1=%s tp2=%s tp1_rr=%.3f tp2_rr=%.3f target_source=%s",
+        symbol, direction, avg_price, sl_price, tp1_price, tp2_price,
+        actual_signal["tp1_rr"], actual_signal["tp2_rr"], rebased["target_source"],
+    )
 
     protection = ensure_directional_protection(
         symbol, direction, avg_price, qty,
@@ -466,6 +591,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
             "close": close_result,
             "protection_cleanup": cleanup,
             "close_verification": verify_closed,
+            "executed_signal": actual_signal,
         }
 
     register_active_trade(
@@ -489,11 +615,15 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         "order": order,
         "position": position,
         "protection": protection,
+        "executed_signal": actual_signal,
     }
 
 def _send_signal(signal: dict[str, Any], execution: dict[str, Any] | None = None) -> None:
     try:
-        text = format_signal(signal, setup=_build_setup(signal), execution=execution)
+        display_signal = signal
+        if isinstance(execution, dict) and isinstance(execution.get("executed_signal"), dict):
+            display_signal = execution["executed_signal"]
+        text = format_signal(display_signal, setup=_build_setup(display_signal), execution=execution)
         ok = send_tg(text)
         _append_jsonl(ACTIONS_PATH, {"ts": int(time.time() * 1000), "action": "SIGNAL", "event_id": signal["event_id"], "telegram_ok": ok})
     except Exception as exc:

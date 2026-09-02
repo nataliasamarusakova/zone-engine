@@ -271,6 +271,9 @@ def test_execute_emergency_closes_when_protection_fails(monkeypatch):
         "score": 90,
         "zone": {"kind": "DEMAND"},
     }
+    monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {
+        "status": "ok", "sl_orders": [], "tp_orders": []
+    })
     monkeypatch.setattr(run_once, "open_market", lambda *a, **k: {
         "status": "opened", "symbol": "TEST-USDT", "qty": 1.0
     })
@@ -355,6 +358,118 @@ def test_zone_only_latest_bar_check_never_reads_pine_direction():
     signal = {"idx": 119, "time": "2026-09-02T11:00:00+00:00", "type": "SHORT", "trigger": {"buy": None, "sell": None}}
     ok, reason = run_once._signal_matches_latest_bar(signal, 119, "2026-09-02T11:00:00+00:00")
     assert ok and reason == "ok"
+
+def test_telegram_uses_zone_only_label_and_dynamic_rr_values():
+    from event_engine.telegram import format_signal
+    msg = format_signal({
+        "type": "LONG", "symbol": "TEST-USDT", "entry": 100.0, "sl": 95.0,
+        "tp1": 102.5, "tp2": 105.0, "tp1_rr": 0.5, "tp2_rr": 1.0, "risk_pct": 5.0,
+        "zone": {"kind": "DEMAND", "btm": 94.0, "top": 99.0, "poi": 96.5, "age_bars": 1, "impulse_atr": 2.0},
+        "confirmation": {},
+    })
+    assert "Demand/Supply Zone First" in msg
+    assert "Ajay R5.41 · ALMA" not in msg
+    assert "(0.5R / 50%)" in msg
+    assert "(1.0R / 50%)" in msg
+
+
+def test_post_fill_rebases_zone_protection_and_never_reuses_stale_absolute_targets():
+    import run_once
+    signal = {
+        "type": "SHORT",
+        "entry": 0.8104,
+        "sl": 0.8127,
+        "tp1": 0.8086,
+        "tp2": 0.8069,
+        "risk_pct": 0.28,
+        "atr": 0.003,
+        "zone": {"btm": 0.808258, "top": 0.8114},
+        "target": {"obstacle_price": 0.8060, "source": "nearest_opposing_structure"},
+    }
+    out = run_once._rebase_protection_after_fill(signal, 0.7974)
+    assert out["entry"] == 0.7974
+    assert out["sl"] > out["entry"]
+    assert out["tp1"] < out["entry"]
+    assert out["tp2"] < out["tp1"]
+
+
+def test_long_post_fill_that_slips_through_zone_stop_moves_stop_behind_fill():
+    import run_once
+    signal = {
+        "type": "LONG",
+        "entry": 4.77,
+        "sl": 4.7365,
+        "tp1": 4.795,
+        "tp2": 4.820,
+        "risk_pct": 0.70,
+        "atr": 0.033,
+        "zone": {"btm": 4.743, "top": 4.7593},
+        "target": {"obstacle_price": 4.85, "source": "nearest_opposing_structure"},
+    }
+    out = run_once._rebase_protection_after_fill(signal, 4.73)
+    assert out["sl"] < out["entry"]
+    assert out["tp1"] > out["entry"]
+    assert out["tp2"] > out["tp1"]
+
+
+def test_execute_rebases_protection_to_actual_fill_before_installing(monkeypatch):
+    import run_once
+    signal = {
+        "event_id": "ZONE_TEST_REBASE", "symbol": "TEST-USDT", "type": "SHORT",
+        "entry": 100.0, "sl": 105.0, "tp1": 99.0, "tp2": 98.0, "risk_pct": 5.0,
+        "score": 75, "atr": 2.0,
+        "zone": {"kind": "SUPPLY", "btm": 99.0, "top": 104.0},
+        "target": {"obstacle_price": 90.0, "source": "nearest_opposing_structure"},
+    }
+    captured = {}
+    monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
+    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: {"status": "opened", "symbol": "TEST-USDT"})
+    monkeypatch.setattr(run_once, "wait_for_position_fill_directional", lambda *a, **k: {"status": "found", "avgPrice": 95.0, "positionAmt": 1.0})
+    def fake_protection(*args, **kwargs):
+        captured["avg"] = args[2]
+        captured["levels"] = args[5]
+        return {"status": "PROTECTED", "tp_orders": [], "sl_result": {}}
+    monkeypatch.setattr(run_once, "ensure_directional_protection", fake_protection)
+    monkeypatch.setattr(run_once, "register_active_trade", lambda *a, **k: None)
+    out = run_once.execute_new_position(signal)
+    assert out["status"] == "opened_protected"
+    assert captured["avg"] == 95.0
+    levels = captured["levels"]
+    assert levels[0]["pnl_pct"] > 0 and levels[1]["pnl_pct"] > levels[0]["pnl_pct"]
+    assert out["executed_signal"]["entry"] == 95.0
+    assert out["executed_signal"]["tp1"] < 95.0
+    assert out["executed_signal"]["tp2"] < out["executed_signal"]["tp1"]
+
+
+def test_invalid_setup_is_rejected_before_protection_preflight(monkeypatch):
+    import run_once
+    signal = {
+        "event_id": "ZONE_TEST_INVALID", "symbol": "ALGO-USDT", "type": "SHORT",
+        "entry": 0.0908, "sl": 0.09, "tp1": 0.09, "tp2": 0.09, "risk_pct": -0.88,
+        "score": 75, "zone": {"kind": "SUPPLY", "btm": 0.089, "top": 0.091},
+    }
+    called = {"preflight": False, "open": False}
+    monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: called.__setitem__("preflight", True) or {"status": "ok"})
+    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: called.__setitem__("open", True))
+    result = run_once.execute_new_position(signal)
+    assert result["status"] == "skipped_invalid_setup"
+    assert called == {"preflight": False, "open": False}
+
+
+def test_protection_endpoint_failure_blocks_market_entry(monkeypatch):
+    import run_once
+    signal = {
+        "event_id": "ZONE_TEST_PREFLIGHT", "symbol": "ALGO-USDT", "type": "SHORT",
+        "entry": 100.0, "sl": 105.0, "tp1": 99.0, "tp2": 98.0, "risk_pct": 5.0,
+        "score": 75, "zone": {"kind": "SUPPLY", "btm": 99.0, "top": 104.0},
+    }
+    called = {"open": False}
+    monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {"status": "error", "error": "code:100410 disabled period"})
+    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: called.__setitem__("open", True))
+    result = run_once.execute_new_position(signal)
+    assert result["status"] == "blocked_protection_preflight"
+    assert called["open"] is False
+
 
 def test_run_once_has_no_pine_execution_rejection_gate():
     from pathlib import Path
