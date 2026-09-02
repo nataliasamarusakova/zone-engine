@@ -48,9 +48,9 @@ KLINE_LIMIT_1H = int(os.environ.get("KLINE_LIMIT_1H", "120"))
 MAX_SIGNAL_AGE_BARS = int(os.environ.get("MAX_SIGNAL_AGE_BARS", "0"))
 # Production execution is strict by default: only the latest closed 1H bar may open a trade.
 EXECUTION_MAX_SIGNAL_AGE_BARS = int(os.environ.get("EXECUTION_MAX_SIGNAL_AGE_BARS", "0"))
-PINE_SIGNAL_MODE = os.environ.get("PINE_SIGNAL_MODE", "historical").strip().lower()
-if PINE_SIGNAL_MODE not in {"historical", "live"}:
-    raise ValueError("PINE_SIGNAL_MODE must be historical or live")
+DIAGNOSTICS_MODE = os.environ.get("DIAGNOSTICS_MODE", "historical").strip().lower()
+if DIAGNOSTICS_MODE not in {"historical", "live"}:
+    raise ValueError("DIAGNOSTICS_MODE must be historical or live")
 SCAN_WORKERS = max(1, int(os.environ.get("SCAN_WORKERS", "12")))
 SCAN_BATCH_SIZE = max(SCAN_WORKERS, int(os.environ.get("SCAN_BATCH_SIZE", "48")))
 SCAN_BATCH_PAUSE_SEC = max(0.0, float(os.environ.get("SCAN_BATCH_PAUSE_SEC", "0.10")))
@@ -131,11 +131,10 @@ def _select_latest_signal(signals: list[dict[str, Any]]) -> dict[str, Any] | Non
 
 
 def _signal_matches_latest_bar(signal: dict[str, Any], latest_closed_idx: int, latest_closed_time: str | None) -> tuple[bool, str]:
-    """Strict live-execution identity check for the signal bar.
+    """Strict latest-bar identity check for the zone-only strategy.
 
-    A signal is executable only when its index AND timestamp are exactly the latest
-    closed 1H bar. This prevents a stale/incorrect timestamp from masquerading as
-    a fresh signal merely because the DataFrame index is the last row.
+    ZONE_ONLY deliberately has no Pine/ALMA execution gate. A zone signal is
+    executable when the signal bar is exactly the latest closed 1H bar.
     """
     try:
         signal_idx = int(signal["idx"])
@@ -151,12 +150,6 @@ def _signal_matches_latest_bar(signal: dict[str, Any], latest_closed_idx: int, l
             return False, "signal_time_not_latest"
     except Exception:
         return False, "invalid_signal_time"
-    trigger = signal.get("trigger") or {}
-    pine_buy = bool(trigger.get("buy"))
-    pine_sell = bool(trigger.get("sell"))
-    expected = "LONG" if pine_buy and not pine_sell else "SHORT" if pine_sell and not pine_buy else None
-    if expected != str(signal.get("type", "")).upper():
-        return False, "direction_not_equal_to_pine_trigger"
     return True, "ok"
 
 def _private_layer_ready() -> bool:
@@ -484,7 +477,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         qty=qty,
         tp_orders=protection.get("tp_orders", []),
         sl_result=protection.get("sl_result", {}),
-        event_type=f"{setup['zone'].get('kind', 'ZONE')}_ALMA_CROSS",
+        event_type=f"{setup['zone'].get('kind', 'ZONE')}_ZONE_TOUCH",
         timeframe="1h",
         score=float(signal.get("score", 0.0)),
         setup={**setup, "protection_status": protection.get("status"), "protection_result": protection},
@@ -573,7 +566,7 @@ def main() -> None:
     analysis_meta = {str(item["bingx_symbol"]): item for item in analysis_universe}
     crypto_n = sum(1 for x in analysis_universe if str(x.get("asset_class")).upper() == "CRYPTO")
     equity_n = sum(1 for x in analysis_universe if str(x.get("asset_class")).upper() == "EQUITY")
-    log.info("[SCAN] Eligible symbols: %d | crypto=%d equity=%d | strategy_mode=ZONE_ONLY | diagnostics_mode=%s", len(symbols), crypto_n, equity_n, PINE_SIGNAL_MODE)
+    log.info("[SCAN] Eligible symbols: %d | crypto=%d equity=%d | strategy_mode=ZONE_ONLY | diagnostics_mode=%s", len(symbols), crypto_n, equity_n, DIAGNOSTICS_MODE)
     if not symbols:
         log.error("[SCAN] No eligible symbols for signal scan")
 
@@ -621,7 +614,7 @@ def main() -> None:
                     "error": f"insufficient_1h_candles:{len(bars)}<{min_bars}", "signals": [],
                 }
 
-            df, supply, demand, signals = generate_zone_signals(pd.DataFrame(bars), symbol=symbol, mode=PINE_SIGNAL_MODE)
+            df, supply, demand, signals = generate_zone_signals(pd.DataFrame(bars), symbol=symbol, mode=DIAGNOSTICS_MODE)
             latest_price = float(df["close"].iloc[-1])
             bingx_price = _bingx_last_price(contract)
             latest_closed_idx = len(df) - 1
@@ -658,11 +651,9 @@ def main() -> None:
                     "error": f"stale_1h_data:{data_age_hours:.2f}h>{MAX_DATA_STALENESS_HOURS:.2f}h",
                 }
 
-            # Trading decisions are derived ONLY from the Pine trigger on the
-            # latest closed 1H candle. We deliberately do not backfill the live
-            # developing-8H model across historical bars: those historical
-            # developing states are not what exists on the currently running
-            # TradingView bar and must never become execution candidates.
+            # ZONE_ONLY trading decisions come only from a fresh Demand/Supply
+            # touch on the latest closed 1H candle. ALMA/Pine diagnostics may still
+            # be attached to the dataframe, but they never gate execution.
             recent = [
                 s for s in signals
                 if int(s.get("idx", -1)) == int(latest_closed_idx)
@@ -791,9 +782,9 @@ def main() -> None:
         total, scan_errors, scan_skips, len(fresh_signals), time.time() - started,
     )
 
-    # Execution safety: choose exactly ONE signal per symbol, namely the newest
-    # Pine ALMA crossover bar. Never allow an older SHORT to compete with a newer
-    # LONG (or vice versa) because of score sorting.
+    # Execution safety: choose exactly ONE zone signal per symbol, namely the
+    # newest fresh-touch bar. Never allow an older setup to compete with a newer
+    # setup because of score sorting.
     latest_by_symbol: dict[str, dict[str, Any]] = {}
     for signal in fresh_signals:
         symbol_key = str(signal["symbol"]).upper()
@@ -831,10 +822,9 @@ def main() -> None:
         matches_latest, reject_reason = _signal_matches_latest_bar(signal, latest_closed_idx, latest_closed_time)
         if not matches_latest:
             log.warning(
-                "[EXEC_REJECT_LATEST_BAR] %s %s | reason=%s signal_idx=%s signal_time=%s latest_closed_idx=%s latest_closed_time=%s age_bars=%s pine_buy=%s pine_sell=%s",
+                "[EXEC_REJECT_LATEST_BAR] %s %s | reason=%s signal_idx=%s signal_time=%s latest_closed_idx=%s latest_closed_time=%s age_bars=%s",
                 signal["symbol"], signal["type"], reject_reason, signal.get("idx"), signal.get("time"),
                 latest_closed_idx, latest_closed_time, signal_age,
-                (signal.get("trigger") or {}).get("buy"), (signal.get("trigger") or {}).get("sell"),
             )
             continue
         bx = get_contract(signal["symbol"])
@@ -855,6 +845,18 @@ def main() -> None:
         if not EXECUTION_ENABLED:
             _send_signal(signal, {"status": "DISABLED"})
             continue
+        log.info(
+            "[EXEC_SIGNAL] symbol=%s direction=%s signal_idx=%s signal_time=%s age_bars=%s "
+            "zone=%s zone_low=%s zone_high=%s target_source=%s obstacle=%s tp1=%s tp2=%s event_id=%s",
+            signal.get("symbol"), signal.get("type"), signal.get("idx"), signal.get("time"),
+            signal.get("execution_age_bars", 0),
+            (signal.get("zone") or {}).get("kind"),
+            (signal.get("zone") or {}).get("btm"),
+            (signal.get("zone") or {}).get("top"),
+            (signal.get("target") or {}).get("source"),
+            (signal.get("target") or {}).get("obstacle_price"),
+            signal.get("tp1"), signal.get("tp2"), signal.get("event_id"),
+        )
         if not private_ready:
             blocked = {"status": "BLOCKED_MISSING_CREDENTIALS", "error": "BingX private credentials are unavailable"}
             log.error("[EXEC_BLOCKED] %s %s: missing BingX private credentials", signal["symbol"], signal["type"])
@@ -869,16 +871,6 @@ def main() -> None:
             })
             _send_signal(signal, blocked)
             continue
-            log.warning(
-            "[EXEC_SIGNAL] symbol=%s direction=%s signal_idx=%s signal_time=%s age_bars=%s "
-            "zone=%s target_source=%s obstacle=%s tp1=%s tp2=%s event_id=%s",
-            signal.get("symbol"), signal.get("type"), signal.get("idx"), signal.get("time"),
-            signal.get("execution_age_bars", 0),
-            (signal.get("zone") or {}).get("kind"),
-            (signal.get("target") or {}).get("source"),
-            (signal.get("target") or {}).get("obstacle_price"),
-            signal.get("tp1"), signal.get("tp2"), signal.get("event_id"),
-        )
         execution = execute_new_position(signal)
         execution_status = str(execution.get("status", ""))
         if execution_status in {"skipped_min_qty", "skipped_invalid_setup"}:

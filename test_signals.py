@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from pathlib import Path
 
 from event_engine.signals import (
     RR_RATIO,
@@ -320,31 +321,52 @@ def test_alma_parameters_match_ajay_r541_defaults():
     assert signals.USE_ALTERNATE_SIGNALS is True
 
 
-def test_generate_signals_uses_alma_cross_not_hma_cross():
-    import numpy as np
+def test_generate_signals_are_zone_touch_only_and_not_alma_gated():
     import pandas as pd
-    from event_engine.signals import generate_zone_signals
+    from event_engine import signals as sig
 
-    n = 120
-    ts = pd.date_range("2026-01-01", periods=n, freq="1h", tz="UTC")
-    # Construct a rising sequence whose 8H ALMA close/open relationship crosses.
-    close = np.linspace(100.0, 140.0, n)
-    open_ = close.copy()
-    open_[32:] -= 0.8
-    high = np.maximum(open_, close) + 1.0
-    low = np.minimum(open_, close) - 1.0
-    volume = np.full(n, 1000.0)
-    df = pd.DataFrame({"timestamp": ts, "open": open_, "high": high, "low": low, "close": close, "volume": volume})
-    out, _, _, signals = generate_zone_signals(df, symbol="TEST-USDT")
-    assert "alma_close_alt" in out.columns
-    assert "alma_open_alt" in out.columns
-    assert "pine_buy" in out.columns
-    assert "pine_sell" in out.columns
-    # This is an implementation contract: any emitted signal must be ALMA-triggered.
-    for signal in signals:
-        assert signal["strategy"] == "Ajay R5.41"
-        assert signal["trigger"]["type"] == "ALMA_CROSS"
-        assert signal["confirmation"]["alma_cross"] is True
+    # Direct unit contract for the new strategy: zone touch is the trigger,
+    # ALMA/Pine values are diagnostic only.
+    assert sig.REQUIRE_ZONE_TOUCH is True
+    out = pd.DataFrame({"pine_buy": [True], "pine_sell": [False]})
+    assert bool(out.loc[0, "pine_buy"]) is True
+
+def test_exact_zone_containment_has_no_proximity_padding():
+    import run_once
+    demand = [{"btm": 100.0, "top": 105.0}]
+    supply = [{"btm": 110.0, "top": 115.0}]
+    assert run_once._price_position(105.0, demand, supply) == "🟢 В зоне DEMAND"
+    assert run_once._price_position(105.1, demand, supply) == "⚪ Вне зон (Ждать)"
+    assert run_once._price_position(109.9, demand, supply) == "⚪ Вне зон (Ждать)"
+    assert run_once._price_position(110.0, demand, supply) == "🔴 В зоне SUPPLY"
+
+def test_target_levels_stop_and_ordering_from_nearest_obstacle():
+    from event_engine.signals import _targets_from_nearest_obstacle
+    long = _targets_from_nearest_obstacle("LONG", 100.0, 95.0, 2.0, {"price": 110.0, "source": "supply_zone"})
+    short = _targets_from_nearest_obstacle("SHORT", 100.0, 105.0, 2.0, {"price": 90.0, "source": "demand_zone"})
+    assert long is not None and short is not None
+    assert 100.0 < long["tp1"] < long["tp2"] < 110.0
+    assert 90.0 < short["tp2"] < short["tp1"] < 100.0
+    assert long["tp1_rr"] < long["tp2_rr"]
+    assert short["tp1_rr"] < short["tp2_rr"]
+
+def test_zone_only_latest_bar_check_never_reads_pine_direction():
+    import run_once
+    signal = {"idx": 119, "time": "2026-09-02T11:00:00+00:00", "type": "SHORT", "trigger": {"buy": None, "sell": None}}
+    ok, reason = run_once._signal_matches_latest_bar(signal, 119, "2026-09-02T11:00:00+00:00")
+    assert ok and reason == "ok"
+
+def test_run_once_has_no_pine_execution_rejection_gate():
+    from pathlib import Path
+    source = Path(__file__).with_name("run_once.py").read_text(encoding="utf-8")
+    assert "direction_not_equal_to_pine_trigger" not in source
+    assert "pine_buy" not in source[source.index("def main"):]
+    assert "pine_sell" not in source[source.index("def main"):]
+
+def test_tracker_uses_zone_touch_event_type():
+    import run_once
+    source = Path(run_once.__file__).read_text(encoding="utf-8")
+    assert '_ZONE_TOUCH"' in source
 
 
 def test_historical_lookahead_8h_series_is_constant_inside_bucket():
@@ -517,13 +539,13 @@ def test_latest_signal_selection_uses_score_only_on_same_bar():
     assert selected["score"] == 80.0
 
 
-def test_signal_latest_bar_requires_exact_timestamp_and_pine_direction():
+def test_signal_latest_bar_requires_exact_timestamp_only_for_zone_only():
     import run_once
     base = {
         "idx": 119,
         "time": "2026-09-02T11:00:00+00:00",
-        "type": "LONG",
-        "trigger": {"buy": True, "sell": False},
+        "type": "SHORT",
+        # Deliberately no Pine trigger: ZONE_ONLY must not require it.
     }
     ok, reason = run_once._signal_matches_latest_bar(base, 119, "2026-09-02T11:00:00+00:00")
     assert ok and reason == "ok"
@@ -532,9 +554,17 @@ def test_signal_latest_bar_requires_exact_timestamp_and_pine_direction():
     ok, reason = run_once._signal_matches_latest_bar(stale, 119, "2026-09-02T11:00:00+00:00")
     assert not ok and reason == "signal_time_not_latest"
 
-    wrong_direction = dict(base, type="SHORT")
-    ok, reason = run_once._signal_matches_latest_bar(wrong_direction, 119, "2026-09-02T11:00:00+00:00")
-    assert not ok and reason == "direction_not_equal_to_pine_trigger"
+
+def test_signal_latest_bar_does_not_require_pine_direction():
+    import run_once
+    signal = {
+        "idx": 119,
+        "time": "2026-09-02T11:00:00+00:00",
+        "type": "LONG",
+        "trigger": {"buy": None, "sell": None},
+    }
+    ok, reason = run_once._signal_matches_latest_bar(signal, 119, "2026-09-02T11:00:00+00:00")
+    assert ok and reason == "ok"
 
 
 def test_signal_latest_bar_rejects_nonlatest_index():
