@@ -9,6 +9,7 @@ import logging
 import math
 import os
 import time
+import threading
 from email.utils import parsedate_to_datetime
 from decimal import (
     Decimal,
@@ -51,15 +52,15 @@ CACHE = {
 TTL = 3600
 SERVER_TIME_OFFSET_MS = 0
 
+# Requests Session is not used concurrently across scan worker threads.
+# Public scan requests get one Session per worker thread, each with a small bounded
+# connection pool. This avoids urllib3 "Connection pool is full" churn while still
+# keeping the public scan concurrent. Private/retryable requests use a dedicated
+# process-wide Session because those calls are serialized by the orchestration layer.
 SESSION = requests.Session()
-# Fast-fail session used by reconciliation/health-sensitive GETs. It deliberately
-# has no urllib3 retry adapter so a single stalled request cannot consume several
-# consecutive 10-second retry windows before the reconciliation loop can continue.
-FAST_SESSION = requests.Session()
-
-_adapter = HTTPAdapter(
-    pool_connections=20,
-    pool_maxsize=20,
+_SESSION_ADAPTER = HTTPAdapter(
+    pool_connections=8,
+    pool_maxsize=8,
     max_retries=Retry(
         total=3,
         connect=3,
@@ -72,8 +73,20 @@ _adapter = HTTPAdapter(
         raise_on_status=False,
     ),
 )
-SESSION.mount("https://", _adapter)
-SESSION.mount("http://", _adapter)
+SESSION.mount("https://", _SESSION_ADAPTER)
+SESSION.mount("http://", _SESSION_ADAPTER)
+
+_FAST_LOCAL = threading.local()
+
+def _get_fast_session() -> requests.Session:
+    session = getattr(_FAST_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=2, pool_maxsize=2, max_retries=0)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        _FAST_LOCAL.session = session
+    return session
 
 
 def get_credentials() -> tuple[str, str]:
@@ -128,7 +141,7 @@ def _request(
     except (TypeError, ValueError):
         request_timeout = 10.0
     request_timeout = max(1.0, min(request_timeout, 60.0))
-    session = SESSION if retryable else FAST_SESSION
+    session = SESSION if retryable else _get_fast_session()
     headers = {}
     max_timestamp_retries = 1 if signed else 0
 
