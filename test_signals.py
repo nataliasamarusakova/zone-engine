@@ -158,3 +158,44 @@ def test_bingx_signed_post_contains_source_key(monkeypatch):
     assert captured["headers"]["X-SOURCE-KEY"] == "BX-AI-SKILL"
     assert "signature" in captured["data"]
     assert "timestamp" in captured["data"]
+
+
+def test_bingx_signed_post_uses_exact_canonical_body(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setenv("BINGX_API_KEY", "key")
+    monkeypatch.setenv("BINGX_SECRET_KEY", "secret")
+    captured = {}
+    class Resp:
+        headers = {}
+        def json(self):
+            return {"code": 0, "data": {}}
+    class Session:
+        def request(self, **kwargs):
+            captured.update(kwargs)
+            return Resp()
+    monkeypatch.setattr(bingx, "SESSION", Session())
+    params = {"symbol": "BRETT-USDT", "side": "LONG", "leverage": "10"}
+    out = bingx._request("POST", "/private-test", params, signed=True, retryable=True)
+    assert out["code"] == 0
+    body = captured["data"]
+    assert isinstance(body, str)
+    assert body.startswith("leverage=10&side=LONG&symbol=BRETT-USDT&timestamp=")
+    assert "&signature=" in body
+    assert captured["headers"]["Content-Type"] == "application/x-www-form-urlencoded"
+
+
+def test_bingx_min_qty_is_nonfatal_skip(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)
+    monkeypatch.setattr(bingx, "get_contract", lambda symbol: {
+        "symbol": symbol, "quantityPrecision": 4, "tradeMinQuantity": 3.4286,
+        "multiplier": 1, "maxLeverage": 10,
+    })
+    monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
+    monkeypatch.setattr(bingx, "has_open_position", lambda symbol, direction: False)
+    monkeypatch.setattr(bingx, "_current_close_price", lambda symbol: 93.368)
+    monkeypatch.setenv("BINGX_MARGIN_USDT", "1")
+    monkeypatch.setenv("BINGX_LEVERAGE", "10")
+    result = bingx.open_market("NCFXNZD2JPY-USDT", "SHORT", 93.368, "TEST")
+    assert result["status"] == "skipped_min_qty"
+    assert result["required_margin_usdt"] > 1.0

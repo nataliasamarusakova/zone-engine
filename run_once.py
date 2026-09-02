@@ -499,8 +499,15 @@ def main() -> None:
             _send_signal(signal, blocked)
             continue
         execution = execute_new_position(signal)
-        if not str(execution.get("status", "")).startswith("opened"):
-            log.error("[EXEC_FAILED] %s %s | status=%s | error=%s | order=%s", signal["symbol"], signal["type"], execution.get("status"), execution.get("error"), execution.get("order"))
+        execution_status = str(execution.get("status", ""))
+        if execution_status == "skipped_min_qty":
+            log.warning(
+                "[EXEC_SKIPPED] %s %s | reason=exchange_min_quantity | qty=%s min_qty=%s required_margin=%.4f configured_margin=%.4f",
+                signal["symbol"], signal["type"], execution.get("qty"), execution.get("min_qty"),
+                float(execution.get("required_margin_usdt", 0.0) or 0.0), float(execution.get("configured_margin_usdt", MARGIN_USDT) or MARGIN_USDT),
+            )
+        elif not execution_status.startswith("opened"):
+            log.error("[EXEC_FAILED] %s %s | status=%s | error=%s | order=%s", signal["symbol"], signal["type"], execution_status, execution.get("error"), execution.get("order"))
         _append_jsonl(TRADES_PATH, {"record_type": "TRADE_OPEN", "event_id": signal["event_id"], "symbol": signal["symbol"], "direction": signal["type"], "score": signal["score"], "signal": signal, "result": execution})
         _send_signal(signal, execution)
         if str(execution.get("status")).startswith("opened"):
