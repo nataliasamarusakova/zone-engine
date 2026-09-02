@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 from typing import Any, Literal
 
 import numpy as np
@@ -30,6 +31,11 @@ TP1_FRACTION = 0.50
 TP2_FRACTION = 0.50
 
 MIN_BARS = 70
+
+# When an Ajay ALMA signal has no directional Demand/Supply zone touching the
+# signal bar, production still needs a deterministic protective stop. This
+# fallback is deliberately expressed in ATR rather than inventing a zone.
+FALLBACK_SL_ATR_MULTIPLIER = float(os.environ.get("FALLBACK_SL_ATR_MULTIPLIER", "1.5"))
 
 # Pine visual S/R settings (diagnostic layer; not an entry filter)
 SR_ENABLE = True
@@ -645,21 +651,36 @@ def generate_zone_signals(
         context_zone = trade_zone or _nearest_zone(direction, cur_c, active_demand, active_supply)
 
         stop = risk = tp1 = tp2 = risk_pct = None
+        sl_source = None
         if trade_zone is not None:
             if direction == "LONG":
                 stop = float(trade_zone["btm"]) - 0.3 * atr
                 risk = cur_c - stop
-                tp1 = cur_c + TP1_R * risk
-                tp2 = cur_c + TP2_R * risk
             else:
                 stop = float(trade_zone["top"]) + 0.3 * atr
                 risk = stop - cur_c
-                tp1 = cur_c - TP1_R * risk
-                tp2 = cur_c - TP2_R * risk
-            if risk > 0 and cur_c > 0:
-                risk_pct = (risk / cur_c) * 100.0
+            sl_source = "zone"
+        else:
+            # Pine's strategy.entry() does not require a Demand/Supply touch.
+            # Therefore a valid ALMA signal must remain a valid production signal
+            # even when there is no directional zone on the trigger bar. Use a
+            # deterministic ATR stop only for risk construction; the zone itself
+            # remains context, not an entry gate.
+            fallback_risk = max(FALLBACK_SL_ATR_MULTIPLIER * atr, cur_c * 0.0001)
+            if direction == "LONG":
+                stop = cur_c - fallback_risk
+                risk = fallback_risk
             else:
-                stop = risk = tp1 = tp2 = risk_pct = None
+                stop = cur_c + fallback_risk
+                risk = fallback_risk
+            sl_source = "atr_fallback"
+
+        if risk is not None and risk > 0 and cur_c > 0:
+            risk_pct = (risk / cur_c) * 100.0
+            tp1 = cur_c + TP1_R * risk if direction == "LONG" else cur_c - TP1_R * risk
+            tp2 = cur_c + TP2_R * risk if direction == "LONG" else cur_c - TP2_R * risk
+        else:
+            stop = risk = tp1 = tp2 = risk_pct = None
 
         avg_vol = _safe_num(df.loc[i, "vol_sma20"], 0.0)
         vol_ratio = (_safe_num(df.loc[i, "volume"]) / avg_vol) if avg_vol > 0 else None
@@ -701,6 +722,10 @@ def generate_zone_signals(
                     "sell": direction == "SHORT",
                 },
                 "zone": zone_ctx,
+                "risk_model": {
+                    "sl_source": sl_source,
+                    "fallback_atr_multiplier": FALLBACK_SL_ATR_MULTIPLIER if sl_source == "atr_fallback" else None,
+                },
                 "confirmation": {
                     "alma_cross": True,
                     "zone_touch": trade_zone is not None,
