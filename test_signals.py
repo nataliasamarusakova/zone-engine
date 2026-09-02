@@ -199,3 +199,25 @@ def test_bingx_min_qty_is_nonfatal_skip(monkeypatch):
     result = bingx.open_market("NCFXNZD2JPY-USDT", "SHORT", 93.368, "TEST")
     assert result["status"] == "skipped_min_qty"
     assert result["required_margin_usdt"] > 1.0
+
+
+def test_binance_symbol_normalization_and_asset_classification():
+    from event_engine.binance import classify_asset, normalize_symbol
+    assert normalize_symbol("BRETT-USDT") == "BRETTUSDT"
+    assert normalize_symbol("1000PEPEUSDT") == "1000PEPEUSDT"
+    assert classify_asset({"underlyingType": "COIN"}) == "CRYPTO"
+    assert classify_asset({"underlyingType": "EQUITY"}) == "EQUITY"
+    assert classify_asset({"underlyingType": "COMMODITY"}) == "UNKNOWN"
+
+
+def test_binance_analysis_universe_uses_bingx_symbols(monkeypatch):
+    from event_engine import binance
+    monkeypatch.setattr(binance, "symbols", lambda: {
+        "BTCUSDT": {"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+        "TSLAUSDT": {"symbol": "TSLAUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "EQUITY"},
+    })
+    out = binance.analysis_symbols_for_bingx(["BTC-USDT", "TSLA-USDT", "NOPE-USDT"])
+    assert out[0]["binance_available"] is True
+    assert out[0]["asset_class"] == "CRYPTO"
+    assert out[1]["asset_class"] == "EQUITY"
+    assert out[2]["binance_available"] is False

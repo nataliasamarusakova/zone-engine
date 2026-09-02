@@ -12,11 +12,12 @@ from typing import Any
 import pandas as pd
 
 from event_engine.analytics import save_scan
+from event_engine.binance import analysis_symbols_for_bingx, fetch_klines as fetch_binance_klines
 from event_engine.bingx import (
     contracts,
     credentials_available,
     ensure_directional_protection,
-    fetch_klines,
+    fetch_klines as fetch_bingx_klines,
     get_contract,
     get_positions,
     get_position_mode,
@@ -46,6 +47,8 @@ MIN_SIGNAL_SCORE = float(os.environ.get("MIN_SIGNAL_SCORE", "70"))
 SCAN_WORKERS = max(1, int(os.environ.get("SCAN_WORKERS", "12")))
 SCAN_BATCH_SIZE = max(SCAN_WORKERS, int(os.environ.get("SCAN_BATCH_SIZE", "48")))
 SCAN_BATCH_PAUSE_SEC = max(0.0, float(os.environ.get("SCAN_BATCH_PAUSE_SEC", "0.10")))
+BINANCE_ASSET_CLASSES = {x.strip().upper() for x in os.environ.get("BINANCE_ASSET_CLASSES", "CRYPTO,EQUITY").split(",") if x.strip()}
+MAX_MARKET_SPREAD_PCT = float(os.environ.get("MAX_MARKET_SPREAD_PCT", "1.50"))
 RECONCILIATION_MAX_SECONDS = float(os.environ.get("RECONCILIATION_MAX_SECONDS", "45"))
 
 
@@ -123,6 +126,23 @@ def _price_position(price: float, demand: list[dict], supply: list[dict]) -> str
     if in_sup:
         return "🔴 В зоне SUPPLY"
     return "⚪ Вне зон (Ждать)"
+
+
+def _bingx_last_price(contract: dict[str, Any]) -> float | None:
+    for key in ("lastPrice", "last", "price", "markPrice"):
+        try:
+            value = float(contract.get(key))
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _market_spread_pct(binance_price: float | None, bingx_price: float | None) -> float | None:
+    if not binance_price or not bingx_price or binance_price <= 0:
+        return None
+    return round(abs(bingx_price - binance_price) / binance_price * 100.0, 4)
 
 
 def _position_keys(positions: list[dict]) -> set[tuple[str, str]]:
@@ -333,11 +353,24 @@ def main() -> None:
         log.info("[TRACKER] skipped: private BingX layer unavailable")
         log.info("[RECON] skipped: private BingX layer unavailable")
 
-    # 2) Dynamic universe from public BingX contracts.
-    symbols = get_scan_symbols()
-    log.info("[SCAN] BingX active USDT symbols: %d", len(symbols))
+    # 2) Dynamic universe: BingX supplies executable symbols; Binance determines which
+    # symbols have the reference market data used by the signal engine. This removes
+    # FX/commodity/synthetic contracts that do not have an eligible Binance market.
+    bingx_symbols = get_scan_symbols()
+    log.info("[SCAN] BingX active USDT symbols: %d", len(bingx_symbols))
+    try:
+        analysis_universe = [
+            item for item in analysis_symbols_for_bingx(bingx_symbols)
+            if item.get("binance_available") and str(item.get("asset_class", "")).upper() in BINANCE_ASSET_CLASSES
+        ]
+    except Exception as exc:
+        log.exception("[SCAN] Binance exchangeInfo failed: %s", exc)
+        analysis_universe = []
+    symbols = [str(item["bingx_symbol"]) for item in analysis_universe]
+    analysis_meta = {str(item["bingx_symbol"]): item for item in analysis_universe}
+    log.info("[SCAN] Binance reference-eligible symbols: %d | asset_classes=%s", len(symbols), ",".join(sorted(BINANCE_ASSET_CLASSES)))
     if not symbols:
-        log.error("[SCAN] No active USDT symbols returned by BingX; no market scan was performed")
+        log.error("[SCAN] No symbols have eligible Binance reference markets; no signal scan was performed")
 
     successful_ids = _load_successful_trade_ids()
     if private_ready:
@@ -356,6 +389,7 @@ def main() -> None:
         """Public-market scan for one symbol. Safe to run concurrently."""
         try:
             contract = get_contract(symbol)
+            meta = analysis_meta.get(symbol, {})
             if not contract:
                 return {
                     "symbol": symbol, "current_price": None, "price_position": "CONTRACT_NOT_FOUND",
@@ -364,7 +398,8 @@ def main() -> None:
                     "error": "contract_not_found", "signals": [],
                 }
 
-            bars = fetch_klines(symbol, "1h", limit=KLINE_LIMIT_1H, retryable=False)
+            binance_symbol = str(meta.get("binance_symbol") or "")
+            bars = fetch_binance_klines(binance_symbol, "1h", limit=KLINE_LIMIT_1H, retryable=False)
             min_bars = SWING_LEN * 2 + 10
             if len(bars) < min_bars:
                 return {
@@ -376,19 +411,46 @@ def main() -> None:
 
             df, supply, demand, signals = generate_zone_signals(pd.DataFrame(bars), symbol=symbol)
             latest_price = float(df["close"].iloc[-1])
+            bingx_price = _bingx_last_price(contract)
             recent = [s for s in signals if int(s["idx"]) >= len(df) - MAX_SIGNAL_AGE_BARS]
             for sig in recent:
                 sig["score"] = score_zone_signal(sig)
             recent = [s for s in recent if float(s["score"]) >= MIN_SIGNAL_SCORE]
+
+            # Only validate BingX live price when a fresh signal exists. This keeps
+            # the full-market scan on Binance while spending a small number of extra
+            # BingX public requests only on actionable candidates.
+            if recent and bingx_price is None:
+                try:
+                    bx_live = fetch_bingx_klines(symbol, "1m", limit=1, retryable=False)
+                    if bx_live:
+                        bingx_price = float(bx_live[-1]["close"])
+                except Exception as bx_exc:
+                    log.warning("[MARKET_CHECK] %s | BingX price validation failed: %s", symbol, bx_exc)
+            spread_pct = _market_spread_pct(latest_price, bingx_price)
+            if spread_pct is not None and spread_pct > MAX_MARKET_SPREAD_PCT:
+                log.warning("[MARKET_SPREAD] %s | Binance=%.12g | BingX=%.12g | spread=%.4f%% > %.4f%%", symbol, latest_price, bingx_price, spread_pct, MAX_MARKET_SPREAD_PCT)
+                recent = []
             latest_signal = max(recent, key=lambda s: (float(s.get("score", 0)), int(s.get("idx", 0)))) if recent else None
+            if not latest_signal and spread_pct is not None and spread_pct > MAX_MARKET_SPREAD_PCT:
+                fresh_text = f"BLOCKED_SPREAD>{MAX_MARKET_SPREAD_PCT:.2f}%"
+            else:
+                fresh_text = None
             price_position = _price_position(latest_price, demand, supply)
-            fresh_text = (
-                f"{latest_signal['type']} @ {latest_signal['entry']} score={latest_signal.get('score', 0):.1f}"
-                if latest_signal else "—"
-            )
+            if fresh_text is None:
+                fresh_text = (
+                    f"{latest_signal['type']} @ {latest_signal['entry']} score={latest_signal.get('score', 0):.1f}"
+                    if latest_signal else "—"
+                )
             return {
                 "symbol": symbol,
                 "current_price": latest_price,
+                "binance_price": latest_price,
+                "bingx_price": bingx_price,
+                "market_spread_pct": spread_pct,
+                "market_source": "binance_futures",
+                "binance_symbol": binance_symbol,
+                "asset_class": meta.get("asset_class", "UNKNOWN"),
                 "price_position": price_position,
                 "fresh_signal": fresh_text,
                 "active_demand": len(demand),
@@ -399,7 +461,9 @@ def main() -> None:
             }
         except Exception as exc:
             return {
-                "symbol": symbol, "current_price": None, "price_position": "ERROR",
+                "symbol": symbol, "current_price": None, "binance_price": None, "bingx_price": None, "market_spread_pct": None,
+                "market_source": "binance_futures", "binance_symbol": analysis_meta.get(symbol, {}).get("binance_symbol"),
+                "asset_class": analysis_meta.get(symbol, {}).get("asset_class", "UNKNOWN"), "price_position": "ERROR",
                 "fresh_signal": "—", "active_demand": 0, "active_supply": 0,
                 "zones": {"demand": [], "supply": []}, "last_signal_count": 0,
                 "error": f"{type(exc).__name__}: {exc}", "signals": [],
@@ -420,7 +484,9 @@ def main() -> None:
                     result = future.result()
                 except Exception as exc:  # defensive: scan_one already catches errors
                     result = {
-                        "symbol": symbol, "current_price": None, "price_position": "ERROR",
+                        "symbol": symbol, "current_price": None, "binance_price": None, "bingx_price": None, "market_spread_pct": None,
+                "market_source": "binance_futures", "binance_symbol": analysis_meta.get(symbol, {}).get("binance_symbol"),
+                "asset_class": analysis_meta.get(symbol, {}).get("asset_class", "UNKNOWN"), "price_position": "ERROR",
                         "fresh_signal": "—", "active_demand": 0, "active_supply": 0,
                         "zones": {"demand": [], "supply": []}, "last_signal_count": 0,
                         "error": f"{type(exc).__name__}: {exc}", "signals": [], "exception": exc,
