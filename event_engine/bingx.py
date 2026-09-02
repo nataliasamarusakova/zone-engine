@@ -535,6 +535,40 @@ def cancel_order(symbol: str, order_id: str | int) -> dict:
     return _request("DELETE", ORDER_PATH, {"symbol": bx, "orderId": str(order_id)}, signed=True)
 
 
+
+def close_position_market(symbol: str, direction: str, qty: float, *, reduce_only: bool = True, trade_id: str | None = None) -> dict:
+    """Close an existing directional position with a MARKET order. Used only as
+    a safety rollback when mandatory protection cannot be established."""
+    direction = str(direction).upper()
+    if direction not in {"LONG", "SHORT"}:
+        return {"status": "error", "error": f"invalid direction={direction}"}
+    bx = to_bx_symbol(symbol)
+    if not bx:
+        return {"status": "error", "error": "contract_not_found"}
+    contract = get_contract(symbol) or {}
+    try:
+        prec = int(contract.get("quantityPrecision") or 0)
+    except (TypeError, ValueError):
+        prec = 0
+    close_qty = _round_qty(abs(float(qty)), prec)
+    if close_qty <= 0:
+        return {"status": "error", "error": "invalid close quantity", "qty": close_qty}
+
+    params = {
+        "symbol": bx,
+        "side": "SELL" if direction == "LONG" else "BUY",
+        "positionSide": position_side_param(direction),
+        "type": "MARKET",
+        "quantity": _format_qty(close_qty, prec),
+        "reduceOnly": "true" if reduce_only else "false",
+    }
+    if trade_id:
+        params["clientOrderId"] = f"EVT_{_trade_digest(trade_id)}_ROLLBACK"
+    resp = _request("POST", ORDER_PATH, params)
+    if not isinstance(resp, dict) or resp.get("code") != 0:
+        return {"status": "error", "error": f"close failed: code={resp.get('code') if isinstance(resp, dict) else None} msg={resp.get('msg') if isinstance(resp, dict) else resp}", "response": resp}
+    return {"status": "closed", "symbol": bx, "direction": direction, "qty": close_qty, "response": resp}
+
 def has_open_position(symbol: str, direction: str) -> bool:
     bx = to_bx_symbol(symbol)
     if not bx:
