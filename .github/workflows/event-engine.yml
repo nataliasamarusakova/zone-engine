@@ -1,0 +1,100 @@
+name: Zone Signal Engine
+
+on:
+  repository_dispatch:
+    types: [run_event_engine]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: zone-engine
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
+      BINGX_SECRET_KEY: ${{ secrets.BINGX_SECRET_KEY }}
+      BINGX_ENV: vst
+      BINGX_BASE_URL: https://open-api-vst.bingx.com
+      BINGX_MARGIN_USDT: "1"
+      BINGX_LEVERAGE: "10"
+      BINGX_MAX_LEVERAGE: "10"
+      BINGX_POSITION_MODE: HEDGE
+      EXECUTION_ENABLED: "true"
+      MAX_TRADES_PER_CYCLE: "5"
+      MAX_SCAN_SYMBOLS: "0"
+      KLINE_LIMIT_1H: "220"
+      MAX_SIGNAL_AGE_BARS: "3"
+      MIN_SIGNAL_SCORE: "70"
+      SCAN_INTERVAL_SEC: "0.15"
+      RECONCILIATION_HTTP_TIMEOUT_SEC: "5"
+      RECONCILIATION_MAX_SECONDS: "45"
+      BINGX_HTTP_TIMEOUT_SEC: "10"
+      TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+      TG_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          ref: main
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Syntax check
+        run: python -m compileall -q event_engine run_once.py test_signals.py
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Run engine
+        run: python run_once.py
+
+      - name: Commit state
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "actions-user"
+          git config user.email "actions@github.com"
+          git status --short
+          git add data/*.jsonl data/*.json data/*.txt 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No state changes"
+            exit 0
+          fi
+          git commit -m "zone engine snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          for attempt in 1 2 3 4 5; do
+            git fetch origin main
+            if git rebase origin/main; then
+              if git push origin HEAD:main; then
+                echo "State pushed successfully"
+                exit 0
+              fi
+            else
+              git rebase --abort 2>/dev/null || true
+            fi
+            sleep $((attempt * 3))
+          done
+          exit 1
