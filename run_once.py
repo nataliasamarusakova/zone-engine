@@ -42,9 +42,9 @@ MAX_SCAN_SYMBOLS = int(os.environ.get("MAX_SCAN_SYMBOLS", "0"))
 KLINE_LIMIT_1H = int(os.environ.get("KLINE_LIMIT_1H", "120"))
 MAX_SIGNAL_AGE_BARS = int(os.environ.get("MAX_SIGNAL_AGE_BARS", "3"))
 MIN_SIGNAL_SCORE = float(os.environ.get("MIN_SIGNAL_SCORE", "70"))
-SCAN_WORKERS = max(1, int(os.environ.get("SCAN_WORKERS", "16")))
-SCAN_BATCH_SIZE = max(SCAN_WORKERS, int(os.environ.get("SCAN_BATCH_SIZE", "64")))
-SCAN_BATCH_PAUSE_SEC = max(0.0, float(os.environ.get("SCAN_BATCH_PAUSE_SEC", "0.20")))
+SCAN_WORKERS = max(1, int(os.environ.get("SCAN_WORKERS", "12")))
+SCAN_BATCH_SIZE = max(SCAN_WORKERS, int(os.environ.get("SCAN_BATCH_SIZE", "48")))
+SCAN_BATCH_PAUSE_SEC = max(0.0, float(os.environ.get("SCAN_BATCH_PAUSE_SEC", "0.10")))
 RECONCILIATION_MAX_SECONDS = float(os.environ.get("RECONCILIATION_MAX_SECONDS", "45"))
 
 
@@ -432,7 +432,7 @@ def main() -> None:
             elif result.get("price_position") == "CONTRACT_NOT_FOUND":
                 log.warning("[COIN_SKIP] %s | contract not found in BingX cache", symbol)
             else:
-                log.info(
+                log.debug(
                     "[COIN] %s | price=%s | %s | fresh=%s | demand=%d | supply=%d",
                     symbol, result["current_price"], result["price_position"], result["fresh_signal"],
                     result["active_demand"], result["active_supply"],
@@ -442,6 +442,13 @@ def main() -> None:
         log.info("[SCAN_PROGRESS] %d/%d symbols | batch=%d | workers=%d", scanned, total, len(batch), min(SCAN_WORKERS, len(batch)))
         if scanned < total and SCAN_BATCH_PAUSE_SEC > 0:
             time.sleep(SCAN_BATCH_PAUSE_SEC)
+
+    scan_errors = sum(1 for row in scan_rows if row.get("price_position") == "ERROR")
+    scan_skips = sum(1 for row in scan_rows if row.get("price_position") in {"INSUFFICIENT_DATA", "CONTRACT_NOT_FOUND"})
+    log.info(
+        "[SCAN_DONE] symbols=%d errors=%d skipped=%d fresh_signals=%d duration=%.1fs",
+        total, scan_errors, scan_skips, len(fresh_signals), time.time() - started,
+    )
 
     # Keep one best fresh signal per symbol/direction and block existing exposure.
     by_key: dict[tuple[str, str], dict[str, Any]] = {}
