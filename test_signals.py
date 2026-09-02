@@ -64,8 +64,8 @@ def test_long_tp_ordering_and_rr():
     }
     assert signal["tp1"] < signal["tp2"]
     assert RR_RATIO == 3.0
-    assert TP1_R == 1.0
-    assert TP2_R == 2.0
+    assert TP1_R == 0.5
+    assert TP2_R == 1.0
     assert score_zone_signal(signal) >= 70
 
 
@@ -303,8 +303,8 @@ def test_open_client_order_id_is_unique():
 
 def test_tp_constants_are_one_and_two_r():
     from event_engine.signals import TP1_R, TP2_R, TP1_FRACTION, TP2_FRACTION
-    assert TP1_R == 1.0
-    assert TP2_R == 2.0
+    assert TP1_R == 0.5
+    assert TP2_R == 1.0
     assert TP1_FRACTION == 0.50
     assert TP2_FRACTION == 0.50
 
@@ -418,23 +418,20 @@ def test_pine_zone_records_are_exposed_for_comparison():
     assert isinstance(result["supply"], list)
 
 
-def test_no_zone_signal_gets_atr_fallback_geometry(monkeypatch):
+def test_no_zone_signal_is_blocked_in_strict_zone_mode(monkeypatch):
     import numpy as np
     import pandas as pd
     from event_engine import signals as sig
 
-    monkeypatch.setattr(sig, "FALLBACK_SL_ATR_MULTIPLIER", 1.5)
+    monkeypatch.setattr(sig, "REQUIRE_ZONE_TOUCH", True)
     n = 120
     ts = pd.date_range("2026-01-01", periods=n, freq="h", tz="UTC")
     close = np.linspace(100.0, 120.0, n)
     open_ = close.copy()
-    open_[40:] += 0.5
-    high = np.maximum(open_, close) + 0.5
-    low = np.minimum(open_, close) - 0.5
+    high = close + 0.5
+    low = close - 0.5
     volume = np.full(n, 1000.0)
     df = pd.DataFrame({"timestamp": ts, "open": open_, "high": high, "low": low, "close": close, "volume": volume})
-    # Force a deterministic ALMA trigger inside generate_zone_signals so this test
-    # isolates risk geometry rather than depending on market-shaped crossings.
     original_attach = sig._attach_exact_alternate_series
     def forced_attach(frame, mode="live"):
         out = original_attach(frame, mode=mode)
@@ -443,15 +440,57 @@ def test_no_zone_signal_gets_atr_fallback_geometry(monkeypatch):
         out.loc[out.index[-1], "pine_buy"] = True
         return out
     monkeypatch.setattr(sig, "_attach_exact_alternate_series", forced_attach)
-    out2, supply, demand, emitted = sig.generate_zone_signals(df, symbol="TEST-USDT", mode="live")
-    assert emitted, "forced latest-bar ALMA signal must be emitted"
+    _, _, _, emitted = sig.generate_zone_signals(df, symbol="TEST-USDT", mode="live")
+    assert emitted == []
+
+
+def test_zone_signal_uses_zone_boundary_stop_and_small_tps(monkeypatch):
+    import numpy as np
+    import pandas as pd
+    from event_engine import signals as sig
+
+    monkeypatch.setattr(sig, "REQUIRE_ZONE_TOUCH", True)
+    n = 120
+    ts = pd.date_range("2026-01-01", periods=n, freq="h", tz="UTC")
+    close = np.linspace(100.0, 120.0, n)
+    open_ = close.copy()
+    high = close + 0.5
+    low = close - 0.5
+    # Give the latest candle a small pullback/touch area.
+    close[-1] = 109.0
+    open_[-1] = 110.0
+    high[-1] = 110.0
+    low[-1] = 108.0
+    volume = np.full(n, 1000.0)
+    df = pd.DataFrame({"timestamp": ts, "open": open_, "high": high, "low": low, "close": close, "volume": volume})
+    original_attach = sig._attach_exact_alternate_series
+    def forced_attach(frame, mode="live"):
+        out = original_attach(frame, mode=mode)
+        out.loc[:, "pine_buy"] = False
+        out.loc[:, "pine_sell"] = False
+        out.loc[out.index[-1], "pine_buy"] = True
+        return out
+    monkeypatch.setattr(sig, "_attach_exact_alternate_series", forced_attach)
+
+    # Supply a deterministic Demand zone touching the latest bar.
+    def forced_walk(frame):
+        demand = [{"top": 110.0, "btm": 107.0, "poi": 108.5, "start": len(frame)-5}]
+        return [], demand, [], [], []
+    monkeypatch.setattr(sig, "_pine_zone_walk", forced_walk)
+
+    # With a forced zone walk, generate_zone_signals builds its own active zone,
+    # so patch zone construction/selection at the deterministic insertion point.
+    forced_zone = {"top": 110.0, "btm": 107.0, "poi": 108.5, "start": n - 5}
+    monkeypatch.setattr(sig, "_find_directional_zone", lambda direction, cur_l, cur_h, cur_c, demand, supply: forced_zone if direction == "LONG" else None)
+
+    _, _, _, emitted = sig.generate_zone_signals(df, symbol="TEST-USDT", mode="live")
+    assert emitted
     latest = emitted[-1]
-    assert latest["confirmation"]["zone_touch"] is False
-    assert latest["risk_model"]["sl_source"] == "atr_fallback"
-    assert latest["sl"] is not None
-    assert latest["tp1"] is not None
-    assert latest["tp2"] is not None
-    assert latest["risk_pct"] > 0
+    assert latest["confirmation"]["zone_touch"] is True
+    assert latest["risk_model"]["sl_source"] == "zone_boundary_plus_atr_buffer"
+    assert latest["tp1"] == round(latest["entry"] + 0.5 * latest["risk_abs"], 8)
+    assert latest["tp2"] == round(latest["entry"] + 1.0 * latest["risk_abs"], 8)
+    assert latest["sl"] < 107.0
 
 
 def test_latest_signal_selection_prefers_newest_bar_over_score():

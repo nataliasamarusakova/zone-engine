@@ -295,8 +295,8 @@ def _build_setup(signal: dict[str, Any]) -> dict[str, Any]:
         "entry_reference": float(signal["entry"]),
         "invalidation_price": float(signal["sl"]),
         "risk_pct": risk_pct,
-        "target_rr": 3.0,
-        "planned_weighted_rr": 2.25,
+        "target_rr": TP2_R,
+        "planned_weighted_rr": TP1_R * 0.50 + TP2_R * 0.50,
         "tp_levels": [
             {"leg": "tp1", "pnl_pct": TP1_R * risk_pct, "close_fraction": 0.50},
             {"leg": "tp2", "pnl_pct": TP2_R * risk_pct, "close_fraction": 0.50},
