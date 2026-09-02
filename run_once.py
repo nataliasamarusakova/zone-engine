@@ -13,6 +13,7 @@ import pandas as pd
 from event_engine.analytics import save_scan
 from event_engine.bingx import (
     contracts,
+    credentials_available,
     ensure_directional_protection,
     fetch_klines,
     get_contract,
@@ -94,6 +95,20 @@ def get_scan_symbols() -> list[str]:
     if MAX_SCAN_SYMBOLS > 0:
         symbols = symbols[:MAX_SCAN_SYMBOLS]
     return symbols
+
+
+def _log_coin_skip(symbol: str, reason: str) -> None:
+    log.warning("[COIN_SKIP] %s | %s", symbol, reason)
+
+
+def _private_layer_ready() -> bool:
+    ready = credentials_available()
+    if not ready:
+        log.warning(
+            "[AUTH] BingX private credentials are missing. "
+            "Public market scan will continue; positions, reconciliation and execution are disabled for this run."
+        )
+    return ready
 
 
 def _price_position(price: float, demand: list[dict], supply: list[dict]) -> str:
@@ -291,16 +306,38 @@ def main() -> None:
     DATA.mkdir(parents=True, exist_ok=True)
     scan_id = f"SCAN_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8].upper()}"
 
-    # 1) Existing positions first: TP/SL/BE lifecycle + missing protection repair.
-    update_active_trades()
-    reconcile_all_open_positions()
+    # 1) Private account layer is optional for a scan. Never let missing credentials
+    #    prevent public market analysis from running.
+    private_ready = _private_layer_ready()
+    if private_ready:
+        try:
+            update_active_trades()
+        except Exception as exc:
+            log.exception("[TRACKER] active trade update failed: %s", exc)
+        try:
+            reconcile_all_open_positions()
+        except Exception as exc:
+            log.exception("[RECON] reconciliation failed: %s", exc)
+    else:
+        log.info("[TRACKER] skipped: private BingX layer unavailable")
+        log.info("[RECON] skipped: private BingX layer unavailable")
 
-    # 2) Dynamic universe from BingX.
+    # 2) Dynamic universe from public BingX contracts.
     symbols = get_scan_symbols()
     log.info("[SCAN] BingX active USDT symbols: %d", len(symbols))
+    if not symbols:
+        log.error("[SCAN] No active USDT symbols returned by BingX; no market scan was performed")
 
     successful_ids = _load_successful_trade_ids()
-    open_keys = _position_keys(get_positions())
+    if private_ready:
+        try:
+            open_keys = _position_keys(get_positions())
+        except Exception as exc:
+            log.exception("[POSITIONS] initial positions fetch failed; no new entries will be executed: %s", exc)
+            open_keys = set()
+            private_ready = False
+    else:
+        open_keys = set()
     scan_rows: list[dict[str, Any]] = []
     fresh_signals: list[dict[str, Any]] = []
 
@@ -311,6 +348,18 @@ def main() -> None:
                 continue
             bars = fetch_klines(symbol, "1h", limit=KLINE_LIMIT_1H, retryable=False)
             if len(bars) < SWING_LEN * 2 + 10:
+                _log_coin_skip(symbol, f"insufficient 1h candles: {len(bars)} < {SWING_LEN * 2 + 10}")
+                scan_rows.append({
+                    "symbol": symbol,
+                    "current_price": None,
+                    "price_position": "INSUFFICIENT_DATA",
+                    "fresh_signal": "—",
+                    "active_demand": 0,
+                    "active_supply": 0,
+                    "zones": {"demand": [], "supply": []},
+                    "last_signal_count": 0,
+                    "error": f"insufficient_1h_candles:{len(bars)}",
+                })
                 continue
             df, supply, demand, signals = generate_zone_signals(pd.DataFrame(bars), symbol=symbol)
             latest_price = float(df["close"].iloc[-1])
@@ -378,6 +427,20 @@ def main() -> None:
     for signal in executable[:MAX_TRADES_PER_CYCLE]:
         if not EXECUTION_ENABLED:
             _send_signal(signal, {"status": "DISABLED"})
+            continue
+        if not private_ready:
+            blocked = {"status": "BLOCKED_MISSING_CREDENTIALS", "error": "BingX private credentials are unavailable"}
+            log.error("[EXEC_BLOCKED] %s %s: missing BingX private credentials", signal["symbol"], signal["type"])
+            _append_jsonl(TRADES_PATH, {
+                "record_type": "TRADE_BLOCKED",
+                "event_id": signal["event_id"],
+                "symbol": signal["symbol"],
+                "direction": signal["type"],
+                "score": signal["score"],
+                "signal": signal,
+                "result": blocked,
+            })
+            _send_signal(signal, blocked)
             continue
         execution = execute_new_position(signal)
         _append_jsonl(TRADES_PATH, {"record_type": "TRADE_OPEN", "event_id": signal["event_id"], "symbol": signal["symbol"], "direction": signal["type"], "score": signal["score"], "signal": signal, "result": execution})
