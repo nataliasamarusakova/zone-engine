@@ -98,7 +98,7 @@ def generate_zone_signals(df: pd.DataFrame, symbol: str = "") -> tuple[pd.DataFr
         ],
         axis=1,
     ).max(axis=1)
-    df["atr50"] = tr.rolling(50, min_periods=1).mean().bfill()
+    df["atr50"] = tr.rolling(50).mean().bfill()
     df["fast_ma"] = calc_hma(df["close"], 5)
     df["slow_ma"] = calc_hma(df["close"], 13)
     df["vol_sma20"] = df["volume"].rolling(20, min_periods=5).mean().bfill()
@@ -145,10 +145,11 @@ def generate_zone_signals(df: pd.DataFrame, symbol: str = "") -> tuple[pd.DataFr
         near_demand = [d for d in active_demand if cur_l <= float(d["top"]) * 1.003 and cur_c >= float(d["btm"])]
         if near_demand and bull_cross:
             zone = near_demand[-1]
-            sl = round(float(zone["btm"]) - 0.3 * c_atr, 8)
-            risk = max(cur_c - sl, 1e-12)
-            tp1 = round(cur_c + TP1_R * risk, 8)
-            tp2 = round(cur_c + TP2_R * risk, 8)
+            sl = round(float(zone["btm"]) - 0.3 * c_atr, 2)
+            risk = cur_c - sl
+            original_tp = round(cur_c + RR_RATIO * max(risk, 1.5 * c_atr), 2)
+            tp1 = round(cur_c + TP1_R * max(risk, 1.5 * c_atr), 2)
+            tp2 = original_tp
             event_id = _make_event_id(symbol or "UNKNOWN", "LONG", int(df.loc[i, "timestamp"].timestamp() * 1000), int(zone["start"]), cur_c)
             vol_ratio = cur_vol = None
             avg_vol = _safe_num(df.loc[i, "vol_sma20"], 0.0)
@@ -166,6 +167,7 @@ def generate_zone_signals(df: pd.DataFrame, symbol: str = "") -> tuple[pd.DataFr
                     "sl": sl,
                     "tp1": tp1,
                     "tp2": tp2,
+                    "tp_original": original_tp,
                     "risk_pct": round((risk / cur_c) * 100.0, 4),
                     "risk_abs": risk,
                     "rr_ratio": RR_RATIO,
@@ -184,10 +186,11 @@ def generate_zone_signals(df: pd.DataFrame, symbol: str = "") -> tuple[pd.DataFr
         near_supply = [s for s in active_supply if cur_h >= float(s["btm"]) * 0.997 and cur_c <= float(s["top"])]
         if near_supply and bear_cross:
             zone = near_supply[-1]
-            sl = round(float(zone["top"]) + 0.3 * c_atr, 8)
-            risk = max(sl - cur_c, 1e-12)
-            tp1 = round(cur_c - TP1_R * risk, 8)
-            tp2 = round(cur_c - TP2_R * risk, 8)
+            sl = round(float(zone["top"]) + 0.3 * c_atr, 2)
+            risk = sl - cur_c
+            original_tp = round(cur_c - RR_RATIO * max(risk, 1.5 * c_atr), 2)
+            tp1 = round(cur_c - TP1_R * max(risk, 1.5 * c_atr), 2)
+            tp2 = original_tp
             event_id = _make_event_id(symbol or "UNKNOWN", "SHORT", int(df.loc[i, "timestamp"].timestamp() * 1000), int(zone["start"]), cur_c)
             vol_ratio = None
             avg_vol = _safe_num(df.loc[i, "vol_sma20"], 0.0)
@@ -204,6 +207,7 @@ def generate_zone_signals(df: pd.DataFrame, symbol: str = "") -> tuple[pd.DataFr
                     "sl": sl,
                     "tp1": tp1,
                     "tp2": tp2,
+                    "tp_original": original_tp,
                     "risk_pct": round((risk / cur_c) * 100.0, 4),
                     "risk_abs": risk,
                     "rr_ratio": RR_RATIO,
