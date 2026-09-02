@@ -632,17 +632,16 @@ def main() -> None:
                     "error": f"stale_1h_data:{data_age_hours:.2f}h>{MAX_DATA_STALENESS_HOURS:.2f}h",
                 }
 
-            min_signal_idx = latest_closed_idx - max(0, MAX_SIGNAL_AGE_BARS)
-            recent = [s for s in signals if min_signal_idx <= int(s["idx"]) <= latest_closed_idx]
-
-            # For live execution, timestamp equality is a mandatory invariant.
-            # With EXECUTION_MAX_SIGNAL_AGE_BARS=0 the accepted signal must be on
-            # the latest closed bar; this extra check prevents index-only false positives.
-            if recent:
-                recent = [
-                    s for s in recent
-                    if pd.Timestamp(s["time"]) == latest_closed_time
-                ]
+            # Trading decisions are derived ONLY from the Pine trigger on the
+            # latest closed 1H candle. We deliberately do not backfill the live
+            # developing-8H model across historical bars: those historical
+            # developing states are not what exists on the currently running
+            # TradingView bar and must never become execution candidates.
+            recent = [
+                s for s in signals
+                if int(s.get("idx", -1)) == int(latest_closed_idx)
+                and pd.Timestamp(s.get("time")) == latest_closed_time
+            ]
             for sig in recent:
                 sig["score"] = score_zone_signal(sig)
 

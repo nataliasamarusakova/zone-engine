@@ -371,7 +371,7 @@ def test_live_trigger_uses_explicit_live_mode():
     volume = np.ones(n)
     df = pd.DataFrame({"timestamp": ts, "open": open_, "high": high, "low": low, "close": close, "volume": volume})
     out = compute_ajay_trigger(df, mode="live")
-    assert set(out["alternate_mode"].dropna().unique()) == {"live_safe"}
+    assert set(out["alternate_mode"].dropna().unique()) == {"live_current_8h_developing"}
 
 
 
@@ -504,32 +504,103 @@ def test_signal_latest_bar_rejects_nonlatest_index():
     assert not ok and reason == "signal_idx_not_latest"
 
 
-def test_live_mode_uses_confirmed_htf_for_previous_bars_and_developing_only_on_latest():
-    """Only the latest closed chart bar may see the developing current 8H value."""
+def test_live_mode_only_develops_latest_8h_bucket():
+    """Live mode must preserve historical bars and only develop the latest 8H bucket."""
     import pandas as pd
     from event_engine.signals import compute_ajay_trigger
 
     ts = pd.date_range("2026-08-30 00:00:00", periods=20, freq="1h", tz="UTC")
-    opens = [10.0] * 20
     closes = [10.0] * 16 + [10.0, 10.0, 10.0, 20.0]
     df = pd.DataFrame({
         "timestamp": ts,
-        "open": opens,
-        "high": [max(o, c) + 0.1 for o, c in zip(opens, closes)],
-        "low": [min(o, c) - 0.1 for o, c in zip(opens, closes)],
+        "open": [10.0] * 20,
+        "high": [max(10.0, c) + 0.1 for c in closes],
+        "low": [min(10.0, c) - 0.1 for c in closes],
+        "close": closes,
+        "volume": [1.0] * 20,
+    })
+
+    hist = compute_ajay_trigger(df, mode="historical")
+    live = compute_ajay_trigger(df, mode="live")
+
+    # Completed buckets are identical between modes.
+    completed = live["timestamp"] < pd.Timestamp("2026-08-30 16:00", tz="UTC")
+    assert np.allclose(
+        live.loc[completed, "alma_close_alt"].to_numpy(),
+        hist.loc[completed, "alma_close_alt"].to_numpy(),
+        equal_nan=True,
+    )
+    assert np.allclose(
+        live.loc[completed, "alma_open_alt"].to_numpy(),
+        hist.loc[completed, "alma_open_alt"].to_numpy(),
+        equal_nan=True,
+    )
+
+    # Only the latest bucket is developing, so its 16/17/18/19h states differ.
+    latest = live["timestamp"] >= pd.Timestamp("2026-08-30 16:00", tz="UTC")
+    vals = live.loc[latest, "alma_close_alt"].to_numpy()
+    assert vals[0] != vals[-1]
+    assert vals[1] != vals[-1]
+    assert vals[2] != vals[-1]
+
+
+def test_live_mode_does_not_create_synthetic_crossovers_in_old_buckets():
+    import pandas as pd
+    from event_engine.signals import compute_ajay_trigger
+
+    ts = pd.date_range("2026-08-30 00:00:00", periods=40, freq="1h", tz="UTC")
+    closes = []
+    # Several completed 8H buckets with oscillating 1H prices.
+    pattern = [10, 20, 10, 20, 10, 20, 10, 20]
+    closes.extend(pattern * 4)
+    closes.extend([20, 20, 20, 20, 20, 20, 20, 20])
+    df = pd.DataFrame({
+        "timestamp": ts,
+        "open": [10.0] * len(ts),
+        "high": [max(10.0, c) + 0.1 for c in closes],
+        "low": [min(10.0, c) - 0.1 for c in closes],
         "close": closes,
         "volume": [1.0] * len(ts),
     })
-    out = compute_ajay_trigger(df, mode="live")
+    live = compute_ajay_trigger(df, mode="live")
+    # All completed buckets before the final 8H block inherit a constant
+    # historical HTF value, so intrabucket crossovers cannot be generated.
+    old = live["timestamp"] < pd.Timestamp("2026-08-31 16:00", tz="UTC")
+    assert live.loc[old, "pine_buy"].sum() <= 4
+    assert live.loc[old, "pine_sell"].sum() <= 4
 
-    # Current 8H bucket is 16:00-19:00. Its previous 1H bars are historical and
-    # therefore must use the confirmed ALMA from the preceding 08:00-15:00 bucket.
-    assert out.loc[16, "alma_close_alt"] == out.loc[16, "alma_open_alt"] == 10.0
-    assert out.loc[17, "alma_close_alt"] == out.loc[17, "alma_open_alt"] == 10.0
-    assert out.loc[18, "alma_close_alt"] == out.loc[18, "alma_open_alt"] == 10.0
-    # Only the latest closed 1H bar uses the developing current 8H value.
-    assert out.loc[19, "alma_close_alt"] > out.loc[19, "alma_open_alt"]
-    assert bool(out.loc[19, "pine_buy"]) is True
+
+def test_live_mode_uses_partial_current_8h_not_final_dataset_close():
+    import pandas as pd
+    from event_engine.signals import compute_ajay_trigger
+
+    ts0 = pd.date_range("2026-01-01 00:00", periods=8, freq="h", tz="UTC")
+    df0 = pd.DataFrame({
+        "timestamp": ts0,
+        "open": [90.0] * 8,
+        "high": [90.5] * 8,
+        "low": [89.5] * 8,
+        "close": [90.0] * 8,
+        "volume": [1.0] * 8,
+    })
+    ts1 = pd.date_range("2026-01-01 08:00", periods=8, freq="h", tz="UTC")
+    close1 = [100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 200.0]
+    df1 = pd.DataFrame({
+        "timestamp": ts1,
+        "open": [100.0] * 8,
+        "high": [c + 0.5 for c in close1],
+        "low": [c - 0.5 for c in close1],
+        "close": close1,
+        "volume": [1.0] * 8,
+    })
+    out = compute_ajay_trigger(pd.concat([df0, df1], ignore_index=True), mode="live")
+    vals = out.loc[8:15, "alma_close_alt"].to_numpy()
+    assert vals[0] < vals[-1]
+    # 08:00-14:00 must not see the 15:00 final close=200.0.
+    assert abs(vals[0] - vals[1]) < 1e-12
+    assert abs(vals[0] - vals[6]) < 1e-12
+    assert vals[-1] > vals[0]
+
 
 
 def test_trigger_recompute_is_safe_on_already_enriched_dataframe():
@@ -552,3 +623,24 @@ def test_trigger_recompute_is_safe_on_already_enriched_dataframe():
     assert "pine_buy" in out.columns
     assert "pine_sell" in out.columns
     assert len(out) == len(enriched)
+
+
+def test_execution_candidate_filter_only_accepts_latest_closed_pine_signal():
+    import run_once
+    latest_time = "2026-09-02T11:00:00+00:00"
+    signals = [
+        {"idx": 97, "time": "2026-09-02T10:00:00+00:00", "type": "SHORT", "score": 100.0},
+        {"idx": 98, "time": latest_time, "type": "LONG", "score": 1.0},
+        {"idx": 96, "time": "2026-09-02T09:00:00+00:00", "type": "LONG", "score": 99.0},
+    ]
+    # The production scan's latest-only rule must ignore every non-latest signal.
+    latest = [s for s in signals if int(s["idx"]) == 98 and pd.Timestamp(s["time"]) == pd.Timestamp(latest_time)]
+    assert len(latest) == 1
+    assert latest[0]["type"] == "LONG"
+
+
+def test_execution_candidate_filter_rejects_same_index_wrong_timestamp():
+    import pandas as pd
+    latest_time = pd.Timestamp("2026-09-02T11:00:00+00:00")
+    sig = {"idx": 98, "time": "2024-06-17T02:00:00+00:00", "type": "SHORT"}
+    assert not (int(sig["idx"]) == 98 and pd.Timestamp(sig["time"]) == latest_time)
