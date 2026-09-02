@@ -19,6 +19,7 @@ from event_engine.bingx import (
     fetch_klines,
     get_contract,
     get_positions,
+    get_position_mode,
     get_position_directional,
     get_open_protection_directional,
     open_market,
@@ -314,13 +315,20 @@ def main() -> None:
     private_ready = _private_layer_ready()
     if private_ready:
         try:
-            update_active_trades()
+            mode = get_position_mode(timeout_sec=float(os.environ.get("PRIVATE_PREFLIGHT_TIMEOUT_SEC", "5")))
+            log.info("[AUTH] BingX private preflight OK | position_mode=%s", mode)
         except Exception as exc:
-            log.exception("[TRACKER] active trade update failed: %s", exc)
-        try:
-            reconcile_all_open_positions()
-        except Exception as exc:
-            log.exception("[RECON] reconciliation failed: %s", exc)
+            log.error("[AUTH] BingX private preflight failed: %s; execution/reconciliation disabled for this run", exc)
+            private_ready = False
+        if private_ready:
+            try:
+                update_active_trades()
+            except Exception as exc:
+                log.exception("[TRACKER] active trade update failed: %s", exc)
+            try:
+                reconcile_all_open_positions()
+            except Exception as exc:
+                log.exception("[RECON] reconciliation failed: %s", exc)
     else:
         log.info("[TRACKER] skipped: private BingX layer unavailable")
         log.info("[RECON] skipped: private BingX layer unavailable")
@@ -491,6 +499,8 @@ def main() -> None:
             _send_signal(signal, blocked)
             continue
         execution = execute_new_position(signal)
+        if not str(execution.get("status", "")).startswith("opened"):
+            log.error("[EXEC_FAILED] %s %s | status=%s | error=%s | order=%s", signal["symbol"], signal["type"], execution.get("status"), execution.get("error"), execution.get("order"))
         _append_jsonl(TRADES_PATH, {"record_type": "TRADE_OPEN", "event_id": signal["event_id"], "symbol": signal["symbol"], "direction": signal["type"], "score": signal["score"], "signal": signal, "result": execution})
         _send_signal(signal, execution)
         if str(execution.get("status")).startswith("opened"):

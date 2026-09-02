@@ -110,3 +110,51 @@ def test_parallel_scan_settings_are_not_serial_sleep_settings():
     assert run_once.SCAN_WORKERS >= 1
     assert run_once.SCAN_BATCH_SIZE >= run_once.SCAN_WORKERS
     assert run_once.KLINE_LIMIT_1H >= 80
+
+
+def test_bingx_signature_is_ascii_sorted(monkeypatch):
+    import hashlib, hmac
+    from event_engine import bingx
+
+    monkeypatch.setenv("BINGX_SECRET_KEY", "secret")
+    params = {"symbol": "BRETT-USDT", "side": "BUY", "positionSide": "LONG", "type": "MARKET", "quantity": "1966", "timestamp": 1700000000000}
+    canonical = "&".join(f"{k}={params[k]}" for k in sorted(params))
+    expected = hmac.new(b"secret", canonical.encode(), hashlib.sha256).hexdigest()
+    assert bingx._sign(params) == expected
+
+
+def test_bingx_one_way_uses_both_position_side(monkeypatch):
+    import time
+    from event_engine import bingx
+
+    monkeypatch.delenv("BINGX_POSITION_MODE_OVERRIDE", raising=False)
+    bingx._POSITION_MODE_CACHE.update({"ts": time.time(), "dual": False})
+    assert bingx.position_side_param("LONG") == "BOTH"
+    assert bingx.position_side_param("SHORT") == "BOTH"
+
+
+def test_bingx_signed_post_contains_source_key(monkeypatch):
+    import requests
+    from event_engine import bingx
+
+    monkeypatch.setenv("BINGX_API_KEY", "key")
+    monkeypatch.setenv("BINGX_SECRET_KEY", "secret")
+    captured = {}
+
+    class Resp:
+        headers = {}
+        def json(self):
+            return {"code": 0, "data": {}}
+
+    class Session:
+        def request(self, **kwargs):
+            captured.update(kwargs)
+            return Resp()
+
+    monkeypatch.setattr(bingx, "SESSION", Session())
+    out = bingx._request("POST", "/private-test", {"symbol": "BTC-USDT"}, signed=True, retryable=True)
+    assert out["code"] == 0
+    assert captured["headers"]["X-BX-APIKEY"] == "key"
+    assert captured["headers"]["X-SOURCE-KEY"] == "BX-AI-SKILL"
+    assert "signature" in captured["data"]
+    assert "timestamp" in captured["data"]
