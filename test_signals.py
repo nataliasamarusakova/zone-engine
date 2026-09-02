@@ -221,3 +221,10 @@ def test_binance_analysis_universe_uses_bingx_symbols(monkeypatch):
     assert out[0]["asset_class"] == "CRYPTO"
     assert out[1]["asset_class"] == "EQUITY"
     assert out[2]["binance_available"] is False
+
+
+def test_binance_provider_uses_public_vision_api():
+    from event_engine import binance
+    assert binance.BASE_URL == 'https://data-api.binance.vision'
+    assert binance.EXCHANGE_INFO_PATH == '/api/v3/exchangeInfo'
+    assert binance.KLINES_PATH == '/api/v3/klines'
