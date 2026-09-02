@@ -168,15 +168,22 @@ def _request(
 
                 try:
                     if method.upper() == "POST":
-                        # BingX signs the sorted, unencoded canonical form and accepts
-                        # the signed form fields as application/x-www-form-urlencoded.
-                        wire_params.pop("signature", None)
+                        # BingX expects the exact canonical parameter string in the
+                        # application/x-www-form-urlencoded POST body. Sending a dict
+                        # lets requests rebuild/encode the body independently, which
+                        # can produce a different byte representation from the string
+                        # that was signed. Send the signed canonical string verbatim.
                         if signed:
-                            wire_params["signature"] = signature
+                            canonical = _canonical_params({k: v for k, v in request_params.items() if k != "signature"})
+                            body = f"{canonical}&signature={signature}"
+                            headers["Content-Type"] = "application/x-www-form-urlencoded"
+                        else:
+                            body = urlencode(wire_params, doseq=False)
+                            headers["Content-Type"] = "application/x-www-form-urlencoded"
                         response = session.request(
                             method=method,
                             url=base_url + path,
-                            data=wire_params,
+                            data=body,
                             headers=headers,
                             timeout=request_timeout,
                         )
@@ -595,13 +602,25 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
     q = Decimal(str(qty)).quantize(Decimal(1).scaleb(-prec), rounding=ROUND_DOWN)
     qty = float(q)
 
-    # Never silently increase leverage. A $1-class position may legitimately
-    # be too small to support all TP legs at the exchange minQty.
-    if qty <= 0 or qty < min_qty:
+    # Never silently increase exposure just to satisfy an exchange minimum.
+    # Return a non-fatal sizing skip with the exact required margin so the caller
+    # can log/audit why this instrument was not traded.
+    if qty <= 0:
         return {
             "status": "error",
-            "error": f"qty={qty} < min_qty={min_qty} at configured leverage={leverage}",
+            "error": "calculated quantity is <= 0",
             "symbol": bx, "qty": qty, "min_qty": min_qty,
+            "leverage": leverage, "sizing_price": sizing_price,
+        }
+    if min_qty > 0 and qty < min_qty:
+        required_margin = (min_qty * sizing_price * mult) / max(leverage, 1)
+        return {
+            "status": "skipped_min_qty",
+            "error": f"qty={qty} < min_qty={min_qty} at configured leverage={leverage}",
+            "reason": "exchange_min_quantity",
+            "symbol": bx, "qty": qty, "min_qty": min_qty,
+            "required_margin_usdt": required_margin,
+            "configured_margin_usdt": MARGIN_USDT,
             "leverage": leverage, "sizing_price": sizing_price,
         }
 
