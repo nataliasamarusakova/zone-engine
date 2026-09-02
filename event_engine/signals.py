@@ -10,8 +10,8 @@ import pandas as pd
 SWING_LEN = 10
 BOX_WIDTH = 2.5
 RR_RATIO = 3.0
-TP1_R = 1.5
-TP2_R = 3.0
+TP1_R = 1
+TP2_R = 2.0
 TP1_FRACTION = 0.50
 TP2_FRACTION = 0.50
 
