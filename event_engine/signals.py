@@ -31,6 +31,21 @@ TP2_FRACTION = 0.50
 
 MIN_BARS = 70
 
+# Pine visual S/R settings (diagnostic layer; not an entry filter)
+SR_ENABLE = True
+SR_STRENGTH = 2
+SR_RB = 10
+SR_PRD = 284
+SR_CHANNEL_W = 10
+SR_LABEL_LOC = 55
+SR_ZONE_WIDTH_PCT = 2
+SR_USE_ZONES = True
+SR_USE_HL_ZONES = True
+SR_EXPAND = True
+SR_SUPPORT_COLOR = "#00DBFF"
+SR_RESISTANCE_COLOR = "#E91E63"
+
+
 
 def _safe_num(value: Any, default: float = 0.0) -> float:
     try:
@@ -374,6 +389,117 @@ def _nearest_zone(direction: str, cur_c: float, demand: list[dict[str, Any]], su
     zones = demand if direction == "LONG" else supply
     return min(zones, key=lambda z: abs(cur_c - float(z["poi"])), default=None)
 
+
+
+def _pivot_series_pine(df: pd.DataFrame, rb: int = SR_RB) -> tuple[pd.Series, pd.Series]:
+    """Series of pivot prices at their Pine confirmation bar (not pivot bar)."""
+    x = _normalize_1h(df)
+    n = len(x)
+    ph = pd.Series(np.nan, index=x.index, dtype=float)
+    pl = pd.Series(np.nan, index=x.index, dtype=float)
+    for confirm in range(2 * rb, n):
+        p = confirm - rb
+        h = float(x.loc[p, "high"])
+        l = float(x.loc[p, "low"])
+        left_h = x.loc[p-rb:p-1, "high"].to_numpy(dtype=float)
+        right_h = x.loc[p+1:p+rb, "high"].to_numpy(dtype=float)
+        left_l = x.loc[p-rb:p-1, "low"].to_numpy(dtype=float)
+        right_l = x.loc[p+1:p+rb, "low"].to_numpy(dtype=float)
+        if np.all(h >= left_h) and np.all(h >= right_h):
+            ph.iloc[confirm] = h
+        if np.all(l <= left_l) and np.all(l <= right_l):
+            pl.iloc[confirm] = l
+    return ph, pl
+
+
+def _pine_sr_event_levels(x: pd.DataFrame, event_i: int, ph: pd.Series, pl: pd.Series) -> dict[str, Any]:
+    """Recreate the supplied Pine SR clustering at one bar where ph/pl fires."""
+    start = max(0, event_i - SR_PRD + 1)
+    window = x.iloc[start:event_i + 1]
+    window_high = float(window["high"].max())
+    window_low = float(window["low"].min())
+    cwidth = (window_high - window_low) * SR_CHANNEL_W / 100.0
+    zone_start = max(0, event_i - 300 + 1)
+    zone_window = x.iloc[zone_start:event_i + 1]
+    zone_perc = (float(zone_window["high"].max()) - float(zone_window["low"].min())) * SR_ZONE_WIDTH_PCT / 100.0
+
+    pivots = []
+    for xx in range(0, SR_PRD + 1):
+        idx = event_i - xx
+        if idx < 0:
+            break
+        if pd.notna(ph.iloc[idx]):
+            pivots.append((idx, float(ph.iloc[idx]), "H"))
+        if pd.notna(pl.iloc[idx]):
+            pivots.append((idx, float(pl.iloc[idx]), "L"))
+        if len(pivots) >= 41:
+            break
+
+    highestph = window_low
+    lowestpl = window_high
+    for _, price, _ in pivots:
+        highestph = max(highestph, price)
+        lowestpl = min(lowestpl, price)
+
+    aas = [True] * 41
+    sr_levels = [None] * 21
+    countpp = 0
+    for _, pivot_price, ptype in pivots:
+        countpp += 1
+        if countpp > 40:
+            break
+        if not aas[countpp]:
+            continue
+        upl = pivot_price + cwidth
+        dnl = pivot_price - cwidth
+        tmp = [True] * 41
+        tpoint = 0
+        cnt = 0
+        for _, price2, _ in pivots:
+            cnt += 1
+            if cnt > 40:
+                break
+            if aas[cnt] and dnl <= price2 <= upl:
+                tpoint += 1
+                tmp[cnt] = False
+        if tpoint >= SR_STRENGTH:
+            for g in range(41):
+                if not tmp[g]:
+                    aas[g] = False
+            if countpp < 21:
+                sr_levels[countpp] = pivot_price
+
+    levels = [v for v in sr_levels if v is not None and math.isfinite(v)]
+    return {
+        "levels": levels,
+        "highestph": highestph,
+        "lowestpl": lowestpl,
+        "cwidth": cwidth,
+        "zonePerc": zone_perc,
+        "event_idx": event_i,
+    }
+
+
+def compute_pine_sr_visual(df: pd.DataFrame) -> dict[str, Any]:
+    """Visual/diagnostic reproduction of the supplied Pine Ajay R5.41 S/R block."""
+    x = _normalize_1h(df)
+    if len(x) < SR_PRD:
+        return {"levels": [], "highestph": None, "lowestpl": None, "cwidth": None, "zonePerc": None, "event_idx": None, "events": []}
+    ph, pl = _pivot_series_pine(x, SR_RB)
+    current = None
+    events = []
+    for i in range(len(x)):
+        if pd.notna(ph.iloc[i]) or pd.notna(pl.iloc[i]):
+            current = _pine_sr_event_levels(x, i, ph, pl)
+            current["timestamp"] = x.iloc[i]["timestamp"]
+            events.append(dict(current))
+    if current is None:
+        current = {"levels": [], "highestph": None, "lowestpl": None, "cwidth": None, "zonePerc": None, "event_idx": None}
+    current = dict(current)
+    current["events"] = events
+    current["ph"] = ph
+    current["pl"] = pl
+    return current
 
 def compute_pine_zone_records(df: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
     """Return historical Supply/Demand box lifetimes and BOS records for plotting."""
