@@ -228,3 +228,61 @@ def test_binance_provider_uses_public_vision_api():
     assert binance.BASE_URL == 'https://data-api.binance.vision'
     assert binance.EXCHANGE_INFO_PATH == '/api/v3/exchangeInfo'
     assert binance.KLINES_PATH == '/api/v3/klines'
+
+
+def test_execute_rejects_invalid_geometry_before_entry(monkeypatch):
+    import run_once
+    signal = {
+        "event_id": "ZONE_TEST_INVALID",
+        "symbol": "ALGO-USDT",
+        "type": "SHORT",
+        "entry": 0.0908,
+        "sl": 0.09,
+        "tp1": 0.09,
+        "tp2": 0.09,
+        "risk_pct": -0.88,
+        "score": 75,
+        "zone": {"kind": "SUPPLY"},
+    }
+    called = {"open": False}
+    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: called.__setitem__("open", True))
+    result = run_once.execute_new_position(signal)
+    assert result["status"] == "skipped_invalid_setup"
+    assert called["open"] is False
+
+
+def test_execute_emergency_closes_when_protection_fails(monkeypatch):
+    import run_once
+    signal = {
+        "event_id": "ZONE_TEST_PROTECT_FAIL",
+        "symbol": "TEST-USDT",
+        "type": "LONG",
+        "entry": 100.0,
+        "sl": 95.0,
+        "tp1": 107.5,
+        "tp2": 115.0,
+        "risk_pct": 5.0,
+        "score": 90,
+        "zone": {"kind": "DEMAND"},
+    }
+    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: {
+        "status": "opened", "symbol": "TEST-USDT", "qty": 1.0
+    })
+    monkeypatch.setattr(run_once, "wait_for_position_fill_directional", lambda *a, **k: {
+        "status": "found", "avgPrice": 100.0, "positionAmt": 1.0
+    })
+    monkeypatch.setattr(run_once, "ensure_directional_protection", lambda *a, **k: {
+        "status": "PROTECTION_FAILED", "error": "TP2 failed", "sl_result": {}, "tp_orders": []
+    })
+    monkeypatch.setattr(run_once, "get_position_directional", lambda *a, **k: {
+        "status": "found", "positionAmt": 1.0
+    })
+    closed = {}
+    monkeypatch.setattr(run_once, "close_position_market", lambda *a, **k: closed.update({"called": True, "qty": a[2]}) or {"status": "closed"})
+    monkeypatch.setattr(run_once.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setattr(run_once, "get_position_directional", lambda *a, **k: {"status": "not_found"})
+    monkeypatch.setattr(run_once, "register_active_trade", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not register unprotected trade")))
+
+    result = run_once.execute_new_position(signal)
+    assert result["status"] == "opened_then_emergency_closed"
+    assert closed.get("called") is True

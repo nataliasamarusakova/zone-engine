@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import logging
 import os
 import time
@@ -23,6 +24,8 @@ from event_engine.bingx import (
     get_position_mode,
     get_position_directional,
     get_open_protection_directional,
+    cancel_order,
+    close_position_market,
     open_market,
     wait_for_position_fill_directional,
 )
@@ -258,38 +261,148 @@ def _build_setup(signal: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+
+def _validate_trade_geometry(signal: dict[str, Any]) -> tuple[bool, str]:
+    """Reject mathematically invalid setups before any MARKET order is sent."""
+    try:
+        direction = str(signal["type"]).upper()
+        entry = float(signal["entry"])
+        sl = float(signal["sl"])
+        tp1 = float(signal["tp1"])
+        tp2 = float(signal["tp2"])
+        risk_pct = float(signal["risk_pct"])
+    except (KeyError, TypeError, ValueError) as exc:
+        return False, f"invalid_numeric_setup: {exc}"
+    values = {"entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "risk_pct": risk_pct}
+    if any(not math.isfinite(v) for v in values.values()):
+        return False, "non_finite_setup"
+    if min(entry, sl, tp1, tp2) <= 0:
+        return False, "non_positive_price"
+    if risk_pct <= 0:
+        return False, f"non_positive_risk_pct={risk_pct}"
+    if risk_pct > float(os.environ.get("MAX_SIGNAL_RISK_PCT", "25")):
+        return False, f"risk_pct_above_limit={risk_pct}"
+    if direction == "LONG":
+        if not sl < entry:
+            return False, f"LONG invalid SL: sl={sl} entry={entry}"
+        if not (tp1 > entry and tp2 > tp1):
+            return False, f"LONG invalid TP geometry: entry={entry} tp1={tp1} tp2={tp2}"
+    elif direction == "SHORT":
+        if not sl > entry:
+            return False, f"SHORT invalid SL: sl={sl} entry={entry}"
+        if not (tp1 < entry and tp2 < tp1):
+            return False, f"SHORT invalid TP geometry: entry={entry} tp1={tp1} tp2={tp2}"
+    else:
+        return False, f"invalid_direction={direction}"
+    return True, "ok"
+
+
+def _protection_geometry_from_fill(direction: str, avg_price: float, risk_pct: float) -> tuple[float, float, float]:
+    risk = avg_price * risk_pct / 100.0
+    if direction == "LONG":
+        return avg_price - risk, avg_price + TP1_R * risk, avg_price + TP2_R * risk
+    return avg_price + risk, avg_price - TP1_R * risk, avg_price - TP2_R * risk
+
+
+def _cleanup_engine_protection(symbol: str, direction: str) -> dict[str, Any]:
+    """Cancel only this engine's outstanding SL/TP orders after an emergency close."""
+    result = {"status": "ok", "cancelled": [], "errors": []}
+    try:
+        existing = get_open_protection_directional(symbol, direction)
+    except Exception as exc:
+        return {"status": "error", "error": str(exc), "cancelled": [], "errors": []}
+    if existing.get("status") != "ok":
+        return {"status": "error", "error": existing.get("error", "openOrders unavailable"), "cancelled": [], "errors": []}
+    for order in list(existing.get("sl_orders", [])) + list(existing.get("tp_orders", [])):
+        cid = str(order.get("clientOrderId", "")).upper()
+        oid = str(order.get("orderId", ""))
+        if not oid or not cid.startswith("EVT_"):
+            continue
+        try:
+            resp = cancel_order(symbol, oid)
+            if isinstance(resp, dict) and resp.get("code") in (0, "0"):
+                result["cancelled"].append(oid)
+            else:
+                result["errors"].append(f"{oid}: code={resp.get('code') if isinstance(resp, dict) else None} msg={resp.get('msg') if isinstance(resp, dict) else resp}")
+        except Exception as exc:
+            result["errors"].append(f"{oid}: {exc}")
+    if result["errors"]:
+        result["status"] = "partial" if result["cancelled"] else "error"
+    return result
+
 def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     symbol = str(signal["symbol"])
     direction = str(signal["type"]).upper()
     event_id = str(signal["event_id"])
     entry_price = float(signal["entry"])
-    setup = _build_setup(signal)
 
+    valid, reason = _validate_trade_geometry(signal)
+    if not valid:
+        log.warning("[EXEC_SKIPPED] %s %s | invalid_setup | %s", symbol, direction, reason)
+        return {"status": "skipped_invalid_setup", "error": reason, "symbol": symbol, "direction": direction}
+
+    setup = _build_setup(signal)
     order = open_market(symbol, direction, entry_price, event_id)
+    if order.get("status") == "skipped_min_qty":
+        return order
     if order.get("status") != "opened":
         return {"status": str(order.get("status", "error")).upper(), "error": order.get("error"), "order": order}
 
     position = wait_for_position_fill_directional(symbol, direction, timeout_sec=int(os.environ.get("POSITION_FILL_TIMEOUT_SEC", "30")), poll_interval=0.5)
     if position.get("status") != "found":
-        return {"status": "OPENED_UNCONFIRMED", "order": order, "position": position}
+        return {"status": "OPENED_UNCONFIRMED", "order": order, "position": position, "error": "position fill could not be confirmed"}
 
     avg_price = float(position["avgPrice"])
     qty = abs(float(position["positionAmt"]))
+    # Rebuild mandatory protection from the ACTUAL fill, not the reference price.
+    sl_price, tp1_price, tp2_price = _protection_geometry_from_fill(direction, avg_price, float(signal["risk_pct"]))
+    actual_signal = dict(signal)
+    actual_signal.update({"entry": avg_price, "sl": sl_price, "tp1": tp1_price, "tp2": tp2_price})
+    valid, reason = _validate_trade_geometry(actual_signal)
+    if not valid:
+        log.critical("[SAFETY_CLOSE] %s %s | invalid post-fill protection geometry | %s", symbol, direction, reason)
+        close_result = close_position_market(symbol, direction, qty, trade_id=event_id)
+        cleanup = _cleanup_engine_protection(symbol, direction)
+        return {"status": "opened_then_emergency_closed", "error": reason, "order": order, "position": position, "close": close_result, "protection_cleanup": cleanup}
+
     setup["entry_reference"] = avg_price
-    setup["invalidation_price"] = avg_price * (1.0 - setup["risk_pct"] / 100.0) if direction == "LONG" else avg_price * (1.0 + setup["risk_pct"] / 100.0)
+    setup["invalidation_price"] = sl_price
     setup["tp_levels"] = [
-        {"leg": "tp1", "pnl_pct": TP1_R * setup["risk_pct"], "close_fraction": 0.50},
-        {"leg": "tp2", "pnl_pct": TP2_R * setup["risk_pct"], "close_fraction": 0.50},
+        {"leg": "tp1", "pnl_pct": TP1_R * float(signal["risk_pct"]), "close_fraction": 0.50, "price": tp1_price},
+        {"leg": "tp2", "pnl_pct": TP2_R * float(signal["risk_pct"]), "close_fraction": 0.50, "price": tp2_price},
     ]
-    setup["target_price"] = avg_price * (1.0 + TP2_R * setup["risk_pct"] / 100.0) if direction == "LONG" else avg_price * (1.0 - TP2_R * setup["risk_pct"] / 100.0)
+    setup["target_price"] = tp2_price
 
     protection = ensure_directional_protection(
         symbol, direction, avg_price, qty,
-        setup["risk_pct"], setup["tp_levels"], trade_id=event_id,
+        float(signal["risk_pct"]), setup["tp_levels"], trade_id=event_id,
     )
-    if protection.get("status") not in {"PROTECTED"}:
-        # Entry remains live; tracker/reconciliation will repair missing protection on next cycle.
-        log.error("[EXEC] protection incomplete for %s %s: %s", symbol, direction, protection)
+    if protection.get("status") != "PROTECTED":
+        log.critical("[SAFETY_CLOSE] %s %s | mandatory protection incomplete | %s", symbol, direction, protection)
+        # Mandatory rule: never leave a newly-opened position live without BOTH
+        # a verified SL and both TP legs. Attempt an immediate market rollback.
+        try:
+            current = get_position_directional(symbol, direction)
+            remaining_qty = abs(float(current.get("positionAmt", qty) or qty)) if current.get("status") == "found" else qty
+        except Exception:
+            remaining_qty = qty
+        close_result = close_position_market(symbol, direction, remaining_qty, trade_id=event_id)
+        cleanup = _cleanup_engine_protection(symbol, direction)
+        try:
+            time.sleep(0.25)
+            verify_closed = get_position_directional(symbol, direction)
+        except Exception as exc:
+            verify_closed = {"status": "verification_error", "error": str(exc)}
+        return {
+            "status": "opened_then_emergency_closed",
+            "error": protection.get("error") or protection.get("status"),
+            "order": order,
+            "position": position,
+            "protection": protection,
+            "close": close_result,
+            "protection_cleanup": cleanup,
+            "close_verification": verify_closed,
+        }
 
     register_active_trade(
         event_id=event_id,
@@ -307,14 +420,12 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         requested_entry_price=entry_price,
     )
 
-    result = {
-        "status": "opened_protected" if protection.get("status") == "PROTECTED" else "opened_protection_check_required",
+    return {
+        "status": "opened_protected",
         "order": order,
         "position": position,
         "protection": protection,
     }
-    return result
-
 
 def _send_signal(signal: dict[str, Any], execution: dict[str, Any] | None = None) -> None:
     try:
@@ -444,6 +555,7 @@ def main() -> None:
             recent = [s for s in signals if int(s["idx"]) >= len(df) - MAX_SIGNAL_AGE_BARS]
             for sig in recent:
                 sig["score"] = score_zone_signal(sig)
+            recent = [s for s in recent if float(s["score"]) >= MIN_SIGNAL_SCORE]
 
             # Only validate BingX live price when a fresh signal exists. This keeps
             # the full-market scan on Binance while spending a small number of extra
@@ -594,17 +706,17 @@ def main() -> None:
             continue
         execution = execute_new_position(signal)
         execution_status = str(execution.get("status", ""))
-        if execution_status == "skipped_min_qty":
+        if execution_status in {"skipped_min_qty", "skipped_invalid_setup"}:
             log.warning(
-                "[EXEC_SKIPPED] %s %s | reason=exchange_min_quantity | qty=%s min_qty=%s required_margin=%.4f configured_margin=%.4f",
-                signal["symbol"], signal["type"], execution.get("qty"), execution.get("min_qty"),
+                "[EXEC_SKIPPED] %s %s | status=%s | reason=%s | error=%s | qty=%s min_qty=%s required_margin=%.4f configured_margin=%.4f",
+                signal["symbol"], signal["type"], execution_status, execution.get("reason", "invalid_setup"), execution.get("error"), execution.get("qty"), execution.get("min_qty"),
                 float(execution.get("required_margin_usdt", 0.0) or 0.0), float(execution.get("configured_margin_usdt", MARGIN_USDT) or MARGIN_USDT),
             )
         elif not execution_status.startswith("opened"):
             log.error("[EXEC_FAILED] %s %s | status=%s | error=%s | order=%s", signal["symbol"], signal["type"], execution_status, execution.get("error"), execution.get("order"))
         _append_jsonl(TRADES_PATH, {"record_type": "TRADE_OPEN", "event_id": signal["event_id"], "symbol": signal["symbol"], "direction": signal["type"], "score": signal["score"], "signal": signal, "result": execution})
         _send_signal(signal, execution)
-        if str(execution.get("status")).startswith("opened"):
+        if str(execution.get("status")) == "opened_protected":
             executed += 1
 
     # Save the exact table + detailed rows for later tuning/backtesting.
