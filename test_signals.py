@@ -102,3 +102,11 @@ def test_bingx_kline_contains_timestamp(monkeypatch):
     rows = bingx.fetch_klines("BTC-USDT", "1h", limit=1)
     assert rows[0]["timestamp"] == 1700000000000
     assert rows[0]["open_time"] == 1700000000000
+
+
+
+def test_parallel_scan_settings_are_not_serial_sleep_settings():
+    import run_once
+    assert run_once.SCAN_WORKERS >= 1
+    assert run_once.SCAN_BATCH_SIZE >= run_once.SCAN_WORKERS
+    assert run_once.KLINE_LIMIT_1H >= 80

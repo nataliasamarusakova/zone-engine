@@ -5,6 +5,7 @@ import logging
 import os
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -38,10 +39,12 @@ EXECUTION_ENABLED = os.environ.get("EXECUTION_ENABLED", "true").lower() == "true
 MARGIN_USDT = float(os.environ.get("BINGX_MARGIN_USDT", "1"))
 MAX_TRADES_PER_CYCLE = int(os.environ.get("MAX_TRADES_PER_CYCLE", "5"))
 MAX_SCAN_SYMBOLS = int(os.environ.get("MAX_SCAN_SYMBOLS", "0"))
-KLINE_LIMIT_1H = int(os.environ.get("KLINE_LIMIT_1H", "220"))
+KLINE_LIMIT_1H = int(os.environ.get("KLINE_LIMIT_1H", "120"))
 MAX_SIGNAL_AGE_BARS = int(os.environ.get("MAX_SIGNAL_AGE_BARS", "3"))
 MIN_SIGNAL_SCORE = float(os.environ.get("MIN_SIGNAL_SCORE", "70"))
-SCAN_INTERVAL_SEC = float(os.environ.get("SCAN_INTERVAL_SEC", "0.15"))
+SCAN_WORKERS = max(1, int(os.environ.get("SCAN_WORKERS", "16")))
+SCAN_BATCH_SIZE = max(SCAN_WORKERS, int(os.environ.get("SCAN_BATCH_SIZE", "64")))
+SCAN_BATCH_PAUSE_SEC = max(0.0, float(os.environ.get("SCAN_BATCH_PAUSE_SEC", "0.20")))
 RECONCILIATION_MAX_SECONDS = float(os.environ.get("RECONCILIATION_MAX_SECONDS", "45"))
 
 
@@ -341,36 +344,41 @@ def main() -> None:
     scan_rows: list[dict[str, Any]] = []
     fresh_signals: list[dict[str, Any]] = []
 
-    for symbol in symbols:
+    def scan_one(symbol: str) -> dict[str, Any]:
+        """Public-market scan for one symbol. Safe to run concurrently."""
         try:
             contract = get_contract(symbol)
             if not contract:
-                continue
+                return {
+                    "symbol": symbol, "current_price": None, "price_position": "CONTRACT_NOT_FOUND",
+                    "fresh_signal": "—", "active_demand": 0, "active_supply": 0,
+                    "zones": {"demand": [], "supply": []}, "last_signal_count": 0,
+                    "error": "contract_not_found", "signals": [],
+                }
+
             bars = fetch_klines(symbol, "1h", limit=KLINE_LIMIT_1H, retryable=False)
-            if len(bars) < SWING_LEN * 2 + 10:
-                _log_coin_skip(symbol, f"insufficient 1h candles: {len(bars)} < {SWING_LEN * 2 + 10}")
-                scan_rows.append({
-                    "symbol": symbol,
-                    "current_price": None,
-                    "price_position": "INSUFFICIENT_DATA",
-                    "fresh_signal": "—",
-                    "active_demand": 0,
-                    "active_supply": 0,
-                    "zones": {"demand": [], "supply": []},
-                    "last_signal_count": 0,
-                    "error": f"insufficient_1h_candles:{len(bars)}",
-                })
-                continue
+            min_bars = SWING_LEN * 2 + 10
+            if len(bars) < min_bars:
+                return {
+                    "symbol": symbol, "current_price": None, "price_position": "INSUFFICIENT_DATA",
+                    "fresh_signal": "—", "active_demand": 0, "active_supply": 0,
+                    "zones": {"demand": [], "supply": []}, "last_signal_count": 0,
+                    "error": f"insufficient_1h_candles:{len(bars)}<{min_bars}", "signals": [],
+                }
+
             df, supply, demand, signals = generate_zone_signals(pd.DataFrame(bars), symbol=symbol)
             latest_price = float(df["close"].iloc[-1])
             recent = [s for s in signals if int(s["idx"]) >= len(df) - MAX_SIGNAL_AGE_BARS]
             for sig in recent:
                 sig["score"] = score_zone_signal(sig)
             recent = [s for s in recent if float(s["score"]) >= MIN_SIGNAL_SCORE]
-            latest_signal = recent[-1] if recent else None
+            latest_signal = max(recent, key=lambda s: (float(s.get("score", 0)), int(s.get("idx", 0)))) if recent else None
             price_position = _price_position(latest_price, demand, supply)
-            fresh_text = f"{latest_signal['type']} @ {latest_signal['entry']} score={latest_signal.get('score', 0):.1f}" if latest_signal else "—"
-            scan_row = {
+            fresh_text = (
+                f"{latest_signal['type']} @ {latest_signal['entry']} score={latest_signal.get('score', 0):.1f}"
+                if latest_signal else "—"
+            )
+            return {
                 "symbol": symbol,
                 "current_price": latest_price,
                 "price_position": price_position,
@@ -379,28 +387,61 @@ def main() -> None:
                 "active_supply": len(supply),
                 "zones": {"demand": demand, "supply": supply},
                 "last_signal_count": len(recent),
+                "signals": recent,
             }
-            scan_rows.append(scan_row)
-            log.info(
-                "[COIN] %s | price=%s | %s | fresh=%s | demand=%d | supply=%d",
-                symbol, latest_price, price_position, fresh_text, len(demand), len(supply)
-            )
-            fresh_signals.extend(recent)
-            if SCAN_INTERVAL_SEC > 0:
-                time.sleep(SCAN_INTERVAL_SEC)
         except Exception as exc:
-            log.exception("[COIN_ERROR] %s scan failed: %s", symbol, exc)
-            scan_rows.append({
-                "symbol": symbol,
-                "current_price": None,
-                "price_position": "ERROR",
-                "fresh_signal": "—",
-                "active_demand": 0,
-                "active_supply": 0,
-                "zones": {"demand": [], "supply": []},
-                "last_signal_count": 0,
-                "error": f"{type(exc).__name__}: {exc}",
-            })
+            return {
+                "symbol": symbol, "current_price": None, "price_position": "ERROR",
+                "fresh_signal": "—", "active_demand": 0, "active_supply": 0,
+                "zones": {"demand": [], "supply": []}, "last_signal_count": 0,
+                "error": f"{type(exc).__name__}: {exc}", "signals": [],
+                "exception": exc,
+            }
+
+    # Parallel public-market scan. Work is submitted in bounded batches so the
+    # engine is much faster than serial I/O without opening hundreds of sockets at once.
+    total = len(symbols)
+    for batch_start in range(0, total, SCAN_BATCH_SIZE):
+        batch = symbols[batch_start: batch_start + SCAN_BATCH_SIZE]
+        batch_results: dict[str, dict[str, Any]] = {}
+        with ThreadPoolExecutor(max_workers=min(SCAN_WORKERS, len(batch))) as executor:
+            future_to_symbol = {executor.submit(scan_one, symbol): symbol for symbol in batch}
+            for future in as_completed(future_to_symbol):
+                symbol = future_to_symbol[future]
+                try:
+                    result = future.result()
+                except Exception as exc:  # defensive: scan_one already catches errors
+                    result = {
+                        "symbol": symbol, "current_price": None, "price_position": "ERROR",
+                        "fresh_signal": "—", "active_demand": 0, "active_supply": 0,
+                        "zones": {"demand": [], "supply": []}, "last_signal_count": 0,
+                        "error": f"{type(exc).__name__}: {exc}", "signals": [], "exception": exc,
+                    }
+                batch_results[symbol] = result
+
+        for symbol in batch:
+            result = batch_results[symbol]
+            result.pop("exception", None)
+            scan_rows.append({k: v for k, v in result.items() if k != "signals"})
+            fresh_signals.extend(result.get("signals", []))
+
+            if result.get("price_position") == "ERROR":
+                log.error("[COIN_ERROR] %s | %s", symbol, result.get("error", "unknown error"))
+            elif result.get("price_position") == "INSUFFICIENT_DATA":
+                log.warning("[COIN_SKIP] %s | %s", symbol, result.get("error", "insufficient data"))
+            elif result.get("price_position") == "CONTRACT_NOT_FOUND":
+                log.warning("[COIN_SKIP] %s | contract not found in BingX cache", symbol)
+            else:
+                log.info(
+                    "[COIN] %s | price=%s | %s | fresh=%s | demand=%d | supply=%d",
+                    symbol, result["current_price"], result["price_position"], result["fresh_signal"],
+                    result["active_demand"], result["active_supply"],
+                )
+
+        scanned = min(batch_start + len(batch), total)
+        log.info("[SCAN_PROGRESS] %d/%d symbols | batch=%d | workers=%d", scanned, total, len(batch), min(SCAN_WORKERS, len(batch)))
+        if scanned < total and SCAN_BATCH_PAUSE_SEC > 0:
+            time.sleep(SCAN_BATCH_PAUSE_SEC)
 
     # Keep one best fresh signal per symbol/direction and block existing exposure.
     by_key: dict[tuple[str, str], dict[str, Any]] = {}
