@@ -114,6 +114,9 @@ def calc_alma(series: pd.Series, length: int = 2, offset: float = 0.85, sigma: f
     numeric = pd.to_numeric(series, errors="coerce").astype(float)
     if length == 1:
         return numeric.copy()
+    # TradingView ta.alma() applies the ALMA weights from the OLDEST sample
+    # in the window to the NEWEST sample. With pandas rolling(), x[0] is the
+    # oldest value and x[-1] is the newest, so this dot product matches Pine.
     m = float(offset) * (length - 1)
     s = length / max(float(sigma), 1e-12)
     weights = np.array(
