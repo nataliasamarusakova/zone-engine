@@ -374,6 +374,29 @@ def test_live_trigger_uses_explicit_live_mode():
     assert set(out["alternate_mode"].dropna().unique()) == {"live_safe"}
 
 
+
+
+def test_epoch_millisecond_timestamps_are_normalized_as_milliseconds():
+    import pandas as pd
+    from event_engine.signals import compute_ajay_trigger
+
+    ts = pd.date_range("2026-09-01", periods=32, freq="1h", tz="UTC")
+    epoch_ms = ts.view("int64") // 1_000_000
+    close = pd.Series(range(100, 132), dtype=float)
+    df = pd.DataFrame({
+        "timestamp": epoch_ms,
+        "open": close - 0.2,
+        "high": close + 0.5,
+        "low": close - 0.5,
+        "close": close,
+        "volume": 1_000.0,
+    })
+    out = compute_ajay_trigger(df, mode="live")
+    assert out["timestamp"].iloc[0] == ts[0]
+    assert out["timestamp"].iloc[-1] == ts[-1]
+    assert out["timestamp"].dt.floor("8h").nunique() == 4
+    assert out["timestamp"].iloc[-1].year == 2026
+
 def test_pine_keltner_visual_series_schema():
     from event_engine.signals import compute_pine_keltner_channels
     df = _candles(120)
