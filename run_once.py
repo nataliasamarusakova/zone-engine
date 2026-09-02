@@ -29,7 +29,7 @@ from event_engine.bingx import (
     open_market,
     wait_for_position_fill_directional,
 )
-from event_engine.signals import SWING_LEN, TP1_R, TP2_R, generate_zone_signals, score_zone_signal
+from event_engine.signals import TP1_R, TP2_R, generate_zone_signals, score_zone_signal
 from event_engine.telegram import format_signal, send as send_tg
 from event_engine.tracker import register_active_trade, update_active_trades, update_active_trade_protection
 
@@ -170,8 +170,11 @@ def _private_layer_ready() -> bool:
 
 
 def _price_position(price: float, demand: list[dict], supply: list[dict]) -> str:
-    in_dem = any(price <= float(z["top"]) * 1.005 and price >= float(z["btm"]) for z in demand)
-    in_sup = any(price >= float(z["btm"]) * 0.995 and price <= float(z["top"]) for z in supply)
+    # Display status must reflect the literal zone boundaries. Do not add
+    # percentage padding here: a price below Supply or above Demand is not
+    # "in the zone" merely because it is close to it.
+    in_dem = any(float(z["btm"]) <= price <= float(z["top"]) for z in demand)
+    in_sup = any(float(z["btm"]) <= price <= float(z["top"]) for z in supply)
     if in_dem:
         return "🟢 В зоне DEMAND"
     if in_sup:
@@ -290,16 +293,16 @@ def _load_active_trades_file() -> dict[str, dict]:
 def _build_setup(signal: dict[str, Any]) -> dict[str, Any]:
     risk_pct = float(signal["risk_pct"])
     return {
-        "strategy": "Ajay R5.41",
+        "strategy": str(signal.get("strategy", "Demand/Supply Zone First")),
         "signal_price": float(signal["entry"]),
         "entry_reference": float(signal["entry"]),
         "invalidation_price": float(signal["sl"]),
         "risk_pct": risk_pct,
-        "target_rr": TP2_R,
-        "planned_weighted_rr": TP1_R * 0.50 + TP2_R * 0.50,
+        "target_rr": float(signal.get("tp2_rr", TP2_R)),
+        "planned_weighted_rr": float(signal.get("tp1_rr", TP1_R)) * 0.50 + float(signal.get("tp2_rr", TP2_R)) * 0.50,
         "tp_levels": [
-            {"leg": "tp1", "pnl_pct": TP1_R * risk_pct, "close_fraction": 0.50},
-            {"leg": "tp2", "pnl_pct": TP2_R * risk_pct, "close_fraction": 0.50},
+            {"leg": "tp1", "pnl_pct": float(signal.get("tp1_rr", TP1_R)) * risk_pct, "close_fraction": 0.50, "price": float(signal["tp1"])},
+            {"leg": "tp2", "pnl_pct": float(signal.get("tp2_rr", TP2_R)) * risk_pct, "close_fraction": 0.50, "price": float(signal["tp2"])},
         ],
         "target_price": float(signal["tp2"]),
         "zone": signal.get("zone", {}),
@@ -402,10 +405,27 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
 
     avg_price = float(position["avgPrice"])
     qty = abs(float(position["positionAmt"]))
-    # Rebuild mandatory protection from the ACTUAL fill, not the reference price.
-    sl_price, tp1_price, tp2_price = _protection_geometry_from_fill(direction, avg_price, float(signal["risk_pct"]))
+    # Keep the zone-derived absolute SL/TP structure after the real fill.
+    # Convert the absolute target prices into percentages only because the
+    # BingX protection helper accepts percentage distances.
+    sl_price = float(signal["sl"])
+    tp1_price = float(signal["tp1"])
+    tp2_price = float(signal["tp2"])
+    actual_risk_abs = abs(avg_price - sl_price)
+    actual_risk_pct = (actual_risk_abs / avg_price) * 100.0 if avg_price > 0 else 0.0
+    tp1_pnl_pct = (abs(tp1_price - avg_price) / avg_price) * 100.0 if avg_price > 0 else 0.0
+    tp2_pnl_pct = (abs(tp2_price - avg_price) / avg_price) * 100.0 if avg_price > 0 else 0.0
     actual_signal = dict(signal)
-    actual_signal.update({"entry": avg_price, "sl": sl_price, "tp1": tp1_price, "tp2": tp2_price})
+    actual_signal.update({
+        "entry": avg_price,
+        "sl": sl_price,
+        "tp1": tp1_price,
+        "tp2": tp2_price,
+        "risk_pct": actual_risk_pct,
+        "risk_abs": actual_risk_abs,
+        "tp1_rr": (tp1_pnl_pct / actual_risk_pct) if actual_risk_pct > 0 else 0.0,
+        "tp2_rr": (tp2_pnl_pct / actual_risk_pct) if actual_risk_pct > 0 else 0.0,
+    })
     valid, reason = _validate_trade_geometry(actual_signal)
     if not valid:
         log.critical("[SAFETY_CLOSE] %s %s | invalid post-fill protection geometry | %s", symbol, direction, reason)
@@ -415,15 +435,18 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
 
     setup["entry_reference"] = avg_price
     setup["invalidation_price"] = sl_price
+    setup["risk_pct"] = actual_risk_pct
+    setup["target_rr"] = actual_signal["tp2_rr"]
+    setup["planned_weighted_rr"] = actual_signal["tp1_rr"] * 0.50 + actual_signal["tp2_rr"] * 0.50
     setup["tp_levels"] = [
-        {"leg": "tp1", "pnl_pct": TP1_R * float(signal["risk_pct"]), "close_fraction": 0.50, "price": tp1_price},
-        {"leg": "tp2", "pnl_pct": TP2_R * float(signal["risk_pct"]), "close_fraction": 0.50, "price": tp2_price},
+        {"leg": "tp1", "pnl_pct": tp1_pnl_pct, "close_fraction": 0.50, "price": tp1_price},
+        {"leg": "tp2", "pnl_pct": tp2_pnl_pct, "close_fraction": 0.50, "price": tp2_price},
     ]
     setup["target_price"] = tp2_price
 
     protection = ensure_directional_protection(
         symbol, direction, avg_price, qty,
-        float(signal["risk_pct"]), setup["tp_levels"], trade_id=event_id,
+        actual_risk_pct, setup["tp_levels"], trade_id=event_id,
     )
     if protection.get("status") != "PROTECTED":
         log.critical("[SAFETY_CLOSE] %s %s | mandatory protection incomplete | %s", symbol, direction, protection)
@@ -550,7 +573,7 @@ def main() -> None:
     analysis_meta = {str(item["bingx_symbol"]): item for item in analysis_universe}
     crypto_n = sum(1 for x in analysis_universe if str(x.get("asset_class")).upper() == "CRYPTO")
     equity_n = sum(1 for x in analysis_universe if str(x.get("asset_class")).upper() == "EQUITY")
-    log.info("[SCAN] Eligible symbols: %d | crypto=%d equity=%d | pine_mode=%s", len(symbols), crypto_n, equity_n, PINE_SIGNAL_MODE)
+    log.info("[SCAN] Eligible symbols: %d | crypto=%d equity=%d | strategy_mode=ZONE_ONLY | diagnostics_mode=%s", len(symbols), crypto_n, equity_n, PINE_SIGNAL_MODE)
     if not symbols:
         log.error("[SCAN] No eligible symbols for signal scan")
 
@@ -846,14 +869,15 @@ def main() -> None:
             })
             _send_signal(signal, blocked)
             continue
-        log.warning(
+            log.warning(
             "[EXEC_SIGNAL] symbol=%s direction=%s signal_idx=%s signal_time=%s age_bars=%s "
-            "pine_buy=%s pine_sell=%s alma_close=%s alma_open=%s event_id=%s",
+            "zone=%s target_source=%s obstacle=%s tp1=%s tp2=%s event_id=%s",
             signal.get("symbol"), signal.get("type"), signal.get("idx"), signal.get("time"),
             signal.get("execution_age_bars", 0),
-            (signal.get("trigger") or {}).get("buy"), (signal.get("trigger") or {}).get("sell"),
-            (signal.get("trigger") or {}).get("alma_close_alt"), (signal.get("trigger") or {}).get("alma_open_alt"),
-            signal.get("event_id"),
+            (signal.get("zone") or {}).get("kind"),
+            (signal.get("target") or {}).get("source"),
+            (signal.get("target") or {}).get("obstacle_price"),
+            signal.get("tp1"), signal.get("tp2"), signal.get("event_id"),
         )
         execution = execute_new_position(signal)
         execution_status = str(execution.get("status", ""))

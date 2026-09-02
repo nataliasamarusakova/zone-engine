@@ -52,7 +52,8 @@ def test_zone_signal_schema():
         assert s["event_id"].startswith("ZONE_")
         if s["zone"]:
             assert s["zone"]["kind"] in {"DEMAND", "SUPPLY"}
-        assert s["confirmation"]["alma_cross"] is True
+        assert s["confirmation"]["alma_cross"] is False
+        assert s["trigger"]["alma_required"] is False
 
 
 def test_long_tp_ordering_and_rr():
@@ -418,7 +419,7 @@ def test_pine_zone_records_are_exposed_for_comparison():
     assert isinstance(result["supply"], list)
 
 
-def test_no_zone_signal_is_blocked_in_strict_zone_mode(monkeypatch):
+def test_no_zone_signal_is_blocked(monkeypatch):
     import numpy as np
     import pandas as pd
     from event_engine import signals as sig
@@ -432,14 +433,6 @@ def test_no_zone_signal_is_blocked_in_strict_zone_mode(monkeypatch):
     low = close - 0.5
     volume = np.full(n, 1000.0)
     df = pd.DataFrame({"timestamp": ts, "open": open_, "high": high, "low": low, "close": close, "volume": volume})
-    original_attach = sig._attach_exact_alternate_series
-    def forced_attach(frame, mode="live"):
-        out = original_attach(frame, mode=mode)
-        out.loc[:, "pine_buy"] = False
-        out.loc[:, "pine_sell"] = False
-        out.loc[out.index[-1], "pine_buy"] = True
-        return out
-    monkeypatch.setattr(sig, "_attach_exact_alternate_series", forced_attach)
     _, _, _, emitted = sig.generate_zone_signals(df, symbol="TEST-USDT", mode="live")
     assert emitted == []
 
@@ -463,15 +456,6 @@ def test_zone_signal_uses_zone_boundary_stop_and_small_tps(monkeypatch):
     low[-1] = 108.0
     volume = np.full(n, 1000.0)
     df = pd.DataFrame({"timestamp": ts, "open": open_, "high": high, "low": low, "close": close, "volume": volume})
-    original_attach = sig._attach_exact_alternate_series
-    def forced_attach(frame, mode="live"):
-        out = original_attach(frame, mode=mode)
-        out.loc[:, "pine_buy"] = False
-        out.loc[:, "pine_sell"] = False
-        out.loc[out.index[-1], "pine_buy"] = True
-        return out
-    monkeypatch.setattr(sig, "_attach_exact_alternate_series", forced_attach)
-
     # Supply a deterministic Demand zone touching the latest bar.
     def forced_walk(frame):
         demand = [{"top": 110.0, "btm": 107.0, "poi": 108.5, "start": len(frame)-5}]
@@ -488,9 +472,29 @@ def test_zone_signal_uses_zone_boundary_stop_and_small_tps(monkeypatch):
     latest = emitted[-1]
     assert latest["confirmation"]["zone_touch"] is True
     assert latest["risk_model"]["sl_source"] == "zone_boundary_plus_atr_buffer"
-    assert latest["tp1"] == round(latest["entry"] + 0.5 * latest["risk_abs"], 8)
-    assert latest["tp2"] == round(latest["entry"] + 1.0 * latest["risk_abs"], 8)
+    assert latest["trigger"]["alma_required"] is False
+    assert latest["target"]["source"] in {"nearest_opposing_structure", "atr_rr_fallback"}
+    assert latest["tp1"] < latest["tp2"]
+    assert latest["tp1_rr"] > 0
+    assert latest["tp2_rr"] >= latest["tp1_rr"]
     assert latest["sl"] < 107.0
+
+
+def test_targets_use_nearest_opposing_zone_and_stay_before_it():
+    from event_engine import signals as sig
+
+    obstacle = {"price": 108.0, "source": "supply_zone"}
+    out = sig._targets_from_nearest_obstacle("LONG", 100.0, 95.0, 1.0, obstacle)
+    assert out is not None
+    assert out["target_source"] == "nearest_opposing_structure"
+    assert out["obstacle_price"] == 108.0
+    assert 100.0 < out["tp1"] < out["tp2"] < 108.0
+    assert out["tp2_rr"] <= sig.TP_MAX_R + 1e-9
+
+    obstacle = {"price": 92.0, "source": "demand_zone"}
+    out = sig._targets_from_nearest_obstacle("SHORT", 100.0, 105.0, 1.0, obstacle)
+    assert out is not None
+    assert 92.0 < out["tp2"] < out["tp1"] < 100.0
 
 
 def test_latest_signal_selection_prefers_newest_bar_over_score():
@@ -712,3 +716,22 @@ def test_live_mode_changes_only_current_8h_bucket():
     assert out.loc[16:23, "alma_close_alt"].nunique() > 1
     # Current 8H open is fixed throughout the bucket.
     assert out.loc[16:23, "alma_open_alt"].nunique() == 1
+
+
+def test_price_position_does_not_call_nearby_price_inside_zone():
+    from run_once import _price_position
+    demand = [{"btm": 100.0, "top": 110.0}]
+    supply = [{"btm": 120.0, "top": 130.0}]
+    assert _price_position(119.0, demand, supply) == "⚪ Вне зон (Ждать)"
+    assert _price_position(120.0, demand, supply) == "🔴 В зоне SUPPLY"
+    assert _price_position(110.0, demand, supply) == "🟢 В зоне DEMAND"
+
+
+def test_directional_zone_requires_actual_candle_touch_without_padding():
+    from event_engine.signals import _find_directional_zone
+    demand = [{"btm": 100.0, "top": 110.0}]
+    supply = [{"btm": 120.0, "top": 130.0}]
+    assert _find_directional_zone("LONG", 110.1, 112.0, 111.0, demand, supply) is None
+    assert _find_directional_zone("LONG", 110.0, 112.0, 111.0, demand, supply) == demand[0]
+    assert _find_directional_zone("SHORT", 118.0, 119.0, 119.0, demand, supply) is None
+    assert _find_directional_zone("SHORT", 118.0, 120.0, 119.5, demand, supply) == supply[0]
