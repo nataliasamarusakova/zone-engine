@@ -44,6 +44,11 @@ EXECUTION_ENABLED = os.environ.get("EXECUTION_ENABLED", "true").lower() == "true
 MARGIN_USDT = float(os.environ.get("BINGX_MARGIN_USDT", "1"))
 MAX_TRADES_PER_CYCLE = int(os.environ.get("MAX_TRADES_PER_CYCLE", "5"))
 MAX_SCAN_SYMBOLS = int(os.environ.get("MAX_SCAN_SYMBOLS", "0"))
+WATCHLIST_ONLY = os.environ.get("WATCHLIST_ONLY", "false").lower() == "true"
+WATCHLIST_SYMBOLS = tuple(x.strip().upper() for x in os.environ.get(
+    "WATCHLIST_SYMBOLS",
+    "BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT,TAO-USDT,LTC-USDT,BCH-USDT,AVAX-USDT,LINK-USDT,ETC-USDT,ADA-USDT,UNI-USDT,XRP-USDT,ICP-USDT,HYPE-USDT,DOGE-USDT,HBAR-USDT,ARB-USDT,POL-USDT,SUI-USDT",
+).split(",") if x.strip())
 KLINE_LIMIT_1H = int(os.environ.get("KLINE_LIMIT_1H", "120"))
 MAX_SIGNAL_AGE_BARS = int(os.environ.get("MAX_SIGNAL_AGE_BARS", "0"))
 # Production execution is strict by default: only the latest closed 1H bar may open a trade.
@@ -104,12 +109,24 @@ def _symbol_from_contract(c: dict[str, Any]) -> str | None:
 
 def get_scan_symbols() -> list[str]:
     all_contracts = contracts()
-    symbols = []
+    available = set()
     for c in all_contracts.values():
         symbol = _symbol_from_contract(c)
-        if symbol and symbol not in symbols:
-            symbols.append(symbol)
-    symbols.sort()
+        if symbol:
+            available.add(symbol)
+
+    if WATCHLIST_ONLY:
+        # Keep the order from the configured watchlist so the runtime log is
+        # deterministic and manual checking is straightforward.
+        symbols = [s for s in WATCHLIST_SYMBOLS if s in available]
+        missing = [s for s in WATCHLIST_SYMBOLS if s not in available]
+        if missing:
+            log.warning("[WATCHLIST_MISSING] symbols_not_active=%s", ",".join(missing))
+        if MAX_SCAN_SYMBOLS > 0:
+            symbols = symbols[:MAX_SCAN_SYMBOLS]
+        return symbols
+
+    symbols = sorted(available)
     if MAX_SCAN_SYMBOLS > 0:
         symbols = symbols[:MAX_SCAN_SYMBOLS]
     return symbols
@@ -662,7 +679,7 @@ def main() -> None:
     # TradFi/equity contracts are analyzed from BingX candles because Binance
     # public Spot market data does not expose the corresponding stock universe.
     bingx_symbols = get_scan_symbols()
-    log.info("[SCAN] BingX active USDT symbols: %d", len(bingx_symbols))
+    log.info("[SCAN] %s symbols selected from BingX | count=%d", "WATCHLIST" if WATCHLIST_ONLY else "FULL_UNIVERSE", len(bingx_symbols))
     bingx_contract_map = contracts()
     try:
         mapped = analysis_symbols_for_bingx(bingx_symbols)
