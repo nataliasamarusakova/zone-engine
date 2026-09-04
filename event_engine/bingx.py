@@ -1037,6 +1037,63 @@ def _effective_weighted_rr(levels: list[dict], stop_loss_pct: float) -> float | 
     return weighted / total if total > 0 else None
 
 
+
+def _order_qty(order: dict) -> float:
+    try:
+        return abs(float(order.get("origQty", 0) or order.get("quantity", 0) or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _find_open_order_by_client_id(orders: list[dict], client_order_id: str) -> dict | None:
+    target = str(client_order_id or "").upper()
+    if not target:
+        return None
+    for order in orders:
+        if str(order.get("clientOrderId", "")).upper() == target:
+            return order
+    return None
+
+
+def _verify_open_order(
+    symbol: str,
+    direction: str,
+    *,
+    client_order_id: str,
+    order_kind: str,
+    expected_price: float,
+    expected_qty: float,
+    price_precision: int,
+    max_attempts: int = 3,
+) -> dict:
+    """Reconcile an order after POST, including ambiguous network failures.
+
+    We never retransmit the POST. Instead we poll openOrders and accept the
+    already-created exchange order when its clientOrderId/side/price/qty match.
+    """
+    expected_kind = str(order_kind).upper()
+    for attempt in range(max(1, max_attempts)):
+        try:
+            book = get_open_protection_directional(symbol, direction, retryable=False)
+        except Exception as exc:
+            book = {"status": "error", "error": str(exc)}
+        if book.get("status") == "ok":
+            orders = list(book.get("sl_orders", [])) + list(book.get("tp_orders", []))
+            for order in orders:
+                if str(order.get("clientOrderId", "")).upper() != str(client_order_id).upper():
+                    continue
+                qty = _order_qty(order)
+                actual_price = float(order.get("stopPrice", 0) or order.get("price", 0) or 0)
+                type_ok = str(order.get("type", "")).upper() == expected_kind
+                price_ok = _format_price(actual_price, price_precision) == _format_price(expected_price, price_precision)
+                qty_ok = _qty_matches_position(qty, expected_qty)
+                if type_ok and price_ok and qty_ok:
+                    return {"status": "verified", "order": order, "attempt": attempt + 1}
+        if attempt + 1 < max(1, max_attempts):
+            time.sleep(0.25 * (attempt + 1))
+    return {"status": "not_found", "client_order_id": client_order_id}
+
+
 def ensure_directional_protection(
     symbol: str, direction: str, avg_price: float, qty: float,
     stop_loss_pct: float, tp_levels: list, trade_id: str | None = None,
@@ -1124,27 +1181,40 @@ def ensure_directional_protection(
         }
 
         resp = _request("POST", ORDER_PATH, params)
-        if resp.get("code") != 0:
-            log.error("[BINGX] SL failed: code=%s msg=%s", resp.get("code"), resp.get("msg"))
-            return {
-                "status": "PROTECTION_FAILED",
-                "error": f"SL failed: {resp.get('msg')}",
-                "sl_result": {"status": "error", "error": resp.get("msg")},
-                "tp_orders": [],
-            }
-
         order = (resp.get("data") or {}).get("order") or resp.get("data") or {}
-        sl_result = {
-            "status": "created",
-            "order_id": str(order.get("orderId", "")),
-            "client_order_id": order.get("clientOrderId") or client_order_id,
-            "stop_price": sl_price,
-            "qty": position_qty,
-        }
+        if resp.get("code") != 0:
+            verify = _verify_open_order(
+                symbol, direction, client_order_id=client_order_id, order_kind="STOP_MARKET",
+                expected_price=sl_price, expected_qty=position_qty, price_precision=price_precision,
+            )
+            if verify.get("status") != "verified":
+                log.error("[BINGX] SL failed/unverified: code=%s msg=%s", resp.get("code"), resp.get("msg"))
+                return {
+                    "status": "PROTECTION_FAILED",
+                    "error": f"SL failed: {resp.get('msg')}",
+                    "sl_result": {"status": "error", "error": resp.get("msg")},
+                    "tp_orders": [],
+                }
+            order = verify["order"]
+            sl_result = {
+                "status": "reconciled_after_post_error",
+                "order_id": str(order.get("orderId", "")),
+                "client_order_id": order.get("clientOrderId") or client_order_id,
+                "stop_price": float(order.get("stopPrice", 0) or order.get("price", 0) or sl_price),
+                "qty": _order_qty(order),
+            }
+        else:
+            sl_result = {
+                "status": "created",
+                "order_id": str(order.get("orderId", "")),
+                "client_order_id": order.get("clientOrderId") or client_order_id,
+                "stop_price": sl_price,
+                "qty": position_qty,
+            }
 
     verified = get_open_protection_directional(symbol, direction)
     verified_sl = list(verified.get("sl_orders", [])) if verified.get("status") == "ok" else []
-    verified_sl_valid = any(_validate_sl_order_for_position(o, direction, avg_price) for o in verified_sl)
+    verified_sl_valid = any(_validate_sl_order_for_position(o, direction, avg_price, position_qty) for o in verified_sl)
 
     if not verified_sl_valid:
         return {
@@ -1307,20 +1377,42 @@ def ensure_directional_protection(
         }
 
         resp = _request("POST", ORDER_PATH, params)
+        order = (resp.get("data") or {}).get("order") or resp.get("data") or {}
         if resp.get("code") != 0:
-            log.error("[BINGX] TP order failed: %s code=%s msg=%s", leg, resp.get("code"), resp.get("msg"))
-            tp_results.append({"leg": leg, "status": "error", "error": f"code={resp.get('code')} msg={resp.get('msg')}", "qty": tp_qty, "pnl_pct": pnl_pct})
+            verify = _verify_open_order(
+                symbol, direction, client_order_id=client_order_id, order_kind="TAKE_PROFIT_MARKET",
+                expected_price=tp_price, expected_qty=tp_qty, price_precision=price_precision,
+            )
+            if verify.get("status") != "verified":
+                log.error("[BINGX] TP order failed/unverified: %s code=%s msg=%s", leg, resp.get("code"), resp.get("msg"))
+                tp_results.append({"leg": leg, "status": "error", "error": f"code={resp.get('code')} msg={resp.get('msg')}", "qty": tp_qty, "pnl_pct": pnl_pct})
+                continue
+            order = verify["order"]
+            tp_results.append({
+                "leg": leg, "status": "reconciled_after_post_error",
+                "order_id": str(order.get("orderId", "")),
+                "client_order_id": order.get("clientOrderId") or client_order_id,
+                "price": float(order.get("stopPrice", 0) or order.get("price", 0) or tp_price),
+                "qty": _order_qty(order), "pnl_pct": pnl_pct,
+            })
             continue
 
-        order = (resp.get("data") or {}).get("order") or resp.get("data") or {}
+        # A code=0 acknowledgement is not enough for protection. Re-read the
+        # exchange open-order book and verify exact client ID, type, price and qty.
+        verify = _verify_open_order(
+            symbol, direction, client_order_id=client_order_id, order_kind="TAKE_PROFIT_MARKET",
+            expected_price=tp_price, expected_qty=tp_qty, price_precision=price_precision,
+        )
+        if verify.get("status") != "verified":
+            tp_results.append({"leg": leg, "status": "error", "error": "TP acknowledged but not verifiable on exchange", "qty": tp_qty, "pnl_pct": pnl_pct})
+            continue
+        order = verify["order"]
         tp_results.append({
-            "leg": leg,
-            "status": "created",
+            "leg": leg, "status": "created",
             "order_id": str(order.get("orderId", "")),
             "client_order_id": order.get("clientOrderId") or client_order_id,
-            "price": tp_price,
-            "qty": tp_qty,
-            "pnl_pct": pnl_pct,
+            "price": float(order.get("stopPrice", 0) or order.get("price", 0) or tp_price),
+            "qty": _order_qty(order), "pnl_pct": pnl_pct,
         })
 
     # Remove only legacy TP3 orders created by this engine. Manual/unrelated
@@ -1334,7 +1426,7 @@ def ensure_directional_protection(
             except Exception as exc:
                 log.warning("[BINGX] Could not remove legacy TP3 %s: %s", old_id, exc)
 
-    successful_tps = [t for t in tp_results if t.get("status") in {"created", "already_exists"}]
+    successful_tps = [t for t in tp_results if t.get("status") in {"created", "already_exists", "reconciled_after_post_error"}]
     if not verified_sl_valid:
         final_status = "PROTECTION_FAILED"
     elif len(successful_tps) == len(tp_levels_norm):
@@ -1368,7 +1460,7 @@ def ensure_directional_protection(
     }
 
 
-def _validate_sl_order_for_position(order: dict, direction: str, avg_price: float) -> bool:
+def _validate_sl_order_for_position(order: dict, direction: str, avg_price: float, position_qty: float | None = None) -> bool:
     order_type = str(order.get("type", "")).upper()
     if order_type not in {"STOP", "STOP_MARKET"}:
         return False
@@ -1383,6 +1475,9 @@ def _validate_sl_order_for_position(order: dict, direction: str, avg_price: floa
         return False
 
     direction = str(direction).upper()
+    if position_qty is not None and not _qty_matches_position(qty, float(position_qty)):
+        return False
+
     if direction == "LONG":
         return sl_price < avg_price
     if direction == "SHORT":

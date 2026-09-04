@@ -36,6 +36,7 @@ TP2_OBSTACLE_FRACTION = float(os.environ.get("TP2_OBSTACLE_FRACTION", "0.90"))
 TP_OBSTACLE_BUFFER_ATR = float(os.environ.get("TP_OBSTACLE_BUFFER_ATR", "0.10"))
 TP_MAX_R = float(os.environ.get("TP_MAX_R", "1.50"))
 TP_MIN_R = float(os.environ.get("TP_MIN_R", "0.50"))
+TP_MIN_R = max(0.50, min(TP_MIN_R, 3.0))
 
 MIN_BARS = 70
 # Production entry filters selected from the last completed audit. Keep them
@@ -816,9 +817,11 @@ def generate_zone_signals(
         if zone_age_bars > MAX_ZONE_AGE_BARS:
             continue
         if REQUIRE_DIRECTIONAL_CANDLE:
-            if direction == "LONG" and cur_c < cur_o:
+            # Require a real directional close. Doji candles are neutral and
+            # must not qualify as confirmation for either side.
+            if direction == "LONG" and cur_c <= cur_o:
                 continue
-            if direction == "SHORT" and cur_c > cur_o:
+            if direction == "SHORT" and cur_c >= cur_o:
                 continue
 
         if not math.isfinite(atr) or atr <= 0:

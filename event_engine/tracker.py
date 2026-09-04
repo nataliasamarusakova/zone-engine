@@ -25,6 +25,7 @@ from event_engine.bingx import (
     _format_qty,
     _request,
     ORDER_PATH,
+    position_side_param,
 )
 from event_engine.telegram import send as send_tg
 
@@ -482,7 +483,7 @@ def _move_sl_to_break_even(
         restore_params = {
             "symbol": bx,
             "side": restore_side,
-            "positionSide": direction,
+            "positionSide": position_side_param(direction),
             "type": "STOP_MARKET",
             "stopPrice": _format_price(old_sl_price, price_precision),
             "quantity": _format_qty(qty, precision),
@@ -513,7 +514,7 @@ def _move_sl_to_break_even(
     params = {
         "symbol": bx,
         "side": sl_side,
-        "positionSide": direction,
+        "positionSide": position_side_param(direction),
         "type": "STOP_MARKET",
         "stopPrice": _format_price(entry_price, price_precision),
         "quantity": _format_qty(qty, precision),
