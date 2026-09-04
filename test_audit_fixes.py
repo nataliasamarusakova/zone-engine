@@ -133,3 +133,52 @@ def test_request_does_not_fallback_post_after_network_error(monkeypatch):
     out = bingx._request('POST', '/foo', {'a':'1'}, signed=True, retryable=True)
     assert out['code'] == -1
     assert len(session.calls) == 1
+
+
+def test_sl_validator_covers_full_position_qty():
+    from event_engine import bingx
+    good = {"type": "STOP_MARKET", "stopPrice": "99", "origQty": "1.0"}
+    bad = {"type": "STOP_MARKET", "stopPrice": "99", "origQty": "0.5"}
+    assert bingx._validate_sl_order_for_position(good, "LONG", 100.0, 1.0)
+    assert not bingx._validate_sl_order_for_position(bad, "LONG", 100.0, 1.0)
+
+
+def test_tp_success_requires_exchange_reconciliation(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
+    out = bingx._verify_open_order("AAA-USDT", "LONG", client_order_id="EVT_X_TP1", order_kind="TAKE_PROFIT_MARKET", expected_price=101.0, expected_qty=1.0, price_precision=2, max_attempts=1)
+    assert out["status"] == "not_found"
+
+
+def test_failed_signal_registry_roundtrip(tmp_path, monkeypatch):
+    import run_once
+    monkeypatch.setattr(run_once, "DATA", tmp_path)
+    monkeypatch.setattr(run_once, "FAILED_SIGNALS_PATH", tmp_path / "failed_signals.json")
+    monkeypatch.setattr(run_once, "FAILED_SIGNAL_TTL_SEC", 3600)
+    run_once._mark_failed_signal("EVT_TEST", "blocked_protection_preflight", "x")
+    loaded = run_once._load_failed_signal_ids()
+    assert "EVT_TEST" in loaded
+
+
+def test_be_uses_detected_one_way_position_side(monkeypatch):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "to_bx_symbol", lambda s: s)
+    monkeypatch.setattr(tracker, "get_contract", lambda s: {"quantityPrecision": 3, "pricePrecision": 2})
+    monkeypatch.setattr(tracker, "position_side_param", lambda direction: "BOTH")
+    order_box = {}
+    def fake_open_orders(*a, **k):
+        if order_box:
+            return {"status": "ok", "sl_orders": [order_box.copy()], "tp_orders": []}
+        return {"status": "ok", "sl_orders": [], "tp_orders": []}
+    monkeypatch.setattr(tracker, "get_open_protection_directional", fake_open_orders)
+    calls = []
+    def fake_request(method, path, params):
+        calls.append((method, params))
+        if method == "POST":
+            order_box.update({"orderId": "123", "clientOrderId": params.get("clientOrderId"), "type": "STOP_MARKET", "stopPrice": params.get("stopPrice"), "origQty": params.get("quantity")})
+            return {"code": 0, "data": {"order": order_box.copy()}}
+        return {"code": 0}
+    monkeypatch.setattr(tracker, "_request", fake_request)
+    out = tracker._move_sl_to_break_even("AAA-USDT", "LONG", 100.0, 1.0, None, "T")
+    assert out["status"] == "created"
+    assert calls[0][1]["positionSide"] == "BOTH"

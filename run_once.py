@@ -38,6 +38,8 @@ log = logging.getLogger("zone_engine")
 
 DATA = Path("data")
 TRADES_PATH = DATA / "trades.jsonl"
+FAILED_SIGNALS_PATH = DATA / "failed_signals.json"
+FAILED_SIGNAL_TTL_SEC = int(os.environ.get("FAILED_SIGNAL_TTL_SEC", str(24 * 3600)))
 ACTIONS_PATH = DATA / "actions.jsonl"
 
 EXECUTION_ENABLED = os.environ.get("EXECUTION_ENABLED", "true").lower() == "true"
@@ -73,6 +75,44 @@ def _append_jsonl(path: Path, obj: dict[str, Any]) -> None:
     DATA.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(obj, ensure_ascii=False, default=str) + "\n")
+
+
+
+def _load_failed_signal_ids() -> dict[str, dict[str, Any]]:
+    try:
+        if not FAILED_SIGNALS_PATH.exists():
+            return {}
+        raw = json.loads(FAILED_SIGNALS_PATH.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}
+        now = int(time.time())
+        cleaned = {}
+        for event_id, record in raw.items():
+            if not isinstance(record, dict):
+                continue
+            ts = int(record.get("ts", 0) or 0)
+            if ts > 0 and now - ts <= FAILED_SIGNAL_TTL_SEC:
+                cleaned[str(event_id)] = record
+        if cleaned != raw:
+            tmp = FAILED_SIGNALS_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, FAILED_SIGNALS_PATH)
+        return cleaned
+    except Exception as exc:
+        log.warning("[FAILED_SIGNALS] load failed: %s", exc)
+        return {}
+
+
+def _mark_failed_signal(event_id: str, status: str, error: str = "") -> None:
+    try:
+        DATA.mkdir(parents=True, exist_ok=True)
+        raw = _load_failed_signal_ids()
+        raw[str(event_id)] = {"ts": int(time.time()), "status": str(status), "error": str(error)[:500]}
+        tmp = FAILED_SIGNALS_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, FAILED_SIGNALS_PATH)
+    except Exception as exc:
+        log.warning("[FAILED_SIGNALS] mark failed for %s: %s", event_id, exc)
 
 
 def _load_successful_trade_ids() -> set[str]:
@@ -501,24 +541,28 @@ def _rebase_protection_after_fill(signal: dict[str, Any], avg_price: float) -> d
 
 
 def _emergency_close_and_verify(symbol: str, direction: str, qty: float, trade_id: str) -> dict[str, Any]:
-    """Close a safety-rollback position and verify that it is actually gone.
-
-    A rollback is not considered successful merely because the POST returned 0.
-    We re-read the directional position and retry once with the currently
-    reported quantity. This keeps an exchange/API failure from turning a
-    protection failure into an untracked naked position.
-    """
+    """Close a safety-rollback position and verify that it is actually gone."""
     attempts = []
+    configured_attempts = max(2, int(os.environ.get("EMERGENCY_CLOSE_ATTEMPTS", "4")))
+    verify_polls = max(2, int(os.environ.get("EMERGENCY_CLOSE_VERIFY_POLLS", "6")))
     last_qty = max(0.0, float(qty or 0.0))
-    for attempt in range(2):
+
+    for attempt in range(configured_attempts):
         try:
             current = get_position_directional(symbol, direction)
         except Exception as exc:
             current = {"status": "error", "error": str(exc)}
         if current.get("status") == "not_found":
             return {"status": "closed_verified", "attempts": attempts, "verification": current}
+        if current.get("status") == "error":
+            attempts.append({"status": "position_check_error", "error": current.get("error")})
+            time.sleep(0.4 * (attempt + 1))
+            continue
         if current.get("status") == "found":
-            last_qty = abs(float(current.get("positionAmt", last_qty) or last_qty))
+            try:
+                last_qty = abs(float(current.get("positionAmt", last_qty) or last_qty))
+            except (TypeError, ValueError):
+                pass
         if last_qty <= 0:
             return {"status": "closed_verified", "attempts": attempts, "verification": current}
         try:
@@ -528,13 +572,22 @@ def _emergency_close_and_verify(symbol: str, direction: str, qty: float, trade_i
         attempts.append(close_result)
         time.sleep(0.35 * (attempt + 1))
 
-    try:
-        verification = get_position_directional(symbol, direction)
-    except Exception as exc:
-        verification = {"status": "verification_error", "error": str(exc)}
-    if verification.get("status") == "not_found":
-        return {"status": "closed_verified", "attempts": attempts, "verification": verification}
-    return {"status": "close_unverified", "attempts": attempts, "verification": verification}
+    verification = {"status": "verification_error", "error": "no verification attempted"}
+    for poll in range(verify_polls):
+        try:
+            verification = get_position_directional(symbol, direction)
+        except Exception as exc:
+            verification = {"status": "verification_error", "error": str(exc)}
+        if verification.get("status") == "not_found":
+            return {"status": "closed_verified", "attempts": attempts, "verification": verification, "verify_poll": poll + 1}
+        if verification.get("status") == "found":
+            try:
+                last_qty = abs(float(verification.get("positionAmt", last_qty) or last_qty))
+            except (TypeError, ValueError):
+                pass
+        time.sleep(0.35)
+
+    return {"status": "close_unverified", "attempts": attempts, "verification": verification, "remaining_qty": last_qty}
 
 def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     symbol = str(signal["symbol"])
@@ -766,6 +819,7 @@ def main() -> None:
         log.error("[SCAN] No eligible symbols for signal scan")
 
     successful_ids = _load_successful_trade_ids()
+    failed_ids = _load_failed_signal_ids()
     if private_ready:
         try:
             open_keys = _position_keys(get_positions())
@@ -1026,7 +1080,7 @@ def main() -> None:
         bx_symbol = str((bx or {}).get("symbol", signal["symbol"])).upper()
         key = (bx_symbol, signal["type"])
         opposite = (bx_symbol, "SHORT" if signal["type"] == "LONG" else "LONG")
-        if signal["event_id"] in successful_ids:
+        if signal["event_id"] in successful_ids or signal["event_id"] in failed_ids:
             continue
         if key in open_keys or opposite in open_keys:
             continue
@@ -1076,6 +1130,8 @@ def main() -> None:
             )
         elif not execution_status.startswith("opened"):
             log.error("[EXEC_FAILED] %s %s | status=%s | error=%s | order=%s", signal["symbol"], signal["type"], execution_status, execution.get("error"), execution.get("order"))
+            if execution_status not in {"skipped_min_qty", "skipped_tp_min_qty", "skipped_invalid_setup"}:
+                _mark_failed_signal(signal["event_id"], execution_status, execution.get("error", ""))
         _append_jsonl(TRADES_PATH, {"record_type": "TRADE_OPEN", "event_id": signal["event_id"], "symbol": signal["symbol"], "direction": signal["type"], "score": signal["score"], "signal": signal, "result": execution})
         _send_signal(signal, execution)
         if str(execution.get("status")) == "opened_protected":
