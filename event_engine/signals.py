@@ -38,6 +38,13 @@ TP_MAX_R = float(os.environ.get("TP_MAX_R", "1.50"))
 TP_MIN_R = float(os.environ.get("TP_MIN_R", "0.50"))
 
 MIN_BARS = 70
+# Production entry filters selected from the last completed audit. Keep them
+# explicit and small so their effect remains observable in the new trade set.
+MAX_ZONE_AGE_BARS = int(os.environ.get("MAX_ZONE_AGE_BARS", "30"))
+MAX_SIGNAL_RISK_PCT = min(float(os.environ.get("MAX_SIGNAL_RISK_PCT", "1.50")), 1.50)
+MIN_STRUCTURE_ROOM_R = float(os.environ.get("MIN_STRUCTURE_ROOM_R", "1.20"))
+REQUIRE_DIRECTIONAL_CANDLE = os.environ.get("REQUIRE_DIRECTIONAL_CANDLE", "true").lower() == "true"
+REQUIRE_STRUCTURE_OBSTACLE = os.environ.get("REQUIRE_STRUCTURE_OBSTACLE", "true").lower() == "true"
 
 # When an Ajay ALMA signal has no directional Demand/Supply zone touching the
 # signal bar, production still needs a deterministic protective stop. This
@@ -93,7 +100,7 @@ def calc_atr(df: pd.DataFrame, length: int) -> pd.Series:
         ],
         axis=1,
     ).max(axis=1)
-    return _wilder_rma(tr, length).bfill()
+    return _wilder_rma(tr, length)
 
 
 
@@ -745,15 +752,13 @@ def generate_zone_signals(
 
     df["atr50"] = calc_atr(df, 50)
     df["atr30"] = calc_atr(df, 30)
-    df["vol_sma20"] = df["volume"].rolling(20, min_periods=5).mean().bfill()
+    df["vol_sma20"] = df["volume"].rolling(20, min_periods=20).mean()
     df["body_atr"] = (df["close"] - df["open"]).abs() / df["atr50"].replace(0, np.nan)
     df["range_atr"] = (df["high"] - df["low"]) / df["atr50"].replace(0, np.nan)
 
     # Keep ALMA columns available for diagnostics/backward-compatible analytics,
     # but they are deliberately NOT an entry condition in this version.
     df = _attach_exact_alternate_series(df, mode=mode)
-    _, _, _, _, _ = _pine_zone_walk(df)
-
     active_supply: list[dict[str, Any]] = []
     active_demand: list[dict[str, Any]] = []
     signals: list[dict[str, Any]] = []
@@ -805,6 +810,20 @@ def generate_zone_signals(
             if not (prev_close < float(trade_zone["btm"]) and cur_h >= float(trade_zone["btm"]) and cur_c <= float(trade_zone["top"])):
                 continue
 
+        # Audit-derived entry filters. These are applied only after a literal
+        # fresh zone touch, never to ordinary in-zone observations.
+        zone_age_bars = max(0, int(i - int(trade_zone.get("start", i))))
+        if zone_age_bars > MAX_ZONE_AGE_BARS:
+            continue
+        if REQUIRE_DIRECTIONAL_CANDLE:
+            if direction == "LONG" and cur_c < cur_o:
+                continue
+            if direction == "SHORT" and cur_c > cur_o:
+                continue
+
+        if not math.isfinite(atr) or atr <= 0:
+            continue
+
         zone_top = float(trade_zone["top"])
         zone_bottom = float(trade_zone["btm"])
         sl_buffer = ZONE_SL_ATR_BUFFER * atr
@@ -818,6 +837,16 @@ def generate_zone_signals(
             continue
 
         obstacle = _nearest_opposing_level(direction, cur_c, active_demand, active_supply, df, i)
+        if REQUIRE_STRUCTURE_OBSTACLE and obstacle is None:
+            continue
+        if obstacle is not None:
+            obstacle_price = float(obstacle["price"])
+            structural_distance = (obstacle_price - cur_c) if direction == "LONG" else (cur_c - obstacle_price)
+            if risk <= 0 or structural_distance <= 0 or (structural_distance / risk) < MIN_STRUCTURE_ROOM_R:
+                continue
+        risk_pct = (risk / cur_c) * 100.0
+        if risk_pct > MAX_SIGNAL_RISK_PCT:
+            continue
         targets = _targets_from_nearest_obstacle(direction, cur_c, stop, atr, obstacle)
         if targets is None:
             continue
@@ -825,8 +854,6 @@ def generate_zone_signals(
         tp2 = float(targets["tp2"])
         tp1_rr = float(targets["tp1_rr"])
         tp2_rr = float(targets["tp2_rr"])
-        risk_pct = (risk / cur_c) * 100.0
-
         avg_vol = _safe_num(df.loc[i, "vol_sma20"], 0.0)
         vol_ratio = (_safe_num(df.loc[i, "volume"]) / avg_vol) if avg_vol > 0 else None
         event_ts = int(df.loc[i, "timestamp"].timestamp() * 1000)
@@ -876,9 +903,15 @@ def generate_zone_signals(
                 "risk_model": {
                     "sl_source": "zone_boundary_plus_atr_buffer",
                     "zone_sl_buffer_atr": ZONE_SL_ATR_BUFFER,
+                    "max_signal_risk_pct": MAX_SIGNAL_RISK_PCT,
                 },
                 "confirmation": {
                     "alma_cross": False,
+                    "directional_candle_required": REQUIRE_DIRECTIONAL_CANDLE,
+                    "directional_candle_ok": (cur_c >= cur_o) if direction == "LONG" else (cur_c <= cur_o),
+                    "zone_age_limit_bars": MAX_ZONE_AGE_BARS,
+                    "zone_age_bars": zone_age_bars,
+                    "minimum_structure_room_r": MIN_STRUCTURE_ROOM_R,
                     "zone_touch": True,
                     "volume_ratio": round(vol_ratio, 3) if vol_ratio is not None else None,
                     "candle_body_atr": round(_safe_num(df.loc[i, "body_atr"]), 3),

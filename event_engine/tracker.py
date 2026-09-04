@@ -5,6 +5,11 @@ import logging
 import os
 import time
 import uuid
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -96,10 +101,39 @@ def _close_record_exists(event_id: str) -> bool:
     return False
 
 
+_JOURNAL_LOCK = threading.Lock()
+
 def _append_trade_record(record: dict) -> None:
     TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with TRADES_PATH.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    with _JOURNAL_LOCK:
+        with TRADES_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+def _append_trade_close_once(record: dict) -> bool:
+    """Atomically avoid duplicate TRADE_CLOSE records across overlapping runs."""
+    TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = TRADES_PATH.with_suffix(TRADES_PATH.suffix + ".lock")
+    with _JOURNAL_LOCK:
+        with lock_path.open("a+", encoding="utf-8") as lockf:
+            if fcntl is not None:
+                fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+            try:
+                event_id = str(record.get("event_id", ""))
+                if TRADES_PATH.exists():
+                    with TRADES_PATH.open("r", encoding="utf-8") as rf:
+                        for line in rf:
+                            try:
+                                obj = json.loads(line)
+                            except Exception:
+                                continue
+                            if obj.get("record_type") == "TRADE_CLOSE" and str(obj.get("event_id")) == event_id:
+                                return False
+                with TRADES_PATH.open("a", encoding="utf-8") as wf:
+                    wf.write(json.dumps(record, ensure_ascii=False) + "\n")
+                return True
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
 
 
 def _normalize_direction(direction: str) -> str:
@@ -656,6 +690,32 @@ def update_active_trades() -> None:
             trade["current_position_qty"] = pos_amt
             trade["last_observation_ts"] = now_ms
 
+            # Audit fix: BE is triggered by PRICE reaching +0.50R, not by TP1
+            # order status. MFE is updated from the fetched 1m candles above, so
+            # an intrabar touch that later retraces is still detected.
+            planned_risk_pct = _derive_planned_risk_pct(trade)
+            be_trigger_r = float(os.environ.get("BE_TRIGGER_R", "0.50"))
+            peak_r = (float(trade.get("peak_pnl_pct", 0.0)) / planned_risk_pct) if planned_risk_pct and planned_risk_pct > 0 else 0.0
+            if pos_status == "found" and rem_qty > 0 and not trade.get("be_activated") and peak_r >= be_trigger_r:
+                old_sl = trade.get("sl_order", {}) if isinstance(trade.get("sl_order"), dict) else {}
+                old_sl_id = old_sl.get("order_id")
+                old_sl_price = _safe_float(old_sl.get("stop_price"), 0.0) or None
+                be_result = _move_sl_to_break_even(symbol, direction, entry_price, rem_qty, old_sl_id, str(event_id).replace("EVT_", ""), old_sl_price=old_sl_price)
+                if be_result.get("status") in {"created", "created_old_sl_cancel_failed"}:
+                    trade["sl_order"] = be_result
+                    trade["be_activated"] = True
+                    trade["be_required"] = False
+                    trade["be_trigger_r"] = be_trigger_r
+                    trade["be_trigger_peak_r"] = peak_r
+                    trade["be_activation_ts"] = trade.get("be_activation_ts") or now_ms
+                    log.info("[TRACKER_BE_ACTIVATED] %s (%s) Price reached +%.2fR. Stop-loss moved to Break-Even: %.8g", trade.get("name", symbol), symbol, peak_r, entry_price)
+                else:
+                    trade["be_required"] = True
+                    trade["be_last_error"] = be_result.get("error")
+                    trade["be_trigger_r"] = be_trigger_r
+                    trade["be_trigger_peak_r"] = peak_r
+                    log.error("[TRACKER_BE_FAILED] %s (%s) Price reached +%.2fR but BE failed: %s", trade.get("name", symbol), symbol, peak_r, be_result.get("error"))
+
             # Retry a failed TP1 -> BE transition while the position remains open.
             if "tp1" in set(trade.get("hit_legs", [])) and not trade.get("be_activated") and rem_qty > 0:
                 old_sl = trade.get("sl_order", {}) if isinstance(trade.get("sl_order"), dict) else {}
@@ -796,7 +856,7 @@ def update_active_trades() -> None:
             elif closed_by_tp:
                 exit_reason = "TAKE_PROFIT_FULL"
             else:
-                exit_reason = "POSITION_CLOSED"
+                exit_reason = "POSITION_CLOSED_UNVERIFIED"
 
             if exit_price <= 0:
                 exit_price = cur_price
@@ -808,10 +868,11 @@ def update_active_trades() -> None:
                 trade["remaining_qty"] = 0.0
 
             final_pnl = (realized_weighted / init_qty) if (init_qty > 0 and realized_qty > 0) else current_pnl
+            realized_pnl_source = "executed_tp_or_sl" if (closed_by_tp or sl_exit_price is not None) else "observation_price_estimate"
             if closed_by_tp and realized_qty > 0 and sl_exit_price is None:
                 exit_price = entry_price * (1.0 + final_pnl / 100.0) if direction == "LONG" else entry_price * (1.0 - final_pnl / 100.0)
             planned_risk_pct = _derive_planned_risk_pct(trade)
-            realized_rr = _calc_realized_rr(final_pnl, planned_risk_pct)
+            realized_rr = _calc_realized_rr(final_pnl, planned_risk_pct) if realized_pnl_source == "executed_tp_or_sl" else None
             planned_rr = _safe_float(trade.get("effective_weighted_rr", trade.get("planned_weighted_rr", 1.05)), 1.05)
 
             trade["remaining_qty"] = 0.0
@@ -819,13 +880,13 @@ def update_active_trades() -> None:
             trade["realized_pnl_qty"] = realized_qty
             trade["realized_pnl_weighted_sum"] = realized_weighted
             trade["realized_rr"] = realized_rr
+            trade["realized_pnl_source"] = realized_pnl_source
             trade["exit_price"] = exit_price
             trade["exit_reason"] = exit_reason
             trade["closed_ts"] = now_ms
             trade["duration_min"] = duration_min
             trade["closed"] = True
-            if not _close_record_exists(event_id):
-                _append_trade_record({
+            _append_trade_close_once({
                 "record_type": "TRADE_CLOSE",
                 "event_id": event_id,
                 "symbol": symbol,
@@ -837,6 +898,7 @@ def update_active_trades() -> None:
                 "exit_price": exit_price,
                 "realized_pnl_pct": final_pnl,
                 "realized_rr": realized_rr,
+                "realized_pnl_source": realized_pnl_source,
                 "effective_weighted_rr": planned_rr,
                 "tp_mode": trade.get("tp_mode", "multi_tp"),
                 "effective_tp_levels": trade.get("effective_tp_levels", []),

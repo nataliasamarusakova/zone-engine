@@ -12,6 +12,7 @@ import time
 import threading
 import uuid
 from email.utils import parsedate_to_datetime
+from datetime import timezone
 from decimal import (
     Decimal,
     ROUND_CEILING,
@@ -120,6 +121,29 @@ def _apply_request_timestamp(params: dict[str, Any]) -> str:
     return signature
 
 
+def _update_server_time_offset(response: Any) -> bool:
+    """Synchronize the signing timestamp from the HTTP Date header.
+
+    BingX can reject signed requests when local clock drift exceeds the allowed
+    window. The request wrapper retries once after refreshing this offset.
+    """
+    global SERVER_TIME_OFFSET_MS
+    try:
+        date_header = response.headers.get("Date") if response is not None else None
+        if not date_header:
+            return False
+        dt = parsedate_to_datetime(date_header)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        server_ms = int(dt.timestamp() * 1000)
+        local_ms = int(time.time() * 1000)
+        SERVER_TIME_OFFSET_MS = server_ms - local_ms
+        log.warning("[BINGX] Server time offset synchronized: %d ms", SERVER_TIME_OFFSET_MS)
+        return True
+    except Exception as exc:
+        log.warning("[BINGX] Failed to synchronize server time: %s", exc)
+        return False
+
 def _base_urls() -> list[str]:
     primary = BASE_URL
     if primary.endswith(".com"):
@@ -199,7 +223,12 @@ def _request(
                     payload = response.json()
                 except Exception as exc:
                     last_error = exc
-                    if retryable and _is_network_error(exc) and base_url != _base_urls()[-1]:
+                    # NEVER resend a non-idempotent POST after a transport error.
+                    # The exchange may have accepted the order while the response
+                    # was lost; sending the same MARKET/STOP/TP POST to another
+                    # endpoint can create a duplicate order. GET/DELETE remain
+                    # eligible for the endpoint fallback.
+                    if retryable and _is_network_error(exc) and method.upper() != "POST" and base_url != _base_urls()[-1]:
                         log.warning("[BINGX] Network failure on %s; trying fallback domain: %s", base_url, exc)
                         break
                     return {"code": -1, "msg": str(exc)}
@@ -662,6 +691,20 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
             "leverage": leverage, "sizing_price": sizing_price,
         }
 
+    # This engine always opens two TP legs. Refuse the entry before MARKET
+    # submission when exchange granularity cannot represent both legs.
+    if min_qty > 0 and qty < (min_qty * 2.0):
+        required_margin = (min_qty * 2.0 * sizing_price * mult) / max(leverage, 1)
+        return {
+            "status": "skipped_tp_min_qty",
+            "error": f"qty={qty} cannot support 2 TP legs at min_qty={min_qty}",
+            "reason": "two_tp_min_quantity",
+            "symbol": bx, "qty": qty, "min_qty": min_qty,
+            "required_margin_usdt": required_margin,
+            "configured_margin_usdt": MARGIN_USDT,
+            "leverage": leverage, "sizing_price": sizing_price,
+        }
+
     if not _set_leverage(bx, leverage, direction):
         return {"status": "error", "error": f"failed to set leverage={leverage} for {direction}", "symbol": bx, "leverage": leverage}
 
@@ -1050,7 +1093,10 @@ def ensure_directional_protection(
         if sl_price <= 0 or sl_qty <= 0:
             continue
 
-        protective_side = (sl_price <= avg_price * 1.002) if direction == "LONG" else (sl_price >= avg_price * 0.998)
+        # Initial protective SL must be strictly on the loss side of the
+        # actual entry. Do not accept a small percentage-wide "tolerance" that
+        # can accidentally treat a wrong-side SL as valid.
+        protective_side = (sl_price < avg_price) if direction == "LONG" else (sl_price > avg_price)
         if protective_side and _qty_matches_position(sl_qty, position_qty):
             valid_existing_sl = sl
             break
@@ -1338,8 +1384,8 @@ def _validate_sl_order_for_position(order: dict, direction: str, avg_price: floa
 
     direction = str(direction).upper()
     if direction == "LONG":
-        return sl_price <= avg_price * 1.003
+        return sl_price < avg_price
     if direction == "SHORT":
-        return sl_price >= avg_price * 0.997
+        return sl_price > avg_price
 
     return False

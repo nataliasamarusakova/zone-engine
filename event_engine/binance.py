@@ -73,7 +73,7 @@ def refresh_exchange_info() -> dict[str, dict[str, Any]]:
             continue
         symbols[symbol] = item
     _CACHE.update(ts=time.time(), symbols=symbols, raw=raw)
-    log.info("[BINANCE] Active USDT perpetual symbols=%d", len(symbols))
+    log.info("[BINANCE] Active USDT spot symbols=%d", len(symbols))
     return symbols
 
 
