@@ -51,6 +51,7 @@ WATCHLIST_SYMBOLS = tuple(x.strip().upper() for x in os.environ.get(
 ).split(",") if x.strip())
 KLINE_LIMIT_1H = int(os.environ.get("KLINE_LIMIT_1H", "120"))
 MAX_SIGNAL_AGE_BARS = int(os.environ.get("MAX_SIGNAL_AGE_BARS", "0"))
+MAX_PRODUCTION_RISK_PCT = min(float(os.environ.get("MAX_SIGNAL_RISK_PCT", "1.50")), 1.50)
 # Production execution is strict by default: only the latest closed 1H bar may open a trade.
 EXECUTION_MAX_SIGNAL_AGE_BARS = int(os.environ.get("EXECUTION_MAX_SIGNAL_AGE_BARS", "0"))
 DIAGNOSTICS_MODE = os.environ.get("DIAGNOSTICS_MODE", "historical").strip().lower()
@@ -341,8 +342,22 @@ def _validate_trade_geometry(signal: dict[str, Any]) -> tuple[bool, str]:
         return False, "non_positive_price"
     if risk_pct <= 0:
         return False, f"non_positive_risk_pct={risk_pct}"
-    if risk_pct > float(os.environ.get("MAX_SIGNAL_RISK_PCT", "25")):
+    if risk_pct > MAX_PRODUCTION_RISK_PCT:
         return False, f"risk_pct_above_limit={risk_pct}"
+    target = signal.get("target") if isinstance(signal.get("target"), dict) else {}
+    obstacle_price = target.get("obstacle_price")
+    try:
+        obstacle_price = float(obstacle_price) if obstacle_price is not None else None
+    except (TypeError, ValueError):
+        obstacle_price = None
+    min_room_r = float(os.environ.get("MIN_STRUCTURE_ROOM_R", "1.20"))
+    risk_abs = abs(entry - sl)
+    if obstacle_price is None and os.environ.get("REQUIRE_STRUCTURE_OBSTACLE", "true").lower() == "true":
+        return False, "missing_structural_obstacle"
+    if obstacle_price is not None and risk_abs > 0:
+        room = (obstacle_price - entry) if direction == "LONG" else (entry - obstacle_price)
+        if room <= 0 or (room / risk_abs) < min_room_r:
+            return False, f"insufficient_structure_room={room / risk_abs:.3f}R < {min_room_r:.3f}R"
     if direction == "LONG":
         if not sl < entry:
             return False, f"LONG invalid SL: sl={sl} entry={entry}"
@@ -437,6 +452,8 @@ def _rebase_protection_after_fill(signal: dict[str, Any], avg_price: float) -> d
     tp2_fraction = float(os.environ.get("TP2_OBSTACLE_FRACTION", "0.90"))
 
     target_source = "atr_rr_fallback_after_fill"
+    if obstacle is None and os.environ.get("REQUIRE_STRUCTURE_OBSTACLE", "true").lower() == "true":
+        raise ValueError("structural obstacle unavailable after fill")
     if obstacle is not None:
         if direction == "LONG" and obstacle > entry + obstacle_buffer:
             usable = obstacle - obstacle_buffer - entry
@@ -483,6 +500,42 @@ def _rebase_protection_after_fill(signal: dict[str, Any], avg_price: float) -> d
     }
 
 
+def _emergency_close_and_verify(symbol: str, direction: str, qty: float, trade_id: str) -> dict[str, Any]:
+    """Close a safety-rollback position and verify that it is actually gone.
+
+    A rollback is not considered successful merely because the POST returned 0.
+    We re-read the directional position and retry once with the currently
+    reported quantity. This keeps an exchange/API failure from turning a
+    protection failure into an untracked naked position.
+    """
+    attempts = []
+    last_qty = max(0.0, float(qty or 0.0))
+    for attempt in range(2):
+        try:
+            current = get_position_directional(symbol, direction)
+        except Exception as exc:
+            current = {"status": "error", "error": str(exc)}
+        if current.get("status") == "not_found":
+            return {"status": "closed_verified", "attempts": attempts, "verification": current}
+        if current.get("status") == "found":
+            last_qty = abs(float(current.get("positionAmt", last_qty) or last_qty))
+        if last_qty <= 0:
+            return {"status": "closed_verified", "attempts": attempts, "verification": current}
+        try:
+            close_result = close_position_market(symbol, direction, last_qty, trade_id=trade_id)
+        except Exception as exc:
+            close_result = {"status": "error", "error": str(exc)}
+        attempts.append(close_result)
+        time.sleep(0.35 * (attempt + 1))
+
+    try:
+        verification = get_position_directional(symbol, direction)
+    except Exception as exc:
+        verification = {"status": "verification_error", "error": str(exc)}
+    if verification.get("status") == "not_found":
+        return {"status": "closed_verified", "attempts": attempts, "verification": verification}
+    return {"status": "close_unverified", "attempts": attempts, "verification": verification}
+
 def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     symbol = str(signal["symbol"])
     direction = str(signal["type"]).upper()
@@ -528,7 +581,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         reason = f"post-fill protection rebase failed: {exc}"
         log.critical("[SAFETY_CLOSE] %s %s | %s", symbol, direction, reason)
-        close_result = close_position_market(symbol, direction, qty, trade_id=event_id)
+        close_result = _emergency_close_and_verify(symbol, direction, qty, event_id)
         cleanup = _cleanup_engine_protection(symbol, direction)
         return {"status": "opened_then_emergency_closed", "error": reason, "order": order, "position": position, "close": close_result, "protection_cleanup": cleanup, "executed_signal": dict(signal)}
 
@@ -558,7 +611,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     valid, reason = _validate_trade_geometry(actual_signal)
     if not valid:
         log.critical("[SAFETY_CLOSE] %s %s | invalid post-fill protection geometry | %s", symbol, direction, reason)
-        close_result = close_position_market(symbol, direction, qty, trade_id=event_id)
+        close_result = _emergency_close_and_verify(symbol, direction, qty, event_id)
         cleanup = _cleanup_engine_protection(symbol, direction)
         return {"status": "opened_then_emergency_closed", "error": reason, "order": order, "position": position, "close": close_result, "protection_cleanup": cleanup, "executed_signal": actual_signal}
 
@@ -587,12 +640,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         log.critical("[SAFETY_CLOSE] %s %s | mandatory protection incomplete | %s", symbol, direction, protection)
         # Mandatory rule: never leave a newly-opened position live without BOTH
         # a verified SL and both TP legs. Attempt an immediate market rollback.
-        try:
-            current = get_position_directional(symbol, direction)
-            remaining_qty = abs(float(current.get("positionAmt", qty) or qty)) if current.get("status") == "found" else qty
-        except Exception:
-            remaining_qty = qty
-        close_result = close_position_market(symbol, direction, remaining_qty, trade_id=event_id)
+        close_result = _emergency_close_and_verify(symbol, direction, qty, event_id)
         cleanup = _cleanup_engine_protection(symbol, direction)
         try:
             time.sleep(0.25)
@@ -1020,7 +1068,7 @@ def main() -> None:
             continue
         execution = execute_new_position(signal)
         execution_status = str(execution.get("status", ""))
-        if execution_status in {"skipped_min_qty", "skipped_invalid_setup"}:
+        if execution_status in {"skipped_min_qty", "skipped_tp_min_qty", "skipped_invalid_setup"}:
             log.warning(
                 "[EXEC_SKIPPED] %s %s | status=%s | reason=%s | error=%s | qty=%s min_qty=%s required_margin=%.4f configured_margin=%.4f",
                 signal["symbol"], signal["type"], execution_status, execution.get("reason", "invalid_setup"), execution.get("error"), execution.get("qty"), execution.get("min_qty"),

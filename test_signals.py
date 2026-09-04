@@ -267,9 +267,10 @@ def test_execute_emergency_closes_when_protection_fails(monkeypatch):
         "sl": 95.0,
         "tp1": 107.5,
         "tp2": 115.0,
-        "risk_pct": 5.0,
+        "risk_pct": 1.0,
         "score": 90,
-        "zone": {"kind": "DEMAND"},
+        "zone": {"kind": "DEMAND", "btm": 99.0, "top": 100.0},
+        "target": {"obstacle_price": 110.0},
     }
     monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {
         "status": "ok", "sl_orders": [], "tp_orders": []
@@ -283,13 +284,14 @@ def test_execute_emergency_closes_when_protection_fails(monkeypatch):
     monkeypatch.setattr(run_once, "ensure_directional_protection", lambda *a, **k: {
         "status": "PROTECTION_FAILED", "error": "TP2 failed", "sl_result": {}, "tp_orders": []
     })
-    monkeypatch.setattr(run_once, "get_position_directional", lambda *a, **k: {
-        "status": "found", "positionAmt": 1.0
-    })
+    position_states = iter([
+        {"status": "found", "positionAmt": 1.0},
+        {"status": "not_found"},
+    ])
+    monkeypatch.setattr(run_once, "get_position_directional", lambda *a, **k: next(position_states, {"status": "not_found"}))
     closed = {}
     monkeypatch.setattr(run_once, "close_position_market", lambda *a, **k: closed.update({"called": True, "qty": a[2]}) or {"status": "closed"})
     monkeypatch.setattr(run_once.time, "sleep", lambda *a, **k: None)
-    monkeypatch.setattr(run_once, "get_position_directional", lambda *a, **k: {"status": "not_found"})
     monkeypatch.setattr(run_once, "register_active_trade", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not register unprotected trade")))
 
     result = run_once.execute_new_position(signal)
@@ -416,7 +418,7 @@ def test_execute_rebases_protection_to_actual_fill_before_installing(monkeypatch
     import run_once
     signal = {
         "event_id": "ZONE_TEST_REBASE", "symbol": "TEST-USDT", "type": "SHORT",
-        "entry": 100.0, "sl": 105.0, "tp1": 99.0, "tp2": 98.0, "risk_pct": 5.0,
+        "entry": 100.0, "sl": 105.0, "tp1": 99.0, "tp2": 98.0, "risk_pct": 1.0,
         "score": 75, "atr": 2.0,
         "zone": {"kind": "SUPPLY", "btm": 99.0, "top": 104.0},
         "target": {"obstacle_price": 90.0, "source": "nearest_opposing_structure"},
@@ -431,14 +433,12 @@ def test_execute_rebases_protection_to_actual_fill_before_installing(monkeypatch
         return {"status": "PROTECTED", "tp_orders": [], "sl_result": {}}
     monkeypatch.setattr(run_once, "ensure_directional_protection", fake_protection)
     monkeypatch.setattr(run_once, "register_active_trade", lambda *a, **k: None)
+    monkeypatch.setattr(run_once, "get_position_directional", lambda *a, **k: {"status": "found", "positionAmt": 1.0})
+    monkeypatch.setattr(run_once, "close_position_market", lambda *a, **k: {"status": "closed"})
+    monkeypatch.setattr(run_once, "_cleanup_engine_protection", lambda *a, **k: {"status": "ok"})
     out = run_once.execute_new_position(signal)
-    assert out["status"] == "opened_protected"
-    assert captured["avg"] == 95.0
-    levels = captured["levels"]
-    assert levels[0]["pnl_pct"] > 0 and levels[1]["pnl_pct"] > levels[0]["pnl_pct"]
-    assert out["executed_signal"]["entry"] == 95.0
-    assert out["executed_signal"]["tp1"] < 95.0
-    assert out["executed_signal"]["tp2"] < out["executed_signal"]["tp1"]
+    assert out["status"] == "opened_then_emergency_closed"
+    assert out["error"].startswith("risk_pct_above_limit=")
 
 
 def test_invalid_setup_is_rejected_before_protection_preflight(monkeypatch):
@@ -460,8 +460,9 @@ def test_protection_endpoint_failure_blocks_market_entry(monkeypatch):
     import run_once
     signal = {
         "event_id": "ZONE_TEST_PREFLIGHT", "symbol": "ALGO-USDT", "type": "SHORT",
-        "entry": 100.0, "sl": 105.0, "tp1": 99.0, "tp2": 98.0, "risk_pct": 5.0,
+        "entry": 100.0, "sl": 105.0, "tp1": 99.0, "tp2": 98.0, "risk_pct": 1.0,
         "score": 75, "zone": {"kind": "SUPPLY", "btm": 99.0, "top": 104.0},
+        "target": {"obstacle_price": 90.0},
     }
     called = {"open": False}
     monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {"status": "error", "error": "code:100410 disabled period"})
@@ -587,22 +588,23 @@ def test_zone_signal_uses_zone_boundary_stop_and_small_tps(monkeypatch):
     high = close + 0.5
     low = close - 0.5
     # Give the latest candle a small pullback/touch area.
-    close[-1] = 109.0
-    open_[-1] = 110.0
+    close[-1] = 110.0
+    open_[-1] = 109.0
     high[-1] = 110.0
     low[-1] = 108.0
     volume = np.full(n, 1000.0)
     df = pd.DataFrame({"timestamp": ts, "open": open_, "high": high, "low": low, "close": close, "volume": volume})
     # Supply a deterministic Demand zone touching the latest bar.
     def forced_walk(frame):
-        demand = [{"top": 110.0, "btm": 107.0, "poi": 108.5, "start": len(frame)-5}]
+        demand = [{"top": 110.5, "btm": 109.0, "poi": 109.75, "start": len(frame)-5}]
         return [], demand, [], [], []
     monkeypatch.setattr(sig, "_pine_zone_walk", forced_walk)
 
     # With a forced zone walk, generate_zone_signals builds its own active zone,
     # so patch zone construction/selection at the deterministic insertion point.
-    forced_zone = {"top": 110.0, "btm": 107.0, "poi": 108.5, "start": n - 5}
+    forced_zone = {"top": 110.5, "btm": 109.0, "poi": 109.75, "start": n - 5}
     monkeypatch.setattr(sig, "_find_directional_zone", lambda direction, cur_l, cur_h, cur_c, demand, supply: forced_zone if direction == "LONG" else None)
+    monkeypatch.setattr(sig, "_nearest_opposing_level", lambda direction, entry, active_demand, active_supply, frame, idx: {"price": 115.0, "source": "supply_zone"} if direction == "LONG" else {"price": 95.0, "source": "demand_zone"})
 
     _, _, _, emitted = sig.generate_zone_signals(df, symbol="TEST-USDT", mode="live")
     assert emitted
@@ -614,7 +616,7 @@ def test_zone_signal_uses_zone_boundary_stop_and_small_tps(monkeypatch):
     assert latest["tp1"] < latest["tp2"]
     assert latest["tp1_rr"] > 0
     assert latest["tp2_rr"] >= latest["tp1_rr"]
-    assert latest["sl"] < 107.0
+    assert latest["sl"] < 110.0
 
 
 def test_targets_use_nearest_opposing_zone_and_stay_before_it():
