@@ -42,10 +42,10 @@
     "be_activation_ts": null,
     "be_required": true,
     "be_last_error": "old SL cancel failed: Signature verification failed due to signature mismatch,please verify our authentication signature and try to  run our sample code  from the link https://bingx-api.github.io/docs/#/en-us/spot/account-api.html#Query%20Assets; new SL not created (no double-SL window)",
-    "peak_pnl_pct": 1.3614179296172642,
+    "peak_pnl_pct": 1.61828923709222,
     "mae_pct": -0.9504238376573373,
     "max_drawdown_pct": -1.7724120215772023,
-    "current_pnl_pct": 1.232982275879792,
+    "current_pnl_pct": 1.5155407141022352,
     "score": 75.0,
     "event_type": "SUPPLY_ZONE_TOUCH",
     "timeframe": "1h",
@@ -202,12 +202,12 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1788616243700,
+    "last_observation_ts": 1788616543604,
     "last_exchange_avg_price": 0.003893,
     "current_position_qty": 1285.0,
-    "protection_last_updated_ts": 1788616252337,
+    "protection_last_updated_ts": 1788616552731,
     "be_trigger_r": 0.5,
-    "be_trigger_peak_r": 1.0290063293597012
+    "be_trigger_peak_r": 1.2231584669747393
   },
   "ZONE_017276782FC7C2F7C80D8332": {
     "event_id": "ZONE_017276782FC7C2F7C80D8332",
@@ -259,7 +259,7 @@
     "peak_pnl_pct": 0.43206913106097544,
     "mae_pct": -0.6240998559769542,
     "max_drawdown_pct": -1.0561689870379296,
-    "current_pnl_pct": -0.04800768122899135,
+    "current_pnl_pct": 0.1440230436870007,
     "score": 65.0,
     "event_type": "SUPPLY_ZONE_TOUCH",
     "timeframe": "1h",
@@ -416,10 +416,10 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1788616243700,
+    "last_observation_ts": 1788616543604,
     "last_exchange_avg_price": 0.2083,
     "current_position_qty": 47.961,
-    "protection_last_updated_ts": 1788616253368
+    "protection_last_updated_ts": 1788616553425
   },
   "ZONE_18A28475FC00E83C7690C954": {
     "event_id": "ZONE_18A28475FC00E83C7690C954",
@@ -439,20 +439,16 @@
     "tp_orders": [
       {
         "leg": "tp1",
-        "status": "already_exists",
-        "order_id": "2096176986627596288",
-        "client_order_id": "evt_667b3ab335486917_tp1",
-        "price": 0.003825,
-        "qty": 1300.7,
+        "status": "error",
+        "error": "code=110414 msg=Take Profit price should be lower than the current price",
+        "qty": 650.4,
         "pnl_pct": 0.4261976047904252
       },
       {
         "leg": "tp2",
-        "status": "already_exists",
-        "order_id": "2096176989815267328",
-        "client_order_id": "evt_667b3ab335486917_tp2",
-        "price": 0.003808,
-        "qty": 1300.7,
+        "status": "error",
+        "error": "stale TP cancel failed: code=100001 msg=Signature verification failed due to signature mismatch,please verify our authentication signature and try to  run our sample code  from the link https://bingx-api.github.io/docs/#/en-us/spot/account-api.html#Query%20Assets",
+        "qty": 650.3,
         "pnl_pct": 0.8523952095808504
       }
     ],
@@ -461,17 +457,17 @@
       "order_id": "2096176981061754880",
       "client_order_id": "evt_667b3ab335486917_sl",
       "stop_price": 0.003863,
-      "qty": 2601.4
+      "qty": 1300.7
     },
     "hit_legs": [],
     "be_activated": false,
     "be_activation_ts": null,
-    "be_required": false,
-    "be_last_error": null,
-    "peak_pnl_pct": 0.23431398073418103,
+    "be_required": true,
+    "be_last_error": "old SL cancel failed: Signature verification failed due to signature mismatch,please verify our authentication signature and try to  run our sample code  from the link https://bingx-api.github.io/docs/#/en-us/spot/account-api.html#Query%20Assets; new SL not created (no double-SL window)",
+    "peak_pnl_pct": 0.4946628482166082,
     "mae_pct": -0.4946628482166195,
     "max_drawdown_pct": -0.6769070554543083,
-    "current_pnl_pct": 0.15620932048945402,
+    "current_pnl_pct": 0.3905233012236351,
     "score": 75.0,
     "event_type": "SUPPLY_ZONE_TOUCH",
     "timeframe": "1h",
@@ -604,18 +600,18 @@
       {
         "leg": "tp1",
         "pnl_pct": 0.4261976047904252,
-        "close_fraction": 0.5,
-        "qty": 1300.7
+        "close_fraction": 0.5000384408395478,
+        "qty": 650.4
       },
       {
         "leg": "tp2",
         "pnl_pct": 0.8523952095808504,
-        "close_fraction": 0.5,
-        "qty": 1300.7
+        "close_fraction": 0.499961559160452,
+        "qty": 650.3
       }
     ],
     "tp_mode": "multi_tp",
-    "effective_weighted_rr": 1.1250000000000002,
+    "effective_weighted_rr": 1.1249711693703393,
     "tp_filled_qty": {},
     "realized_pnl_qty": 0.0,
     "realized_pnl_weighted_sum": 0.0,
@@ -628,9 +624,11 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1788616243700,
+    "last_observation_ts": 1788616543604,
     "last_exchange_avg_price": 0.003841,
-    "current_position_qty": 2601.4,
-    "protection_last_updated_ts": 1788616254834
+    "current_position_qty": 1300.7,
+    "protection_last_updated_ts": 1788616556624,
+    "be_trigger_r": 0.5,
+    "be_trigger_peak_r": 0.8704815137215218
   }
 }
