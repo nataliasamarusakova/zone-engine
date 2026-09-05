@@ -17,20 +17,16 @@
     "tp_orders": [
       {
         "leg": "tp1",
-        "status": "already_exists",
-        "order_id": "2096071202736529408",
-        "client_order_id": "evt_26f4ceca9ea03419_tp1",
-        "price": 0.2119,
-        "qty": 24.0,
+        "status": "error",
+        "error": "code=110413 msg=Take Profit price should be greater than the current price",
+        "qty": 12.0,
         "pnl_pct": 0.5992670940170927
       },
       {
         "leg": "tp2",
-        "status": "already_exists",
-        "order_id": "2096071206498820096",
-        "client_order_id": "evt_26f4ceca9ea03419_tp2",
-        "price": 0.2131,
-        "qty": 23.0,
+        "status": "error",
+        "error": "stale TP cancel failed: code=100001 msg=Signature verification failed due to signature mismatch,please verify our authentication signature and try to  run our sample code  from the link https://bingx-api.github.io/docs/#/en-us/spot/account-api.html#Query%20Assets",
+        "qty": 11.0,
         "pnl_pct": 1.1985341880341984
       }
     ],
@@ -39,17 +35,17 @@
       "order_id": "2096071199586607104",
       "client_order_id": "evt_26f4ceca9ea03419_sl",
       "stop_price": 0.2089,
-      "qty": 47.0
+      "qty": 23.0
     },
     "hit_legs": [],
     "be_activated": false,
     "be_activation_ts": null,
     "be_required": true,
     "be_last_error": "old SL cancel failed: Signature verification failed due to signature mismatch,please verify our authentication signature and try to  run our sample code  from the link https://bingx-api.github.io/docs/#/en-us/spot/account-api.html#Query%20Assets; new SL not created (no double-SL window)",
-    "peak_pnl_pct": 0.4273504273504198,
+    "peak_pnl_pct": 0.7122507122507129,
     "mae_pct": -0.522317188983864,
     "max_drawdown_pct": -0.8547008547008528,
-    "current_pnl_pct": 0.4273504273504198,
+    "current_pnl_pct": 0.5223171889838508,
     "score": 65.0,
     "event_type": "DEMAND_ZONE_TOUCH",
     "timeframe": "1h",
@@ -182,18 +178,18 @@
       {
         "leg": "tp1",
         "pnl_pct": 0.5992670940170927,
-        "close_fraction": 0.5106382978723404,
-        "qty": 24.0
+        "close_fraction": 0.5217391304347826,
+        "qty": 12.0
       },
       {
         "leg": "tp2",
         "pnl_pct": 1.1985341880341984,
-        "close_fraction": 0.48936170212765956,
-        "qty": 23.0
+        "close_fraction": 0.4782608695652174,
+        "qty": 11.0
       }
     ],
     "tp_mode": "multi_tp",
-    "effective_weighted_rr": 1.1170212765957404,
+    "effective_weighted_rr": 1.1086956521739086,
     "tp_filled_qty": {},
     "realized_pnl_qty": 0.0,
     "realized_pnl_weighted_sum": 0.0,
@@ -206,12 +202,12 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1788588346405,
+    "last_observation_ts": 1788588647533,
     "last_exchange_avg_price": 0.2106,
-    "current_position_qty": 47.0,
-    "protection_last_updated_ts": 1788588354210,
+    "current_position_qty": 23.0,
+    "protection_last_updated_ts": 1788588654780,
     "be_trigger_r": 0.5,
-    "be_trigger_peak_r": 0.5348413482280564
+    "be_trigger_peak_r": 0.8914022470467774
   },
   "ZONE_1370E65D41E5FEA91D4B4CAD": {
     "event_id": "ZONE_1370E65D41E5FEA91D4B4CAD",
@@ -260,10 +256,10 @@
     "be_activation_ts": null,
     "be_required": false,
     "be_last_error": null,
-    "peak_pnl_pct": 0.0,
+    "peak_pnl_pct": 0.2963194011228879,
     "mae_pct": -0.09357454772302636,
-    "max_drawdown_pct": -0.09357454772302636,
-    "current_pnl_pct": -0.06238303181534369,
+    "max_drawdown_pct": -0.15595757953837003,
+    "current_pnl_pct": 0.24953212726137475,
     "score": 65.0,
     "event_type": "SUPPLY_ZONE_TOUCH",
     "timeframe": "1h",
@@ -420,9 +416,9 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1788588346405,
+    "last_observation_ts": 1788588647533,
     "last_exchange_avg_price": 0.06412,
     "current_position_qty": 155.9,
-    "protection_last_updated_ts": 1788588355084
+    "protection_last_updated_ts": 1788588655149
   }
 }
