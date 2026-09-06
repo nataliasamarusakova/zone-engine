@@ -47,7 +47,7 @@
     "peak_pnl_pct": 1.7241379310344873,
     "mae_pct": -0.5747126436781624,
     "max_drawdown_pct": -2.2988505747126498,
-    "current_pnl_pct": 0.2873563218390812,
+    "current_pnl_pct": 0.07183908045976718,
     "score": 65.0,
     "event_type": "SUPPLY_ZONE_TOUCH",
     "timeframe": "1h",
@@ -204,10 +204,10 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1788733542193,
+    "last_observation_ts": 1788733863849,
     "last_exchange_avg_price": 0.01392,
     "current_position_qty": 358.0,
-    "protection_last_updated_ts": 1788733555981,
+    "protection_last_updated_ts": 1788733877500,
     "be_trigger_r": 0.5,
     "be_trigger_peak_r": 1.3968593944614476
   },
@@ -259,7 +259,7 @@
     "peak_pnl_pct": 0.37968675842430094,
     "mae_pct": -0.3796867584242845,
     "max_drawdown_pct": -0.7593735168485855,
-    "current_pnl_pct": -0.21357380161366826,
+    "current_pnl_pct": -0.11865211200758068,
     "score": 65.0,
     "event_type": "DEMAND_ZONE_TOUCH",
     "timeframe": "1h",
@@ -416,10 +416,10 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1788733542193,
+    "last_observation_ts": 1788733863849,
     "last_exchange_avg_price": 0.04214,
     "current_position_qty": 118.7,
-    "protection_last_updated_ts": 1788733559978,
+    "protection_last_updated_ts": 1788733885779,
     "be_trigger_r": 0.5,
     "be_trigger_peak_r": 0.5945524135112139
   },
@@ -441,20 +441,16 @@
     "tp_orders": [
       {
         "leg": "tp1",
-        "status": "already_exists",
-        "order_id": "2096690338986549248",
-        "client_order_id": "evt_62b1e90c74a7150c_tp1",
-        "price": 0.11964,
-        "qty": 42.13,
+        "status": "error",
+        "error": "code=110413 msg=Take Profit price should be greater than the current price",
+        "qty": 21.06,
         "pnl_pct": 0.8067549292214258
       },
       {
         "leg": "tp2",
-        "status": "already_exists",
-        "order_id": "2096690341184364544",
-        "client_order_id": "evt_62b1e90c74a7150c_tp2",
-        "price": 0.12059,
-        "qty": 42.12,
+        "status": "error",
+        "error": "stale TP cancel failed: code=100001 msg=Signature verification failed due to signature mismatch,please verify our authentication signature and try to  run our sample code  from the link https://bingx-api.github.io/docs/#/en-us/spot/account-api.html#Query%20Assets",
+        "qty": 21.06,
         "pnl_pct": 1.6135098584428516
       }
     ],
@@ -463,17 +459,17 @@
       "order_id": "2096690335790489600",
       "client_order_id": "evt_62b1e90c74a7150c_sl",
       "stop_price": 0.1174,
-      "qty": 84.25
+      "qty": 42.12
     },
     "hit_legs": [],
     "be_activated": false,
     "be_activation_ts": null,
     "be_required": true,
     "be_last_error": "old SL cancel failed: Signature verification failed due to signature mismatch,please verify our authentication signature and try to  run our sample code  from the link https://bingx-api.github.io/docs/#/en-us/spot/account-api.html#Query%20Assets; new SL not created (no double-SL window)",
-    "peak_pnl_pct": 0.6150994270306779,
+    "peak_pnl_pct": 0.7583417593528917,
     "mae_pct": -0.4128749578698942,
     "max_drawdown_pct": -0.9858442871587383,
-    "current_pnl_pct": 0.46343107516010185,
+    "current_pnl_pct": 0.7414897202561559,
     "score": 65.0,
     "event_type": "DEMAND_ZONE_TOUCH",
     "timeframe": "1h",
@@ -606,18 +602,18 @@
       {
         "leg": "tp1",
         "pnl_pct": 0.8067549292214258,
-        "close_fraction": 0.500059347181009,
-        "qty": 42.13
+        "close_fraction": 0.5,
+        "qty": 21.06
       },
       {
         "leg": "tp2",
         "pnl_pct": 1.6135098584428516,
-        "close_fraction": 0.4999406528189911,
-        "qty": 42.12
+        "close_fraction": 0.5,
+        "qty": 21.06
       }
     ],
     "tp_mode": "multi_tp",
-    "effective_weighted_rr": 1.1249554896142433,
+    "effective_weighted_rr": 1.1249999999999998,
     "tp_filled_qty": {},
     "realized_pnl_qty": 0.0,
     "realized_pnl_weighted_sum": 0.0,
@@ -630,11 +626,11 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1788733542193,
+    "last_observation_ts": 1788733863849,
     "last_exchange_avg_price": 0.11868,
-    "current_position_qty": 84.25,
-    "protection_last_updated_ts": 1788733559314,
+    "current_position_qty": 42.12,
+    "protection_last_updated_ts": 1788733884418,
     "be_trigger_r": 0.5,
-    "be_trigger_peak_r": 0.5718273958588868
+    "be_trigger_peak_r": 0.7049926798260259
   }
 }
