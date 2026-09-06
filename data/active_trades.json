@@ -17,20 +17,16 @@
     "tp_orders": [
       {
         "leg": "tp1",
-        "status": "already_exists",
-        "order_id": "2096433663033565184",
-        "client_order_id": "evt_82f3501805a49691_tp1",
-        "price": 0.2349,
-        "qty": 21.0,
+        "status": "error",
+        "error": "code=101400 msg=clientOrderID unique check failed",
+        "qty": 11.0,
         "pnl_pct": 0.8605276487969635
       },
       {
         "leg": "tp2",
-        "status": "already_exists",
-        "order_id": "2096433666707775488",
-        "client_order_id": "evt_82f3501805a49691_tp2",
-        "price": 0.2328,
-        "qty": 21.0,
+        "status": "error",
+        "error": "stale TP cancel failed: code=100001 msg=Signature verification failed due to signature mismatch,please verify our authentication signature and try to  run our sample code  from the link https://bingx-api.github.io/docs/#/en-us/spot/account-api.html#Query%20Assets",
+        "qty": 10.0,
         "pnl_pct": 1.7210552975939157
       }
     ],
@@ -39,17 +35,17 @@
       "order_id": "2096433656691777536",
       "client_order_id": "evt_82f3501805a49691_sl",
       "stop_price": 0.2396,
-      "qty": 42.0
+      "qty": 21.0
     },
     "hit_legs": [],
     "be_activated": false,
     "be_activation_ts": null,
     "be_required": true,
     "be_last_error": "old SL cancel failed: Signature verification failed due to signature mismatch,please verify our authentication signature and try to  run our sample code  from the link https://bingx-api.github.io/docs/#/en-us/spot/account-api.html#Query%20Assets; new SL not created (no double-SL window)",
-    "peak_pnl_pct": 0.8442380751371894,
+    "peak_pnl_pct": 1.1397214014352082,
     "mae_pct": -1.0975094976783415,
     "max_drawdown_pct": -1.8151118615449549,
-    "current_pnl_pct": 0.8020261713803347,
+    "current_pnl_pct": 1.0130856901646321,
     "score": 70.0,
     "event_type": "SUPPLY_ZONE_TOUCH",
     "timeframe": "1h",
@@ -182,18 +178,18 @@
       {
         "leg": "tp1",
         "pnl_pct": 0.8605276487969635,
-        "close_fraction": 0.5,
-        "qty": 21.0
+        "close_fraction": 0.5238095238095238,
+        "qty": 11.0
       },
       {
         "leg": "tp2",
         "pnl_pct": 1.7210552975939157,
-        "close_fraction": 0.5,
-        "qty": 21.0
+        "close_fraction": 0.47619047619047616,
+        "qty": 10.0
       }
     ],
     "tp_mode": "multi_tp",
-    "effective_weighted_rr": 1.1250000000000024,
+    "effective_weighted_rr": 1.1071428571428599,
     "tp_filled_qty": {},
     "realized_pnl_qty": 0.0,
     "realized_pnl_weighted_sum": 0.0,
@@ -206,223 +202,12 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1788704739593,
+    "last_observation_ts": 1788705058957,
     "last_exchange_avg_price": 0.2369,
-    "current_position_qty": 42.0,
-    "protection_last_updated_ts": 1788704759345,
+    "current_position_qty": 21.0,
+    "protection_last_updated_ts": 1788705082057,
     "be_trigger_r": 0.5,
-    "be_trigger_peak_r": 0.7358026871514166
-  },
-  "ZONE_E2A1434B3F1EE4A3CDE59F87": {
-    "event_id": "ZONE_E2A1434B3F1EE4A3CDE59F87",
-    "symbol": "ARK-USDT",
-    "name": "ARK-USDT",
-    "direction": "SHORT",
-    "entry_price": 0.1179,
-    "actual_entry_price": 0.1179,
-    "requested_entry_price": 0.1177,
-    "signal_reference_price": 0.1177,
-    "pre_order_reference_price": 0.1177,
-    "entry_slippage_pct": 0.16992353440952057,
-    "adverse_entry_slippage_pct": 0.0,
-    "initial_qty": 84.0,
-    "remaining_qty": 0.0,
-    "entry_ts": 1788670918651,
-    "tp_orders": [
-      {
-        "leg": "tp1",
-        "status": "error",
-        "error": "code=110414 msg=Take Profit price should be lower than the current price",
-        "qty": 21.0,
-        "pnl_pct": 0.5172474554707347
-      },
-      {
-        "leg": "tp2",
-        "status": "error",
-        "error": "stale TP cancel failed: code=100001 msg=Signature verification failed due to signature mismatch,please verify our authentication signature and try to  run our sample code  from the link https://bingx-api.github.io/docs/#/en-us/spot/account-api.html#Query%20Assets",
-        "qty": 21.0,
-        "pnl_pct": 1.0344949109414694
-      }
-    ],
-    "sl_order": {
-      "status": "already_exists",
-      "order_id": "2096463892191993856",
-      "client_order_id": "evt_716d13fd116ea45c_sl",
-      "stop_price": 0.1187,
-      "qty": 42.0
-    },
-    "hit_legs": [],
-    "be_activated": false,
-    "be_activation_ts": null,
-    "be_required": true,
-    "be_last_error": "old SL cancel failed: Signature verification failed due to signature mismatch,please verify our authentication signature and try to  run our sample code  from the link https://bingx-api.github.io/docs/#/en-us/spot/account-api.html#Query%20Assets; new SL not created (no double-SL window)",
-    "peak_pnl_pct": 1.1874469889737052,
-    "mae_pct": -0.5937234944868467,
-    "max_drawdown_pct": -1.1026293469041524,
-    "current_pnl_pct": 1.0178117048346111,
-    "score": 65.0,
-    "event_type": "SUPPLY_ZONE_TOUCH",
-    "timeframe": "1h",
-    "research": {
-      "source": "BingX 1H demand_supply zone engine"
-    },
-    "setup": {
-      "strategy": "Demand/Supply Zone First",
-      "signal_price": 0.1177,
-      "entry_reference": 0.1179,
-      "invalidation_price": 0.118713113,
-      "risk_pct": 0.6896632739609756,
-      "target_rr": 1.5000000000000084,
-      "planned_weighted_rr": 1.1250000000000062,
-      "tp_levels": [
-        {
-          "leg": "tp1",
-          "pnl_pct": 0.5172474554707347,
-          "close_fraction": 0.5,
-          "price": 0.11729016525000001
-        },
-        {
-          "leg": "tp2",
-          "pnl_pct": 1.0344949109414694,
-          "close_fraction": 0.5,
-          "price": 0.11668033050000001
-        }
-      ],
-      "target_price": 0.11668033050000001,
-      "zone": {
-        "top": 0.1186,
-        "btm": 0.1183009686260775,
-        "poi": 0.11845048431303876,
-        "start": 100,
-        "start_idx": 100,
-        "age_bars": 18,
-        "impulse_atr": 0.54,
-        "kind": "SUPPLY"
-      },
-      "confirmation": {
-        "alma_cross": false,
-        "directional_candle_required": true,
-        "directional_candle_ok": true,
-        "zone_age_limit_bars": 30,
-        "zone_age_bars": 18,
-        "minimum_structure_room_r": 1.2,
-        "zone_touch": true,
-        "volume_ratio": 0.549,
-        "candle_body_atr": 0.442,
-        "range_atr": 0.884,
-        "bullish_candle": false,
-        "bearish_candle": true
-      },
-      "score": 65.0,
-      "event_time": "2026-09-06T04:00:00+00:00",
-      "protection_status": "PROTECTED",
-      "protection_result": {
-        "status": "PROTECTED",
-        "symbol": "ARK-USDT",
-        "bx_symbol": "ARK-USDT",
-        "direction": "SHORT",
-        "avg_price": 0.1179,
-        "qty": 84.0,
-        "tp_mode": "multi_tp",
-        "effective_tp_levels": [
-          {
-            "leg": "tp1",
-            "pnl_pct": 0.5172474554707347,
-            "close_fraction": 0.5,
-            "qty": 42.0
-          },
-          {
-            "leg": "tp2",
-            "pnl_pct": 1.0344949109414694,
-            "close_fraction": 0.5,
-            "qty": 42.0
-          }
-        ],
-        "effective_weighted_rr": 1.1250000000000064,
-        "tp_orders": [
-          {
-            "leg": "tp1",
-            "status": "created",
-            "order_id": "2096463895488716800",
-            "client_order_id": "evt_716d13fd116ea45c_tp1",
-            "price": 0.1173,
-            "qty": 42.0,
-            "pnl_pct": 0.5172474554707347
-          },
-          {
-            "leg": "tp2",
-            "status": "created",
-            "order_id": "2096463897741058048",
-            "client_order_id": "evt_716d13fd116ea45c_tp2",
-            "price": 0.1167,
-            "qty": 42.0,
-            "pnl_pct": 1.0344949109414694
-          }
-        ],
-        "sl_result": {
-          "status": "created",
-          "order_id": "2096463892191993856",
-          "client_order_id": "EVT_716D13FD116EA45C_SL",
-          "stop_price": 0.11871311300000001,
-          "qty": 84.0
-        }
-      }
-    },
-    "planned_risk_pct": 0.6896632739609756,
-    "planned_target_rr": 1.5000000000000084,
-    "planned_weighted_rr": 1.1250000000000062,
-    "planned_entry_reference": 0.1179,
-    "planned_invalidation_price": 0.118713113,
-    "planned_target_price": 0.11668033050000001,
-    "tp_levels": [
-      {
-        "leg": "tp1",
-        "pnl_pct": 0.5172474554707347,
-        "close_fraction": 0.5,
-        "price": 0.11729016525000001
-      },
-      {
-        "leg": "tp2",
-        "pnl_pct": 1.0344949109414694,
-        "close_fraction": 0.5,
-        "price": 0.11668033050000001
-      }
-    ],
-    "effective_tp_levels": [
-      {
-        "leg": "tp1",
-        "pnl_pct": 0.5172474554707347,
-        "close_fraction": 0.5,
-        "qty": 21.0
-      },
-      {
-        "leg": "tp2",
-        "pnl_pct": 1.0344949109414694,
-        "close_fraction": 0.5,
-        "qty": 21.0
-      }
-    ],
-    "tp_mode": "multi_tp",
-    "effective_weighted_rr": 1.1250000000000064,
-    "tp_filled_qty": {},
-    "realized_pnl_qty": 84.0,
-    "realized_pnl_weighted_sum": 85.49618320610733,
-    "last_tp_exec_price": null,
-    "last_close_exec_price": null,
-    "realized_pnl_pct": 1.0178117048346111,
-    "realized_rr": null,
-    "exit_price": 0.1167,
-    "exit_reason": "POSITION_CLOSED_UNVERIFIED",
-    "closed_ts": 1788704739593,
-    "duration_min": 563.6823666666667,
-    "closed": true,
-    "last_observation_ts": 1788704739593,
-    "last_exchange_avg_price": 0.1179,
-    "current_position_qty": 0.0,
-    "protection_last_updated_ts": 1788704171694,
-    "be_trigger_r": 0.5,
-    "be_trigger_peak_r": 1.3528254990388997,
-    "realized_pnl_source": "observation_price_estimate"
+    "be_trigger_peak_r": 0.9933336276544147
   },
   "ZONE_0D7D8FB7887DC60FC2D31254": {
     "event_id": "ZONE_0D7D8FB7887DC60FC2D31254",
@@ -467,10 +252,10 @@
     "be_activation_ts": null,
     "be_required": true,
     "be_last_error": "old SL cancel failed: Signature verification failed due to signature mismatch,please verify our authentication signature and try to  run our sample code  from the link https://bingx-api.github.io/docs/#/en-us/spot/account-api.html#Query%20Assets; new SL not created (no double-SL window)",
-    "peak_pnl_pct": 1.2778315585672815,
+    "peak_pnl_pct": 1.4133591481122971,
     "mae_pct": -0.11616650532429343,
-    "max_drawdown_pct": -0.7550822846079408,
-    "current_pnl_pct": 1.2778315585672815,
+    "max_drawdown_pct": -1.393998063891575,
+    "current_pnl_pct": 1.374636979670866,
     "score": 70.0,
     "event_type": "SUPPLY_ZONE_TOUCH",
     "timeframe": "1h",
@@ -627,12 +412,12 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1788704739593,
+    "last_observation_ts": 1788705058957,
     "last_exchange_avg_price": 0.05165,
     "current_position_qty": 96.71,
     "protection_last_updated_ts": 1788704766605,
     "be_trigger_r": 0.5,
-    "be_trigger_peak_r": 1.3325284323206872
+    "be_trigger_peak_r": 1.4738572054456096
   },
   "ZONE_E15059F922629B29BC85B320": {
     "event_id": "ZONE_E15059F922629B29BC85B320",
@@ -652,20 +437,16 @@
     "tp_orders": [
       {
         "leg": "tp1",
-        "status": "already_exists",
-        "order_id": "2096584756401102848",
-        "client_order_id": "evt_6d2255b6f29f867c_tp1",
-        "price": 0.01379,
-        "qty": 358.0,
+        "status": "error",
+        "error": "code=101400 msg=clientOrderID unique check failed",
+        "qty": 179.0,
         "pnl_pct": 0.9257219827586294
       },
       {
         "leg": "tp2",
-        "status": "already_exists",
-        "order_id": "2096584758548586496",
-        "client_order_id": "evt_6d2255b6f29f867c_tp2",
-        "price": 0.01366,
-        "qty": 358.0,
+        "status": "error",
+        "error": "stale TP cancel failed: code=100001 msg=Signature verification failed due to signature mismatch,please verify our authentication signature and try to  run our sample code  from the link https://bingx-api.github.io/docs/#/en-us/spot/account-api.html#Query%20Assets",
+        "qty": 179.0,
         "pnl_pct": 1.851443965517246
       }
     ],
@@ -674,17 +455,17 @@
       "order_id": "2096584753356038144",
       "client_order_id": "evt_6d2255b6f29f867c_sl",
       "stop_price": 0.01409,
-      "qty": 716.0
+      "qty": 358.0
     },
     "hit_legs": [],
     "be_activated": false,
     "be_activation_ts": null,
     "be_required": true,
     "be_last_error": "old SL cancel failed: Signature verification failed due to signature mismatch,please verify our authentication signature and try to  run our sample code  from the link https://bingx-api.github.io/docs/#/en-us/spot/account-api.html#Query%20Assets; new SL not created (no double-SL window)",
-    "peak_pnl_pct": 0.9339080459770108,
+    "peak_pnl_pct": 1.0775862068965576,
     "mae_pct": -0.2873563218390812,
-    "max_drawdown_pct": -1.0775862068965576,
-    "current_pnl_pct": 0.8620689655172437,
+    "max_drawdown_pct": -1.221264367816092,
+    "current_pnl_pct": 1.0775862068965576,
     "score": 65.0,
     "event_type": "SUPPLY_ZONE_TOUCH",
     "timeframe": "1h",
@@ -818,13 +599,13 @@
         "leg": "tp1",
         "pnl_pct": 0.9257219827586294,
         "close_fraction": 0.5,
-        "qty": 358.0
+        "qty": 179.0
       },
       {
         "leg": "tp2",
         "pnl_pct": 1.851443965517246,
         "close_fraction": 0.5,
-        "qty": 358.0
+        "qty": 179.0
       }
     ],
     "tp_mode": "multi_tp",
@@ -841,12 +622,12 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1788704739593,
+    "last_observation_ts": 1788705058957,
     "last_exchange_avg_price": 0.01392,
-    "current_position_qty": 716.0,
-    "protection_last_updated_ts": 1788704767517,
+    "current_position_qty": 358.0,
+    "protection_last_updated_ts": 1788705080360,
     "be_trigger_r": 0.5,
-    "be_trigger_peak_r": 0.7566321719999483
+    "be_trigger_peak_r": 0.8730371215384072
   },
   "ZONE_D942403B5AD50F7119B49F03": {
     "event_id": "ZONE_D942403B5AD50F7119B49F03",
@@ -896,7 +677,7 @@
     "peak_pnl_pct": 0.8856275303643685,
     "mae_pct": -0.15182186234817782,
     "max_drawdown_pct": -1.0374493927125463,
-    "current_pnl_pct": 0.16025641025640666,
+    "current_pnl_pct": 0.45546558704453344,
     "score": 65.0,
     "event_type": "DEMAND_ZONE_TOUCH",
     "timeframe": "1h",
@@ -1053,10 +834,10 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1788704739593,
+    "last_observation_ts": 1788705058957,
     "last_exchange_avg_price": 0.11856,
     "current_position_qty": 42.15,
-    "protection_last_updated_ts": 1788704764487,
+    "protection_last_updated_ts": 1788705086420,
     "be_trigger_r": 0.5,
     "be_trigger_peak_r": 0.8918901700961992
   },
@@ -1103,10 +884,10 @@
     "be_activation_ts": null,
     "be_required": true,
     "be_last_error": "old SL cancel failed: Signature verification failed due to signature mismatch,please verify our authentication signature and try to  run our sample code  from the link https://bingx-api.github.io/docs/#/en-us/spot/account-api.html#Query%20Assets; new SL not created (no double-SL window)",
-    "peak_pnl_pct": 0.9059233449477322,
+    "peak_pnl_pct": 1.0452961672473877,
     "mae_pct": -0.3484320557491293,
-    "max_drawdown_pct": -0.9756097560975503,
-    "current_pnl_pct": 0.8362369337978947,
+    "max_drawdown_pct": -1.2543554006968614,
+    "current_pnl_pct": 1.0452961672473877,
     "score": 70.0,
     "event_type": "SUPPLY_ZONE_TOUCH",
     "timeframe": "1h",
@@ -1263,11 +1044,11 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1788704739593,
+    "last_observation_ts": 1788705058957,
     "last_exchange_avg_price": 0.1435,
     "current_position_qty": 34.0,
-    "protection_last_updated_ts": 1788704761069,
+    "protection_last_updated_ts": 1788705083780,
     "be_trigger_r": 0.5,
-    "be_trigger_peak_r": 0.8513374839309891
+    "be_trigger_peak_r": 0.9823124814588376
   }
 }
