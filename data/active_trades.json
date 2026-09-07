@@ -18,7 +18,7 @@
       {
         "leg": "tp1",
         "status": "created",
-        "order_id": "2096826144875175936",
+        "order_id": "2096828586941571072",
         "client_order_id": "evt_97b41c35f2e679b0_tp1",
         "price": 0.003123,
         "qty": 797.0,
@@ -47,7 +47,7 @@
     "peak_pnl_pct": 0.9232728430436149,
     "mae_pct": -0.2546959567016797,
     "max_drawdown_pct": -1.1779687997452946,
-    "current_pnl_pct": 0.5412289079910884,
+    "current_pnl_pct": 0.5093919134033733,
     "score": 70.0,
     "event_type": "SUPPLY_ZONE_TOUCH",
     "timeframe": "1h",
@@ -204,10 +204,10 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1788757543578,
+    "last_observation_ts": 1788757849826,
     "last_exchange_avg_price": 0.003141,
     "current_position_qty": 1593.0,
-    "protection_last_updated_ts": 1788757285580,
+    "protection_last_updated_ts": 1788757867930,
     "be_trigger_r": 0.5,
     "be_trigger_peak_r": 1.1902807420784836
   },
@@ -229,7 +229,7 @@
     "tp_orders": [
       {
         "leg": "tp1",
-        "status": "created",
+        "status": "already_exists",
         "order_id": "2096826264911962112",
         "client_order_id": "evt_dbc9fd7bb35c31cf_tp1",
         "price": 0.008026,
@@ -238,7 +238,7 @@
       },
       {
         "leg": "tp2",
-        "status": "created",
+        "status": "already_exists",
         "order_id": "2096826266753261568",
         "client_order_id": "evt_dbc9fd7bb35c31cf_tp2",
         "price": 0.008059,
@@ -247,21 +247,21 @@
       }
     ],
     "sl_order": {
-      "status": "created",
+      "status": "already_exists",
       "order_id": "2096826259274817536",
-      "client_order_id": "EVT_DBC9FD7BB35C31CF_SL",
-      "stop_price": 0.007949185,
+      "client_order_id": "evt_dbc9fd7bb35c31cf_sl",
+      "stop_price": 0.007949,
       "qty": 1251.0
     },
     "hit_legs": [],
     "be_activated": false,
     "be_activation_ts": null,
-    "be_required": false,
-    "be_last_error": null,
-    "peak_pnl_pct": 0.1876642061804002,
+    "be_required": true,
+    "be_last_error": "old SL cancel failed: Signature verification failed due to signature mismatch,please verify our authentication signature and try to  run our sample code  from the link https://bingx-api.github.io/docs/#/en-us/spot/account-api.html#Query%20Assets; new SL not created (no double-SL window)",
+    "peak_pnl_pct": 0.37532841236082215,
     "mae_pct": -0.08757662955085777,
-    "max_drawdown_pct": -0.2251970474164759,
-    "current_pnl_pct": 0.13762041786563986,
+    "max_drawdown_pct": -0.27524083573125796,
+    "current_pnl_pct": 0.21268610033779123,
     "score": 65.0,
     "event_type": "DEMAND_ZONE_TOUCH",
     "timeframe": "1h",
@@ -390,9 +390,22 @@
         "price": 0.0080587225
       }
     ],
-    "effective_tp_levels": [],
+    "effective_tp_levels": [
+      {
+        "leg": "tp1",
+        "pnl_pct": 0.41112535968973124,
+        "close_fraction": 0.5003996802557954,
+        "qty": 626.0
+      },
+      {
+        "leg": "tp2",
+        "pnl_pct": 0.8222507193794625,
+        "close_fraction": 0.49960031974420466,
+        "qty": 625.0
+      }
+    ],
     "tp_mode": "multi_tp",
-    "effective_weighted_rr": 1.1249999999999851,
+    "effective_weighted_rr": 1.1247002398081385,
     "tp_filled_qty": {},
     "realized_pnl_qty": 0.0,
     "realized_pnl_weighted_sum": 0.0,
@@ -405,8 +418,11 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1788757543578,
+    "last_observation_ts": 1788757849826,
     "last_exchange_avg_price": 0.007993,
-    "current_position_qty": 1251.0
+    "current_position_qty": 1251.0,
+    "be_trigger_r": 0.5,
+    "be_trigger_peak_r": 0.6846970215679543,
+    "protection_last_updated_ts": 1788757869019
   }
 }
