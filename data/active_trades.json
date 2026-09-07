@@ -49,7 +49,7 @@
     "peak_pnl_pct": 0.6453347674106052,
     "mae_pct": -1.0890024200053847,
     "max_drawdown_pct": -1.4923366496370176,
-    "current_pnl_pct": 0.026888948642116325,
+    "current_pnl_pct": 0.17477816617370948,
     "score": 75.0,
     "event_type": "SUPPLY_ZONE_TOUCH",
     "timeframe": "1h",
@@ -206,10 +206,10 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1788811033887,
+    "last_observation_ts": 1788811378685,
     "last_exchange_avg_price": 0.07438,
     "current_position_qty": 134.4,
-    "protection_last_updated_ts": 1788811043822
+    "protection_last_updated_ts": 1788811390561
   },
   "ZONE_D05B58D22ACA5097650158D5": {
     "event_id": "ZONE_D05B58D22ACA5097650158D5",
@@ -261,7 +261,7 @@
     "peak_pnl_pct": 0.6395614435815498,
     "mae_pct": -0.45682960255824295,
     "max_drawdown_pct": -1.0050251256281315,
-    "current_pnl_pct": 0.6395614435815498,
+    "current_pnl_pct": 0.2740977615349522,
     "score": 75.0,
     "event_type": "SUPPLY_ZONE_TOUCH",
     "timeframe": "1h",
@@ -418,11 +418,647 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1788811033887,
+    "last_observation_ts": 1788811378685,
     "last_exchange_avg_price": 0.02189,
     "current_position_qty": 457.03,
-    "protection_last_updated_ts": 1788811044201,
+    "protection_last_updated_ts": 1788811391659,
     "be_trigger_r": 0.5,
     "be_trigger_peak_r": 0.509155710726827
+  },
+  "ZONE_119724B99DC0E0BD71CA6D56": {
+    "event_id": "ZONE_119724B99DC0E0BD71CA6D56",
+    "symbol": "ACT-USDT",
+    "name": "ACT-USDT",
+    "direction": "LONG",
+    "entry_price": 0.010941,
+    "actual_entry_price": 0.010941,
+    "requested_entry_price": 0.01092,
+    "signal_reference_price": 0.01092,
+    "pre_order_reference_price": 0.01092,
+    "entry_slippage_pct": 0.192307692307694,
+    "adverse_entry_slippage_pct": 0.192307692307694,
+    "initial_qty": 913.82,
+    "remaining_qty": 913.82,
+    "entry_ts": 1788811366271,
+    "tp_orders": [
+      {
+        "leg": "tp1",
+        "status": "already_exists",
+        "order_id": "2097052976140607488",
+        "client_order_id": "evt_8e92aa86c584fb8f_tp1",
+        "price": 0.011027,
+        "qty": 456.91,
+        "pnl_pct": 0.7854126679462448
+      },
+      {
+        "leg": "tp2",
+        "status": "already_exists",
+        "order_id": "2097052978002878464",
+        "client_order_id": "evt_8e92aa86c584fb8f_tp2",
+        "price": 0.011113,
+        "qty": 456.91,
+        "pnl_pct": 1.5708253358924895
+      }
+    ],
+    "sl_order": {
+      "status": "already_exists",
+      "order_id": "2097052970524434432",
+      "client_order_id": "evt_8e92aa86c584fb8f_sl",
+      "stop_price": 0.010826,
+      "qty": 913.82
+    },
+    "hit_legs": [],
+    "be_activated": false,
+    "be_activation_ts": null,
+    "be_required": false,
+    "be_last_error": null,
+    "peak_pnl_pct": 0.0,
+    "mae_pct": 0.0,
+    "max_drawdown_pct": 0.0,
+    "current_pnl_pct": -0.027419797093497223,
+    "score": 65.0,
+    "event_type": "DEMAND_ZONE_TOUCH",
+    "timeframe": "1h",
+    "research": {
+      "source": "BingX 1H demand_supply zone engine"
+    },
+    "setup": {
+      "strategy": "Demand/Supply Zone First",
+      "signal_price": 0.01092,
+      "entry_reference": 0.010941,
+      "invalidation_price": 0.010826424000000001,
+      "risk_pct": 1.047216890594993,
+      "target_rr": 1.5,
+      "planned_weighted_rr": 1.125,
+      "tp_levels": [
+        {
+          "leg": "tp1",
+          "pnl_pct": 0.7854126679462448,
+          "close_fraction": 0.5,
+          "price": 0.011026931999999998
+        },
+        {
+          "leg": "tp2",
+          "pnl_pct": 1.5708253358924895,
+          "close_fraction": 0.5,
+          "price": 0.011112863999999997
+        }
+      ],
+      "target_price": 0.011112863999999997,
+      "zone": {
+        "top": 0.010873876151976075,
+        "btm": 0.01084,
+        "poi": 0.010856938075988039,
+        "start": 969,
+        "start_idx": 969,
+        "age_bars": 29,
+        "impulse_atr": 0.41,
+        "kind": "DEMAND"
+      },
+      "confirmation": {
+        "alma_cross": false,
+        "directional_candle_required": true,
+        "directional_candle_ok": true,
+        "zone_age_limit_bars": 30,
+        "zone_age_bars": 29,
+        "minimum_structure_room_r": 1.2,
+        "zone_touch": true,
+        "volume_ratio": 0.337,
+        "candle_body_atr": 0.516,
+        "range_atr": 0.81,
+        "bullish_candle": true,
+        "bearish_candle": false
+      },
+      "score": 65.0,
+      "event_time": "2026-09-07T19:00:00+00:00",
+      "protection_status": "PROTECTED",
+      "protection_result": {
+        "status": "PROTECTED",
+        "symbol": "ACT-USDT",
+        "bx_symbol": "ACT-USDT",
+        "direction": "LONG",
+        "avg_price": 0.010941,
+        "qty": 913.82,
+        "tp_mode": "multi_tp",
+        "effective_tp_levels": [
+          {
+            "leg": "tp1",
+            "pnl_pct": 0.7854126679462448,
+            "close_fraction": 0.5,
+            "qty": 456.91
+          },
+          {
+            "leg": "tp2",
+            "pnl_pct": 1.5708253358924895,
+            "close_fraction": 0.5,
+            "qty": 456.91
+          }
+        ],
+        "effective_weighted_rr": 1.125,
+        "tp_orders": [
+          {
+            "leg": "tp1",
+            "status": "created",
+            "order_id": "2097052976140607488",
+            "client_order_id": "evt_8e92aa86c584fb8f_tp1",
+            "price": 0.011027,
+            "qty": 456.91,
+            "pnl_pct": 0.7854126679462448
+          },
+          {
+            "leg": "tp2",
+            "status": "created",
+            "order_id": "2097052978002878464",
+            "client_order_id": "evt_8e92aa86c584fb8f_tp2",
+            "price": 0.011113,
+            "qty": 456.91,
+            "pnl_pct": 1.5708253358924895
+          }
+        ],
+        "sl_result": {
+          "status": "created",
+          "order_id": "2097052970524434432",
+          "client_order_id": "EVT_8E92AA86C584FB8F_SL",
+          "stop_price": 0.010826424000000001,
+          "qty": 913.82
+        }
+      }
+    },
+    "planned_risk_pct": 1.047216890594993,
+    "planned_target_rr": 1.5,
+    "planned_weighted_rr": 1.125,
+    "planned_entry_reference": 0.010941,
+    "planned_invalidation_price": 0.010826424000000001,
+    "planned_target_price": 0.011112863999999997,
+    "tp_levels": [
+      {
+        "leg": "tp1",
+        "pnl_pct": 0.7854126679462448,
+        "close_fraction": 0.5,
+        "price": 0.011026931999999998
+      },
+      {
+        "leg": "tp2",
+        "pnl_pct": 1.5708253358924895,
+        "close_fraction": 0.5,
+        "price": 0.011112863999999997
+      }
+    ],
+    "effective_tp_levels": [
+      {
+        "leg": "tp1",
+        "pnl_pct": 0.7854126679462448,
+        "close_fraction": 0.5,
+        "qty": 456.91
+      },
+      {
+        "leg": "tp2",
+        "pnl_pct": 1.5708253358924895,
+        "close_fraction": 0.5,
+        "qty": 456.91
+      }
+    ],
+    "tp_mode": "multi_tp",
+    "effective_weighted_rr": 1.125,
+    "tp_filled_qty": {},
+    "realized_pnl_qty": 0.0,
+    "realized_pnl_weighted_sum": 0.0,
+    "last_tp_exec_price": null,
+    "last_close_exec_price": null,
+    "realized_pnl_pct": null,
+    "realized_rr": null,
+    "exit_price": null,
+    "exit_reason": null,
+    "closed_ts": null,
+    "duration_min": null,
+    "closed": false,
+    "last_observation_ts": 1788811378685,
+    "last_exchange_avg_price": 0.010941,
+    "current_position_qty": 913.82,
+    "protection_last_updated_ts": 1788811392055
+  },
+  "ZONE_00BD0B2B0EEA46EB753751BB": {
+    "event_id": "ZONE_00BD0B2B0EEA46EB753751BB",
+    "symbol": "BLUR-USDT",
+    "name": "BLUR-USDT",
+    "direction": "LONG",
+    "entry_price": 0.01743,
+    "actual_entry_price": 0.01743,
+    "requested_entry_price": 0.01741,
+    "signal_reference_price": 0.01741,
+    "pre_order_reference_price": 0.01741,
+    "entry_slippage_pct": 0.11487650775417954,
+    "adverse_entry_slippage_pct": 0.11487650775417954,
+    "initial_qty": 574.0,
+    "remaining_qty": 574.0,
+    "entry_ts": 1788811372346,
+    "tp_orders": [
+      {
+        "leg": "tp1",
+        "status": "already_exists",
+        "order_id": "2097053001675530240",
+        "client_order_id": "evt_0fa6a9e11345dc9c_tp1",
+        "price": 0.01757,
+        "qty": 287.0,
+        "pnl_pct": 0.8035413080894942
+      },
+      {
+        "leg": "tp2",
+        "status": "already_exists",
+        "order_id": "2097053003491663872",
+        "client_order_id": "evt_0fa6a9e11345dc9c_tp2",
+        "price": 0.01771,
+        "qty": 287.0,
+        "pnl_pct": 1.6070826161789884
+      }
+    ],
+    "sl_order": {
+      "status": "already_exists",
+      "order_id": "2097052997615443968",
+      "client_order_id": "evt_0fa6a9e11345dc9c_sl",
+      "stop_price": 0.01724,
+      "qty": 574.0
+    },
+    "hit_legs": [],
+    "be_activated": false,
+    "be_activation_ts": null,
+    "be_required": false,
+    "be_last_error": null,
+    "peak_pnl_pct": 0.0,
+    "mae_pct": 0.0,
+    "max_drawdown_pct": 0.0,
+    "current_pnl_pct": -0.2294893861159027,
+    "score": 65.0,
+    "event_type": "DEMAND_ZONE_TOUCH",
+    "timeframe": "1h",
+    "research": {
+      "source": "BingX 1H demand_supply zone engine"
+    },
+    "setup": {
+      "strategy": "Demand/Supply Zone First",
+      "signal_price": 0.01741,
+      "entry_reference": 0.01743,
+      "invalidation_price": 0.017243257,
+      "risk_pct": 1.071388410785999,
+      "target_rr": 1.4999999999999907,
+      "planned_weighted_rr": 1.124999999999993,
+      "tp_levels": [
+        {
+          "leg": "tp1",
+          "pnl_pct": 0.8035413080894942,
+          "close_fraction": 0.5,
+          "price": 0.01757005725
+        },
+        {
+          "leg": "tp2",
+          "pnl_pct": 1.6070826161789884,
+          "close_fraction": 0.5,
+          "price": 0.0177101145
+        }
+      ],
+      "target_price": 0.0177101145,
+      "zone": {
+        "top": 0.017302448296956287,
+        "btm": 0.01726,
+        "poi": 0.017281224148478144,
+        "start": 986,
+        "start_idx": 986,
+        "age_bars": 12,
+        "impulse_atr": 1.978,
+        "kind": "DEMAND"
+      },
+      "confirmation": {
+        "alma_cross": false,
+        "directional_candle_required": true,
+        "directional_candle_ok": true,
+        "zone_age_limit_bars": 30,
+        "zone_age_bars": 12,
+        "minimum_structure_room_r": 1.2,
+        "zone_touch": true,
+        "volume_ratio": 0.367,
+        "candle_body_atr": 0.597,
+        "range_atr": 0.717,
+        "bullish_candle": true,
+        "bearish_candle": false
+      },
+      "score": 65.0,
+      "event_time": "2026-09-07T19:00:00+00:00",
+      "protection_status": "PROTECTED",
+      "protection_result": {
+        "status": "PROTECTED",
+        "symbol": "BLUR-USDT",
+        "bx_symbol": "BLUR-USDT",
+        "direction": "LONG",
+        "avg_price": 0.01743,
+        "qty": 574.0,
+        "tp_mode": "multi_tp",
+        "effective_tp_levels": [
+          {
+            "leg": "tp1",
+            "pnl_pct": 0.8035413080894942,
+            "close_fraction": 0.5,
+            "qty": 287.0
+          },
+          {
+            "leg": "tp2",
+            "pnl_pct": 1.6070826161789884,
+            "close_fraction": 0.5,
+            "qty": 287.0
+          }
+        ],
+        "effective_weighted_rr": 1.1249999999999931,
+        "tp_orders": [
+          {
+            "leg": "tp1",
+            "status": "created",
+            "order_id": "2097053001675530240",
+            "client_order_id": "evt_0fa6a9e11345dc9c_tp1",
+            "price": 0.01757,
+            "qty": 287.0,
+            "pnl_pct": 0.8035413080894942
+          },
+          {
+            "leg": "tp2",
+            "status": "created",
+            "order_id": "2097053003491663872",
+            "client_order_id": "evt_0fa6a9e11345dc9c_tp2",
+            "price": 0.01771,
+            "qty": 287.0,
+            "pnl_pct": 1.6070826161789884
+          }
+        ],
+        "sl_result": {
+          "status": "created",
+          "order_id": "2097052997615443968",
+          "client_order_id": "EVT_0FA6A9E11345DC9C_SL",
+          "stop_price": 0.017243257,
+          "qty": 574.0
+        }
+      }
+    },
+    "planned_risk_pct": 1.071388410785999,
+    "planned_target_rr": 1.4999999999999907,
+    "planned_weighted_rr": 1.124999999999993,
+    "planned_entry_reference": 0.01743,
+    "planned_invalidation_price": 0.017243257,
+    "planned_target_price": 0.0177101145,
+    "tp_levels": [
+      {
+        "leg": "tp1",
+        "pnl_pct": 0.8035413080894942,
+        "close_fraction": 0.5,
+        "price": 0.01757005725
+      },
+      {
+        "leg": "tp2",
+        "pnl_pct": 1.6070826161789884,
+        "close_fraction": 0.5,
+        "price": 0.0177101145
+      }
+    ],
+    "effective_tp_levels": [
+      {
+        "leg": "tp1",
+        "pnl_pct": 0.8035413080894942,
+        "close_fraction": 0.5,
+        "qty": 287.0
+      },
+      {
+        "leg": "tp2",
+        "pnl_pct": 1.6070826161789884,
+        "close_fraction": 0.5,
+        "qty": 287.0
+      }
+    ],
+    "tp_mode": "multi_tp",
+    "effective_weighted_rr": 1.1249999999999931,
+    "tp_filled_qty": {},
+    "realized_pnl_qty": 0.0,
+    "realized_pnl_weighted_sum": 0.0,
+    "last_tp_exec_price": null,
+    "last_close_exec_price": null,
+    "realized_pnl_pct": null,
+    "realized_rr": null,
+    "exit_price": null,
+    "exit_reason": null,
+    "closed_ts": null,
+    "duration_min": null,
+    "closed": false,
+    "last_observation_ts": 1788811378685,
+    "last_exchange_avg_price": 0.01743,
+    "current_position_qty": 574.0,
+    "protection_last_updated_ts": 1788811393156
+  },
+  "ZONE_882D3EC85B6F1B3CCB15AFA9": {
+    "event_id": "ZONE_882D3EC85B6F1B3CCB15AFA9",
+    "symbol": "PENGU-USDT",
+    "name": "PENGU-USDT",
+    "direction": "LONG",
+    "entry_price": 0.008586,
+    "actual_entry_price": 0.008586,
+    "requested_entry_price": 0.008601,
+    "signal_reference_price": 0.008601,
+    "pre_order_reference_price": 0.008601,
+    "entry_slippage_pct": -0.17439832577606545,
+    "adverse_entry_slippage_pct": 0.0,
+    "initial_qty": 1164.2,
+    "remaining_qty": 1164.2,
+    "entry_ts": 1788811378134,
+    "tp_orders": [
+      {
+        "leg": "tp1",
+        "status": "already_exists",
+        "order_id": "2097053023783706624",
+        "client_order_id": "evt_28d8e13991f28ef6_tp1",
+        "price": 0.008671,
+        "qty": 582.1,
+        "pnl_pct": 0.9904350104821651
+      },
+      {
+        "leg": "tp2",
+        "status": "already_exists",
+        "order_id": "2097053027747323904",
+        "client_order_id": "evt_28d8e13991f28ef6_tp2",
+        "price": 0.008756,
+        "qty": 582.1,
+        "pnl_pct": 1.9808700209643302
+      }
+    ],
+    "sl_order": {
+      "status": "already_exists",
+      "order_id": "2097053018209476608",
+      "client_order_id": "evt_28d8e13991f28ef6_sl",
+      "stop_price": 0.008473,
+      "qty": 1164.2
+    },
+    "hit_legs": [],
+    "be_activated": false,
+    "be_activation_ts": null,
+    "be_required": false,
+    "be_last_error": null,
+    "peak_pnl_pct": 0.0,
+    "mae_pct": 0.0,
+    "max_drawdown_pct": 0.0,
+    "current_pnl_pct": -0.046587467971121954,
+    "score": 65.0,
+    "event_type": "DEMAND_ZONE_TOUCH",
+    "timeframe": "1h",
+    "research": {
+      "source": "BingX 1H demand_supply zone engine"
+    },
+    "setup": {
+      "strategy": "Demand/Supply Zone First",
+      "signal_price": 0.008601,
+      "entry_reference": 0.008586,
+      "invalidation_price": 0.008472615000000001,
+      "risk_pct": 1.3205800139762267,
+      "target_rr": 1.4999999999999925,
+      "planned_weighted_rr": 1.1249999999999942,
+      "tp_levels": [
+        {
+          "leg": "tp1",
+          "pnl_pct": 0.9904350104821651,
+          "close_fraction": 0.5,
+          "price": 0.008671038749999999
+        },
+        {
+          "leg": "tp2",
+          "pnl_pct": 1.9808700209643302,
+          "close_fraction": 0.5,
+          "price": 0.008756077499999997
+        }
+      ],
+      "target_price": 0.008756077499999997,
+      "zone": {
+        "top": 0.00851713946366067,
+        "btm": 0.008486,
+        "poi": 0.008501569731830336,
+        "start": 970,
+        "start_idx": 970,
+        "age_bars": 28,
+        "impulse_atr": 1.38,
+        "kind": "DEMAND"
+      },
+      "confirmation": {
+        "alma_cross": false,
+        "directional_candle_required": true,
+        "directional_candle_ok": true,
+        "zone_age_limit_bars": 30,
+        "zone_age_bars": 28,
+        "minimum_structure_room_r": 1.2,
+        "zone_touch": true,
+        "volume_ratio": 0.475,
+        "candle_body_atr": 0.605,
+        "range_atr": 0.994,
+        "bullish_candle": true,
+        "bearish_candle": false
+      },
+      "score": 65.0,
+      "event_time": "2026-09-07T19:00:00+00:00",
+      "protection_status": "PROTECTED",
+      "protection_result": {
+        "status": "PROTECTED",
+        "symbol": "PENGU-USDT",
+        "bx_symbol": "PENGU-USDT",
+        "direction": "LONG",
+        "avg_price": 0.008586,
+        "qty": 1164.2,
+        "tp_mode": "multi_tp",
+        "effective_tp_levels": [
+          {
+            "leg": "tp1",
+            "pnl_pct": 0.9904350104821651,
+            "close_fraction": 0.5,
+            "qty": 582.1
+          },
+          {
+            "leg": "tp2",
+            "pnl_pct": 1.9808700209643302,
+            "close_fraction": 0.5,
+            "qty": 582.1
+          }
+        ],
+        "effective_weighted_rr": 1.1249999999999944,
+        "tp_orders": [
+          {
+            "leg": "tp1",
+            "status": "created",
+            "order_id": "2097053023783706624",
+            "client_order_id": "evt_28d8e13991f28ef6_tp1",
+            "price": 0.008671,
+            "qty": 582.1,
+            "pnl_pct": 0.9904350104821651
+          },
+          {
+            "leg": "tp2",
+            "status": "created",
+            "order_id": "2097053027747323904",
+            "client_order_id": "evt_28d8e13991f28ef6_tp2",
+            "price": 0.008756,
+            "qty": 582.1,
+            "pnl_pct": 1.9808700209643302
+          }
+        ],
+        "sl_result": {
+          "status": "created",
+          "order_id": "2097053018209476608",
+          "client_order_id": "EVT_28D8E13991F28EF6_SL",
+          "stop_price": 0.008472615000000001,
+          "qty": 1164.2
+        }
+      }
+    },
+    "planned_risk_pct": 1.3205800139762267,
+    "planned_target_rr": 1.4999999999999925,
+    "planned_weighted_rr": 1.1249999999999942,
+    "planned_entry_reference": 0.008586,
+    "planned_invalidation_price": 0.008472615000000001,
+    "planned_target_price": 0.008756077499999997,
+    "tp_levels": [
+      {
+        "leg": "tp1",
+        "pnl_pct": 0.9904350104821651,
+        "close_fraction": 0.5,
+        "price": 0.008671038749999999
+      },
+      {
+        "leg": "tp2",
+        "pnl_pct": 1.9808700209643302,
+        "close_fraction": 0.5,
+        "price": 0.008756077499999997
+      }
+    ],
+    "effective_tp_levels": [
+      {
+        "leg": "tp1",
+        "pnl_pct": 0.9904350104821651,
+        "close_fraction": 0.5,
+        "qty": 582.1
+      },
+      {
+        "leg": "tp2",
+        "pnl_pct": 1.9808700209643302,
+        "close_fraction": 0.5,
+        "qty": 582.1
+      }
+    ],
+    "tp_mode": "multi_tp",
+    "effective_weighted_rr": 1.1249999999999944,
+    "tp_filled_qty": {},
+    "realized_pnl_qty": 0.0,
+    "realized_pnl_weighted_sum": 0.0,
+    "last_tp_exec_price": null,
+    "last_close_exec_price": null,
+    "realized_pnl_pct": null,
+    "realized_rr": null,
+    "exit_price": null,
+    "exit_reason": null,
+    "closed_ts": null,
+    "duration_min": null,
+    "closed": false,
+    "last_observation_ts": 1788811378685,
+    "last_exchange_avg_price": 0.008586,
+    "current_position_qty": 1164.2,
+    "protection_last_updated_ts": 1788811394224
   }
 }
