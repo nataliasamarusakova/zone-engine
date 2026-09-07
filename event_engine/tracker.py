@@ -479,6 +479,34 @@ def _notify_be_failure(symbol: str, direction: str, detail: str, *, event_id: st
     _send_tracker_notification("BE_FAILURE", event_id, text, symbol=symbol)
 
 
+def _cancel_engine_protection_before_emergency_close(symbol: str, direction: str) -> dict:
+    """Cancel engine-owned SL/TP orders before a MARKET safety rollback."""
+    result = {"status": "ok", "cancelled": [], "errors": []}
+    try:
+        existing = get_open_protection_directional(symbol, direction)
+    except Exception as exc:
+        return {"status": "error", "cancelled": [], "errors": [str(exc)]}
+    if existing.get("status") != "ok":
+        return {"status": "error", "cancelled": [], "errors": [existing.get("error", "openOrders unavailable")]}
+    for order in list(existing.get("sl_orders", [])) + list(existing.get("tp_orders", [])):
+        oid = str(order.get("orderId", ""))
+        cid = str(order.get("clientOrderId", "")).upper()
+        if not oid or not cid.startswith("EVT_"):
+            continue
+        try:
+            resp = cancel_order(symbol, oid)
+        except Exception as exc:
+            result["errors"].append(f"{oid}: {exc}")
+            continue
+        if isinstance(resp, dict) and resp.get("code") in (0, "0"):
+            result["cancelled"].append(oid)
+        else:
+            result["errors"].append(f"{oid}: {resp}")
+    if result["errors"]:
+        result["status"] = "partial" if result["cancelled"] else "error"
+    return result
+
+
 def _emergency_close_after_be_failure(symbol: str, direction: str, qty: float, trade_id: str | None) -> dict:
     """Close and verify a position after BE protection cannot be proven.
 
@@ -493,9 +521,13 @@ def _emergency_close_after_be_failure(symbol: str, direction: str, qty: float, t
 
     def _extract_directional_from_positions(rows: list[dict]) -> dict:
         wanted = str(direction).upper()
-        bx = to_bx_symbol(symbol)
+        # Rows returned by get_positions() already contain the BingX symbol. Do
+        # not call to_bx_symbol() here: that helper can refresh contracts over the
+        # network and would turn a supposedly local fallback reconciliation into
+        # another network dependency during an emergency path.
+        bx = str(symbol or "").upper()
         for p in rows or []:
-            if str(p.get("symbol", "")).upper() != str(bx or "").upper():
+            if str(p.get("symbol", "")).upper() != bx:
                 continue
             side = str(p.get("positionSide", "")).upper()
             try:
@@ -557,6 +589,9 @@ def _emergency_close_after_be_failure(symbol: str, direction: str, qty: float, t
     current_qty = abs(_safe_float(initial.get("positionAmt"), qty))
     if current_qty <= 0:
         return {"status": "already_closed", "attempts": attempts, "remaining_qty": 0.0, "last_known_qty": 0.0}
+
+    cleanup_result = _cancel_engine_protection_before_emergency_close(symbol, direction)
+    attempts.append({"cleanup_before_close": cleanup_result})
 
     try:
         close_result = close_position_market(symbol, direction, current_qty, trade_id=trade_id)
@@ -759,7 +794,15 @@ def _move_sl_to_break_even(
                 current_protection = {"status": "error", "error": str(exc)}
             if current_protection.get("status") == "ok":
                 for sl in current_protection.get("sl_orders", []):
-                    if str(sl.get("orderId", "")) == str(old_sl_id) and _validate_sl_order_for_position(sl, direction, entry_price, qty):
+                    if str(sl.get("orderId", "")) != str(old_sl_id):
+                        continue
+                    sl_qty = _safe_float(sl.get("origQty") or sl.get("quantity"), 0.0)
+                    # After TP1 the live position may be smaller than the original
+                    # SL order quantity. The original SL still protects the residual
+                    # position as long as it covers the residual size and is on the
+                    # correct side of the market.
+                    qty_covers_position = sl_qty > 0 and sl_qty + max(qty * 0.01, 1e-12) >= qty
+                    if qty_covers_position and _validate_sl_order_for_position(sl, direction, entry_price, None):
                         old_sl_still_protected = True
                         break
 
@@ -833,11 +876,23 @@ def _move_sl_to_break_even(
     if not new_order_id:
         return _fail("BE stop response has no orderId")
 
-    verified_after = get_open_protection_directional(symbol, direction)
-    if verified_after.get("status") != "ok":
-        return _fail("BE stop verification failed")
+    # BingX may acknowledge the order before it appears in open-orders. Poll
+    # GET/openOrders rather than treating the first read as a definitive failure.
+    found = False
+    polls = max(3, int(os.environ.get("BE_VERIFY_POLLS", "5")))
+    delay = max(0.10, float(os.environ.get("BE_VERIFY_POLL_SEC", "0.30")))
+    for attempt in range(polls):
+        try:
+            verified_after = get_open_protection_directional(symbol, direction)
+        except Exception as exc:
+            verified_after = {"status": "error", "error": str(exc)}
+        if verified_after.get("status") == "ok":
+            if any(str(o.get("orderId", "")) == new_order_id for o in verified_after.get("sl_orders", [])):
+                found = True
+                break
+        if attempt + 1 < polls:
+            time.sleep(delay * (attempt + 1))
 
-    found = any(str(o.get("orderId", "")) == new_order_id for o in verified_after.get("sl_orders", []))
     if not found:
         return _fail("BE stop not visible on exchange")
 

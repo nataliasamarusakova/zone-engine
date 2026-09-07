@@ -1320,7 +1320,7 @@ def ensure_directional_protection(
         if sl_price <= 0 or sl_qty <= 0:
             continue
 
-        protective_side = (sl_price < avg_price) if direction == "LONG" else (sl_price > avg_price)
+        protective_side = (sl_price <= avg_price) if direction == "LONG" else (sl_price >= avg_price)
         qty_matches = _qty_matches_position(sl_qty, position_qty)
         if protective_side and qty_matches and valid_existing_sl is None:
             valid_existing_sl = sl
@@ -1697,8 +1697,8 @@ def _validate_sl_order_for_position(order: dict, direction: str, avg_price: floa
         return False
 
     if direction == "LONG":
-        return sl_price < avg_price
+        return sl_price <= avg_price
     if direction == "SHORT":
-        return sl_price > avg_price
+        return sl_price >= avg_price
 
     return False
