@@ -3,8 +3,6 @@ name: Zone Signal Engine
 on:
   repository_dispatch:
     types: [run_event_engine]
-  schedule:
-    - cron: "*/5 * * * *"
 
 permissions:
   contents: write
@@ -94,22 +92,8 @@ jobs:
       - name: Run tests
         run: python -m pytest -q
 
-      - name: Run engine / tracker
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ "${{ github.event_name }}" == "schedule" ]]; then
-            echo "[SCHEDULE] tracker-only cycle"
-            python - <<'PY'
-          from event_engine.tracker import update_active_trades
-          from run_once import reconcile_all_open_positions
-
-          update_active_trades()
-          reconcile_all_open_positions()
-          PY
-          else
-            python run_once.py
-          fi
+      - name: Run engine
+        run: python run_once.py
 
       - name: Commit state
         if: always()
