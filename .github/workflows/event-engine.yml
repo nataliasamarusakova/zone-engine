@@ -103,9 +103,10 @@ jobs:
           git config user.name "actions-user"
           git config user.email "actions@github.com"
           git status --short
-          # Never stage the unbounded scan journal; it is intentionally local-only.
-          git rm --cached --ignore-unmatch data/scan_history.jsonl 2>/dev/null || true
-          git add data/actions.jsonl data/active_trades.json data/failed_signals.json data/latest_scan.json data/latest_scan.txt data/signal_history.jsonl data/trades.jsonl 2>/dev/null || true
+          # Stage all persistent engine state, including newly-created files.
+          # Keep the unbounded scan journal local-only.
+          git add data/
+          git reset -- data/scan_history.jsonl data/scan_history.jsonl.* 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "No state changes"
             exit 0
