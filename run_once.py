@@ -36,7 +36,8 @@ from event_engine.tracker import register_active_trade, update_active_trades, up
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("zone_engine")
 
-DATA = Path("data")
+PROJECT_ROOT = Path(__file__).resolve().parent
+DATA = PROJECT_ROOT / "data"
 TRADES_PATH = DATA / "trades.jsonl"
 FAILED_SIGNALS_PATH = DATA / "failed_signals.json"
 FAILED_SIGNAL_TTL_SEC = int(os.environ.get("FAILED_SIGNAL_TTL_SEC", str(24 * 3600)))

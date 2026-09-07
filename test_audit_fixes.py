@@ -929,3 +929,20 @@ def test_be_rollback_does_not_call_stale_qty_current_after_close_verification_er
     assert out["status"] == "close_unverified"
     assert out["remaining_qty"] is None
     assert out["last_known_qty"] == 1.0
+
+
+def test_runtime_state_paths_are_project_root_relative(tmp_path, monkeypatch):
+    """State must stay under the repository data/ directory regardless of cwd."""
+    import os
+    import run_once
+    from event_engine import analytics, tracker
+
+    monkeypatch.chdir(tmp_path)
+    expected = (tmp_path / "unused").resolve()
+    project_root = Path(run_once.__file__).resolve().parent
+
+    assert run_once.DATA == project_root / "data"
+    assert tracker.DATA == project_root / "data"
+    assert analytics.DATA_DIR == project_root / "data"
+    assert run_once.DATA != Path.cwd() / "data"
+    assert expected != project_root / "data"
