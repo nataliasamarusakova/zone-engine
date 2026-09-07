@@ -613,6 +613,33 @@ def _rebase_protection_after_fill(signal: dict[str, Any], avg_price: float) -> d
     }
 
 
+def _cancel_engine_protection_before_emergency_close(symbol: str, direction: str) -> dict[str, Any]:
+    """Best-effort cleanup of this engine's SL/TP orders before a MARKET rollback."""
+    result = {"status": "ok", "cancelled": [], "errors": []}
+    try:
+        existing = get_open_protection_directional(symbol, direction)
+    except Exception as exc:
+        return {"status": "error", "cancelled": [], "errors": [str(exc)]}
+    if existing.get("status") != "ok":
+        return {"status": "error", "cancelled": [], "errors": [existing.get("error", "openOrders unavailable")]}
+    for order in list(existing.get("sl_orders", [])) + list(existing.get("tp_orders", [])):
+        oid = str(order.get("orderId", ""))
+        cid = str(order.get("clientOrderId", "")).upper()
+        if not oid or not cid.startswith("EVT_"):
+            continue
+        try:
+            resp = cancel_order(symbol, oid)
+            if isinstance(resp, dict) and resp.get("code") in (0, "0"):
+                result["cancelled"].append(oid)
+            else:
+                result["errors"].append(f"{oid}: {resp}")
+        except Exception as exc:
+            result["errors"].append(f"{oid}: {exc}")
+    if result["errors"]:
+        result["status"] = "partial" if result["cancelled"] else "error"
+    return result
+
+
 def _emergency_close_and_verify(symbol: str, direction: str, qty: float, trade_id: str) -> dict[str, Any]:
     """Close a safety-rollback position and verify that it is actually gone."""
     attempts = []
@@ -758,8 +785,8 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     if adverse_slippage_pct > MAX_ENTRY_SLIPPAGE_PCT:
         reason = f"adverse_entry_slippage={adverse_slippage_pct:.4f}% > {MAX_ENTRY_SLIPPAGE_PCT:.4f}%"
         log.critical("[SAFETY_CLOSE] %s %s | %s", symbol, direction, reason)
+        cleanup = _cancel_engine_protection_before_emergency_close(symbol, direction)
         close_result = _emergency_close_and_verify(symbol, direction, qty, event_id)
-        cleanup = _cleanup_engine_protection(symbol, direction)
         return {"status": "opened_then_emergency_closed", "error": reason, "order": order, "position": position, "close": close_result, "protection_cleanup": cleanup, "executed_signal": dict(signal)}
 
     # Recalculate ALL absolute protection levels from the real market fill.
@@ -769,8 +796,8 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         reason = f"post-fill protection rebase failed: {exc}"
         log.critical("[SAFETY_CLOSE] %s %s | %s", symbol, direction, reason)
+        cleanup = _cancel_engine_protection_before_emergency_close(symbol, direction)
         close_result = _emergency_close_and_verify(symbol, direction, qty, event_id)
-        cleanup = _cleanup_engine_protection(symbol, direction)
         return {"status": "opened_then_emergency_closed", "error": reason, "order": order, "position": position, "close": close_result, "protection_cleanup": cleanup, "executed_signal": dict(signal)}
 
     sl_price = float(rebased["sl"])
@@ -799,8 +826,8 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     valid, reason = _validate_trade_geometry(actual_signal)
     if not valid:
         log.critical("[SAFETY_CLOSE] %s %s | invalid post-fill protection geometry | %s", symbol, direction, reason)
+        cleanup = _cancel_engine_protection_before_emergency_close(symbol, direction)
         close_result = _emergency_close_and_verify(symbol, direction, qty, event_id)
-        cleanup = _cleanup_engine_protection(symbol, direction)
         return {"status": "opened_then_emergency_closed", "error": reason, "order": order, "position": position, "close": close_result, "protection_cleanup": cleanup, "executed_signal": actual_signal}
 
     setup["entry_reference"] = avg_price
@@ -828,8 +855,8 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         log.critical("[SAFETY_CLOSE] %s %s | mandatory protection incomplete | %s", symbol, direction, protection)
         # Mandatory rule: never leave a newly-opened position live without BOTH
         # a verified SL and both TP legs. Attempt an immediate market rollback.
+        cleanup = _cancel_engine_protection_before_emergency_close(symbol, direction)
         close_result = _emergency_close_and_verify(symbol, direction, qty, event_id)
-        cleanup = _cleanup_engine_protection(symbol, direction)
         try:
             time.sleep(0.25)
             verify_closed = get_position_directional(symbol, direction)

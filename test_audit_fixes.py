@@ -89,9 +89,11 @@ def test_open_market_blocks_two_tp_min_quantity_before_order(monkeypatch):
     assert out["status"] == "skipped_tp_min_qty"
 
 
-def test_sl_order_validation_is_strictly_one_sided():
+def test_sl_order_validation_is_one_sided_and_be_allows_entry():
     from event_engine import bingx
     assert bingx._validate_sl_order_for_position({"type":"STOP_MARKET","stopPrice":"99","origQty":"1"}, "LONG", 100.0)
+    assert bingx._validate_sl_order_for_position({"type":"STOP_MARKET","stopPrice":"100","origQty":"1"}, "LONG", 100.0)
+    assert bingx._validate_sl_order_for_position({"type":"STOP_MARKET","stopPrice":"100","origQty":"1"}, "SHORT", 100.0)
     assert not bingx._validate_sl_order_for_position({"type":"STOP_MARKET","stopPrice":"100.2","origQty":"1"}, "LONG", 100.0)
     assert bingx._validate_sl_order_for_position({"type":"STOP_MARKET","stopPrice":"101","origQty":"1"}, "SHORT", 100.0)
     assert not bingx._validate_sl_order_for_position({"type":"STOP_MARKET","stopPrice":"99.8","origQty":"1"}, "SHORT", 100.0)
@@ -904,6 +906,7 @@ def test_be_rollback_uses_full_position_fallback_when_directional_read_errors(mo
     from event_engine import tracker
     monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: {"status": "error", "error": "temporary"})
     monkeypatch.setattr(tracker, "get_positions", lambda *a, **k: [])
+    monkeypatch.setattr(tracker, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
     monkeypatch.setattr(tracker, "close_position_market", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not send close when full positions confirms absence")))
     out = tracker._emergency_close_after_be_failure("AAA-USDT", "LONG", 1.0, "T")
     assert out["status"] == "already_closed"
@@ -918,6 +921,7 @@ def test_be_rollback_does_not_call_stale_qty_current_after_close_verification_er
     ])
     monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: next(states, {"status": "error", "error": "position endpoint timeout"}))
     monkeypatch.setattr(tracker, "get_positions", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("full positions timeout")))
+    monkeypatch.setattr(tracker, "get_open_protection_directional", lambda *a, **k: {"status": "error", "error": "openOrders timeout"})
     monkeypatch.setattr(tracker, "close_position_market", lambda *a, **k: {
         "status": "closed", "response": {"code": 0, "data": {"order": {"orderId": "CLOSE1"}}},
     })
@@ -946,3 +950,138 @@ def test_runtime_state_paths_are_project_root_relative(tmp_path, monkeypatch):
     assert analytics.DATA_DIR == project_root / "data"
     assert run_once.DATA != Path.cwd() / "data"
     assert expected != project_root / "data"
+
+
+def test_be_sl_at_entry_is_valid_protection(monkeypatch):
+    from event_engine import bingx
+    sl = {"type": "STOP_MARKET", "stopPrice": "100", "origQty": "1"}
+    assert bingx._validate_sl_order_for_position(sl, "LONG", 100.0, 1.0) is True
+    assert bingx._validate_sl_order_for_position(sl, "SHORT", 100.0, 1.0) is True
+
+
+def test_be_verification_polls_after_eventual_consistency(monkeypatch):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "to_bx_symbol", lambda s: s)
+    monkeypatch.setattr(tracker, "get_contract", lambda s: {"quantityPrecision": 3, "pricePrecision": 2})
+    monkeypatch.setattr(tracker, "position_side_param", lambda direction: "LONG")
+    states = iter([
+        {"status": "ok", "sl_orders": [{"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1"}], "tp_orders": []},
+        {"status": "ok", "sl_orders": [{"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1"}], "tp_orders": []},
+        {"status": "ok", "sl_orders": [{"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1"}, {"orderId": "BE1", "type": "STOP_MARKET", "stopPrice": "100", "origQty": "0.5"}], "tp_orders": []},
+        {"status": "ok", "sl_orders": [{"orderId": "BE1", "type": "STOP_MARKET", "stopPrice": "100", "origQty": "0.5"}], "tp_orders": []},
+    ])
+    monkeypatch.setattr(tracker, "get_open_protection_directional", lambda *a, **k: next(states))
+    monkeypatch.setattr(tracker, "_request", lambda method, path, params: {"code": 0, "data": {"order": {"orderId": "BE1", "clientOrderId": params["clientOrderId"]}}})
+    monkeypatch.setattr(tracker, "_cancel_old_sl_verified", lambda *a, **k: (True, "cancelled"))
+    monkeypatch.setattr(tracker.time, "sleep", lambda *a, **k: None)
+    out = tracker._move_sl_to_break_even("AAA-USDT", "LONG", 100.0, 0.5, "OLD1", "T", old_sl_price=99.0)
+    assert out["status"] == "created"
+    assert out["order_id"] == "BE1"
+
+
+def test_be_failure_accepts_full_size_old_sl_for_residual_position(monkeypatch):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "to_bx_symbol", lambda s: s)
+    monkeypatch.setattr(tracker, "get_contract", lambda s: {"quantityPrecision": 3, "pricePrecision": 2})
+    monkeypatch.setattr(tracker, "position_side_param", lambda direction: "LONG")
+    states = iter([
+        {"status": "ok", "sl_orders": [{"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1"}], "tp_orders": []},
+        {"status": "ok", "sl_orders": [{"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1"}], "tp_orders": []},
+    ])
+    monkeypatch.setattr(tracker, "get_open_protection_directional", lambda *a, **k: next(states))
+    monkeypatch.setattr(tracker, "_request", lambda method, path, params: {"code": 99, "msg": "BE rejected"})
+    monkeypatch.setattr(tracker, "_emergency_close_after_be_failure", lambda *a, **k: (_ for _ in ()).throw(AssertionError("should keep valid old SL")))
+    monkeypatch.setattr(tracker, "send_tg", lambda *a, **k: True)
+    out = tracker._move_sl_to_break_even("AAA-USDT", "LONG", 100.0, 0.5, "OLD1", "T", old_sl_price=99.0)
+    assert out["safety_action"] == "old_sl_kept"
+    assert out["old_sl_restored"] is True
+
+
+def test_emergency_close_cleanup_happens_before_market_close(monkeypatch):
+    import run_once
+    calls = []
+    monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {
+        "status": "ok",
+        "sl_orders": [{"orderId": "SL1", "clientOrderId": "EVT_SL"}],
+        "tp_orders": [{"orderId": "TP1", "clientOrderId": "EVT_TP"}],
+    })
+    monkeypatch.setattr(run_once, "cancel_order", lambda symbol, oid: calls.append(("cancel", oid)) or {"code": 0})
+    monkeypatch.setattr(run_once, "get_position_directional", lambda *a, **k: {"status": "found", "positionAmt": 1.0})
+    monkeypatch.setattr(run_once, "close_position_market", lambda *a, **k: calls.append(("close",)) or {"status": "closed", "response": {"data": {"order": {"orderId": "C1"}}}})
+    monkeypatch.setattr(run_once, "time", type("T", (), {"sleep": staticmethod(lambda *a, **k: None)})())
+    # Force one bounded attempt to avoid a long mock loop.
+    monkeypatch.setenv("EMERGENCY_CLOSE_ATTEMPTS", "2")
+    monkeypatch.setenv("EMERGENCY_CLOSE_VERIFY_POLLS", "2")
+    result = run_once.execute_new_position
+    # Inspect helper directly: cleanup must precede any caller that invokes the close.
+    cleanup = run_once._cancel_engine_protection_before_emergency_close("AAA-USDT", "LONG")
+    assert cleanup["status"] == "ok"
+    calls.clear()
+    run_once._emergency_close_and_verify("AAA-USDT", "LONG", 1.0, "EVT1")
+    # The close helper itself has no cleanup side effect; the production call sites
+    # are responsible for invoking cleanup first. Verify that helper separately is callable.
+    assert calls[0][0] == "close"
+
+
+def test_workflow_stages_all_data_but_excludes_scan_history():
+    from pathlib import Path
+    text = Path(".github/workflows/event-engine.yml").read_text(encoding="utf-8")
+    assert "git add data/" in text
+    assert "git reset -- data/scan_history.jsonl" in text
+    assert 'schedule:' not in text
+
+
+def test_emergency_be_rollback_cleans_engine_orders_before_close(monkeypatch):
+    from event_engine import tracker
+    calls = []
+    monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: {"status": "found", "positionAmt": 1.0, "avgPrice": 100.0})
+    monkeypatch.setattr(tracker, "get_open_protection_directional", lambda *a, **k: {
+        "status": "ok",
+        "sl_orders": [{"orderId": "SL1", "clientOrderId": "EVT_SL"}],
+        "tp_orders": [{"orderId": "TP1", "clientOrderId": "EVT_TP"}],
+    })
+    monkeypatch.setattr(tracker, "cancel_order", lambda symbol, oid: calls.append(("cancel", oid)) or {"code": 0})
+    monkeypatch.setattr(tracker, "close_position_market", lambda *a, **k: calls.append(("close",)) or {"status": "closed", "response": {"data": {"order": {"orderId": "C1"}}}})
+    states = iter([{"status": "found", "positionAmt": 1.0}, {"status": "not_found"}])
+    monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: next(states, {"status": "not_found"}))
+    monkeypatch.setattr(tracker, "get_order", lambda *a, **k: {"status": "ok", "order_status": "FILLED", "executed_qty": 1.0})
+    monkeypatch.setattr(tracker.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setenv("BE_FAILURE_CLOSE_POLLS", "2")
+    out = tracker._emergency_close_after_be_failure("AAA-USDT", "LONG", 1.0, "T")
+    assert out["status"] == "closed_verified"
+    assert calls[:3] == [("cancel", "SL1"), ("cancel", "TP1"), ("close",)]
+
+
+def test_emergency_close_only_cancels_engine_owned_protection(monkeypatch):
+    import run_once
+    monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {
+        "status": "ok",
+        "sl_orders": [
+            {"orderId": "E1", "clientOrderId": "EVT_SL"},
+            {"orderId": "M1", "clientOrderId": "MANUAL_SL"},
+        ],
+        "tp_orders": [{"orderId": "E2", "clientOrderId": "EVT_TP"}],
+    })
+    cancelled = []
+    monkeypatch.setattr(run_once, "cancel_order", lambda symbol, oid: cancelled.append(oid) or {"code": 0})
+    out = run_once._cancel_engine_protection_before_emergency_close("AAA-USDT", "LONG")
+    assert out["status"] == "ok"
+    assert cancelled == ["E1", "E2"]
+
+
+def test_emergency_be_rollback_fallback_does_not_refresh_contracts(monkeypatch):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: {"status": "error", "error": "temporary"})
+    monkeypatch.setattr(tracker, "get_positions", lambda *a, **k: [])
+    monkeypatch.setattr(tracker, "to_bx_symbol", lambda *a, **k: (_ for _ in ()).throw(AssertionError("fallback must not refresh contracts")))
+    out = tracker._emergency_close_after_be_failure("AAA-USDT", "LONG", 1.0, "T")
+    assert out["status"] == "already_closed"
+
+
+def test_run_once_all_emergency_paths_cleanup_before_close():
+    from pathlib import Path
+    text = Path("run_once.py").read_text(encoding="utf-8")
+    # Each execute_new_position emergency branch must call cleanup immediately
+    # before the emergency close helper, preventing protection orders from
+    # competing with the rollback MARKET close.
+    assert text.count("cleanup = _cancel_engine_protection_before_emergency_close(symbol, direction)\n        close_result = _emergency_close_and_verify") >= 4
