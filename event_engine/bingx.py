@@ -1306,6 +1306,7 @@ def ensure_directional_protection(
     tp_levels_norm = _normalize_tp_levels(tp_levels)
 
     valid_existing_sl = None
+    engine_owned_invalid_sl_ids: list[str] = []
     for sl in existing_sl:
         order_type = str(sl.get("type", "")).upper()
         if order_type not in {"STOP", "STOP_MARKET"}:
@@ -1319,13 +1320,36 @@ def ensure_directional_protection(
         if sl_price <= 0 or sl_qty <= 0:
             continue
 
-        # Initial protective SL must be strictly on the loss side of the
-        # actual entry. Do not accept a small percentage-wide "tolerance" that
-        # can accidentally treat a wrong-side SL as valid.
         protective_side = (sl_price < avg_price) if direction == "LONG" else (sl_price > avg_price)
-        if protective_side and _qty_matches_position(sl_qty, position_qty):
+        qty_matches = _qty_matches_position(sl_qty, position_qty)
+        if protective_side and qty_matches and valid_existing_sl is None:
             valid_existing_sl = sl
-            break
+            continue
+
+        # A stale/wrong-side/order-size-mismatched SL created by this engine
+        # must never remain alongside a newly-created protective SL. Manual
+        # orders are intentionally left untouched; the engine only cleans its
+        # own EVT_* protection orders.
+        client_id = str(sl.get("clientOrderId", ""))
+        order_id = str(sl.get("orderId", ""))
+        if order_id and client_id.upper().startswith("EVT_"):
+            engine_owned_invalid_sl_ids.append(order_id)
+
+    if engine_owned_invalid_sl_ids:
+        for old_id in engine_owned_invalid_sl_ids:
+            try:
+                cancel_resp = cancel_order(symbol, old_id)
+            except Exception as exc:
+                return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "error": f"engine SL cleanup failed for {old_id}: {exc}"}
+            if not isinstance(cancel_resp, dict) or cancel_resp.get("code") not in (0, "0"):
+                return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "error": f"engine SL cleanup failed for {old_id}: {cancel_resp}"}
+
+        post_cleanup = get_open_protection_directional(symbol, direction)
+        if post_cleanup.get("status") != "ok":
+            return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "error": "engine SL cleanup could not be verified"}
+        remaining_ids = {str(o.get("orderId", "")) for o in post_cleanup.get("sl_orders", [])}
+        if any(old_id in remaining_ids for old_id in engine_owned_invalid_sl_ids):
+            return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "error": "engine SL cleanup not visible on exchange"}
 
     if valid_existing_sl is not None:
         sl = valid_existing_sl

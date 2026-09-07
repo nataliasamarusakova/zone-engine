@@ -22,6 +22,7 @@ from event_engine.bingx import (
     fetch_klines,
     to_bx_symbol,
     get_contract,
+    close_position_market,
     _format_price,
     _format_qty,
     _request,
@@ -35,6 +36,7 @@ log = logging.getLogger("event_engine.tracker")
 DATA = Path("data")
 ACTIVE_TRADES_PATH = DATA / "active_trades.json"
 TRADES_PATH = DATA / "trades.jsonl"
+ACTIONS_PATH = DATA / "actions.jsonl"
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -119,6 +121,52 @@ def _append_trade_record(record: dict) -> None:
     with _JOURNAL_LOCK:
         with TRADES_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _append_action_record(record: dict) -> None:
+    ACTIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _JOURNAL_LOCK:
+        with ACTIONS_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _send_tracker_notification(kind: str, event_id: str, text: str, *, symbol: str, leg: str | None = None) -> bool:
+    """Send a non-trading notification and record the delivery outcome.
+
+    Telegram delivery is deliberately not retried here: a client-side timeout
+    can mean Telegram accepted the message, and an automatic resend could create
+    a duplicate notification. The caller must treat False as a delivery failure
+    for observability, never as a trading-state failure.
+    """
+    try:
+        ok = bool(send_tg(text))
+    except Exception as exc:
+        ok = False
+        log.error("[TG_%s_FAILED] event=%s symbol=%s leg=%s error=%s", kind, event_id, symbol, leg or "", exc)
+        _append_action_record({
+            "ts": int(time.time() * 1000),
+            "action": kind,
+            "event_id": str(event_id),
+            "symbol": symbol,
+            "leg": leg,
+            "telegram_ok": False,
+            "error": str(exc),
+        })
+        return False
+
+    _append_action_record({
+        "ts": int(time.time() * 1000),
+        "action": kind,
+        "event_id": str(event_id),
+        "symbol": symbol,
+        "leg": leg,
+        "telegram_ok": ok,
+    })
+    if not ok:
+        log.error("[TG_%s_FAILED] event=%s symbol=%s leg=%s send() returned False", kind, event_id, symbol, leg or "")
+    else:
+        log.info("[TG_%s_SENT] event=%s symbol=%s leg=%s", kind, event_id, symbol, leg or "")
+    return ok
 
 def _append_trade_close_once(record: dict) -> bool:
     """Atomically avoid duplicate TRADE_CLOSE records across overlapping runs."""
@@ -396,16 +444,58 @@ def _cancel_old_sl_verified(symbol: str, direction: str, order_id: str, max_atte
     return False, last_error
 
 
-def _notify_be_failure(symbol: str, direction: str, detail: str) -> None:
-    """Best-effort Telegram alert when the BE swap could not be completed."""
+def _notify_be_failure(symbol: str, direction: str, detail: str, *, event_id: str = "") -> None:
+    """Alert on BE failure and record whether Telegram accepted the request."""
+    text = (
+        f"🛑 <b>BE move failed ({symbol} {direction})</b>\n"
+        f"Status: <code>{detail}</code>\n"
+        f"Защитный rollback выполнен/проверяется автоматически; оставшаяся позиция требует reconciliation."
+    )
+    _send_tracker_notification("BE_FAILURE", event_id, text, symbol=symbol)
+
+
+def _emergency_close_after_be_failure(symbol: str, direction: str, qty: float, trade_id: str | None) -> dict:
+    """Safety rollback when BE failed and original SL could not be proven restored.
+
+    The tracker must not leave a live position in an unverified protection state.
+    Never blindly repost the BE request; close using the actual exchange quantity,
+    then reconcile until the position is confirmed absent.
+    """
+    attempts = []
+    polls = max(2, int(os.environ.get("BE_FAILURE_CLOSE_POLLS", "6")))
     try:
-        send_tg(
-            f"🛑 <b>BE move failed ({symbol} {direction})</b>\n"
-            f"Status: <code>{detail}</code>\n"
-            f"Позиция может остаться со старым SL или без SL — требуется проверка."
-        )
-    except Exception:
-        pass
+        pos = get_position_directional(symbol, direction)
+    except Exception as exc:
+        pos = {"status": "error", "error": str(exc)}
+    if pos.get("status") == "not_found":
+        return {"status": "already_closed", "attempts": attempts}
+    if pos.get("status") != "found":
+        return {"status": "close_unverified", "error": pos.get("error", "position state unavailable"), "attempts": attempts}
+
+    current_qty = abs(_safe_float(pos.get("positionAmt"), qty))
+    if current_qty <= 0:
+        return {"status": "already_closed", "attempts": attempts}
+
+    try:
+        close_result = close_position_market(symbol, direction, current_qty, trade_id=trade_id)
+    except Exception as exc:
+        close_result = {"status": "error", "error": str(exc)}
+    attempts.append(close_result)
+
+    for poll in range(polls):
+        try:
+            verification = get_position_directional(symbol, direction)
+        except Exception as exc:
+            verification = {"status": "error", "error": str(exc)}
+        if verification.get("status") == "not_found":
+            return {"status": "closed_verified", "attempts": attempts, "verify_poll": poll + 1}
+        if verification.get("status") == "found":
+            remaining = abs(_safe_float(verification.get("positionAmt"), 0.0))
+            if remaining <= 1e-12:
+                return {"status": "closed_verified", "attempts": attempts, "verify_poll": poll + 1}
+        time.sleep(0.35)
+
+    return {"status": "close_unverified", "attempts": attempts, "error": "position remains after BE failure rollback"}
 
 
 def _move_sl_to_break_even(
@@ -531,13 +621,29 @@ def _move_sl_to_break_even(
             "[TRACKER] BE move failed for %s %s: %s; old SL restore %s.",
             direction, symbol, error, "succeeded" if restored else "FAILED",
         )
-        _notify_be_failure(symbol, direction, f"{error}; restore={'ok' if restored else 'failed'}")
+        if restored:
+            _notify_be_failure(symbol, direction, f"{error}; restore=ok", event_id=trade_id or "")
+            return {
+                "status": "error",
+                "error": error,
+                "order_id": "",
+                "stop_price": entry_price,
+                "old_sl_restored": True,
+                "safety_action": "old_sl_restored",
+            }
+
+        # At this point the original SL is not proven to exist. The position is
+        # therefore not allowed to remain live in an unverified protection state.
+        rollback = _emergency_close_after_be_failure(symbol, direction, qty, trade_token)
+        _notify_be_failure(symbol, direction, f"{error}; restore=failed; rollback={rollback.get('status')}", event_id=trade_id or "")
         return {
             "status": "error",
             "error": error,
             "order_id": "",
             "stop_price": entry_price,
-            "old_sl_restored": bool(restored),
+            "old_sl_restored": False,
+            "safety_action": "emergency_close",
+            "rollback": rollback,
         }
 
     sl_side = "SELL" if direction == "LONG" else "BUY"
@@ -806,7 +912,11 @@ def update_active_trades() -> None:
                 if exchange_avg > 0:
                     trade["last_exchange_avg_price"] = exchange_avg
             else:
-                rem_qty = 0.0
+                # The position is already gone. Keep the last locally tracked
+                # residual quantity available for historical exit/PnL recovery.
+                # The final exchange lookup below will set the live quantity to
+                # zero after reconciliation.
+                rem_qty = max(0.0, rem_qty)
 
             cur_price = entry_price
             try:
@@ -898,7 +1008,23 @@ def update_active_trades() -> None:
                     continue
                 pnl_tp = _calc_trade_pnl_pct(entry_price, exec_price, direction)
 
-                rem_qty = max(0.0, rem_qty - delta_qty)
+                # The position snapshot taken before this TP query is already exchange-authoritative.
+                # Do not subtract the TP delta from it again: the exchange position may already
+                # reflect the fill. Reconcile the live quantity after observing the TP execution.
+                try:
+                    tp_pos = get_position_directional(symbol, direction)
+                except Exception as tp_pos_exc:
+                    tp_pos = {"status": "error", "error": str(tp_pos_exc)}
+                if tp_pos.get("status") == "found":
+                    rem_qty = abs(_safe_float(tp_pos.get("positionAmt")))
+                    trade["current_position_qty"] = rem_qty
+                elif tp_pos.get("status") == "not_found":
+                    rem_qty = 0.0
+                    trade["current_position_qty"] = 0.0
+                else:
+                    # Keep the last authoritative snapshot if the immediate TP reconciliation failed.
+                    log.warning("[TRACKER_TP] %s %s %s immediate position reconcile failed: %s", symbol, direction, leg, tp_pos.get("error"))
+
                 realized_qty += delta_qty
                 realized_weighted += delta_qty * pnl_tp
                 filled_by_leg[leg] = executed_qty
@@ -917,21 +1043,22 @@ def update_active_trades() -> None:
                         trade.get("name", symbol), symbol, leg, pnl_tp, exec_price, rem_qty, rem_pct
                     )
 
-                    try:
-                        send_tg(
-                            format_tp_hit_message(
-                                name=trade.get("name", symbol),
-                                symbol=symbol,
-                                leg=leg,
-                                pnl_pct=pnl_tp,
-                                exec_price=exec_price,
-                                closed_qty=delta_qty,
-                                remaining_qty=rem_qty,
-                                remaining_pct=rem_pct,
-                            )
-                        )
-                    except Exception:
-                        pass
+                    _send_tracker_notification(
+                        "TP_HIT",
+                        event_id,
+                        format_tp_hit_message(
+                            name=trade.get("name", symbol),
+                            symbol=symbol,
+                            leg=leg,
+                            pnl_pct=pnl_tp,
+                            exec_price=exec_price,
+                            closed_qty=delta_qty,
+                            remaining_qty=rem_qty,
+                            remaining_pct=rem_pct,
+                        ),
+                        symbol=symbol,
+                        leg=leg,
+                    )
 
                     # ПЕРЕНОС В БЕЗУБЫТОК ПОСЛЕ TP1 (audit fix B4: cancel-first swap)
                     if leg == "tp1" and not trade.get("be_activated") and rem_qty > 0:
@@ -970,6 +1097,10 @@ def update_active_trades() -> None:
             # fill between the first position snapshot and the order query loop;
             # the exchange position remains the source of truth for the final
             # residual quantity and for deciding whether the position is gone.
+            # Preserve the residual quantity that was still outstanding before
+            # the final exchange lookup says the position has disappeared. It is
+            # required to reconstruct the PnL of the residual close.
+            residual_qty_before_position_disappeared = max(0.0, rem_qty)
             final_pos = get_position_directional(symbol, direction)
             final_pos_status = str(final_pos.get("status", "")).lower()
             if final_pos_status == "found":
@@ -1017,7 +1148,7 @@ def update_active_trades() -> None:
                 exit_reason = "TAKE_PROFIT_FULL"
             elif position_gone:
                 hist_px, hist_reason, hist_source, historical_order = _reconcile_historical_exit_order(
-                    symbol, direction, entry_ts, rem_qty, trade.get("tp_orders", []), sl_order
+                    symbol, direction, entry_ts, residual_qty_before_position_disappeared, trade.get("tp_orders", []), sl_order
                 )
                 if hist_px is not None:
                     exit_price = hist_px
@@ -1030,10 +1161,10 @@ def update_active_trades() -> None:
             if exit_price <= 0:
                 exit_price = cur_price
 
-            if position_gone and rem_qty > 0 and init_qty > 0:
+            if position_gone and residual_qty_before_position_disappeared > 0 and init_qty > 0:
                 residual_pnl = _calc_trade_pnl_pct(entry_price, exit_price, direction)
-                realized_weighted += rem_qty * residual_pnl
-                realized_qty += rem_qty
+                realized_weighted += residual_qty_before_position_disappeared * residual_pnl
+                realized_qty += residual_qty_before_position_disappeared
                 trade["remaining_qty"] = 0.0
 
             final_pnl = (realized_weighted / init_qty) if (init_qty > 0 and realized_qty > 0) else current_pnl
@@ -1058,6 +1189,7 @@ def update_active_trades() -> None:
             trade["closed_ts"] = now_ms
             trade["duration_min"] = duration_min
             trade["closed"] = True
+            emoji = "💚" if final_pnl >= 0.0 else "💔"
             _append_trade_close_once({
                 "record_type": "TRADE_CLOSE",
                 "event_id": event_id,
@@ -1088,27 +1220,27 @@ def update_active_trades() -> None:
 
             log.info("[TRACKER_TRADE_CLOSED] %s (%s) | PnL: %+.2f%% | Realized R:R: %s | Planned R:R: %.2f | Exit: %.8g (%s) | Duration: %.1f min", emoji, trade.get("name", symbol), symbol, final_pnl, (f"{realized_rr:.3f}" if realized_rr is not None else "—"), planned_rr, exit_price, exit_reason, duration_min)
 
-            try:
-                send_tg(
-                    format_trade_closed_message(
-                        name=trade.get("name", symbol),
-                        symbol=symbol,
-                        direction=direction,
-                        entry_price=entry_price,
-                        exit_price=exit_price,
-                        pnl_pct=final_pnl,
-                        realized_rr=realized_rr,
-                        planned_rr=planned_rr,
-                        duration_min=duration_min,
-                        peak_pnl=_safe_float(trade.get("peak_pnl_pct")),
-                        max_drawdown=_safe_float(trade.get("max_drawdown_pct")),
-                        exit_reason=exit_reason,
-                        event_type=trade.get("event_type", "DIVERGENCE"),
-                        timeframe=trade.get("timeframe") or (trade.get("setup") or {}).get("event_timeframe") or "1h",
-                    )
-                )
-            except Exception:
-                pass
+            _send_tracker_notification(
+                "TRADE_CLOSE",
+                event_id,
+                format_trade_closed_message(
+                    name=trade.get("name", symbol),
+                    symbol=symbol,
+                    direction=direction,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    pnl_pct=final_pnl,
+                    realized_rr=realized_rr,
+                    planned_rr=planned_rr,
+                    duration_min=duration_min,
+                    peak_pnl=_safe_float(trade.get("peak_pnl_pct")),
+                    max_drawdown=_safe_float(trade.get("max_drawdown_pct")),
+                    exit_reason=exit_reason,
+                    event_type=trade.get("event_type", "DIVERGENCE"),
+                    timeframe=trade.get("timeframe") or (trade.get("setup") or {}).get("event_timeframe") or "1h",
+                ),
+                symbol=symbol,
+            )
 
             for tp in trade.get("tp_orders", []):
                 if tp.get("leg") not in hit_legs and tp.get("order_id"):
