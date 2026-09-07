@@ -28,6 +28,7 @@ from event_engine.bingx import (
     _request,
     ORDER_PATH,
     position_side_param,
+    _validate_sl_order_for_position,
 )
 from event_engine.telegram import send as send_tg
 
@@ -444,37 +445,52 @@ def _cancel_old_sl_verified(symbol: str, direction: str, order_id: str, max_atte
     return False, last_error
 
 
-def _notify_be_failure(symbol: str, direction: str, detail: str, *, event_id: str = "") -> None:
-    """Alert on BE failure and record whether Telegram accepted the request."""
+def _notify_be_failure(symbol: str, direction: str, detail: str, *, event_id: str = "", rollback: dict | None = None) -> None:
+    """Alert on BE failure with an exact, non-misleading rollback state."""
+    rollback = rollback or {}
+    status = str(rollback.get("status") or "").lower()
+    if status in {"closed_verified", "already_closed"}:
+        suffix = "Позиция подтверждённо закрыта биржей."
+    elif status == "close_unverified":
+        remaining = _safe_float(rollback.get("remaining_qty"), 0.0)
+        suffix = (
+            f"Закрытие не подтверждено биржей; остаток позиции: <code>{remaining:.8f}</code>. "
+            "Требуется следующее reconciliation."
+        )
+    else:
+        suffix = "Состояние rollback требует reconciliation; закрытие не считается подтверждённым."
     text = (
         f"🛑 <b>BE move failed ({symbol} {direction})</b>\n"
         f"Status: <code>{detail}</code>\n"
-        f"Защитный rollback выполнен/проверяется автоматически; оставшаяся позиция требует reconciliation."
+        f"{suffix}"
     )
     _send_tracker_notification("BE_FAILURE", event_id, text, symbol=symbol)
 
 
 def _emergency_close_after_be_failure(symbol: str, direction: str, qty: float, trade_id: str | None) -> dict:
-    """Safety rollback when BE failed and original SL could not be proven restored.
+    """Close and verify a position after BE protection cannot be proven.
 
-    The tracker must not leave a live position in an unverified protection state.
-    Never blindly repost the BE request; close using the actual exchange quantity,
-    then reconcile until the position is confirmed absent.
+    The MARKET close POST is never blindly retried. After an accepted POST we
+    reconcile both the order and the live position for a bounded period so a
+    normal exchange propagation delay does not get misclassified as
+    ``close_unverified``.
     """
-    attempts = []
-    polls = max(2, int(os.environ.get("BE_FAILURE_CLOSE_POLLS", "6")))
+    attempts: list[dict] = []
+    polls = max(4, int(os.environ.get("BE_FAILURE_CLOSE_POLLS", "12")))
+    poll_delay = max(0.15, float(os.environ.get("BE_FAILURE_CLOSE_POLL_SEC", "0.5")))
+
     try:
         pos = get_position_directional(symbol, direction)
     except Exception as exc:
         pos = {"status": "error", "error": str(exc)}
     if pos.get("status") == "not_found":
-        return {"status": "already_closed", "attempts": attempts}
+        return {"status": "already_closed", "attempts": attempts, "remaining_qty": 0.0}
     if pos.get("status") != "found":
         return {"status": "close_unverified", "error": pos.get("error", "position state unavailable"), "attempts": attempts}
 
     current_qty = abs(_safe_float(pos.get("positionAmt"), qty))
     if current_qty <= 0:
-        return {"status": "already_closed", "attempts": attempts}
+        return {"status": "already_closed", "attempts": attempts, "remaining_qty": 0.0}
 
     try:
         close_result = close_position_market(symbol, direction, current_qty, trade_id=trade_id)
@@ -482,21 +498,74 @@ def _emergency_close_after_be_failure(symbol: str, direction: str, qty: float, t
         close_result = {"status": "error", "error": str(exc)}
     attempts.append(close_result)
 
+    accepted_order_id = None
+    if isinstance(close_result, dict):
+        response = close_result.get("response") or {}
+        order = (response.get("data") or {}).get("order") or response.get("data") or {}
+        accepted_order_id = order.get("orderId") or close_result.get("order_id")
+
+    last_qty = current_qty
+    last_verification: dict = {"status": "error", "error": "verification not attempted"}
+    order_filled = False
     for poll in range(polls):
+        # Verify the accepted order first when an order id is available. This
+        # distinguishes 'POST accepted, position endpoint lagging' from a real
+        # close failure without retransmitting the POST.
+        if accepted_order_id:
+            try:
+                order_info = get_order(symbol, accepted_order_id)
+            except Exception as exc:
+                order_info = {"status": "error", "error": str(exc)}
+            if order_info.get("status") == "ok" and str(order_info.get("order_status", "")).upper() in {"FILLED", "PARTIALLY_FILLED"}:
+                order_filled = float(order_info.get("executed_qty", 0.0) or 0.0) > 0
+                attempts.append({"verification": "order", "poll": poll + 1, "order": order_info})
+
         try:
             verification = get_position_directional(symbol, direction)
         except Exception as exc:
             verification = {"status": "error", "error": str(exc)}
+        last_verification = verification
         if verification.get("status") == "not_found":
-            return {"status": "closed_verified", "attempts": attempts, "verify_poll": poll + 1}
+            return {
+                "status": "closed_verified",
+                "attempts": attempts,
+                "verification": verification,
+                "verify_poll": poll + 1,
+                "remaining_qty": 0.0,
+                "order_filled": order_filled,
+            }
         if verification.get("status") == "found":
-            remaining = abs(_safe_float(verification.get("positionAmt"), 0.0))
-            if remaining <= 1e-12:
-                return {"status": "closed_verified", "attempts": attempts, "verify_poll": poll + 1}
-        time.sleep(0.35)
+            remaining = abs(_safe_float(verification.get("positionAmt"), last_qty))
+            last_qty = remaining
+            if remaining <= 1e-12 and (order_filled or accepted_order_id):
+                return {
+                    "status": "closed_verified",
+                    "attempts": attempts,
+                    "verification": verification,
+                    "verify_poll": poll + 1,
+                    "remaining_qty": 0.0,
+                    "order_filled": order_filled,
+                }
+        time.sleep(poll_delay)
 
-    return {"status": "close_unverified", "attempts": attempts, "error": "position remains after BE failure rollback"}
+    # One final exchange read after the polling window. Never claim success on
+    # a stale/errored exchange response.
+    try:
+        final_verification = get_position_directional(symbol, direction)
+    except Exception as exc:
+        final_verification = {"status": "error", "error": str(exc)}
+    if final_verification.get("status") == "not_found":
+        return {"status": "closed_verified", "attempts": attempts, "verification": final_verification, "remaining_qty": 0.0, "order_filled": order_filled}
+    if final_verification.get("status") == "found":
+        last_qty = abs(_safe_float(final_verification.get("positionAmt"), last_qty))
 
+    return {
+        "status": "close_unverified",
+        "attempts": attempts,
+        "verification": final_verification or last_verification,
+        "remaining_qty": last_qty,
+        "order_filled": order_filled,
+    }
 
 def _move_sl_to_break_even(
     symbol: str, direction: str, entry_price: float, qty: float, old_sl_id: str | None, trade_id: str | None = None,
@@ -504,18 +573,21 @@ def _move_sl_to_break_even(
 ) -> dict:
     """Move the stop-loss to break-even without ever holding two SL orders.
 
-    Audit fix B4 (race condition): the previous implementation created the new
-    STOP_MARKET first and cancelled the old SL only afterwards, leaving two
-    live stops for a ms-to-seconds window; if both triggered the position
-    could be over-closed or flipped. The order is now:
+    Safety rule: never create an unprotected window. The exchange-visible
+    sequence is:
 
-      Step 1: if a BE SL already exists -> keep it, try to cancel the old one.
-      Step 2: cancel the OLD SL first and verify the cancellation.
-              If it fails -> DO NOT create the new SL (position stays protected
-              by the old stop; no double-SL window is possible).
-      Step 3: create the new STOP_MARKET at entry price.
-      Step 4: verify the new SL on the exchange; on failure restore the old
-              stop price (best effort) and raise an error status.
+      Step 1: if a BE SL already exists -> keep it, then remove any old SL.
+      Step 2: create the new BE STOP_MARKET while the old SL still protects the
+              position.
+      Step 3: verify the new SL on the exchange.
+      Step 4: cancel the old SL and verify that cancellation.
+      Step 5: if old-SL cancellation cannot be proven, keep the verified BE SL
+              (position remains protected) and report a cleanup issue; do not
+              emergency-close a position merely because two valid protective
+              stops briefly coexist.
+      Step 6: if BE creation/verification fails, the old SL remains in place;
+              only then use the emergency-close path if restoration cannot be
+              proven.
     """
     direction = str(direction).upper()
     bx = to_bx_symbol(symbol)
@@ -566,22 +638,6 @@ def _move_sl_to_break_even(
                     "stop_price": entry_price,
                 }
 
-    # Step 2 (audit fix B4): cancel the old SL BEFORE creating the new one.
-    if old_sl_id:
-        old_cancelled, cancel_note = _cancel_old_sl_verified(symbol, direction, str(old_sl_id))
-        if not old_cancelled:
-            log.error(
-                "[TRACKER] %s %s: old SL %s could not be cancelled (%s); new BE SL NOT created to avoid double-SL race.",
-                direction, symbol, old_sl_id, cancel_note,
-            )
-            return {
-                "status": "error",
-                "error": f"old SL cancel failed: {cancel_note}; new SL not created (no double-SL window)",
-                "order_id": "",
-                "stop_price": entry_price,
-                "old_sl_id": str(old_sl_id),
-            }
-
     def _restore_old_sl() -> bool:
         """Best-effort restore of protection when the new SL could not be placed."""
         if not old_sl_price or old_sl_price <= 0 or abs(old_sl_price - entry_price) / max(entry_price, 1e-12) < 1e-9:
@@ -616,6 +672,38 @@ def _move_sl_to_break_even(
         return bool(restored) and _validate_sl_order_for_position(restored[0], direction, entry_price, qty)
 
     def _fail(error: str) -> dict:
+        # With the safe create-new-first sequence the old SL was never cancelled
+        # before a BE verification failure. First prove whether that old SL is
+        # still present. If it is, keep it: posting another copy would create a
+        # duplicate protection order and is unnecessary.
+        old_sl_still_protected = False
+        if old_sl_id:
+            try:
+                current_protection = get_open_protection_directional(symbol, direction)
+            except Exception as exc:
+                current_protection = {"status": "error", "error": str(exc)}
+            if current_protection.get("status") == "ok":
+                for sl in current_protection.get("sl_orders", []):
+                    if str(sl.get("orderId", "")) == str(old_sl_id) and _validate_sl_order_for_position(sl, direction, entry_price, qty):
+                        old_sl_still_protected = True
+                        break
+
+        if old_sl_still_protected:
+            log.error(
+                "[TRACKER] BE move failed for %s %s: %s; original SL remains verified.",
+                direction, symbol, error,
+            )
+            _notify_be_failure(symbol, direction, f"{error}; old_sl=verified", event_id=trade_id or "")
+            return {
+                "status": "error",
+                "error": error,
+                "order_id": "",
+                "stop_price": entry_price,
+                "old_sl_restored": True,
+                "safety_action": "old_sl_kept",
+            }
+
+        # Old protection cannot be proven. Only now attempt restoration.
         restored = _restore_old_sl()
         log.error(
             "[TRACKER] BE move failed for %s %s: %s; old SL restore %s.",
@@ -635,7 +723,7 @@ def _move_sl_to_break_even(
         # At this point the original SL is not proven to exist. The position is
         # therefore not allowed to remain live in an unverified protection state.
         rollback = _emergency_close_after_be_failure(symbol, direction, qty, trade_token)
-        _notify_be_failure(symbol, direction, f"{error}; restore=failed; rollback={rollback.get('status')}", event_id=trade_id or "")
+        _notify_be_failure(symbol, direction, f"{error}; restore=failed; rollback={rollback.get('status')}", event_id=trade_id or "", rollback=rollback)
         return {
             "status": "error",
             "error": error,
@@ -678,12 +766,27 @@ def _move_sl_to_break_even(
     if not found:
         return _fail("BE stop not visible on exchange")
 
-    return {
-        "status": "created",
+    # The BE stop is now proven to exist, so the position never becomes naked.
+    # Remove the obsolete engine SL afterwards. If cancellation cannot be
+    # proven, retain the verified BE stop and surface cleanup as an error rather
+    # than closing a safely protected position.
+    old_cleanup_error = None
+    if old_sl_id and str(old_sl_id) != new_order_id:
+        old_cancelled, cancel_note = _cancel_old_sl_verified(symbol, direction, str(old_sl_id))
+        if not old_cancelled:
+            old_cleanup_error = f"old SL cleanup failed: {cancel_note}"
+            log.error("[TRACKER] %s %s: BE verified but old SL cleanup failed: %s", direction, symbol, cancel_note)
+
+    result = {
+        "status": "created" if old_cleanup_error is None else "created_cleanup_pending",
         "order_id": new_order_id,
         "client_order_id": order.get("clientOrderId") or be_client_id,
         "stop_price": entry_price,
     }
+    if old_cleanup_error:
+        result["error"] = old_cleanup_error
+        result["old_sl_cleanup_pending"] = True
+    return result
 
 
 def _exit_outcome_category(exit_reason: str) -> str:
@@ -1074,7 +1177,7 @@ def update_active_trades() -> None:
                             trade_id=str(event_id).replace("EVT_", ""),
                             old_sl_price=old_sl_price,
                         )
-                        if new_sl.get("status") == "created":
+                        if new_sl.get("status") in {"created", "created_cleanup_pending"}:
                             trade["sl_order"] = new_sl
                             trade["be_activated"] = True
                             trade["be_activation_ts"] = now_ms
