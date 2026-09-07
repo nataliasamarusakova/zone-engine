@@ -31,6 +31,15 @@ jobs:
       KLINE_LIMIT_1H: "120"
       MAX_SIGNAL_AGE_BARS: "0"
       MAX_SIGNAL_RISK_PCT: "1.50"
+      MAX_ENTRY_SLIPPAGE_PCT: "1.00"
+      MAX_SCAN_HISTORY_BYTES: "31457280"
+      MAX_ZONE_AGE_BARS: "30"
+      MIN_STRUCTURE_ROOM_R: "1.20"
+      REQUIRE_DIRECTIONAL_CANDLE: "true"
+      REQUIRE_STRUCTURE_OBSTACLE: "true"
+      TP_MIN_R: "0.50"
+      TP_MAX_R: "1.50"
+      FAILED_SIGNAL_TTL_SEC: "86400"
       EXECUTION_MAX_SIGNAL_AGE_BARS: "0"
       DIAGNOSTICS_MODE: "historical"
       REQUIRE_ZONE_TOUCH: "true"
@@ -94,7 +103,9 @@ jobs:
           git config user.name "actions-user"
           git config user.email "actions@github.com"
           git status --short
-          git add data/*.jsonl data/*.json data/*.txt 2>/dev/null || true
+          # Never stage the unbounded scan journal; it is intentionally local-only.
+          git rm --cached --ignore-unmatch data/scan_history.jsonl 2>/dev/null || true
+          git add data/actions.jsonl data/active_trades.json data/failed_signals.json data/latest_scan.json data/latest_scan.txt data/signal_history.jsonl data/trades.jsonl 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "No state changes"
             exit 0
