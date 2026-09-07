@@ -77,11 +77,20 @@ def _load_active_trades() -> dict[str, dict]:
 
 
 def _save_active_trades(trades: dict[str, dict]) -> None:
+    """Atomically persist active-trade state and serialize concurrent writers."""
     ACTIVE_TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = ACTIVE_TRADES_PATH.with_name(ACTIVE_TRADES_PATH.name + ".tmp")
+    lock_path = ACTIVE_TRADES_PATH.with_suffix(ACTIVE_TRADES_PATH.suffix + ".lock")
     payload = json.dumps(trades, ensure_ascii=False, indent=2)
-    tmp_path.write_text(payload, encoding="utf-8")
-    os.replace(tmp_path, ACTIVE_TRADES_PATH)
+    with lock_path.open("a+") as lockf:
+        if fcntl is not None:
+            fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+        try:
+            tmp_path.write_text(payload, encoding="utf-8")
+            os.replace(tmp_path, ACTIVE_TRADES_PATH)
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
 
 
 def _close_record_exists(event_id: str) -> bool:
@@ -447,14 +456,21 @@ def _move_sl_to_break_even(
                 cancel_note = ""
                 if old_sl_id and existing_id and str(old_sl_id) != existing_id:
                     old_cancelled, cancel_note = _cancel_old_sl_verified(symbol, direction, str(old_sl_id))
-                status = "created" if old_cancelled else "created_old_sl_cancel_failed"
                 if not old_cancelled:
                     log.warning(
-                        "[TRACKER] BE already in place for %s but old SL %s cancel failed: %s",
+                        "[TRACKER] BE already in place for %s but old SL %s cancel failed: %s; "
+                        "BE is NOT considered active while multiple SL states may coexist.",
                         symbol, old_sl_id, cancel_note,
                     )
+                    return {
+                        "status": "error",
+                        "error": f"BE exists but old SL cancel failed: {cancel_note}",
+                        "order_id": existing_id,
+                        "client_order_id": cid or be_client_id,
+                        "stop_price": entry_price,
+                    }
                 return {
-                    "status": status,
+                    "status": "created",
                     "order_id": existing_id,
                     "client_order_id": cid or be_client_id,
                     "stop_price": entry_price,
@@ -494,7 +510,20 @@ def _move_sl_to_break_even(
             restore_resp = _request("POST", ORDER_PATH, restore_params)
         except Exception:
             return False
-        return isinstance(restore_resp, dict) and restore_resp.get("code") == 0
+        if not isinstance(restore_resp, dict) or restore_resp.get("code") != 0:
+            return False
+        try:
+            verification = get_open_protection_directional(symbol, direction)
+        except Exception:
+            return False
+        if verification.get("status") != "ok":
+            return False
+        restored = [
+            order for order in verification.get("sl_orders", [])
+            if str(order.get("orderId", "")) == str((restore_resp.get("data") or {}).get("order", {}).get("orderId", ""))
+            or str(order.get("clientOrderId", "")).upper() == str(restore_params["clientOrderId"]).upper()
+        ]
+        return bool(restored) and _validate_sl_order_for_position(restored[0], direction, entry_price, qty)
 
     def _fail(error: str) -> dict:
         restored = _restore_old_sl()
@@ -549,6 +578,22 @@ def _move_sl_to_break_even(
         "client_order_id": order.get("clientOrderId") or be_client_id,
         "stop_price": entry_price,
     }
+
+
+def _exit_outcome_category(exit_reason: str) -> str:
+    """Separate strategy exits from technical/emergency outcomes in analytics."""
+    reason = str(exit_reason or "").upper()
+    if reason in {"STOP_LOSS", "TAKE_PROFIT_FULL", "BREAK_EVEN"}:
+        return "STRATEGY_EXIT"
+    if reason in {"POSITION_CLOSED_UNVERIFIED", "UNVERIFIED_CLOSE"}:
+        return "UNVERIFIED_CLOSE"
+    if reason in {"MANUAL_CLOSE_RECONCILED"}:
+        return "POSITION_CLOSED_RECONCILED"
+    if "EMERGENCY" in reason:
+        return "EMERGENCY_EXIT"
+    if "PROTECTION" in reason:
+        return "PROTECTION_FAILURE"
+    return "TECHNICAL_EXIT"
 
 
 def _calc_trade_pnl_pct(entry_price: float, exit_price: float, direction: str) -> float:
@@ -751,9 +796,17 @@ def update_active_trades() -> None:
 
             pos_amt = abs(_safe_float(pos.get("positionAmt"))) if pos_status == "found" else 0.0
             if pos_status == "found":
+                # The exchange is authoritative for the live position quantity.
+                # Local remaining_qty may be stale after a partial fill, manual
+                # close, or an external reduction. Keep TP fill accounting
+                # separate from the actual residual position size.
+                rem_qty = pos_amt
+                trade["remaining_qty"] = pos_amt
                 exchange_avg = _safe_float(pos.get("avgPrice"))
                 if exchange_avg > 0:
                     trade["last_exchange_avg_price"] = exchange_avg
+            else:
+                rem_qty = 0.0
 
             cur_price = entry_price
             try:
@@ -780,7 +833,7 @@ def update_active_trades() -> None:
                 old_sl_id = old_sl.get("order_id")
                 old_sl_price = _safe_float(old_sl.get("stop_price"), 0.0) or None
                 be_result = _move_sl_to_break_even(symbol, direction, entry_price, rem_qty, old_sl_id, str(event_id).replace("EVT_", ""), old_sl_price=old_sl_price)
-                if be_result.get("status") in {"created", "created_old_sl_cancel_failed"}:
+                if be_result.get("status") == "created":
                     trade["sl_order"] = be_result
                     trade["be_activated"] = True
                     trade["be_required"] = False
@@ -801,7 +854,7 @@ def update_active_trades() -> None:
                 old_sl_id = old_sl.get("order_id")
                 old_sl_price = _safe_float(old_sl.get("stop_price"), 0.0) or None
                 retry = _move_sl_to_break_even(symbol, direction, entry_price, rem_qty, old_sl_id, str(event_id).replace("EVT_", ""), old_sl_price=old_sl_price)
-                if retry.get("status") in {"created", "created_old_sl_cancel_failed"}:
+                if retry.get("status") == "created":
                     trade["sl_order"] = retry
                     trade["be_activated"] = True
                     trade["be_required"] = False
@@ -894,7 +947,7 @@ def update_active_trades() -> None:
                             trade_id=str(event_id).replace("EVT_", ""),
                             old_sl_price=old_sl_price,
                         )
-                        if new_sl.get("status") in {"created", "created_old_sl_cancel_failed"}:
+                        if new_sl.get("status") == "created":
                             trade["sl_order"] = new_sl
                             trade["be_activated"] = True
                             trade["be_activation_ts"] = now_ms
@@ -913,8 +966,33 @@ def update_active_trades() -> None:
             trade["hit_legs"] = sorted(hit_legs)
             trade["tp_filled_qty"] = filled_by_leg
 
-            closed_by_tp = rem_qty <= 1e-12 and realized_qty > 0
-            position_gone = pos_status == "not_found"
+            # Re-read the position after processing TP order status. A TP can
+            # fill between the first position snapshot and the order query loop;
+            # the exchange position remains the source of truth for the final
+            # residual quantity and for deciding whether the position is gone.
+            final_pos = get_position_directional(symbol, direction)
+            final_pos_status = str(final_pos.get("status", "")).lower()
+            if final_pos_status == "found":
+                rem_qty = abs(_safe_float(final_pos.get("positionAmt")))
+                trade["current_position_qty"] = rem_qty
+                trade["remaining_qty"] = rem_qty
+                final_avg = _safe_float(final_pos.get("avgPrice"))
+                if final_avg > 0:
+                    trade["last_exchange_avg_price"] = final_avg
+                position_gone = False
+            elif final_pos_status == "not_found":
+                rem_qty = 0.0
+                trade["current_position_qty"] = 0.0
+                trade["remaining_qty"] = 0.0
+                position_gone = True
+            else:
+                # Do not manufacture a close from an exchange error. Preserve
+                # the authoritative last-known quantity and keep the trade open
+                # for the next reconciliation cycle.
+                position_gone = False
+                trade["position_reconcile_error"] = final_pos.get("error")
+
+            closed_by_tp = rem_qty <= 1e-12 and realized_qty > 0 and position_gone
 
             if not position_gone and not closed_by_tp:
                 updated_trades[event_id] = trade
@@ -988,6 +1066,7 @@ def update_active_trades() -> None:
                 "event_type": trade.get("event_type"),
                 "closed_ts": now_ms,
                 "exit_reason": exit_reason,
+                "outcome_category": _exit_outcome_category(exit_reason),
                 "entry_price": entry_price,
                 "exit_price": exit_price,
                 "realized_pnl_pct": final_pnl,

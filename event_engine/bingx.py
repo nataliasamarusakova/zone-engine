@@ -1189,6 +1189,80 @@ def _verify_open_order(
     return {"status": "not_found", "client_order_id": client_order_id}
 
 
+def _verify_market_reduce_order(
+    symbol: str,
+    direction: str,
+    order_id: str | None,
+    expected_qty: float,
+    pre_qty: float,
+    attempts: int = 5,
+) -> dict:
+    """Verify a crossed-TP MARKET reduction from exchange state.
+
+    A successful POST acknowledgement is not sufficient: the market order must
+    show execution and/or the live position must decrease. This helper never
+    retries the MARKET POST itself.
+    """
+    direction = str(direction).upper()
+    expected_qty = max(0.0, float(expected_qty))
+    pre_qty = max(0.0, float(pre_qty))
+    last = {"status": "unverified", "executed_qty": 0.0, "remaining_qty": pre_qty}
+    for attempt in range(max(1, attempts)):
+        executed_qty = 0.0
+        order_info = None
+        if order_id:
+            try:
+                order_info = get_order(symbol, order_id)
+            except Exception:
+                order_info = None
+            if isinstance(order_info, dict) and order_info.get("status") == "ok":
+                try:
+                    executed_qty = max(0.0, float(order_info.get("executed_qty", 0.0) or 0.0))
+                except (TypeError, ValueError):
+                    executed_qty = 0.0
+
+        try:
+            pos = get_position_directional(symbol, direction)
+        except Exception as exc:
+            pos = {"status": "error", "error": str(exc)}
+
+        if pos.get("status") == "found":
+            try:
+                remaining_qty = max(0.0, float(pos.get("positionAmt", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                remaining_qty = pre_qty
+        elif pos.get("status") == "not_found":
+            remaining_qty = 0.0
+        else:
+            remaining_qty = pre_qty
+
+        reduced_qty = max(0.0, pre_qty - remaining_qty)
+        last = {
+            "status": "unverified",
+            "executed_qty": executed_qty,
+            "remaining_qty": remaining_qty,
+            "reduced_qty": reduced_qty,
+            "order": order_info,
+        }
+
+        # Require real evidence of execution. Either the order reports fills,
+        # or the exchange position demonstrably shrank. For a position that
+        # disappeared entirely, the residual check itself is authoritative.
+        if executed_qty > 0 and (reduced_qty > 0 or remaining_qty <= 1e-12):
+            last["status"] = "verified"
+            return last
+        if reduced_qty > 0 and (executed_qty > 0 or order_info is None):
+            last["status"] = "verified"
+            return last
+
+        if attempt + 1 < max(1, attempts):
+            time.sleep(0.2 * (attempt + 1))
+
+    if expected_qty <= 0 and last.get("remaining_qty", pre_qty) <= 1e-12:
+        last["status"] = "verified"
+    return last
+
+
 def ensure_directional_protection(
     symbol: str, direction: str, avg_price: float, qty: float,
     stop_loss_pct: float, tp_levels: list, trade_id: str | None = None,
@@ -1443,20 +1517,45 @@ def ensure_directional_protection(
                 "clientOrderId": client_order_id,
             }
 
+            pre_position_qty = position_qty
             resp = _request("POST", ORDER_PATH, market_params)
+            order = (resp.get("data") or {}).get("order") or resp.get("data") or {}
+            order_id = str(order.get("orderId", ""))
             if resp.get("code") != 0:
-                log.error("[BINGX] TP market close failed: %s msg=%s", leg, resp.get("msg"))
-                tp_results.append({"leg": leg, "status": "error", "error": f"code={resp.get('code')} msg={resp.get('msg')}", "qty": tp_qty, "pnl_pct": pnl_pct})
+                # Never blind-retry an ambiguous MARKET reduction. Reconcile
+                # the order/position and only accept the leg when execution is
+                # actually observable.
+                verification = _verify_market_reduce_order(
+                    symbol, direction, order_id, tp_qty, pre_position_qty
+                )
             else:
-                order = (resp.get("data") or {}).get("order") or resp.get("data") or {}
+                verification = _verify_market_reduce_order(
+                    symbol, direction, order_id, tp_qty, pre_position_qty
+                )
+
+            if verification.get("status") != "verified":
+                tp_results.append({
+                    "leg": leg,
+                    "status": "error",
+                    "error": (
+                        f"TP market close acknowledged/attempted but execution could not be verified: "
+                        f"response_code={resp.get('code')} verification={verification}"
+                    ),
+                    "qty": tp_qty,
+                    "pnl_pct": pnl_pct,
+                })
+            else:
                 tp_results.append({
                     "leg": leg,
                     "status": "created",
-                    "order_id": str(order.get("orderId", "")),
+                    "order_id": order_id,
                     "client_order_id": order.get("clientOrderId") or client_order_id,
                     "price": current_price,
-                    "qty": tp_qty,
+                    "qty": float(verification.get("reduced_qty") or verification.get("executed_qty") or tp_qty),
                     "pnl_pct": pnl_pct,
+                    "execution_verified": True,
+                    "executed_qty": float(verification.get("executed_qty", 0.0) or 0.0),
+                    "remaining_qty": float(verification.get("remaining_qty", 0.0) or 0.0),
                 })
             continue
 
