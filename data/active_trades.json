@@ -17,7 +17,7 @@
     "tp_orders": [
       {
         "leg": "tp1",
-        "status": "created",
+        "status": "already_exists",
         "order_id": "2096881375617048576",
         "client_order_id": "evt_a446ddcdfe7f8903_tp1",
         "price": 2.149,
@@ -26,7 +26,7 @@
       },
       {
         "leg": "tp2",
-        "status": "created",
+        "status": "already_exists",
         "order_id": "2096881379157041152",
         "client_order_id": "evt_a446ddcdfe7f8903_tp2",
         "price": 2.135,
@@ -35,10 +35,10 @@
       }
     ],
     "sl_order": {
-      "status": "created",
+      "status": "already_exists",
       "order_id": "2096881371225612288",
-      "client_order_id": "EVT_A446DDCDFE7F8903_SL",
-      "stop_price": 2.181661042,
+      "client_order_id": "evt_a446ddcdfe7f8903_sl",
+      "stop_price": 2.182,
       "qty": 4.62
     },
     "hit_legs": [],
@@ -47,9 +47,9 @@
     "be_required": false,
     "be_last_error": null,
     "peak_pnl_pct": 0.0,
-    "mae_pct": 0.0,
-    "max_drawdown_pct": 0.0,
-    "current_pnl_pct": 0.0,
+    "mae_pct": -0.18492834026814628,
+    "max_drawdown_pct": -0.18492834026814628,
+    "current_pnl_pct": -0.04623208506705197,
     "score": 70.0,
     "event_type": "SUPPLY_ZONE_TOUCH",
     "timeframe": "1h",
@@ -178,9 +178,22 @@
         "price": 2.1350084369999998
       }
     ],
-    "effective_tp_levels": [],
+    "effective_tp_levels": [
+      {
+        "leg": "tp1",
+        "pnl_pct": 0.6470541608876675,
+        "close_fraction": 0.5,
+        "qty": 2.31
+      },
+      {
+        "leg": "tp2",
+        "pnl_pct": 1.2941083217753147,
+        "close_fraction": 0.5,
+        "qty": 2.31
+      }
+    ],
     "tp_mode": "multi_tp",
-    "effective_weighted_rr": 1.124999999999997,
+    "effective_weighted_rr": 1.1249999999999971,
     "tp_filled_qty": {},
     "realized_pnl_qty": 0.0,
     "realized_pnl_weighted_sum": 0.0,
@@ -193,6 +206,9 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1788770454316
+    "last_observation_ts": 1788770750178,
+    "last_exchange_avg_price": 2.163,
+    "current_position_qty": 4.62,
+    "protection_last_updated_ts": 1788770753153
   }
 }
