@@ -1016,7 +1016,7 @@ def main() -> None:
                 return {
                     "symbol": symbol,
                     "current_price": latest_price,
-                    "binance_price": binance_live_price if binance_live_price is not None else latest_price,
+                    "binance_price": latest_price,
                     "bingx_price": bingx_price,
                     "market_spread_pct": None,
                     "market_source": source_name,
@@ -1303,6 +1303,21 @@ def main() -> None:
     # full inactive-symbol table into runtime logs. Runtime logs contain active
     # symbols only.
     save_scan(scan_rows, fresh_signals, duration_sec=time.time() - started, scan_id=scan_id)
+    # Final tracking checkpoint: orders/positions can change during the scan or
+    # execution phase. Reconcile once more before this process exits so a TP,
+    # close, or BE transition that happened during this run is not deferred to
+    # the next invocation. Long-lived monitoring is provided by the scheduled
+    # tracker workflow; this checkpoint is deliberately only one pass.
+    if private_ready:
+        try:
+            update_active_trades()
+        except Exception as exc:
+            log.exception("[TRACKER_FINAL] active trade update failed: %s", exc)
+        try:
+            reconcile_all_open_positions()
+        except Exception as exc:
+            log.exception("[RECON_FINAL] reconciliation failed: %s", exc)
+
     active_log_rows = [
         r for r in scan_rows
         if r.get("fresh_signal") not in {None, "—"}
