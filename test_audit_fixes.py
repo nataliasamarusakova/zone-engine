@@ -889,3 +889,43 @@ def test_emergency_be_rollback_verifies_order_before_final_unverified(monkeypatc
     assert out["status"] == "closed_verified"
     assert out["order_filled"] is True
     assert out["remaining_qty"] == 0.0
+
+
+def test_be_rollback_reports_already_closed_when_position_is_absent(monkeypatch):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: {"status": "not_found"})
+    monkeypatch.setattr(tracker, "close_position_market", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not send close when already absent")))
+    out = tracker._emergency_close_after_be_failure("AAA-USDT", "LONG", 1.0, "T")
+    assert out["status"] == "already_closed"
+    assert out["remaining_qty"] == 0.0
+
+
+def test_be_rollback_uses_full_position_fallback_when_directional_read_errors(monkeypatch):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: {"status": "error", "error": "temporary"})
+    monkeypatch.setattr(tracker, "get_positions", lambda *a, **k: [])
+    monkeypatch.setattr(tracker, "close_position_market", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not send close when full positions confirms absence")))
+    out = tracker._emergency_close_after_be_failure("AAA-USDT", "LONG", 1.0, "T")
+    assert out["status"] == "already_closed"
+    assert out["remaining_qty"] == 0.0
+
+
+def test_be_rollback_does_not_call_stale_qty_current_after_close_verification_error(monkeypatch):
+    from event_engine import tracker
+    states = iter([
+        {"status": "found", "positionAmt": 1.0, "avgPrice": 100.0},
+        {"status": "error", "error": "position endpoint timeout"},
+    ])
+    monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: next(states, {"status": "error", "error": "position endpoint timeout"}))
+    monkeypatch.setattr(tracker, "get_positions", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("full positions timeout")))
+    monkeypatch.setattr(tracker, "close_position_market", lambda *a, **k: {
+        "status": "closed", "response": {"code": 0, "data": {"order": {"orderId": "CLOSE1"}}},
+    })
+    monkeypatch.setattr(tracker, "get_order", lambda *a, **k: {
+        "status": "ok", "order_id": "CLOSE1", "order_status": "FILLED", "executed_qty": 1.0,
+    })
+    monkeypatch.setattr(tracker.time, "sleep", lambda *a, **k: None)
+    out = tracker._emergency_close_after_be_failure("AAA-USDT", "LONG", 1.0, "T")
+    assert out["status"] == "close_unverified"
+    assert out["remaining_qty"] is None
+    assert out["last_known_qty"] == 1.0
