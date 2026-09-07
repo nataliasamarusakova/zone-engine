@@ -13,7 +13,7 @@ from typing import Any
 import pandas as pd
 
 from event_engine.analytics import save_scan
-from event_engine.binance import analysis_symbols_for_bingx, classify_bingx_contract, fetch_klines as fetch_binance_klines
+from event_engine.binance import analysis_symbols_for_bingx, classify_bingx_contract, fetch_24h_ticker, fetch_klines as fetch_binance_klines
 from event_engine.bingx import (
     contracts,
     credentials_available,
@@ -40,6 +40,9 @@ DATA = Path("data")
 TRADES_PATH = DATA / "trades.jsonl"
 FAILED_SIGNALS_PATH = DATA / "failed_signals.json"
 FAILED_SIGNAL_TTL_SEC = int(os.environ.get("FAILED_SIGNAL_TTL_SEC", str(24 * 3600)))
+FAILED_SIGNAL_MAX_RETRIES = max(1, int(os.environ.get("FAILED_SIGNAL_MAX_RETRIES", "3")))
+FAILED_SIGNAL_RETRY_BASE_SEC = max(1, int(os.environ.get("FAILED_SIGNAL_RETRY_BASE_SEC", "300")))
+FAILED_SIGNAL_RETRY_MAX_SEC = max(FAILED_SIGNAL_RETRY_BASE_SEC, int(os.environ.get("FAILED_SIGNAL_RETRY_MAX_SEC", str(3600))))
 ACTIONS_PATH = DATA / "actions.jsonl"
 
 EXECUTION_ENABLED = os.environ.get("EXECUTION_ENABLED", "true").lower() == "true"
@@ -104,16 +107,62 @@ def _load_failed_signal_ids() -> dict[str, dict[str, Any]]:
         return {}
 
 
+def _failed_signal_is_blocked(record: dict[str, Any] | None, now: int | None = None) -> bool:
+    """Return whether a failed signal should currently be suppressed.
+
+    Failed execution is retriable, but bounded: after MAX retries the record is
+    terminal and must not create an infinite execution loop.
+    """
+    if not isinstance(record, dict):
+        return False
+    now = int(time.time()) if now is None else int(now)
+    if bool(record.get("terminal")):
+        return True
+    next_retry_at = int(record.get("next_retry_at", 0) or 0)
+    return next_retry_at <= 0 or now < next_retry_at
+
+
 def _mark_failed_signal(event_id: str, status: str, error: str = "") -> None:
     try:
         DATA.mkdir(parents=True, exist_ok=True)
         raw = _load_failed_signal_ids()
-        raw[str(event_id)] = {"ts": int(time.time()), "status": str(status), "error": str(error)[:500]}
+        previous = raw.get(str(event_id), {}) if isinstance(raw.get(str(event_id)), dict) else {}
+        retry_count = int(previous.get("retry_count", 0) or 0) + 1
+        now = int(time.time())
+        delay = min(FAILED_SIGNAL_RETRY_MAX_SEC, FAILED_SIGNAL_RETRY_BASE_SEC * (2 ** max(0, retry_count - 1)))
+        terminal = retry_count >= FAILED_SIGNAL_MAX_RETRIES
+        raw[str(event_id)] = {
+            "ts": now,
+            "status": str(status),
+            "error": str(error)[:500],
+            "retry_count": retry_count,
+            "last_failed_at": now,
+            "next_retry_at": 0 if terminal else now + delay,
+            "terminal": terminal,
+        }
         tmp = FAILED_SIGNALS_PATH.with_suffix(".tmp")
         tmp.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, FAILED_SIGNALS_PATH)
     except Exception as exc:
         log.warning("[FAILED_SIGNALS] mark failed for %s: %s", event_id, exc)
+
+
+def _execution_outcome_category(status: str) -> str:
+    """Classify execution outcomes without conflating them with strategy exits."""
+    value = str(status or "").upper()
+    if value == "OPENED_PROTECTED":
+        return "PROTECTED_ENTRY"
+    if "EMERGENCY" in value:
+        return "EMERGENCY_EXIT"
+    if "PROTECTION" in value or "SL_UNVERIFIED" in value:
+        return "PROTECTION_FAILURE"
+    if "UNVERIFIED" in value or "TIMEOUT" in value:
+        return "EXECUTION_UNVERIFIED"
+    if value in {"ENTRY_NOT_FILLED", "SKIPPED_MIN_QTY", "SKIPPED_TP_MIN_QTY", "SKIPPED_INVALID_SETUP", "BLOCKED_PROTECTION_PREFLIGHT"}:
+        return "EXECUTION_BLOCKED"
+    if value in {"ERROR", "OPENED", "DISABLED", "BLOCKED_MISSING_CREDENTIALS"} or value.endswith("_FAILED") or value.startswith("FAILED"):
+        return "EXECUTION_FAILURE"
+    return "EXECUTION_OTHER"
 
 
 def _load_successful_trade_ids() -> set[str]:
@@ -251,19 +300,41 @@ def _market_spread_pct(binance_price: float | None, bingx_price: float | None) -
     return round(abs(bingx_price - binance_price) / binance_price * 100.0, 4)
 
 
+def _normalize_position_direction(position: dict[str, Any]) -> str | None:
+    """Normalize BingX position-side semantics into LONG/SHORT.
+
+    In HEDGE mode BingX returns positionSide=LONG/SHORT. In ONE_WAY mode it
+    commonly returns positionSide=BOTH and the sign of positionAmt carries the
+    direction. Reconciliation must understand both representations.
+    """
+    side = str(position.get("positionSide", "")).upper()
+    if side in {"LONG", "SHORT"}:
+        return side
+    if side != "BOTH":
+        return None
+    try:
+        raw_amt = float(position.get("positionAmt", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if raw_amt > 0:
+        return "LONG"
+    if raw_amt < 0:
+        return "SHORT"
+    return None
+
+
 def _position_keys(positions: list[dict]) -> set[tuple[str, str]]:
     out: set[tuple[str, str]] = set()
     for p in positions:
         symbol = str(p.get("symbol", "")).upper()
-        side = str(p.get("positionSide", "")).upper()
+        direction = _normalize_position_direction(p)
         try:
             qty = abs(float(p.get("positionAmt", 0) or 0))
-        except Exception:
+        except (TypeError, ValueError):
             qty = 0.0
-        if qty <= 0:
+        if not symbol or direction is None or qty <= 0:
             continue
-        if side in {"LONG", "SHORT"}:
-            out.add((symbol, side))
+        out.add((symbol, direction))
     return out
 
 
@@ -281,8 +352,8 @@ def reconcile_all_open_positions() -> None:
         if time.time() - started >= RECONCILIATION_MAX_SECONDS:
             break
         symbol = str(p.get("symbol", "")).upper()
-        side = str(p.get("positionSide", "")).upper()
-        if side not in {"LONG", "SHORT"}:
+        side = _normalize_position_direction(p)
+        if side is None:
             continue
         qty = abs(float(p.get("positionAmt", 0) or 0))
         avg = float(p.get("avgPrice", 0) or p.get("entryPrice", 0) or 0)
@@ -622,9 +693,53 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     if order.get("status") != "opened":
         return {"status": str(order.get("status", "error")).upper(), "error": order.get("error"), "order": order}
 
-    position = wait_for_position_fill_directional(symbol, direction, timeout_sec=int(os.environ.get("POSITION_FILL_TIMEOUT_SEC", "30")), poll_interval=0.5)
+    position = wait_for_position_fill_directional(
+        symbol,
+        direction,
+        timeout_sec=int(os.environ.get("POSITION_FILL_TIMEOUT_SEC", "30")),
+        poll_interval=0.5,
+    )
     if position.get("status") != "found":
-        return {"status": "OPENED_UNCONFIRMED", "order": order, "position": position, "error": "position fill could not be confirmed"}
+        # A MARKET response plus a fill-poll timeout is an ambiguous exchange
+        # state, not proof that the position does not exist. Never leave a
+        # potentially-open position unmanaged and never blindly repost the entry.
+        try:
+            reconciled_position = get_position_directional(symbol, direction)
+        except Exception as exc:
+            reconciled_position = {"status": "error", "error": str(exc)}
+
+        if reconciled_position.get("status") == "found":
+            log.warning(
+                "[EXEC_ENTRY_RECONCILED] %s %s | fill polling did not confirm entry, "
+                "but authoritative position reconciliation found the position; continuing to protection.",
+                symbol, direction,
+            )
+            position = reconciled_position
+        elif reconciled_position.get("status") == "not_found":
+            log.warning(
+                "[EXEC_ENTRY_NOT_FILLED] %s %s | market order acknowledged but no position exists after authoritative reconciliation.",
+                symbol, direction,
+            )
+            return {
+                "status": "entry_not_filled",
+                "order": order,
+                "position": reconciled_position,
+                "fill_poll": position,
+                "error": "market order acknowledged but authoritative position reconciliation found no open position",
+            }
+        else:
+            error_detail = reconciled_position.get("error") or position.get("error") or position.get("last_poll_error")
+            log.critical(
+                "[EXEC_ENTRY_UNVERIFIED] %s %s | position state remains ambiguous after fill timeout: %s",
+                symbol, direction, error_detail,
+            )
+            return {
+                "status": "entry_state_unverified",
+                "order": order,
+                "position": reconciled_position,
+                "fill_poll": position,
+                "error": f"entry state could not be authoritatively reconciled: {error_detail}",
+            }
 
     avg_price = float(position["avgPrice"])
     qty = abs(float(position["positionAmt"]))
@@ -901,7 +1016,7 @@ def main() -> None:
                 return {
                     "symbol": symbol,
                     "current_price": latest_price,
-                    "binance_price": latest_price,
+                    "binance_price": binance_live_price if binance_live_price is not None else latest_price,
                     "bingx_price": bingx_price,
                     "market_spread_pct": None,
                     "market_source": source_name,
@@ -940,7 +1055,25 @@ def main() -> None:
                         bingx_price = float(bx_live[-1]["close"])
                 except Exception as bx_exc:
                     log.warning("[MARKET_CHECK] %s | BingX price validation failed: %s", symbol, bx_exc)
-            spread_pct = _market_spread_pct(latest_price, bingx_price) if provider == "binance" else None
+            # For executable spread validation, compare two current venue prices.
+            # The closed 1H candle remains the strategy reference; it must not be
+            # used as the Binance side of a live cross-venue spread check.
+            binance_live_price = None
+            if recent and provider == "binance":
+                try:
+                    ticker = fetch_24h_ticker(binance_symbol)
+                    if isinstance(ticker, dict):
+                        raw_last = ticker.get("lastPrice") or ticker.get("last") or ticker.get("price")
+                        if raw_last is not None:
+                            candidate = float(raw_last)
+                            if candidate > 0:
+                                binance_live_price = candidate
+                except Exception as ticker_exc:
+                    log.warning("[MARKET_CHECK] %s | Binance live ticker validation failed: %s", symbol, ticker_exc)
+            spread_pct = _market_spread_pct(
+                binance_live_price if binance_live_price is not None else latest_price,
+                bingx_price,
+            ) if provider == "binance" else None
             if spread_pct is not None and spread_pct > MAX_MARKET_SPREAD_PCT:
                 log.warning("[MARKET_SPREAD] %s | Binance=%.12g | BingX=%.12g | spread=%.4f%% > %.4f%%", symbol, latest_price, bingx_price, spread_pct, MAX_MARKET_SPREAD_PCT)
                 recent = []
@@ -1099,7 +1232,8 @@ def main() -> None:
         bx_symbol = str((bx or {}).get("symbol", signal["symbol"])).upper()
         key = (bx_symbol, signal["type"])
         opposite = (bx_symbol, "SHORT" if signal["type"] == "LONG" else "LONG")
-        if signal["event_id"] in successful_ids or signal["event_id"] in failed_ids:
+        failed_record = failed_ids.get(signal["event_id"])
+        if signal["event_id"] in successful_ids or _failed_signal_is_blocked(failed_record):
             continue
         if key in open_keys or opposite in open_keys:
             continue
@@ -1151,7 +1285,16 @@ def main() -> None:
             log.error("[EXEC_FAILED] %s %s | status=%s | error=%s | order=%s", signal["symbol"], signal["type"], execution_status, execution.get("error"), execution.get("order"))
             if execution_status not in {"DISABLED", "BLOCKED_MISSING_CREDENTIALS"}:
                 _mark_failed_signal(signal["event_id"], execution_status, execution.get("error", ""))
-        _append_jsonl(TRADES_PATH, {"record_type": "TRADE_OPEN", "event_id": signal["event_id"], "symbol": signal["symbol"], "direction": signal["type"], "score": signal["score"], "signal": signal, "result": execution})
+        _append_jsonl(TRADES_PATH, {
+            "record_type": "TRADE_OPEN",
+            "event_id": signal["event_id"],
+            "symbol": signal["symbol"],
+            "direction": signal["type"],
+            "score": signal["score"],
+            "signal": signal,
+            "outcome_category": _execution_outcome_category(execution_status),
+            "result": execution,
+        })
         _send_signal(signal, execution)
         if str(execution.get("status")) == "opened_protected":
             executed += 1
