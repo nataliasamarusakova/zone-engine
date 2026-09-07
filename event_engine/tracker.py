@@ -15,6 +15,7 @@ from typing import Any
 
 from event_engine.bingx import (
     get_position_directional,
+    get_positions,
     get_order,
     get_all_orders,
     get_open_protection_directional,
@@ -34,7 +35,8 @@ from event_engine.telegram import send as send_tg
 
 log = logging.getLogger("event_engine.tracker")
 
-DATA = Path("data")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA = PROJECT_ROOT / "data"
 ACTIVE_TRADES_PATH = DATA / "active_trades.json"
 TRADES_PATH = DATA / "trades.jsonl"
 ACTIONS_PATH = DATA / "actions.jsonl"
@@ -452,11 +454,21 @@ def _notify_be_failure(symbol: str, direction: str, detail: str, *, event_id: st
     if status in {"closed_verified", "already_closed"}:
         suffix = "Позиция подтверждённо закрыта биржей."
     elif status == "close_unverified":
-        remaining = _safe_float(rollback.get("remaining_qty"), 0.0)
-        suffix = (
-            f"Закрытие не подтверждено биржей; остаток позиции: <code>{remaining:.8f}</code>. "
-            "Требуется следующее reconciliation."
-        )
+        remaining = rollback.get("remaining_qty")
+        last_known = rollback.get("last_known_qty")
+        if remaining is not None:
+            suffix = (
+                f"Закрытие не подтверждено биржей; подтверждённый остаток позиции: <code>{_safe_float(remaining):.8f}</code>. "
+                "Требуется следующее reconciliation."
+            )
+        elif last_known is not None:
+            suffix = (
+                "Закрытие не подтверждено биржей; текущий остаток неизвестен. "
+                f"Последний известный объём: <code>{_safe_float(last_known):.8f}</code>. "
+                "Требуется следующее reconciliation."
+            )
+        else:
+            suffix = "Закрытие не подтверждено биржей; текущий остаток неизвестен. Требуется следующее reconciliation."
     else:
         suffix = "Состояние rollback требует reconciliation; закрытие не считается подтверждённым."
     text = (
@@ -471,26 +483,80 @@ def _emergency_close_after_be_failure(symbol: str, direction: str, qty: float, t
     """Close and verify a position after BE protection cannot be proven.
 
     The MARKET close POST is never blindly retried. After an accepted POST we
-    reconcile both the order and the live position for a bounded period so a
-    normal exchange propagation delay does not get misclassified as
-    ``close_unverified``.
+    reconcile the order and the live position. A transient verification error
+    must never be reported as a numeric "remaining_qty": that number would only
+    be the last known quantity, not proof that the position still exists.
     """
     attempts: list[dict] = []
     polls = max(4, int(os.environ.get("BE_FAILURE_CLOSE_POLLS", "12")))
     poll_delay = max(0.15, float(os.environ.get("BE_FAILURE_CLOSE_POLL_SEC", "0.5")))
 
-    try:
-        pos = get_position_directional(symbol, direction)
-    except Exception as exc:
-        pos = {"status": "error", "error": str(exc)}
-    if pos.get("status") == "not_found":
-        return {"status": "already_closed", "attempts": attempts, "remaining_qty": 0.0}
-    if pos.get("status") != "found":
-        return {"status": "close_unverified", "error": pos.get("error", "position state unavailable"), "attempts": attempts}
+    def _extract_directional_from_positions(rows: list[dict]) -> dict:
+        wanted = str(direction).upper()
+        bx = to_bx_symbol(symbol)
+        for p in rows or []:
+            if str(p.get("symbol", "")).upper() != str(bx or "").upper():
+                continue
+            side = str(p.get("positionSide", "")).upper()
+            try:
+                raw_amt = float(p.get("positionAmt", 0) or 0)
+                avg_price = float(p.get("avgPrice", 0) or p.get("entryPrice", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if side == wanted:
+                qty_abs = abs(raw_amt)
+            elif side == "BOTH":
+                if wanted == "LONG" and raw_amt < 0:
+                    continue
+                if wanted == "SHORT" and raw_amt > 0:
+                    continue
+                qty_abs = abs(raw_amt)
+            else:
+                continue
+            if qty_abs > 0 and avg_price > 0:
+                return {
+                    "status": "found",
+                    "symbol": p.get("symbol", bx),
+                    "positionSide": wanted,
+                    "positionAmt": qty_abs,
+                    "avgPrice": avg_price,
+                    "entryPrice": float(p.get("entryPrice", 0) or avg_price),
+                }
+        return {"status": "not_found", "symbol": bx, "positionSide": wanted}
 
-    current_qty = abs(_safe_float(pos.get("positionAmt"), qty))
+    def _authoritative_position_read() -> dict:
+        """Use directional read first, then full position list as independent parser path."""
+        try:
+            direct = get_position_directional(symbol, direction)
+        except Exception as exc:
+            direct = {"status": "error", "error": str(exc)}
+        if direct.get("status") in {"found", "not_found"}:
+            return direct
+
+        try:
+            rows = get_positions(timeout_sec=float(os.environ.get("RECONCILIATION_HTTP_TIMEOUT_SEC", "5")))
+            return _extract_directional_from_positions(rows)
+        except Exception as exc:
+            return {
+                "status": "error",
+                "error": f"directional={direct.get('error', 'unknown')}; full_positions={exc}",
+            }
+
+    initial = _authoritative_position_read()
+    if initial.get("status") == "not_found":
+        return {"status": "already_closed", "attempts": attempts, "remaining_qty": 0.0, "last_known_qty": 0.0}
+    if initial.get("status") != "found":
+        return {
+            "status": "close_unverified",
+            "error": initial.get("error", "position state unavailable"),
+            "attempts": attempts,
+            "remaining_qty": None,
+            "last_known_qty": max(0.0, float(qty or 0.0)),
+        }
+
+    current_qty = abs(_safe_float(initial.get("positionAmt"), qty))
     if current_qty <= 0:
-        return {"status": "already_closed", "attempts": attempts, "remaining_qty": 0.0}
+        return {"status": "already_closed", "attempts": attempts, "remaining_qty": 0.0, "last_known_qty": 0.0}
 
     try:
         close_result = close_position_market(symbol, direction, current_qty, trade_id=trade_id)
@@ -504,26 +570,21 @@ def _emergency_close_after_be_failure(symbol: str, direction: str, qty: float, t
         order = (response.get("data") or {}).get("order") or response.get("data") or {}
         accepted_order_id = order.get("orderId") or close_result.get("order_id")
 
-    last_qty = current_qty
+    last_known_qty = current_qty
     last_verification: dict = {"status": "error", "error": "verification not attempted"}
     order_filled = False
     for poll in range(polls):
-        # Verify the accepted order first when an order id is available. This
-        # distinguishes 'POST accepted, position endpoint lagging' from a real
-        # close failure without retransmitting the POST.
         if accepted_order_id:
             try:
                 order_info = get_order(symbol, accepted_order_id)
             except Exception as exc:
                 order_info = {"status": "error", "error": str(exc)}
             if order_info.get("status") == "ok" and str(order_info.get("order_status", "")).upper() in {"FILLED", "PARTIALLY_FILLED"}:
-                order_filled = float(order_info.get("executed_qty", 0.0) or 0.0) > 0
+                executed_qty = _safe_float(order_info.get("executed_qty"), 0.0)
+                order_filled = executed_qty >= max(0.0, current_qty - 1e-12)
                 attempts.append({"verification": "order", "poll": poll + 1, "order": order_info})
 
-        try:
-            verification = get_position_directional(symbol, direction)
-        except Exception as exc:
-            verification = {"status": "error", "error": str(exc)}
+        verification = _authoritative_position_read()
         last_verification = verification
         if verification.get("status") == "not_found":
             return {
@@ -532,11 +593,12 @@ def _emergency_close_after_be_failure(symbol: str, direction: str, qty: float, t
                 "verification": verification,
                 "verify_poll": poll + 1,
                 "remaining_qty": 0.0,
+                "last_known_qty": 0.0,
                 "order_filled": order_filled,
             }
         if verification.get("status") == "found":
-            remaining = abs(_safe_float(verification.get("positionAmt"), last_qty))
-            last_qty = remaining
+            remaining = abs(_safe_float(verification.get("positionAmt"), last_known_qty))
+            last_known_qty = remaining
             if remaining <= 1e-12 and (order_filled or accepted_order_id):
                 return {
                     "status": "closed_verified",
@@ -544,26 +606,39 @@ def _emergency_close_after_be_failure(symbol: str, direction: str, qty: float, t
                     "verification": verification,
                     "verify_poll": poll + 1,
                     "remaining_qty": 0.0,
+                    "last_known_qty": 0.0,
                     "order_filled": order_filled,
                 }
         time.sleep(poll_delay)
 
-    # One final exchange read after the polling window. Never claim success on
-    # a stale/errored exchange response.
-    try:
-        final_verification = get_position_directional(symbol, direction)
-    except Exception as exc:
-        final_verification = {"status": "error", "error": str(exc)}
+    final_verification = _authoritative_position_read()
     if final_verification.get("status") == "not_found":
-        return {"status": "closed_verified", "attempts": attempts, "verification": final_verification, "remaining_qty": 0.0, "order_filled": order_filled}
+        return {
+            "status": "closed_verified",
+            "attempts": attempts,
+            "verification": final_verification,
+            "remaining_qty": 0.0,
+            "last_known_qty": 0.0,
+            "order_filled": order_filled,
+        }
     if final_verification.get("status") == "found":
-        last_qty = abs(_safe_float(final_verification.get("positionAmt"), last_qty))
+        confirmed_qty = abs(_safe_float(final_verification.get("positionAmt"), last_known_qty))
+        return {
+            "status": "close_unverified",
+            "attempts": attempts,
+            "verification": final_verification,
+            "remaining_qty": confirmed_qty,
+            "last_known_qty": confirmed_qty,
+            "order_filled": order_filled,
+        }
 
     return {
         "status": "close_unverified",
         "attempts": attempts,
         "verification": final_verification or last_verification,
-        "remaining_qty": last_qty,
+        # Do not expose the stale quantity as if it were current exchange truth.
+        "remaining_qty": None,
+        "last_known_qty": last_known_qty,
         "order_filled": order_filled,
     }
 

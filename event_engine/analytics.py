@@ -6,7 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-DATA_DIR = Path("data")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = PROJECT_ROOT / "data"
 SCAN_JSONL = DATA_DIR / "scan_history.jsonl"
 MAX_SCAN_HISTORY_BYTES = max(1_048_576, int(os.environ.get("MAX_SCAN_HISTORY_BYTES", str(30 * 1024 * 1024))))
 SIGNALS_JSONL = DATA_DIR / "signal_history.jsonl"
