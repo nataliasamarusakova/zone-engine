@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 import threading
 import uuid
@@ -20,7 +21,7 @@ from decimal import (
     ROUND_FLOOR,
 )
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -105,6 +106,28 @@ def credentials_available() -> bool:
 def _canonical_params(params: dict[str, Any]) -> str:
     """BingX canonical signing string: ASCII-sort keys; values are not URL encoded."""
     return "&".join(f"{key}={params[key]}" for key in sorted(params))
+
+
+def _validate_signed_values(params: dict[str, Any]) -> None:
+    """Reject query-string metacharacters that could alter signed semantics."""
+    forbidden = re.compile(r"[&=?#\r\n]")
+    for key, value in params.items():
+        text = str(value)
+        if forbidden.search(text):
+            raise ValueError(f"parameter {key!r} contains forbidden query character")
+
+
+def _signed_query(params: dict[str, Any]) -> str:
+    """Build BingX's actual query string from the unencoded canonical params."""
+    canonical = _canonical_params(params)
+    needs_encoding = "[" in canonical or "{" in canonical
+    parts = []
+    for key in sorted(params):
+        value = str(params[key])
+        if needs_encoding:
+            value = quote(value, safe="-_.~")
+        parts.append(f"{key}={value}")
+    return "&".join(parts)
 
 
 def _sign(params: dict[str, Any]) -> str:
@@ -213,13 +236,15 @@ def _request(
                             timeout=request_timeout,
                         )
                     else:
-                        response = session.request(
-                            method=method,
-                            url=base_url + path,
-                            params=wire_params,
-                            headers=headers,
-                            timeout=request_timeout,
-                        )
+                        if signed:
+                            _validate_signed_values({k: v for k, v in request_params.items() if k != "signature"})
+                            query = _signed_query({k: v for k, v in request_params.items() if k != "signature"})
+                            query = f"{query}&signature={signature}"
+                            url = f"{base_url + path}?{query}"
+                            request_kwargs = {"method": method, "url": url, "headers": headers, "timeout": request_timeout}
+                        else:
+                            request_kwargs = {"method": method, "url": base_url + path, "params": wire_params, "headers": headers, "timeout": request_timeout}
+                        response = session.request(**request_kwargs)
                     payload = response.json()
                 except Exception as exc:
                     last_error = exc
@@ -566,6 +591,27 @@ def cancel_order(symbol: str, order_id: str | int) -> dict:
 
 
 
+def get_all_orders(
+    symbol: str,
+    start_time_ms: int | None = None,
+    end_time_ms: int | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    """Fetch recent historical orders used for deterministic exit reconciliation."""
+    bx = to_bx_symbol(symbol)
+    if not bx:
+        return []
+    params: dict[str, Any] = {"symbol": bx, "limit": min(max(int(limit), 1), 100)}
+    if start_time_ms is not None:
+        params["startTime"] = int(start_time_ms)
+    if end_time_ms is not None:
+        params["endTime"] = int(end_time_ms)
+    resp = _request("GET", "/openApi/swap/v2/trade/allOrders", params, signed=True)
+    if not isinstance(resp, dict) or resp.get("code") != 0:
+        return []
+    return _normalize_orders_list(resp)
+
+
 def close_position_market(symbol: str, direction: str, qty: float, *, reduce_only: bool = True, trade_id: str | None = None) -> dict:
     """Close an existing directional position with a MARKET order. Used only as
     a safety rollback when mandatory protection cannot be established."""
@@ -584,14 +630,18 @@ def close_position_market(symbol: str, direction: str, qty: float, *, reduce_onl
     if close_qty <= 0:
         return {"status": "error", "error": "invalid close quantity", "qty": close_qty}
 
+    position_side = position_side_param(direction)
     params = {
         "symbol": bx,
         "side": "SELL" if direction == "LONG" else "BUY",
-        "positionSide": position_side_param(direction),
+        "positionSide": position_side,
         "type": "MARKET",
         "quantity": _format_qty(close_qty, prec),
-        "reduceOnly": "true" if reduce_only else "false",
     }
+    # BingX hedge mode rejects reduceOnly. It is only valid/needed in ONE-WAY
+    # (positionSide=BOTH).
+    if position_side == "BOTH" and reduce_only:
+        params["reduceOnly"] = "true"
     if trade_id:
         params["clientOrderId"] = f"EVT_{_trade_digest(trade_id)}_ROLLBACK"
     resp = _request("POST", ORDER_PATH, params)
@@ -631,6 +681,24 @@ def _new_open_client_order_id(bx_symbol: str, trade_id: str) -> str:
     nonce = uuid.uuid4().hex.upper()[:12]
     digest = hashlib.sha256(f"{bx_symbol}:{trade_id}:{nonce}".encode()).hexdigest().upper()[:10]
     return f"EVT_OPEN_{digest}_{nonce}"
+
+
+def _find_recent_order_by_client_id(symbol: str, client_order_id: str, lookback_ms: int = 120_000) -> dict | None:
+    """Resolve an ambiguous order POST without issuing a duplicate order."""
+    try:
+        orders = get_all_orders(
+            symbol,
+            start_time_ms=max(0, int(time.time() * 1000) - int(lookback_ms)),
+            end_time_ms=int(time.time() * 1000) + 5_000,
+            limit=100,
+        )
+    except Exception:
+        return None
+    target = str(client_order_id).upper()
+    for order in orders:
+        if str(order.get("clientOrderId", "")).upper() == target:
+            return order
+    return None
 
 
 def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dict:
@@ -738,10 +806,27 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
             and "missing bingx credentials" not in str(response.get("msg", "")).lower()
         )
         if transport_error:
-            log.warning("[BINGX] Order POST transport error for %s (%s); verifying via position...", bx, response.get("msg"))
+            log.warning("[BINGX] Order POST transport error for %s (%s); reconciling clientOrderId before using position state...", bx, response.get("msg"))
+            historical_order = _find_recent_order_by_client_id(symbol, client_order_id)
+            if historical_order is not None:
+                log.warning("[BINGX] Matching clientOrderId found after transport error; treating MARKET order as resolved.")
+                return {
+                    "status": "opened",
+                    "symbol": bx,
+                    "qty": qty,
+                    "leverage": leverage,
+                    "sizing_price": sizing_price,
+                    "signal_price": float(price),
+                    "order_reference_price": sizing_price,
+                    "order_id": historical_order.get("orderId"),
+                    "client_order_id": historical_order.get("clientOrderId") or client_order_id,
+                    "idempotency": "client_order_id_verified_after_transport_error",
+                    "response": response,
+                    "historical_order": historical_order,
+                }
             try:
                 if has_open_position(symbol, direction):
-                    log.warning("[BINGX] Position found after transport error -> treating order as filled (idempotent).")
+                    log.warning("[BINGX] Position found after transport error with no matching historical order; treating as unresolved-but-opened without re-POST.")
                     return {
                         "status": "opened",
                         "symbol": bx,
@@ -752,7 +837,7 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
                         "order_reference_price": sizing_price,
                         "order_id": None,
                         "client_order_id": client_order_id,
-                        "idempotency": "position_verified_after_transport_error",
+                        "idempotency": "position_verified_after_transport_error_no_order_match",
                         "response": response,
                     }
             except Exception as exc:
@@ -826,13 +911,23 @@ def get_position_directional(symbol: str, direction: str) -> dict:
 
 def wait_for_position_fill_directional(symbol: str, direction: str, timeout_sec: int = 30, poll_interval: float = 0.5) -> dict:
     started = time.time()
+    last_error: dict | None = None
     while time.time() - started < timeout_sec:
         pos = get_position_directional(symbol, direction)
-        if pos.get("status") in {"found", "error"}:
+        if pos.get("status") == "found":
             return pos
+        if pos.get("status") == "error":
+            last_error = pos
         time.sleep(poll_interval)
 
-    return {"status": "timeout", "symbol": to_bx_symbol(symbol), "positionSide": str(direction).upper()}
+    # One final authoritative read. A transient API error during the normal poll
+    # interval must not be mistaken for a definitive non-fill.
+    final = get_position_directional(symbol, direction)
+    if final.get("status") == "found":
+        return final
+    if final.get("status") == "error":
+        return {**final, "last_poll_error": last_error}
+    return {"status": "timeout", "symbol": to_bx_symbol(symbol), "positionSide": str(direction).upper(), "last_poll_error": last_error}
 
 
 def get_open_protection_directional(

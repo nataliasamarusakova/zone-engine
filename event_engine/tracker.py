@@ -16,6 +16,7 @@ from typing import Any
 from event_engine.bingx import (
     get_position_directional,
     get_order,
+    get_all_orders,
     get_open_protection_directional,
     cancel_order,
     fetch_klines,
@@ -614,24 +615,101 @@ def _update_mfe_mae(trade: dict, candles: list[dict]) -> None:
     trade["mae_pct"] = mae
     trade["max_drawdown_pct"] = drawdown
 
-def _get_exit_from_sl(symbol: str, sl_order_id: str | None) -> tuple[float | None, str | None]:
-    if not sl_order_id:
-        return None, None
+def _get_filled_order(symbol: str, order_id: str | None) -> dict | None:
+    if not order_id:
+        return None
     try:
-        sl_info = get_order(symbol, sl_order_id)
+        info = get_order(symbol, order_id)
     except Exception as exc:
-        log.warning("[TRACKER] SL order query error for %s: %s", symbol, exc)
-        return None, None
+        log.warning("[TRACKER] order query error for %s/%s: %s", symbol, order_id, exc)
+        return None
+    if info.get("status") != "ok" or str(info.get("order_status", "")).upper() != "FILLED":
+        return None
+    return info
 
-    if sl_info.get("status") != "ok":
-        return None, None
 
-    status = str(sl_info.get("order_status", "")).upper()
-    if status != "FILLED":
+def _get_exit_from_sl(symbol: str, sl_order_id: str | None) -> tuple[float | None, str | None]:
+    info = _get_filled_order(symbol, sl_order_id)
+    if not info:
         return None, None
-
-    exit_price = _safe_float(sl_info.get("avg_price"), 0.0)
+    exit_price = _safe_float(info.get("avg_price"), 0.0)
     return (exit_price if exit_price > 0 else None, "SL_FILLED")
+
+
+def _reconcile_historical_exit_order(
+    symbol: str,
+    direction: str,
+    entry_ts: int,
+    remaining_qty: float,
+    tp_orders: list[dict],
+    sl_order: dict | None,
+) -> tuple[float | None, str | None, str | None, dict | None]:
+    """Recover an exchange-verified residual exit after a position disappears.
+
+    TP fills already accounted for by the tracker are excluded. A residual
+    position must be closed by a protective SL or a separate closing order; a
+    previous TP1 fill must never be reused as the residual exit price.
+    """
+    # First ask the known SL order directly.
+    sl_id = sl_order.get("order_id") if isinstance(sl_order, dict) else None
+    sl_info = _get_filled_order(symbol, sl_id)
+    if sl_info:
+        px = _safe_float(sl_info.get("avg_price"), 0.0)
+        if px > 0:
+            return px, "STOP_LOSS", "historical_sl_order", sl_info
+
+    tp_ids = {str(x.get("order_id")) for x in tp_orders if x.get("order_id")}
+    start = max(0, int(entry_ts) - 30_000)
+    end = int(time.time() * 1000) + 30_000
+    try:
+        orders = get_all_orders(symbol, start, end, limit=100)
+    except Exception as exc:
+        log.warning("[TRACKER] historical order reconciliation failed for %s: %s", symbol, exc)
+        return None, None, None, None
+
+    wanted_side = "SELL" if direction == "LONG" else "BUY"
+    candidates: list[dict] = []
+    for order in orders:
+        oid = str(order.get("orderId", ""))
+        if oid and oid in tp_ids:
+            continue
+        status = str(order.get("status", order.get("orderStatus", ""))).upper()
+        if status != "FILLED":
+            continue
+        side = str(order.get("side", "")).upper()
+        if side != wanted_side:
+            continue
+        try:
+            created = int(float(order.get("updateTime") or order.get("time") or order.get("createTime") or 0))
+            qty = abs(float(order.get("executedQty") or order.get("cumQty") or order.get("origQty") or order.get("quantity") or 0))
+            px = float(order.get("avgPrice") or order.get("price") or order.get("stopPrice") or 0)
+        except (TypeError, ValueError):
+            continue
+        if entry_ts and created and created < entry_ts:
+            continue
+        if px <= 0 or qty <= 0:
+            continue
+        candidates.append({**order, "_ts": created, "_qty": qty, "_px": px})
+
+    if not candidates:
+        return None, None, None, None
+
+    # Prefer protective stop orders for a disappearing residual position.
+    stop_candidates = [
+        o for o in candidates
+        if str(o.get("type", "")).upper() in {"STOP", "STOP_MARKET"}
+    ]
+    pool = stop_candidates or candidates
+    pool.sort(key=lambda o: int(o.get("_ts", 0)), reverse=True)
+
+    # Avoid mistaking a small unrelated close for the residual position.
+    residual = max(0.0, float(remaining_qty))
+    for order in pool:
+        if residual <= 0 or order["_qty"] >= residual * 0.95:
+            reason = "STOP_LOSS" if str(order.get("type", "")).upper() in {"STOP", "STOP_MARKET"} else "MANUAL_CLOSE_RECONCILED"
+            return order["_px"], reason, "historical_all_orders", order
+
+    return None, None, None, None
 
 
 def update_active_trades() -> None:
@@ -845,9 +923,12 @@ def update_active_trades() -> None:
             # Фиксация выхода и закрытие
             duration_min = (now_ms - entry_ts) / 60000.0
             exit_price = _safe_float(trade.get("last_tp_exec_price"), cur_price)
-            sl_order_id = trade.get("sl_order", {}).get("order_id") if isinstance(trade.get("sl_order"), dict) else None
+            sl_order = trade.get("sl_order", {}) if isinstance(trade.get("sl_order"), dict) else {}
+            sl_order_id = sl_order.get("order_id")
 
             sl_exit_price, _ = _get_exit_from_sl(symbol, sl_order_id)
+            historical_source = None
+            historical_order = None
             if sl_exit_price is not None:
                 exit_price = sl_exit_price
                 if trade.get("be_activated") and abs(exit_price - entry_price) / max(entry_price, 1e-12) < 0.003:
@@ -856,6 +937,15 @@ def update_active_trades() -> None:
                     exit_reason = "STOP_LOSS"
             elif closed_by_tp:
                 exit_reason = "TAKE_PROFIT_FULL"
+            elif position_gone:
+                hist_px, hist_reason, hist_source, historical_order = _reconcile_historical_exit_order(
+                    symbol, direction, entry_ts, rem_qty, trade.get("tp_orders", []), sl_order
+                )
+                if hist_px is not None:
+                    exit_price = hist_px
+                    exit_reason = hist_reason or "MANUAL_CLOSE_RECONCILED"
+                else:
+                    exit_reason = "POSITION_CLOSED_UNVERIFIED"
             else:
                 exit_reason = "POSITION_CLOSED_UNVERIFIED"
 
@@ -869,7 +959,10 @@ def update_active_trades() -> None:
                 trade["remaining_qty"] = 0.0
 
             final_pnl = (realized_weighted / init_qty) if (init_qty > 0 and realized_qty > 0) else current_pnl
-            realized_pnl_source = "executed_tp_or_sl" if (closed_by_tp or sl_exit_price is not None) else "observation_price_estimate"
+            realized_pnl_source = (
+                "executed_tp_or_sl" if (closed_by_tp or sl_exit_price is not None)
+                else (hist_source or "observation_price_estimate")
+            )
             if closed_by_tp and realized_qty > 0 and sl_exit_price is None:
                 exit_price = entry_price * (1.0 + final_pnl / 100.0) if direction == "LONG" else entry_price * (1.0 - final_pnl / 100.0)
             planned_risk_pct = _derive_planned_risk_pct(trade)
