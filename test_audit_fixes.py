@@ -182,3 +182,130 @@ def test_be_uses_detected_one_way_position_side(monkeypatch):
     out = tracker._move_sl_to_break_even("AAA-USDT", "LONG", 100.0, 1.0, None, "T")
     assert out["status"] == "created"
     assert calls[0][1]["positionSide"] == "BOTH"
+
+def test_signed_get_and_delete_use_explicit_query(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setenv("BINGX_API_KEY", "key")
+    monkeypatch.setenv("BINGX_SECRET_KEY", "secret")
+    captured = []
+    class Resp:
+        headers = {}
+        def json(self): return {"code": 0, "data": {}}
+    class Session:
+        def request(self, **kwargs):
+            captured.append(kwargs)
+            return Resp()
+    monkeypatch.setattr(bingx, "SESSION", Session())
+    bingx._request("GET", "/p", {"symbol":"BTC-USDT", "orderId":"123"}, signed=True)
+    bingx._request("DELETE", "/p", {"symbol":"BTC-USDT", "orderId":"123"}, signed=True)
+    for call in captured:
+        assert "?" in call["url"]
+        assert call.get("params") is None
+        assert "signature=" in call["url"]
+
+
+def test_close_position_omits_reduce_only_in_hedge(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda s: s)
+    monkeypatch.setattr(bingx, "get_contract", lambda s: {"quantityPrecision": 3})
+    monkeypatch.setattr(bingx, "position_side_param", lambda d: d)
+    calls = []
+    monkeypatch.setattr(bingx, "_request", lambda method, path, params: calls.append(params) or {"code":0})
+    out = bingx.close_position_market("AAA-USDT", "SHORT", 1.0, reduce_only=True, trade_id="T")
+    assert out["status"] == "closed"
+    assert calls and "reduceOnly" not in calls[-1]
+    assert calls[-1]["positionSide"] == "SHORT"
+
+
+def test_close_position_uses_reduce_only_in_one_way(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda s: s)
+    monkeypatch.setattr(bingx, "get_contract", lambda s: {"quantityPrecision": 3})
+    monkeypatch.setattr(bingx, "position_side_param", lambda d: "BOTH")
+    calls = []
+    monkeypatch.setattr(bingx, "_request", lambda method, path, params: calls.append(params) or {"code":0})
+    out = bingx.close_position_market("AAA-USDT", "LONG", 1.0, reduce_only=True, trade_id="T")
+    assert out["status"] == "closed"
+    assert calls[-1]["reduceOnly"] == "true"
+
+
+def test_failed_signal_is_recorded_after_emergency_like_status(tmp_path, monkeypatch):
+    import run_once
+    monkeypatch.setattr(run_once, "DATA", tmp_path)
+    monkeypatch.setattr(run_once, "FAILED_SIGNALS_PATH", tmp_path / "failed_signals.json")
+    monkeypatch.setattr(run_once, "FAILED_SIGNAL_TTL_SEC", 3600)
+    # The execution-status branch used by main must treat any non-protected
+    # outcome as terminal, including statuses whose prefix is 'opened'.
+    status = "opened_then_emergency_closed"
+    if status != "opened_protected":
+        run_once._mark_failed_signal("EVT_EMERGENCY", status, "rollback")
+    assert "EVT_EMERGENCY" in run_once._load_failed_signal_ids()
+
+
+def test_scan_history_rotates_and_keeps_complete_records(tmp_path, monkeypatch):
+    from event_engine import analytics
+    monkeypatch.setattr(analytics, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(analytics, "SCAN_JSONL", tmp_path / "scan_history.jsonl")
+    monkeypatch.setattr(analytics, "MAX_SCAN_HISTORY_BYTES", 1024)
+    for i in range(80):
+        analytics._append_jsonl(analytics.SCAN_JSONL, {"i": i, "payload": "x" * 40})
+        analytics._rotate_scan_history()
+    assert analytics.SCAN_JSONL.stat().st_size <= 1400
+    rows = [json.loads(x) for x in analytics.SCAN_JSONL.read_text().splitlines() if x.strip()]
+    assert rows and rows[-1]["i"] == 79
+
+
+def test_all_orders_helper_uses_historical_endpoint(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda s: s)
+    captured = {}
+    def fake_request(method, path, params, signed=True):
+        captured.update(method=method, path=path, params=params, signed=signed)
+        return {"code": 0, "data": [{"orderId": "1"}]}
+    monkeypatch.setattr(bingx, "_request", fake_request)
+    out = bingx.get_all_orders("AAA-USDT", 100, 200, 50)
+    assert out == [{"orderId": "1"}]
+    assert captured["path"] == "/openApi/swap/v2/trade/allOrders"
+    assert captured["params"]["startTime"] == 100
+    assert captured["params"]["endTime"] == 200
+
+
+def test_historical_exit_reconciliation_does_not_use_tp_for_residual(monkeypatch):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "_get_filled_order", lambda *a, **k: None)
+    monkeypatch.setattr(tracker, "get_all_orders", lambda *a, **k: [
+        {"orderId":"TP1", "status":"FILLED", "side":"SELL", "type":"TAKE_PROFIT_MARKET", "executedQty":"1", "avgPrice":"110", "updateTime":200},
+        {"orderId":"SL1", "status":"FILLED", "side":"SELL", "type":"STOP_MARKET", "executedQty":"1", "avgPrice":"95", "updateTime":300},
+    ])
+    out = tracker._reconcile_historical_exit_order("AAA-USDT", "LONG", 100, 1, [{"order_id":"TP1"}], {"order_id":"SL1"})
+    assert out[0] == 95.0
+    assert out[1] == "STOP_LOSS"
+
+
+def test_post_fill_slippage_guard_emergency_closes(monkeypatch):
+    import run_once
+    monkeypatch.setattr(run_once, "MAX_ENTRY_SLIPPAGE_PCT", 1.0)
+    signal = {"event_id":"EVT_SLIP", "symbol":"AAA-USDT", "type":"LONG", "entry":100.0, "sl":99.0, "tp1":101.0, "tp2":102.0, "risk_pct":1.0,
+              "zone":{"kind":"DEMAND","btm":98,"top":99}, "target":{"obstacle_price":110}}
+    monkeypatch.setattr(run_once, "_validate_trade_geometry", lambda s: (True, ""))
+    monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {"status":"ok","sl_orders":[],"tp_orders":[]})
+    monkeypatch.setattr(run_once, "_build_setup", lambda s: {"zone":{"kind":"DEMAND"}})
+    monkeypatch.setattr(run_once, "open_market", lambda *a: {"status":"opened"})
+    monkeypatch.setattr(run_once, "wait_for_position_fill_directional", lambda *a, **k: {"status":"found","avgPrice":102.5,"positionAmt":1})
+    monkeypatch.setattr(run_once, "_emergency_close_and_verify", lambda *a, **k: {"status":"closed_verified"})
+    monkeypatch.setattr(run_once, "_cleanup_engine_protection", lambda *a, **k: {"status":"ok"})
+    out = run_once.execute_new_position(signal)
+    assert out["status"] == "opened_then_emergency_closed"
+    assert "adverse_entry_slippage" in out["error"]
+
+def test_wait_for_position_fill_retries_transient_errors(monkeypatch):
+    from event_engine import bingx
+    seq = [
+        {"status":"error", "error":"temporary"},
+        {"status":"not_found"},
+        {"status":"found", "avgPrice":100, "positionAmt":1},
+    ]
+    monkeypatch.setattr(bingx, "get_position_directional", lambda *a, **k: seq.pop(0))
+    monkeypatch.setattr(bingx.time, "sleep", lambda *a, **k: None)
+    out = bingx.wait_for_position_fill_directional("AAA-USDT", "LONG", timeout_sec=1, poll_interval=0)
+    assert out["status"] == "found"

@@ -64,6 +64,7 @@ SCAN_BATCH_SIZE = max(SCAN_WORKERS, int(os.environ.get("SCAN_BATCH_SIZE", "48"))
 SCAN_BATCH_PAUSE_SEC = max(0.0, float(os.environ.get("SCAN_BATCH_PAUSE_SEC", "0.10")))
 BINANCE_ASSET_CLASSES = {x.strip().upper() for x in os.environ.get("BINANCE_ASSET_CLASSES", "CRYPTO,EQUITY").split(",") if x.strip()}
 MAX_MARKET_SPREAD_PCT = float(os.environ.get("MAX_MARKET_SPREAD_PCT", "1.50"))
+MAX_ENTRY_SLIPPAGE_PCT = max(0.0, float(os.environ.get("MAX_ENTRY_SLIPPAGE_PCT", "1.00")))
 RECONCILIATION_MAX_SECONDS = float(os.environ.get("RECONCILIATION_MAX_SECONDS", "45"))
 # Live execution requires the signal timestamp to be exactly the latest closed 1H bar.
 # Also reject stale market data so a symbol with an old/delisted Binance series cannot
@@ -627,6 +628,24 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
 
     avg_price = float(position["avgPrice"])
     qty = abs(float(position["positionAmt"]))
+    # Abort on materially adverse market-entry slippage. Once a market order is
+    # filled, accepting a severely worse price can invalidate the signal geometry
+    # before protection is even submitted. Roll back safely instead of widening risk.
+    try:
+        adverse_slippage_pct = (
+            max(0.0, avg_price - entry_price) / entry_price * 100.0
+            if direction == "LONG"
+            else max(0.0, entry_price - avg_price) / entry_price * 100.0
+        )
+    except (TypeError, ValueError, ZeroDivisionError):
+        adverse_slippage_pct = float("inf")
+    if adverse_slippage_pct > MAX_ENTRY_SLIPPAGE_PCT:
+        reason = f"adverse_entry_slippage={adverse_slippage_pct:.4f}% > {MAX_ENTRY_SLIPPAGE_PCT:.4f}%"
+        log.critical("[SAFETY_CLOSE] %s %s | %s", symbol, direction, reason)
+        close_result = _emergency_close_and_verify(symbol, direction, qty, event_id)
+        cleanup = _cleanup_engine_protection(symbol, direction)
+        return {"status": "opened_then_emergency_closed", "error": reason, "order": order, "position": position, "close": close_result, "protection_cleanup": cleanup, "executed_signal": dict(signal)}
+
     # Recalculate ALL absolute protection levels from the real market fill.
     # Never submit targets computed from the stale signal/reference close.
     try:
@@ -1128,9 +1147,9 @@ def main() -> None:
                 signal["symbol"], signal["type"], execution_status, execution.get("reason", "invalid_setup"), execution.get("error"), execution.get("qty"), execution.get("min_qty"),
                 float(execution.get("required_margin_usdt", 0.0) or 0.0), float(execution.get("configured_margin_usdt", MARGIN_USDT) or MARGIN_USDT),
             )
-        elif not execution_status.startswith("opened"):
+        elif execution_status != "opened_protected":
             log.error("[EXEC_FAILED] %s %s | status=%s | error=%s | order=%s", signal["symbol"], signal["type"], execution_status, execution.get("error"), execution.get("order"))
-            if execution_status not in {"skipped_min_qty", "skipped_tp_min_qty", "skipped_invalid_setup"}:
+            if execution_status not in {"DISABLED", "BLOCKED_MISSING_CREDENTIALS"}:
                 _mark_failed_signal(signal["event_id"], execution_status, execution.get("error", ""))
         _append_jsonl(TRADES_PATH, {"record_type": "TRADE_OPEN", "event_id": signal["event_id"], "symbol": signal["symbol"], "direction": signal["type"], "score": signal["score"], "signal": signal, "result": execution})
         _send_signal(signal, execution)

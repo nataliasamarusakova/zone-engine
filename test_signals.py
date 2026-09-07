@@ -416,6 +416,7 @@ def test_long_post_fill_that_slips_through_zone_stop_moves_stop_behind_fill():
 
 def test_execute_rebases_protection_to_actual_fill_before_installing(monkeypatch):
     import run_once
+    monkeypatch.setattr(run_once, "MAX_ENTRY_SLIPPAGE_PCT", 99.0)
     signal = {
         "event_id": "ZONE_TEST_REBASE", "symbol": "TEST-USDT", "type": "SHORT",
         "entry": 100.0, "sl": 105.0, "tp1": 99.0, "tp2": 98.0, "risk_pct": 1.0,
