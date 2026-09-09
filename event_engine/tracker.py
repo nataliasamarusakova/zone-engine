@@ -273,19 +273,6 @@ def _extract_setup_metrics(setup: dict | None) -> dict[str, Any]:
     }
 
 
-def get_active_trade_id(symbol: str, direction: str) -> str | None:
-    """Return the durable aggregate trade id without any network I/O."""
-    want_symbol = str(symbol or "").upper()
-    want_direction = str(direction).upper()
-    for trade in _load_active_trades().values():
-        if trade.get("closed"):
-            continue
-        trade_symbol = str(trade.get("symbol", "")).upper()
-        if trade_symbol == want_symbol and str(trade.get("direction", "")).upper() == want_direction:
-            return str(trade.get("event_id"))
-    return None
-
-
 def register_active_trade(
     event_id: str,
     symbol: str,
@@ -301,100 +288,38 @@ def register_active_trade(
     setup: dict | None = None,
     requested_entry_price: float | None = None,
     entry_ts_ms: int | None = None,
-    entry_margin_usdt: float | None = None,
-    zone_id: str | None = None,
-    entry_leg_qty: float | None = None,
 ) -> None:
-    """Register/merge one entry into the aggregate directional position state."""
     direction = _normalize_direction(direction)
     trades = _load_active_trades()
     now_ms = int(time.time() * 1000)
     actual_entry_ts = int(entry_ts_ms) if entry_ts_ms is not None and int(entry_ts_ms) > 0 else now_ms
-    actual_entry_price = _safe_float(entry_price)
-    total_qty = abs(_safe_float(qty))
-    added_qty = abs(_safe_float(entry_leg_qty, total_qty))
-    if actual_entry_price <= 0 or total_qty <= 0 or added_qty <= 0:
-        raise ValueError(f"Cannot register invalid position: entry_price={actual_entry_price} qty={total_qty} entry_leg_qty={added_qty}")
 
-    # One exchange directional position maps to one aggregate state record. This
-    # prevents multiple active records from managing the same SL/TP position.
-    existing_key = None
-    existing = None
-    # State aggregation must be pure/local. A tracker registration cannot issue a
-    # network lookup merely to normalize a symbol, especially during recovery.
-    want_symbol = str(symbol or "").upper()
-    for key, trade in trades.items():
-        if trade.get("closed"):
-            continue
-        trade_symbol = str(trade.get("symbol", "")).upper()
-        if trade_symbol == want_symbol and str(trade.get("direction", "")).upper() == direction:
-            existing_key, existing = key, trade
-            break
+    actual_entry_price = _safe_float(entry_price)
+    actual_qty = abs(_safe_float(qty))
+
+    if actual_entry_price <= 0 or actual_qty <= 0:
+        raise ValueError(f"Cannot register invalid position: entry_price={actual_entry_price} qty={actual_qty}")
 
     setup_metrics = _extract_setup_metrics(setup)
+    research: dict[str, Any] = {"source": "BingX 1H demand_supply zone engine"}
+
     requested_price = _safe_float(requested_entry_price, 0.0) if requested_entry_price is not None else setup_metrics["entry_reference"]
     signal_reference_price = _safe_float((setup or {}).get("signal_price"), 0.0) if isinstance(setup, dict) else 0.0
     if signal_reference_price <= 0:
         signal_reference_price = _safe_float(setup_metrics.get("entry_reference"), 0.0)
     pre_order_reference_price = _safe_float((setup or {}).get("pre_order_reference_price"), 0.0) if isinstance(setup, dict) else 0.0
-    entry_slippage_pct = ((actual_entry_price - requested_price) / requested_price * 100.0) if requested_price and requested_price > 0 else None
-    adverse_entry_slippage_pct = (max(0.0, entry_slippage_pct) if direction == "LONG" else max(0.0, -entry_slippage_pct)) if entry_slippage_pct is not None else None
-    leg = {
-        "event_id": str(event_id),
-        "zone_id": str(zone_id or (setup or {}).get("zone_id") or (setup or {}).get("zone", {}).get("level_id") or ""),
-        "qty": float(added_qty),
-        "entry_price": float(actual_entry_price),
-        "margin_usdt": _safe_float(entry_margin_usdt, 0.0),
-        "ts": actual_entry_ts,
-        "event_type": event_type,
-    }
+    entry_slippage_pct = None
+    adverse_entry_slippage_pct = None
 
-    if existing is not None:
-        legs = existing.setdefault("entry_legs", [])
-        is_new_leg = not any(str(x.get("event_id")) == str(event_id) for x in legs)
-        old_initial_qty = _safe_float(existing.get("initial_qty"), 0.0)
-        old_avg_price = _safe_float(existing.get("actual_entry_price", existing.get("entry_price")), 0.0)
-        if is_new_leg:
-            legs.append(leg)
-        new_initial_qty = old_initial_qty + (added_qty if is_new_leg else 0.0)
-        if new_initial_qty <= 0:
-            raise ValueError("aggregate entry quantity became non-positive")
-        weighted_avg = (old_initial_qty * old_avg_price + added_qty * actual_entry_price) / new_initial_qty if is_new_leg and old_initial_qty > 0 and old_avg_price > 0 else (actual_entry_price if is_new_leg else old_avg_price)
-        aggregate_key = f"{want_symbol}:{direction}"
-        if existing_key != aggregate_key:
-            trades.pop(existing_key, None)
-            existing_key = aggregate_key
-        existing["initial_qty"] = new_initial_qty
-        existing["remaining_qty"] = total_qty
-        existing["entry_price"] = weighted_avg
-        existing["actual_entry_price"] = weighted_avg
-        existing["requested_entry_price"] = requested_price
-        existing["signal_reference_price"] = signal_reference_price if signal_reference_price > 0 else existing.get("signal_reference_price")
-        existing["pre_order_reference_price"] = pre_order_reference_price if pre_order_reference_price > 0 else existing.get("pre_order_reference_price")
-        existing["entry_slippage_pct"] = entry_slippage_pct
-        existing["adverse_entry_slippage_pct"] = adverse_entry_slippage_pct
-        existing["tp_orders"] = tp_orders if isinstance(tp_orders, list) else []
-        existing["sl_order"] = sl_result if isinstance(sl_result, dict) else {}
-        if isinstance(setup, dict):
-            existing["setup"] = setup.copy()
-            existing["planned_risk_pct"] = setup_metrics["planned_risk_pct"]
-            existing["planned_target_rr"] = setup_metrics["planned_target_rr"]
-            existing["planned_weighted_rr"] = setup_metrics["planned_weighted_rr"]
-            existing["planned_invalidation_price"] = setup_metrics["invalidation_price"]
-            existing["planned_target_price"] = setup_metrics["target_price"]
-            existing["tp_levels"] = setup_metrics["tp_levels"]
-            existing["effective_tp_levels"] = setup_metrics["effective_tp_levels"]
-            existing["effective_weighted_rr"] = setup_metrics["effective_weighted_rr"]
-            existing["tp_mode"] = setup_metrics["tp_mode"]
-        existing["score"] = max(_safe_float(existing.get("score"), 50.0), _safe_float(score, 50.0))
-        existing["last_entry_ts"] = actual_entry_ts
-        existing["last_observation_ts"] = now_ms
-        trades[existing_key] = existing
-        _save_active_trades(trades)
-        return
+    if requested_price is not None and requested_price > 0:
+        entry_slippage_pct = (actual_entry_price - requested_price) / requested_price * 100.0
+        if direction == "LONG":
+            adverse_entry_slippage_pct = max(0.0, entry_slippage_pct)
+        else:
+            adverse_entry_slippage_pct = max(0.0, -entry_slippage_pct)
 
-    aggregate = {
-        "event_id": str(event_id),
+    trades[event_id] = {
+        "event_id": event_id,
         "symbol": symbol,
         "name": name or symbol,
         "direction": direction,
@@ -405,10 +330,9 @@ def register_active_trade(
         "pre_order_reference_price": pre_order_reference_price if pre_order_reference_price > 0 else requested_price,
         "entry_slippage_pct": entry_slippage_pct,
         "adverse_entry_slippage_pct": adverse_entry_slippage_pct,
-        "initial_qty": added_qty,
-        "remaining_qty": total_qty,
+        "initial_qty": actual_qty,
+        "remaining_qty": actual_qty,
         "entry_ts": actual_entry_ts,
-        "entry_legs": [leg],
         "tp_orders": tp_orders if isinstance(tp_orders, list) else [],
         "sl_order": sl_result if isinstance(sl_result, dict) else {},
         "hit_legs": [],
@@ -423,7 +347,7 @@ def register_active_trade(
         "score": _safe_float(score, 50.0),
         "event_type": event_type,
         "timeframe": str(timeframe or (setup or {}).get("event_timeframe") or (setup or {}).get("timeframe") or "1h").lower(),
-        "research": {"source": "BingX 1H zone/structure engine"},
+        "research": research,
         "setup": setup.copy() if isinstance(setup, dict) else {},
         "planned_risk_pct": setup_metrics["planned_risk_pct"],
         "planned_target_rr": setup_metrics["planned_target_rr"],
@@ -448,68 +372,9 @@ def register_active_trade(
         "duration_min": None,
         "closed": False,
         "last_observation_ts": now_ms,
-        "structure_exit_consumed": [],
     }
-    # Durable aggregate key is symbol:direction; event_id remains the logical
-    # trade identifier used by journals/notifications.
-    trades[f"{want_symbol}:{direction}"] = aggregate
-    _save_active_trades(trades)
 
-def recover_exchange_position(
-    event_id: str, symbol: str, direction: str, avg_price: float, qty: float,
-    *, sl_order: dict | None = None, tp_orders: list[dict] | None = None,
-    entry_ts_ms: int | None = None, strategy: str = "Zone/Structure First",
-) -> str:
-    """Persist a minimal aggregate state reconstructed from exchange state.
-
-    This function deliberately performs no exchange lookups or symbol conversion;
-    reconciliation has already established the authoritative position.
-    """
-    direction = _normalize_direction(direction)
-    symbol = str(symbol).upper()
-    avg_price = _safe_float(avg_price)
-    qty = abs(_safe_float(qty))
-    if not symbol or avg_price <= 0 or qty <= 0:
-        raise ValueError("invalid exchange position for recovery")
-    trades = _load_active_trades()
-    key = f"{symbol}:{direction}"
-    existing = trades.get(key)
-    if existing and not existing.get("closed"):
-        return str(existing.get("event_id"))
-    now_ms = int(entry_ts_ms) if entry_ts_ms is not None and int(entry_ts_ms) > 0 else int(time.time() * 1000)
-    sl = dict(sl_order) if isinstance(sl_order, dict) else {}
-    tps = list(tp_orders) if isinstance(tp_orders, list) else []
-    trade = {
-        "event_id": str(event_id), "symbol": symbol, "name": symbol,
-        "direction": direction, "entry_price": avg_price, "actual_entry_price": avg_price,
-        "requested_entry_price": avg_price, "signal_reference_price": avg_price,
-        "pre_order_reference_price": avg_price, "entry_slippage_pct": 0.0,
-        "adverse_entry_slippage_pct": 0.0, "initial_qty": qty, "remaining_qty": qty,
-        "current_position_qty": qty, "entry_ts": now_ms,
-        "entry_legs": [{"event_id": str(event_id), "zone_id": "", "qty": qty, "entry_price": avg_price,
-                        "margin_usdt": 0.0, "ts": now_ms, "event_type": "RECONCILIATION"}],
-        "tp_orders": tps, "sl_order": sl, "hit_legs": [], "be_activated": False,
-        "be_activation_ts": None, "be_required": False, "be_last_error": None,
-        "peak_pnl_pct": 0.0, "mae_pct": 0.0, "max_drawdown_pct": 0.0, "current_pnl_pct": 0.0,
-        "score": 0.0, "event_type": "RECONCILIATION", "timeframe": "1h",
-        "research": {"source": "BingX authoritative position recovery"},
-        "setup": {"strategy": strategy, "signal_price": avg_price, "entry_reference": avg_price,
-                  "invalidation_price": _safe_float(sl.get("stop_price"), 0.0) or None,
-                  "risk_pct": 1.0, "tp_levels": [], "recovery": True},
-        "planned_risk_pct": 1.0, "planned_target_rr": None, "planned_weighted_rr": 0.0,
-        "planned_entry_reference": avg_price,
-        "planned_invalidation_price": _safe_float(sl.get("stop_price"), 0.0) or None,
-        "planned_target_price": None, "tp_levels": [], "effective_tp_levels": [],
-        "tp_mode": "none", "effective_weighted_rr": 0.0, "tp_filled_qty": {},
-        "realized_pnl_qty": 0.0, "realized_pnl_weighted_sum": 0.0,
-        "last_tp_exec_price": None, "last_close_exec_price": None, "realized_pnl_pct": None,
-        "realized_rr": None, "exit_price": None, "exit_reason": None, "closed_ts": None,
-        "duration_min": None, "closed": False, "last_observation_ts": int(time.time() * 1000),
-        "structure_exit_consumed": [], "recovered": True,
-    }
-    trades[key] = trade
     _save_active_trades(trades)
-    return str(event_id)
 
 
 def format_tp_hit_message(
@@ -1231,127 +1096,6 @@ def _reconcile_historical_exit_order(
     return None, None, None, None
 
 
-def process_structural_exits(scan_rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """Reduce open positions when a fresh opposite structural level is touched.
-
-    One structural cluster can trigger one partial exit per fresh visit. Multiple
-    crossed levels are processed in deterministic price order. Exchange position
-    size is read immediately before/after every reduction; local state never
-    supplies the authoritative remaining quantity.
-    """
-    fraction = min(1.0, max(0.0, float(os.environ.get("STRUCTURAL_EXIT_FRACTION", "0.50"))))
-    if fraction <= 0:
-        return {"status": "disabled", "processed": 0}
-    by_symbol = {str(r.get("symbol", "")).upper(): r for r in scan_rows if isinstance(r, dict)}
-    trades = _load_active_trades()
-    processed = 0
-    changes = False
-
-    for trade_key, trade in list(trades.items()):
-        if trade.get("closed"):
-            continue
-        symbol = str(trade.get("symbol", "")).upper()
-        direction = str(trade.get("direction", "")).upper()
-        row = by_symbol.get(symbol)
-        if direction not in {"LONG", "SHORT"} or not row or not isinstance(row.get("levels"), dict):
-            continue
-        latest_ts = str(row.get("latest_closed_time") or "")
-        if latest_ts and str(trade.get("last_structure_exit_bar")) == latest_ts:
-            continue
-        # Mark this bar observed even if no level fires; a second overlapping run
-        # must not emit a duplicate reduction for the same closed candle.
-        trade["last_structure_exit_bar"] = latest_ts
-
-        ohlc = row.get("latest_ohlc") or {}
-        try:
-            high = float(ohlc.get("high")); low = float(ohlc.get("low")); prev_close = float(ohlc.get("prev_close"))
-        except (TypeError, ValueError):
-            continue
-        levels_key = "red" if direction == "LONG" else "blue"
-        candidates = list((row["levels"].get(levels_key) or []))
-        consumed = {str(x) for x in trade.get("structure_exit_consumed", [])}
-        touched = []
-        for level in candidates:
-            lid = str(level.get("level_id", ""))
-            if not lid or lid in consumed:
-                continue
-            lo = float(level.get("lower", level.get("price", 0.0)))
-            hi = float(level.get("upper", level.get("price", 0.0)))
-            if direction == "LONG":
-                fresh = prev_close < lo and high >= lo
-            else:
-                fresh = prev_close > hi and low <= hi
-            if fresh:
-                touched.append(level)
-        if direction == "LONG":
-            touched.sort(key=lambda x: (float(x.get("lower", x.get("price", 0.0))), str(x.get("level_id", ""))))
-        else:
-            touched.sort(key=lambda x: (-float(x.get("upper", x.get("price", 0.0))), str(x.get("level_id", ""))))
-
-        for level in touched:
-            current = get_position_directional(symbol, direction)
-            if current.get("status") == "not_found":
-                trade["closed"] = True
-                break
-            if current.get("status") != "found":
-                log.error("[STRUCTURE_EXIT] %s %s | position read failed: %s", symbol, direction, current.get("error"))
-                break
-            current_qty = abs(_safe_float(current.get("positionAmt")))
-            if current_qty <= 0:
-                trade["closed"] = True
-                break
-            close_qty = current_qty * fraction
-            level_id = str(level.get("level_id"))
-            result = close_position_market(symbol, direction, close_qty, reduce_only=True, trade_id=f"{trade.get('event_id','TRADE')}_{level_id}")
-            # A successful POST is not enough. Verify the directional exchange qty changed.
-            verify = get_position_directional(symbol, direction)
-            if verify.get("status") == "found":
-                after_qty = abs(_safe_float(verify.get("positionAmt")))
-            elif verify.get("status") == "not_found":
-                after_qty = 0.0
-            else:
-                after_qty = current_qty
-            reduced = current_qty - after_qty
-            if result.get("status") == "closed" and reduced > max(current_qty * 1e-6, 1e-12):
-                consumed.add(level_id)
-                trade["structure_exit_consumed"] = sorted(consumed)
-                trade["remaining_qty"] = after_qty
-                trade["last_close_exec_price"] = float(current.get("avgPrice", 0.0) or 0.0)
-                processed += 1
-                changes = True
-                log.info("[STRUCTURE_EXIT] %s | %s | level=%s | reduced=%.12g | remaining=%.12g", symbol, direction, level_id, reduced, after_qty)
-                if after_qty <= 1e-12:
-                    trade["closed"] = True
-                    break
-                # Rebuild protection against the authoritative remaining position.
-                setup = trade.get("setup") if isinstance(trade.get("setup"), dict) else {}
-                try:
-                    prot = __import__("event_engine.bingx", fromlist=["ensure_directional_protection"]).ensure_directional_protection(
-                        symbol, direction, float(verify.get("avgPrice", current.get("avgPrice", 0.0))), after_qty,
-                        float(trade.get("planned_risk_pct") or 1.0),
-                        setup.get("tp_levels") if isinstance(setup.get("tp_levels"), list) else [],
-                        trade_id=str(trade.get("event_id")),
-                        requested_sl_price=setup.get("invalidation_price"),
-                    )
-                    if prot.get("status") not in {"PROTECTED", "SL_ONLY"}:
-                        log.error("[STRUCTURE_EXIT_PROTECTION] %s %s | failed after reduction: %s", symbol, direction, prot)
-                    else:
-                        trade["tp_orders"] = prot.get("tp_orders", [])
-                        trade["sl_order"] = prot.get("sl_result", {})
-                except Exception as exc:
-                    log.exception("[STRUCTURE_EXIT_PROTECTION] %s %s | %s", symbol, direction, exc)
-            else:
-                log.error("[STRUCTURE_EXIT] %s %s | reduction not verified | result=%s pre=%.12g post=%.12g", symbol, direction, result, current_qty, after_qty)
-                break
-
-        trade["last_observation_ts"] = int(time.time() * 1000)
-        trades[trade_key] = trade
-
-    if changes:
-        _save_active_trades(trades)
-    return {"status": "ok", "processed": processed}
-
-
 def update_active_trades() -> None:
     trades = _load_active_trades()
     if not trades:
@@ -1656,56 +1400,6 @@ def update_active_trades() -> None:
                 realized_qty += residual_qty_before_position_disappeared
                 trade["remaining_qty"] = 0.0
 
-            # Do not finalize a closed trade until engine-owned protection cleanup
-            # has been attempted and positively verified. A zero exchange position
-            # must never coexist with stale local SL/TP orders that remain armed.
-            cleanup_errors: list[str] = []
-            try:
-                open_protection = get_open_protection_directional(symbol, direction)
-            except Exception as exc:
-                open_protection = {"status": "error", "error": str(exc)}
-            if open_protection.get("status") != "ok":
-                cleanup_errors.append(str(open_protection.get("error", "openOrders unavailable")))
-            else:
-                engine_orders = [
-                    o for o in list(open_protection.get("sl_orders", [])) + list(open_protection.get("tp_orders", []))
-                    if str(o.get("clientOrderId", "")).upper().startswith("EVT_") and o.get("orderId")
-                ]
-                for order in engine_orders:
-                    try:
-                        resp = cancel_order(symbol, str(order.get("orderId")))
-                    except Exception as exc:
-                        cleanup_errors.append(f"{order.get('orderId')}: {exc}")
-                        continue
-                    if not isinstance(resp, dict) or resp.get("code") not in (0, "0"):
-                        cleanup_errors.append(f"{order.get('orderId')}: {resp}")
-                try:
-                    verify_cleanup = get_open_protection_directional(symbol, direction)
-                except Exception as exc:
-                    verify_cleanup = {"status": "error", "error": str(exc)}
-                if verify_cleanup.get("status") != "ok":
-                    cleanup_errors.append(str(verify_cleanup.get("error", "cleanup verification failed")))
-                else:
-                    remaining_engine_ids = {
-                        str(o.get("orderId")) for o in list(verify_cleanup.get("sl_orders", [])) + list(verify_cleanup.get("tp_orders", []))
-                        if str(o.get("clientOrderId", "")).upper().startswith("EVT_") and o.get("orderId")
-                    }
-                    for order in engine_orders:
-                        oid = str(order.get("orderId"))
-                        if oid in remaining_engine_ids:
-                            cleanup_errors.append(f"{oid}: still visible after cancellation")
-
-            if cleanup_errors:
-                trade["closed"] = False
-                trade["cleanup_pending"] = True
-                trade["cleanup_errors"] = cleanup_errors
-                trade["remaining_qty"] = 0.0
-                updated_trades[event_id] = trade
-                log.error("[TRACKER_CLEANUP_PENDING] %s %s | position is gone but protective cleanup is not verified: %s", symbol, direction, cleanup_errors)
-                continue
-            trade["cleanup_pending"] = False
-            trade.pop("cleanup_errors", None)
-
             final_pnl = (realized_weighted / init_qty) if (init_qty > 0 and realized_qty > 0) else current_pnl
             realized_pnl_source = (
                 "executed_tp_or_sl" if (closed_by_tp or sl_exit_price is not None)
@@ -1780,6 +1474,19 @@ def update_active_trades() -> None:
                 ),
                 symbol=symbol,
             )
+
+            for tp in trade.get("tp_orders", []):
+                if tp.get("leg") not in hit_legs and tp.get("order_id"):
+                    try:
+                        cancel_order(symbol, tp["order_id"])
+                    except Exception:
+                        pass
+
+            if sl_order_id:
+                try:
+                    cancel_order(symbol, sl_order_id)
+                except Exception:
+                    pass
 
         except Exception as exc:
             log.exception("[TRACKER] Fatal trade error for event %s: %s", event_id, exc)

@@ -11,6 +11,7 @@ import os
 import re
 import time
 import threading
+import uuid
 from email.utils import parsedate_to_datetime
 from datetime import timezone
 from decimal import (
@@ -642,7 +643,11 @@ def close_position_market(symbol: str, direction: str, qty: float, *, reduce_onl
     if position_side == "BOTH" and reduce_only:
         params["reduceOnly"] = "true"
     if trade_id:
-        params["clientOrderId"] = f"EVT_{_trade_digest(trade_id)}_ROLLBACK"
+        # Every MARKET rollback attempt gets a fresh clientOrderId. Reusing the
+        # same rollback id after a partial/ambiguous exchange response can be
+        # rejected by BingX as a duplicate id even though the position is still open.
+        nonce = uuid.uuid4().hex.upper()[:10]
+        params["clientOrderId"] = f"EVT_{_trade_digest(trade_id)}_RB_{nonce}"
     resp = _request("POST", ORDER_PATH, params)
     if not isinstance(resp, dict) or resp.get("code") != 0:
         return {"status": "error", "error": f"close failed: code={resp.get('code') if isinstance(resp, dict) else None} msg={resp.get('msg') if isinstance(resp, dict) else resp}", "response": resp}
@@ -675,33 +680,15 @@ def _trade_digest(trade_id: str) -> str:
 
 
 def _new_open_client_order_id(bx_symbol: str, trade_id: str) -> str:
-    # Deterministic per signal. This is intentionally reused across restart/retry
-    # so the same logical entry cannot silently become a second MARKET order.
-    digest = hashlib.sha256(f"{bx_symbol}:{trade_id}".encode()).hexdigest().upper()[:18]
-    return f"EVT_OPEN_{digest}"
+    # ENTRY ids must be unique for every new order attempt. Idempotency is
+    # provided by the position check before POST, not by reusing a client ID.
+    nonce = uuid.uuid4().hex.upper()[:12]
+    digest = hashlib.sha256(f"{bx_symbol}:{trade_id}:{nonce}".encode()).hexdigest().upper()[:10]
+    return f"EVT_OPEN_{digest}_{nonce}"
 
 
-def _client_order_matches_request(order: dict, *, direction: str, position_side: str, qty: float) -> bool:
-    """Return True only when an existing client-order record matches this logical request."""
-    side = "BUY" if str(direction).upper() == "LONG" else "SELL"
-    if str(order.get("side", "")).upper() not in {side, ""}:
-        return False
-    op_side = str(order.get("positionSide", "")).upper()
-    if op_side and op_side not in {str(position_side).upper(), "BOTH"}:
-        return False
-    try:
-        order_qty = float(order.get("origQty", order.get("quantity", order.get("executedQty", 0))) or 0)
-    except (TypeError, ValueError):
-        order_qty = 0.0
-    if order_qty > 0 and abs(order_qty - float(qty)) > max(float(qty) * 1e-6, 1e-12):
-        return False
-    return True
-
-
-def _find_recent_order_by_client_id(symbol: str, client_order_id: str, lookback_ms: int | None = None) -> dict | None:
+def _find_recent_order_by_client_id(symbol: str, client_order_id: str, lookback_ms: int = 120_000) -> dict | None:
     """Resolve an ambiguous order POST without issuing a duplicate order."""
-    if lookback_ms is None:
-        lookback_ms = int(float(os.environ.get("CLIENT_ORDER_LOOKBACK_HOURS", "24")) * 3600_000)
     try:
         orders = get_all_orders(
             symbol,
@@ -718,15 +705,7 @@ def _find_recent_order_by_client_id(symbol: str, client_order_id: str, lookback_
     return None
 
 
-def open_market(
-    symbol: str,
-    direction: str,
-    price: float,
-    trade_id: str,
-    *,
-    margin_usdt: float | None = None,
-    max_position_margin_usdt: float | None = None,
-) -> dict:
+def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dict:
     direction = str(direction).upper()
     if direction not in {"LONG", "SHORT"}:
         return {"status": "error", "error": f"invalid direction={direction}"}
@@ -735,20 +714,15 @@ def open_market(
     if not bx:
         return {"status": "error", "error": "contract_not_found"}
 
-    # Backward-compatible single-entry mode: callers that do not supply the
-    # tiered sizing/cap arguments keep the historic duplicate-position guard.
-    # Production Zone Engine passes both arguments and may scale the same
-    # directional position across distinct zones.
-    if margin_usdt is None and max_position_margin_usdt is None:
-        try:
-            if has_open_position(symbol, direction):
-                return {"status": "existing_position", "symbol": bx, "direction": direction}
-        except Exception as exc:
-            return {"status": "error", "error": f"position_check_failed: {exc}", "symbol": bx}
-
     c = get_contract(symbol) or {}
     if not contract_exists(symbol):
         return {"status": "error", "error": "contract_unavailable", "symbol": bx}
+
+    try:
+        if has_open_position(symbol, direction):
+            return {"status": "existing_position", "symbol": bx, "direction": direction}
+    except Exception as exc:
+        return {"status": "error", "error": f"position_check_failed: {exc}", "symbol": bx}
 
     try:
         prec = int(c.get("quantityPrecision") or 0)
@@ -763,59 +737,7 @@ def open_market(
         return {"status": "error", "error": "invalid sizing price", "symbol": bx}
 
     leverage = min(LEVERAGE, MAX_LEVERAGE, max_lev)
-    requested_margin = MARGIN_USDT if margin_usdt is None else float(margin_usdt)
-    max_margin = None if max_position_margin_usdt is None else float(max_position_margin_usdt)
-    if not math.isfinite(requested_margin) or requested_margin <= 0:
-        return {"status": "error", "error": "invalid requested margin", "symbol": bx}
-    if max_margin is not None and (not math.isfinite(max_margin) or max_margin <= 0):
-        return {"status": "error", "error": "invalid max position margin", "symbol": bx}
-
-    existing_qty = 0.0
-    existing_avg = 0.0
-    legacy_single_entry = margin_usdt is None and max_position_margin_usdt is None
-    if legacy_single_entry:
-        current = {"status": "not_found"}
-    else:
-        try:
-            current = get_position_directional(symbol, direction)
-        except Exception as exc:
-            current = {"status": "error", "error": str(exc)}
-    if current.get("status") == "found":
-        existing_qty = abs(float(current.get("positionAmt", 0.0) or 0.0))
-        existing_avg = float(current.get("avgPrice", 0.0) or 0.0)
-    elif current.get("status") == "error":
-        return {"status": "error", "error": f"position_check_failed: {current.get('error')}", "symbol": bx}
-
-    existing_margin = (existing_qty * (existing_avg or sizing_price) * mult) / max(leverage, 1)
-    effective_margin = requested_margin
-    if max_margin is not None:
-        remaining_margin = max_margin - existing_margin
-        if remaining_margin <= 1e-12:
-            return {
-                "status": "skipped_position_margin_cap",
-                "reason": "max_position_margin_reached",
-                "symbol": bx, "direction": direction,
-                "requested_margin_usdt": requested_margin,
-                "effective_margin_usdt": 0.0,
-                "existing_margin_usdt": existing_margin,
-                "remaining_margin_usdt": 0.0,
-                "max_position_margin_usdt": max_margin,
-                "leverage": leverage, "sizing_price": sizing_price,
-            }
-        if requested_margin > remaining_margin + 1e-12:
-            return {
-                "status": "skipped_position_margin_cap",
-                "reason": "requested_margin_exceeds_remaining_position_cap",
-                "symbol": bx, "direction": direction,
-                "requested_margin_usdt": requested_margin,
-                "effective_margin_usdt": 0.0,
-                "existing_margin_usdt": existing_margin,
-                "remaining_margin_usdt": remaining_margin,
-                "max_position_margin_usdt": max_margin,
-                "leverage": leverage, "sizing_price": sizing_price,
-            }
-
-    qty = (effective_margin * leverage) / max(sizing_price * mult, 1e-12)
+    qty = (MARGIN_USDT * leverage) / max(sizing_price * mult, 1e-12)
     q = Decimal(str(qty)).quantize(Decimal(1).scaleb(-prec), rounding=ROUND_DOWN)
     qty = float(q)
 
@@ -824,8 +746,7 @@ def open_market(
     # can log/audit why this instrument was not traded.
     if qty <= 0:
         return {
-            "status": "skipped_min_qty" if min_qty > 0 else "error",
-            "reason": "exchange_min_quantity" if min_qty > 0 else "invalid_calculated_quantity",
+            "status": "error",
             "error": "calculated quantity is <= 0",
             "symbol": bx, "qty": qty, "min_qty": min_qty,
             "leverage": leverage, "sizing_price": sizing_price,
@@ -838,10 +759,7 @@ def open_market(
             "reason": "exchange_min_quantity",
             "symbol": bx, "qty": qty, "min_qty": min_qty,
             "required_margin_usdt": required_margin,
-            "configured_margin_usdt": effective_margin,
-            "requested_margin_usdt": requested_margin,
-            "existing_margin_usdt": existing_margin,
-            "max_position_margin_usdt": max_margin,
+            "configured_margin_usdt": MARGIN_USDT,
             "leverage": leverage, "sizing_price": sizing_price,
         }
 
@@ -855,10 +773,7 @@ def open_market(
             "reason": "two_tp_min_quantity",
             "symbol": bx, "qty": qty, "min_qty": min_qty,
             "required_margin_usdt": required_margin,
-            "configured_margin_usdt": effective_margin,
-            "requested_margin_usdt": requested_margin,
-            "existing_margin_usdt": existing_margin,
-            "max_position_margin_usdt": max_margin,
+            "configured_margin_usdt": MARGIN_USDT,
             "leverage": leverage, "sizing_price": sizing_price,
         }
 
@@ -871,41 +786,6 @@ def open_market(
     except Exception as exc:
         return {"status": "error", "error": f"position_mode_query_failed: {exc}", "symbol": bx}
     client_order_id = _new_open_client_order_id(bx, trade_id)
-
-    # Idempotent restart/retry check before the POST. A previous process may have
-    # submitted this exact logical signal and crashed before writing local state.
-    existing_order = _find_recent_order_by_client_id(symbol, client_order_id)
-    if existing_order is not None:
-        if not _client_order_matches_request(existing_order, direction=direction, position_side=position_side, qty=qty):
-            return {
-                "status": "error",
-                "error": "client_order_id_collision_with_different_order",
-                "symbol": bx,
-                "direction": direction,
-                "client_order_id": client_order_id,
-                "existing_order": existing_order,
-            }
-        return {
-            "status": "opened",
-            "symbol": bx,
-            "qty": qty,
-            "leverage": leverage,
-            "sizing_price": sizing_price,
-            "signal_price": float(price),
-            "order_reference_price": sizing_price,
-            "configured_margin_usdt": effective_margin,
-            "requested_margin_usdt": requested_margin,
-            "existing_margin_usdt": existing_margin,
-            "max_position_margin_usdt": max_margin,
-            "order_id": existing_order.get("orderId"),
-            "client_order_id": existing_order.get("clientOrderId") or client_order_id,
-            "idempotency": "client_order_id_already_exists",
-            "response": {"code": 0, "data": {"order": existing_order}},
-            "historical_order": existing_order,
-            "pre_position_qty": existing_qty,
-            "pre_position_avg_price": existing_avg,
-            "contract_multiplier": mult,
-        }
 
     params = {
         "symbol": bx,
@@ -924,7 +804,7 @@ def open_market(
         # the outcome unknown -- the order may have been created even though we
         # did not receive an ack. Never blindly retry a POST; verify the result
         # via the position instead. The pre-flight has_open_position check above
-        # preserves idempotency by reconciling the unique client order id.
+        # guarantees any position present now was opened by THIS order.
         transport_error = (
             response.get("code") == -1
             and "missing bingx credentials" not in str(response.get("msg", "")).lower()
@@ -933,17 +813,6 @@ def open_market(
             log.warning("[BINGX] Order POST transport error for %s (%s); reconciling clientOrderId before using position state...", bx, response.get("msg"))
             historical_order = _find_recent_order_by_client_id(symbol, client_order_id)
             if historical_order is not None:
-                if not _client_order_matches_request(historical_order, direction=direction, position_side=position_side, qty=qty):
-                    log.critical("[BINGX] ClientOrderId collision after transport error: existing order does not match requested MARKET order.")
-                    return {
-                        "status": "error",
-                        "error": "client_order_id_collision_with_different_order",
-                        "symbol": bx,
-                        "direction": direction,
-                        "client_order_id": client_order_id,
-                        "response": response,
-                        "historical_order": historical_order,
-                    }
                 log.warning("[BINGX] Matching clientOrderId found after transport error; treating MARKET order as resolved.")
                 return {
                     "status": "opened",
@@ -958,34 +827,23 @@ def open_market(
                     "idempotency": "client_order_id_verified_after_transport_error",
                     "response": response,
                     "historical_order": historical_order,
-                    "pre_position_qty": existing_qty,
-                    "pre_position_avg_price": existing_avg,
-                    "contract_multiplier": mult,
                 }
             try:
-                post_position = get_position_directional(symbol, direction)
-                if post_position.get("status") == "found":
-                    post_qty = abs(float(post_position.get("positionAmt", 0.0) or 0.0))
-                    if post_qty > existing_qty + max(min_qty, 1e-12) / 2.0:
-                        log.warning("[BINGX] Position increased after transport error without historical order match; treating as resolved, never re-POSTing.")
-                        return {
-                            "status": "opened",
-                            "symbol": bx,
-                            "qty": qty,
-                            "leverage": leverage,
-                            "sizing_price": sizing_price,
-                            "signal_price": float(price),
-                            "order_reference_price": sizing_price,
-                            "order_id": None,
-                            "client_order_id": client_order_id,
-                            "idempotency": "position_delta_verified_after_transport_error",
-                            "response": response,
-                            "pre_position_qty": existing_qty,
-                            "pre_position_avg_price": existing_avg,
-                            "post_position_qty": post_qty,
-                            "contract_multiplier": mult,
-                        }
-                    log.error("[BINGX] Transport error with no order match and no directional position increase; refusing to attribute an existing position to this entry.")
+                if has_open_position(symbol, direction):
+                    log.warning("[BINGX] Position found after transport error with no matching historical order; treating as unresolved-but-opened without re-POST.")
+                    return {
+                        "status": "opened",
+                        "symbol": bx,
+                        "qty": qty,
+                        "leverage": leverage,
+                        "sizing_price": sizing_price,
+                        "signal_price": float(price),
+                        "order_reference_price": sizing_price,
+                        "order_id": None,
+                        "client_order_id": client_order_id,
+                        "idempotency": "position_verified_after_transport_error_no_order_match",
+                        "response": response,
+                    }
             except Exception as exc:
                 log.error("[BINGX] Post-error position verification failed: %s", exc)
 
@@ -1003,16 +861,9 @@ def open_market(
         "sizing_price": sizing_price,
         "signal_price": float(price),
         "order_reference_price": sizing_price,
-        "configured_margin_usdt": effective_margin,
-        "requested_margin_usdt": requested_margin,
-        "existing_margin_usdt": existing_margin,
-        "max_position_margin_usdt": max_margin,
         "order_id": order_id,
         "client_order_id": order.get("clientOrderId") or client_order_id,
         "response": response,
-        "pre_position_qty": existing_qty,
-        "pre_position_avg_price": existing_avg,
-        "contract_multiplier": mult,
     }
 
 
@@ -1244,11 +1095,6 @@ def _tp_leg_from_order(order: dict, expected_leg: str, expected_price: float, pr
     return False
 
 
-def get_execution_reference_price(symbol: str) -> float | None:
-    """Return the freshest public execution reference used by the sizer."""
-    return _current_close_price(symbol)
-
-
 def _current_close_price(symbol: str) -> float | None:
     try:
         rows = fetch_klines(symbol, "1m", limit=2)
@@ -1424,7 +1270,6 @@ def _verify_market_reduce_order(
 def ensure_directional_protection(
     symbol: str, direction: str, avg_price: float, qty: float,
     stop_loss_pct: float, tp_levels: list, trade_id: str | None = None,
-    requested_sl_price: float | None = None,
 ) -> dict:
     direction = str(direction).upper()
     if direction not in {"LONG", "SHORT"}:
@@ -1494,6 +1339,22 @@ def ensure_directional_protection(
         if order_id and client_id.upper().startswith("EVT_"):
             engine_owned_invalid_sl_ids.append(order_id)
 
+    if engine_owned_invalid_sl_ids:
+        for old_id in engine_owned_invalid_sl_ids:
+            try:
+                cancel_resp = cancel_order(symbol, old_id)
+            except Exception as exc:
+                return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "error": f"engine SL cleanup failed for {old_id}: {exc}"}
+            if not isinstance(cancel_resp, dict) or cancel_resp.get("code") not in (0, "0"):
+                return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "error": f"engine SL cleanup failed for {old_id}: {cancel_resp}"}
+
+        post_cleanup = get_open_protection_directional(symbol, direction)
+        if post_cleanup.get("status") != "ok":
+            return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "error": "engine SL cleanup could not be verified"}
+        remaining_ids = {str(o.get("orderId", "")) for o in post_cleanup.get("sl_orders", [])}
+        if any(old_id in remaining_ids for old_id in engine_owned_invalid_sl_ids):
+            return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "error": "engine SL cleanup not visible on exchange"}
+
     if valid_existing_sl is not None:
         sl = valid_existing_sl
         sl_result = {
@@ -1504,36 +1365,17 @@ def ensure_directional_protection(
             "qty": float(sl.get("origQty", 0) or sl.get("quantity", 0) or position_qty),
         }
     else:
-        # Prefer the caller's structurally-derived stop. The fallback percentage
-        # stop is retained only for legacy/recovery trades that have no stored
-        # structural stop geometry. Never accept a requested stop on the wrong
-        # side of the actual fill.
-        requested = None
-        try:
-            candidate = float(requested_sl_price) if requested_sl_price is not None else None
-            if candidate is not None and math.isfinite(candidate) and candidate > 0:
-                if (direction == "LONG" and candidate < avg_price) or (direction == "SHORT" and candidate > avg_price):
-                    requested = candidate
-        except (TypeError, ValueError):
-            requested = None
-        sl_price = requested if requested is not None else (
-            avg_price * (1.0 - stop_loss_pct / 100.0)
-            if direction == "LONG"
-            else avg_price * (1.0 + stop_loss_pct / 100.0)
-        )
+        sl_price = avg_price * (1.0 - stop_loss_pct / 100.0) if direction == "LONG" else avg_price * (1.0 + stop_loss_pct / 100.0)
         client_order_id = build_sl_client_order_id(trade_id)
-        position_side = position_side_param(direction)
         params = {
             "symbol": bx_symbol,
             "side": "SELL" if direction == "LONG" else "BUY",
-            "positionSide": position_side,
+            "positionSide": position_side_param(direction),
             "type": "STOP_MARKET",
             "stopPrice": _format_price(sl_price, price_precision),
             "quantity": _format_qty(position_qty, precision),
             "clientOrderId": client_order_id,
         }
-        if position_side == "BOTH":
-            params["reduceOnly"] = "true"
 
         resp = _request("POST", ORDER_PATH, params)
         order = (resp.get("data") or {}).get("order") or resp.get("data") or {}
@@ -1565,40 +1407,6 @@ def ensure_directional_protection(
                 "client_order_id": order.get("clientOrderId") or client_order_id,
                 "stop_price": sl_price,
                 "qty": position_qty,
-            }
-
-    # Safe replacement ordering: the new SL must already exist and be verified
-    # before any stale engine-owned SL is cancelled. Never leave the position
-    # without at least one verified SL.
-    if engine_owned_invalid_sl_ids:
-        for old_id in engine_owned_invalid_sl_ids:
-            try:
-                cancel_resp = cancel_order(symbol, old_id)
-            except Exception as exc:
-                return {
-                    "status": "SL_CLEANUP_PENDING", "symbol": symbol, "direction": direction,
-                    "avg_price": avg_price, "qty": position_qty, "sl_result": sl_result,
-                    "error": f"engine SL cleanup failed for {old_id}: {exc}",
-                }
-            if not isinstance(cancel_resp, dict) or cancel_resp.get("code") not in (0, "0"):
-                return {
-                    "status": "SL_CLEANUP_PENDING", "symbol": symbol, "direction": direction,
-                    "avg_price": avg_price, "qty": position_qty, "sl_result": sl_result,
-                    "error": f"engine SL cleanup failed for {old_id}: {cancel_resp}",
-                }
-        cleanup_verify = get_open_protection_directional(symbol, direction)
-        if cleanup_verify.get("status") != "ok":
-            return {
-                "status": "SL_CLEANUP_PENDING", "symbol": symbol, "direction": direction,
-                "avg_price": avg_price, "qty": position_qty, "sl_result": sl_result,
-                "error": "engine SL cleanup could not be verified",
-            }
-        remaining_ids = {str(o.get("orderId", "")) for o in cleanup_verify.get("sl_orders", [])}
-        if any(old_id in remaining_ids for old_id in engine_owned_invalid_sl_ids):
-            return {
-                "status": "SL_CLEANUP_PENDING", "symbol": symbol, "direction": direction,
-                "avg_price": avg_price, "qty": position_qty, "sl_result": sl_result,
-                "error": "engine SL cleanup not visible on exchange",
             }
 
     verified = get_open_protection_directional(symbol, direction)
@@ -1728,17 +1536,14 @@ def ensure_directional_protection(
         if trigger_invalid:
             log.warning("[BINGX] TP market execution for %s %s: price=%s current=%s (trigger crossed)", symbol, leg, _format_price(tp_price, price_precision), _format_price(current_price, price_precision))
             client_order_id = build_tp_client_order_id(leg, trade_id)
-            market_position_side = position_side_param(direction)
             market_params = {
                 "symbol": bx_symbol,
                 "side": "SELL" if direction == "LONG" else "BUY",
-                "positionSide": market_position_side,
+                "positionSide": position_side_param(direction),
                 "type": "MARKET",
                 "quantity": _format_qty(tp_qty, precision),
                 "clientOrderId": client_order_id,
             }
-            if market_position_side == "BOTH":
-                market_params["reduceOnly"] = "true"
 
             pre_position_qty = position_qty
             resp = _request("POST", ORDER_PATH, market_params)
@@ -1783,18 +1588,15 @@ def ensure_directional_protection(
             continue
 
         client_order_id = build_tp_client_order_id(leg, trade_id)
-        position_side = position_side_param(direction)
         params = {
             "symbol": bx_symbol,
             "side": "SELL" if direction == "LONG" else "BUY",
-            "positionSide": position_side,
+            "positionSide": position_side_param(direction),
             "type": "TAKE_PROFIT_MARKET",
             "stopPrice": _format_price(tp_price, price_precision),
             "quantity": _format_qty(tp_qty, precision),
             "clientOrderId": client_order_id,
         }
-        if position_side == "BOTH":
-            params["reduceOnly"] = "true"
 
         resp = _request("POST", ORDER_PATH, params)
         order = (resp.get("data") or {}).get("order") or resp.get("data") or {}

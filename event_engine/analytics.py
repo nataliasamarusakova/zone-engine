@@ -48,33 +48,11 @@ def _atomic_json(path: Path, payload: Any) -> None:
     tmp.replace(path)
 
 
-def _format_levels(levels: Any, key: str, limit: int = 12) -> str:
-    items = (levels or {}).get(key) if isinstance(levels, dict) else []
-    if not items:
-        return "—"
-    out = []
-    for x in items[:limit]:
-        lid = str(x.get("level_id", "?"))[-8:]
-        kind = str(x.get("kind", "?"))
-        lo = float(x.get("lower", x.get("price", 0)) or 0)
-        hi = float(x.get("upper", x.get("price", 0)) or 0)
-        strength = int(x.get("strength", 1) or 1)
-        age = x.get("age_bars")
-        if abs(hi - lo) <= 1e-12:
-            geometry = f"{lo:.12g}"
-        else:
-            geometry = f"{lo:.12g}-{hi:.12g}"
-        out.append(f"{lid}:{kind}@{geometry}/S{strength}/A{age if age is not None else '?'}")
-    return ";".join(out)
-
-
 def _line(row: dict[str, Any]) -> str:
-    levels = row.get("levels") or {}
     return (
         f"Монета={row.get('symbol')} | Цена={row.get('current_price')} | "
         f"Положение={row.get('price_position')} | Сигнал={row.get('fresh_signal', '—')} | "
         f"DEMAND={row.get('active_demand', 0)} | SUPPLY={row.get('active_supply', 0)} | "
-        f"BLUE={_format_levels(levels, 'blue')} | RED={_format_levels(levels, 'red')} | "
         f"Source={row.get('market_source', 'binance_spot')} | "
         f"Binance={row.get('binance_price')} | BingX={row.get('bingx_price')} | "
         f"Spread={row.get('market_spread_pct')}% | Asset={row.get('asset_class', 'UNKNOWN')}"

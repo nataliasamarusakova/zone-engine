@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 import logging
 import os
 import threading
@@ -170,17 +169,14 @@ def fetch_klines(symbol: str, interval: str = "1h", limit: int = 120, *, retryab
     for row in payload:
         if not isinstance(row, list) or len(row) < 6:
             continue
-        o, h, l, c, v = map(float, row[1:6])
-        if not all(math.isfinite(x) for x in (o, h, l, c, v)) or h < max(o, c) or l > min(o, c) or h < l or v < 0:
-            continue
         rows.append(
             {
                 "timestamp": int(row[0]),
-                "open": o,
-                "high": h,
-                "low": l,
-                "close": c,
-                "volume": v,
+                "open": float(row[1]),
+                "high": float(row[2]),
+                "low": float(row[3]),
+                "close": float(row[4]),
+                "volume": float(row[5]),
                 "close_time": int(row[6]) if len(row) > 6 else None,
                 "quote_volume": float(row[7]) if len(row) > 7 else None,
                 "trade_count": int(row[8]) if len(row) > 8 and str(row[8]).isdigit() else None,
