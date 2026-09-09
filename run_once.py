@@ -146,12 +146,25 @@ def _log_human_level_map(symbol: str, result: dict[str, Any]) -> None:
     log.info("[LEVEL_MAP] %s | PRICE=%s", symbol, _fmt_num(result.get("current_price")))
     log.info("[LEVEL_MAP] %s | BLUE | %s", symbol, _fmt_level_list(blue))
     log.info("[LEVEL_MAP] %s | RED  | %s", symbol, _fmt_level_list(red))
-    log.info(
-        "[LEVEL_MAP] %s | ZONES | DEMAND=%s | SUPPLY=%s",
-        symbol,
-        ", ".join(_fmt_zone_human(z, latest_idx) for z in demand[:4]) or "—",
-        ", ".join(_fmt_zone_human(z, latest_idx) for z in supply[:4]) or "—",
-    )
+    # Human-readable zone log: one explicit line per visible zone so values can
+    # be compared directly with TradingView. Do not collapse/rename zone
+    # boundaries into HIGH/LOW structural levels.
+    if demand:
+        for idx, zone in enumerate(demand, 1):
+            log.info(
+                "[ZONES] %s | 🔵 DEMAND #%d | %s",
+                symbol, idx, _fmt_zone_human(zone, latest_idx),
+            )
+    else:
+        log.info("[ZONES] %s | 🔵 DEMAND | —", symbol)
+    if supply:
+        for idx, zone in enumerate(supply, 1):
+            log.info(
+                "[ZONES] %s | 🔴 SUPPLY #%d | %s",
+                symbol, idx, _fmt_zone_human(zone, latest_idx),
+            )
+    else:
+        log.info("[ZONES] %s | 🔴 SUPPLY | —", symbol)
 
     high = levels.get("high_level") or {}
     low = levels.get("low_level") or {}

@@ -2343,3 +2343,43 @@ def test_human_level_logging_never_emits_nan_and_exposes_trade_map(caplog):
     assert "[TRADE_MAP] BTC-USDT | DIRECTION=LONG" in text
     assert "[TRADE_MAP] BTC-USDT | PROTECTION" in text
     assert "nan" not in text.lower()
+
+
+def test_human_zone_logging_emits_each_zone_with_explicit_values(caplog):
+    from run_once import _log_human_level_map
+    result = {
+        "current_price": 100.0,
+        "latest_closed_idx": 10,
+        "zones": {
+            "demand": [
+                {"btm": 95.0, "top": 96.0, "start": 9},
+                {"btm": 90.0, "top": 91.0, "start": 8},
+            ],
+            "supply": [
+                {"btm": 104.0, "top": 105.0, "start": 7},
+                {"btm": 108.0, "top": 109.0, "start": 6},
+            ],
+        },
+        "levels": {
+            "blue": [], "red": [], "invalid": [],
+            "active_zones": {
+                "demand": [
+                    {"btm": 95.0, "top": 96.0, "start": 9},
+                    {"btm": 90.0, "top": 91.0, "start": 8},
+                ],
+                "supply": [
+                    {"btm": 104.0, "top": 105.0, "start": 7},
+                    {"btm": 108.0, "top": 109.0, "start": 6},
+                ],
+            },
+            "high_level": {}, "low_level": {},
+        },
+        "signals": [],
+    }
+    caplog.set_level("INFO", logger="zone_engine")
+    _log_human_level_map("TEST-USDT", result)
+    text = "\n".join(r.message for r in caplog.records)
+    assert "[ZONES] TEST-USDT | 🔵 DEMAND #1 | 95–96 age=1" in text
+    assert "[ZONES] TEST-USDT | 🔵 DEMAND #2 | 90–91 age=2" in text
+    assert "[ZONES] TEST-USDT | 🔴 SUPPLY #1 | 104–105 age=3" in text
+    assert "[ZONES] TEST-USDT | 🔴 SUPPLY #2 | 108–109 age=4" in text
