@@ -681,8 +681,27 @@ def _new_open_client_order_id(bx_symbol: str, trade_id: str) -> str:
     return f"EVT_OPEN_{digest}"
 
 
-def _find_recent_order_by_client_id(symbol: str, client_order_id: str, lookback_ms: int = 120_000) -> dict | None:
+def _client_order_matches_request(order: dict, *, direction: str, position_side: str, qty: float) -> bool:
+    """Return True only when an existing client-order record matches this logical request."""
+    side = "BUY" if str(direction).upper() == "LONG" else "SELL"
+    if str(order.get("side", "")).upper() not in {side, ""}:
+        return False
+    op_side = str(order.get("positionSide", "")).upper()
+    if op_side and op_side not in {str(position_side).upper(), "BOTH"}:
+        return False
+    try:
+        order_qty = float(order.get("origQty", order.get("quantity", order.get("executedQty", 0))) or 0)
+    except (TypeError, ValueError):
+        order_qty = 0.0
+    if order_qty > 0 and abs(order_qty - float(qty)) > max(float(qty) * 1e-6, 1e-12):
+        return False
+    return True
+
+
+def _find_recent_order_by_client_id(symbol: str, client_order_id: str, lookback_ms: int | None = None) -> dict | None:
     """Resolve an ambiguous order POST without issuing a duplicate order."""
+    if lookback_ms is None:
+        lookback_ms = int(float(os.environ.get("CLIENT_ORDER_LOOKBACK_HOURS", "24")) * 3600_000)
     try:
         orders = get_all_orders(
             symbol,
@@ -805,7 +824,8 @@ def open_market(
     # can log/audit why this instrument was not traded.
     if qty <= 0:
         return {
-            "status": "error",
+            "status": "skipped_min_qty" if min_qty > 0 else "error",
+            "reason": "exchange_min_quantity" if min_qty > 0 else "invalid_calculated_quantity",
             "error": "calculated quantity is <= 0",
             "symbol": bx, "qty": qty, "min_qty": min_qty,
             "leverage": leverage, "sizing_price": sizing_price,
@@ -856,6 +876,15 @@ def open_market(
     # submitted this exact logical signal and crashed before writing local state.
     existing_order = _find_recent_order_by_client_id(symbol, client_order_id)
     if existing_order is not None:
+        if not _client_order_matches_request(existing_order, direction=direction, position_side=position_side, qty=qty):
+            return {
+                "status": "error",
+                "error": "client_order_id_collision_with_different_order",
+                "symbol": bx,
+                "direction": direction,
+                "client_order_id": client_order_id,
+                "existing_order": existing_order,
+            }
         return {
             "status": "opened",
             "symbol": bx,
@@ -904,6 +933,17 @@ def open_market(
             log.warning("[BINGX] Order POST transport error for %s (%s); reconciling clientOrderId before using position state...", bx, response.get("msg"))
             historical_order = _find_recent_order_by_client_id(symbol, client_order_id)
             if historical_order is not None:
+                if not _client_order_matches_request(historical_order, direction=direction, position_side=position_side, qty=qty):
+                    log.critical("[BINGX] ClientOrderId collision after transport error: existing order does not match requested MARKET order.")
+                    return {
+                        "status": "error",
+                        "error": "client_order_id_collision_with_different_order",
+                        "symbol": bx,
+                        "direction": direction,
+                        "client_order_id": client_order_id,
+                        "response": response,
+                        "historical_order": historical_order,
+                    }
                 log.warning("[BINGX] Matching clientOrderId found after transport error; treating MARKET order as resolved.")
                 return {
                     "status": "opened",
@@ -1202,6 +1242,11 @@ def _tp_leg_from_order(order: dict, expected_leg: str, expected_price: float, pr
     if f"_{expected_leg}_" in f"_{client_id}_":
         return actual_formatted == expected_formatted
     return False
+
+
+def get_execution_reference_price(symbol: str) -> float | None:
+    """Return the freshest public execution reference used by the sizer."""
+    return _current_close_price(symbol)
 
 
 def _current_close_price(symbol: str) -> float | None:
