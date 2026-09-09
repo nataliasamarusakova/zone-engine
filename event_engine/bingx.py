@@ -1266,6 +1266,7 @@ def _verify_market_reduce_order(
 def ensure_directional_protection(
     symbol: str, direction: str, avg_price: float, qty: float,
     stop_loss_pct: float, tp_levels: list, trade_id: str | None = None,
+    requested_sl_price: float | None = None,
 ) -> dict:
     direction = str(direction).upper()
     if direction not in {"LONG", "SHORT"}:
@@ -1361,17 +1362,36 @@ def ensure_directional_protection(
             "qty": float(sl.get("origQty", 0) or sl.get("quantity", 0) or position_qty),
         }
     else:
-        sl_price = avg_price * (1.0 - stop_loss_pct / 100.0) if direction == "LONG" else avg_price * (1.0 + stop_loss_pct / 100.0)
+        # Prefer the caller's structurally-derived stop. The fallback percentage
+        # stop is retained only for legacy/recovery trades that have no stored
+        # structural stop geometry. Never accept a requested stop on the wrong
+        # side of the actual fill.
+        requested = None
+        try:
+            candidate = float(requested_sl_price) if requested_sl_price is not None else None
+            if candidate is not None and math.isfinite(candidate) and candidate > 0:
+                if (direction == "LONG" and candidate < avg_price) or (direction == "SHORT" and candidate > avg_price):
+                    requested = candidate
+        except (TypeError, ValueError):
+            requested = None
+        sl_price = requested if requested is not None else (
+            avg_price * (1.0 - stop_loss_pct / 100.0)
+            if direction == "LONG"
+            else avg_price * (1.0 + stop_loss_pct / 100.0)
+        )
         client_order_id = build_sl_client_order_id(trade_id)
+        position_side = position_side_param(direction)
         params = {
             "symbol": bx_symbol,
             "side": "SELL" if direction == "LONG" else "BUY",
-            "positionSide": position_side_param(direction),
+            "positionSide": position_side,
             "type": "STOP_MARKET",
             "stopPrice": _format_price(sl_price, price_precision),
             "quantity": _format_qty(position_qty, precision),
             "clientOrderId": client_order_id,
         }
+        if position_side == "BOTH":
+            params["reduceOnly"] = "true"
 
         resp = _request("POST", ORDER_PATH, params)
         order = (resp.get("data") or {}).get("order") or resp.get("data") or {}
@@ -1532,14 +1552,17 @@ def ensure_directional_protection(
         if trigger_invalid:
             log.warning("[BINGX] TP market execution for %s %s: price=%s current=%s (trigger crossed)", symbol, leg, _format_price(tp_price, price_precision), _format_price(current_price, price_precision))
             client_order_id = build_tp_client_order_id(leg, trade_id)
+            market_position_side = position_side_param(direction)
             market_params = {
                 "symbol": bx_symbol,
                 "side": "SELL" if direction == "LONG" else "BUY",
-                "positionSide": position_side_param(direction),
+                "positionSide": market_position_side,
                 "type": "MARKET",
                 "quantity": _format_qty(tp_qty, precision),
                 "clientOrderId": client_order_id,
             }
+            if market_position_side == "BOTH":
+                market_params["reduceOnly"] = "true"
 
             pre_position_qty = position_qty
             resp = _request("POST", ORDER_PATH, market_params)
@@ -1584,15 +1607,18 @@ def ensure_directional_protection(
             continue
 
         client_order_id = build_tp_client_order_id(leg, trade_id)
+        position_side = position_side_param(direction)
         params = {
             "symbol": bx_symbol,
             "side": "SELL" if direction == "LONG" else "BUY",
-            "positionSide": position_side_param(direction),
+            "positionSide": position_side,
             "type": "TAKE_PROFIT_MARKET",
             "stopPrice": _format_price(tp_price, price_precision),
             "quantity": _format_qty(tp_qty, precision),
             "clientOrderId": client_order_id,
         }
+        if position_side == "BOTH":
+            params["reduceOnly"] = "true"
 
         resp = _request("POST", ORDER_PATH, params)
         order = (resp.get("data") or {}).get("order") or resp.get("data") or {}
