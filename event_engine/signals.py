@@ -221,6 +221,16 @@ def _normalize_1h(df: pd.DataFrame) -> pd.DataFrame:
         out[col] = pd.to_numeric(out[col], errors="coerce")
     out = out.dropna(subset=["timestamp", "open", "high", "low", "close", "volume"])
     out = out.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
+    out = out[out["timestamp"] <= pd.Timestamp.now(tz="UTC")].reset_index(drop=True)
+    if not out.empty:
+        valid = (
+            np.isfinite(out["open"]) & np.isfinite(out["high"]) & np.isfinite(out["low"]) &
+            np.isfinite(out["close"]) & np.isfinite(out["volume"]) &
+            (out["high"] >= np.maximum(out["open"], out["close"])) &
+            (out["low"] <= np.minimum(out["open"], out["close"])) &
+            (out["high"] >= out["low"]) & (out["volume"] >= 0)
+        )
+        out = out.loc[valid].reset_index(drop=True)
 
     # A 1H candle sequence compressed into milliseconds is always a malformed
     # timestamp conversion, not valid market data. Fail loudly instead of
@@ -232,6 +242,7 @@ def _normalize_1h(df: pd.DataFrame) -> pd.DataFrame:
                 "Invalid 1H timestamp spacing after normalization: "
                 f"median_delta={deltas.median()}"
             )
+        out.attrs["gap_count"] = int((deltas > pd.Timedelta(hours=1.5)).sum())
     return out
 
 
@@ -694,12 +705,104 @@ def _targets_from_nearest_obstacle(
     }
 
 
+def _build_structural_pool_at_bar(
+    df: pd.DataFrame,
+    i: int,
+    active_demand: list[dict[str, Any]],
+    active_supply: list[dict[str, Any]],
+    sr_ph: pd.Series,
+    sr_pl: pd.Series,
+) -> dict[str, Any]:
+    """Build every tradable structural level known at closed bar ``i`` only."""
+    cur_c = float(df.loc[i, "close"])
+    atr = max(float(df.loc[i, "atr50"]), 1e-12)
+    sr_event = _pine_sr_event_levels(df, i, sr_ph, sr_pl)
+    sr_levels: list[dict[str, Any]] = []
+    for raw_price in sr_event.get("levels", []):
+        price = float(raw_price)
+        matched = None
+        for pp in range(i, max(-1, i - SR_PRD - 1), -1):
+            if pd.notna(sr_ph.iloc[pp]) and abs(float(sr_ph.iloc[pp]) - price) <= max(1e-12, atr * 1e-8):
+                matched = {"price": price, "semantic": "RESISTANCE", "created_idx": pp, "age_bars": i - pp, "pivot_idx": pp, "strength": SR_STRENGTH}
+                break
+            if pd.notna(sr_pl.iloc[pp]) and abs(float(sr_pl.iloc[pp]) - price) <= max(1e-12, atr * 1e-8):
+                matched = {"price": price, "semantic": "SUPPORT", "created_idx": pp, "age_bars": i - pp, "pivot_idx": pp, "strength": SR_STRENGTH}
+                break
+        if matched is not None:
+            sr_levels.append(matched)
+
+    pivot_lows = [
+        {"price": float(sr_pl.iloc[pp]), "created_idx": pp, "age_bars": i - pp}
+        for pp in range(max(SR_RB, i - 120), i + 1) if pd.notna(sr_pl.iloc[pp])
+    ]
+    pivot_highs = [
+        {"price": float(sr_ph.iloc[pp]), "created_idx": pp, "age_bars": i - pp}
+        for pp in range(max(SR_RB, i - 120), i + 1) if pd.notna(sr_ph.iloc[pp])
+    ]
+    high_levels = []
+    low_levels = []
+    if sr_event.get("highestph") is not None:
+        high_levels = [{"price": float(sr_event["highestph"]), "created_idx": int(sr_event.get("event_idx") or i), "anchor": f"HIGH:{int(sr_event.get('event_idx') or i)}"}]
+    if sr_event.get("lowestpl") is not None:
+        low_levels = [{"price": float(sr_event["lowestpl"]), "created_idx": int(sr_event.get("event_idx") or i), "anchor": f"LOW:{int(sr_event.get('event_idx') or i)}"}]
+
+    return build_level_pool(
+        demand=active_demand,
+        supply=active_supply,
+        support_resistance=sr_levels,
+        pivot_lows=pivot_lows,
+        pivot_highs=pivot_highs,
+        high_levels=high_levels,
+        low_levels=low_levels,
+        current_idx=i,
+        reference_price=cur_c,
+        atr=atr,
+    )
+
+
+def _level_tier(level: dict[str, Any]) -> str:
+    kinds = {str(x).upper() for x in (level.get("member_kinds") or [])}
+    if str(level.get("kind", "")).upper() in {"DEMAND", "SUPPLY"}:
+        kinds.add(str(level.get("kind")).upper())
+    if kinds & {"DEMAND", "SUPPLY"}:
+        return "STRONG"
+    if kinds & {"SUPPORT", "RESISTANCE"}:
+        return "MEDIUM"
+    return "WEAK"
+
+
+def _touches_level(direction: str, candle_low: float, candle_high: float, candle_close: float, level: dict[str, Any]) -> bool:
+    """Wick-based touch of a structural range, constrained by direction."""
+    lo = float(level["lower"])
+    hi = float(level["upper"])
+    direction = str(direction).upper()
+    if direction == "LONG":
+        return candle_low <= hi and candle_close >= lo
+    return candle_high >= lo and candle_close <= hi
+
+
+def _fresh_level_touch(direction: str, prev_close: float, candle_low: float, candle_high: float, candle_close: float, level: dict[str, Any]) -> bool:
+    """One signal only on the first closed candle that re-enters a structure."""
+    lo = float(level["lower"])
+    hi = float(level["upper"])
+    direction = str(direction).upper()
+    if direction == "LONG":
+        return prev_close > hi and _touches_level(direction, candle_low, candle_high, candle_close, level)
+    return prev_close < lo and _touches_level(direction, candle_low, candle_high, candle_close, level)
+
+
 def generate_zone_signals(
     df: pd.DataFrame,
     symbol: str = "",
     mode: Literal["historical", "live"] = "live",
 ) -> tuple[pd.DataFrame, list[dict], list[dict], list[dict]]:
-    """Zone-first strategy: trade fresh Demand/Supply touches, no ALMA required."""
+    """Structure-first strategy over all BLUE/RED structural levels.
+
+    Demand/Supply, Support/Resistance, Pivot Low/High and Low/High Level are
+    all tradable structures. A single clustered structure produces one entry
+    per fresh visit; multiple independent clusters may produce multiple signals
+    on the same closed candle. No forming candle or future pivot is used.
+    """
     df = _drop_incomplete_1h(df)
     if len(df) < MIN_BARS:
         return df, [], [], []
@@ -709,10 +812,8 @@ def generate_zone_signals(
     df["vol_sma20"] = df["volume"].rolling(20, min_periods=20).mean()
     df["body_atr"] = (df["close"] - df["open"]).abs() / df["atr50"].replace(0, np.nan)
     df["range_atr"] = (df["high"] - df["low"]) / df["atr50"].replace(0, np.nan)
-
-    # Keep ALMA columns available for diagnostics/backward-compatible analytics,
-    # but they are deliberately NOT an entry condition in this version.
     df = _attach_exact_alternate_series(df, mode=mode)
+
     active_supply: list[dict[str, Any]] = []
     active_demand: list[dict[str, Any]] = []
     signals: list[dict[str, Any]] = []
@@ -724,268 +825,172 @@ def generate_zone_signals(
         l = float(df.loc[p, "low"])
         atr = max(float(df.loc[i, "atr50"]), 1e-12)
 
-        is_ph = all(h >= float(df.loc[p-k, "high"]) for k in range(1, SWING_LEN+1)) and all(
-            h >= float(df.loc[p+k, "high"]) for k in range(1, SWING_LEN+1)
+        # Pine pivots become knowable at i=p+SWING_LEN: no future bar is used
+        # after this confirmation point.
+        is_ph = all(h >= float(df.loc[p-k, "high"]) for k in range(1, SWING_LEN + 1)) and all(
+            h >= float(df.loc[p+k, "high"]) for k in range(1, SWING_LEN + 1)
         )
-        is_pl = all(l <= float(df.loc[p-k, "low"]) for k in range(1, SWING_LEN+1)) and all(
-            l <= float(df.loc[p+k, "low"]) for k in range(1, SWING_LEN+1)
+        is_pl = all(l <= float(df.loc[p-k, "low"]) for k in range(1, SWING_LEN + 1)) and all(
+            l <= float(df.loc[p+k, "low"]) for k in range(1, SWING_LEN + 1)
         )
         if is_ph:
-            zone = _build_zone(h, 1, atr, p)
-            if _pine_overlap_check(zone["poi"], active_supply, atr):
-                active_supply.insert(0, zone)
+            z = _build_zone(h, 1, atr, p)
+            if _pine_overlap_check(z["poi"], active_supply, atr):
+                active_supply.insert(0, z)
                 del active_supply[ZONE_HISTORY:]
         elif is_pl:
-            zone = _build_zone(l, -1, atr, p)
-            if _pine_overlap_check(zone["poi"], active_demand, atr):
-                active_demand.insert(0, zone)
+            z = _build_zone(l, -1, atr, p)
+            if _pine_overlap_check(z["poi"], active_demand, atr):
+                active_demand.insert(0, z)
                 del active_demand[ZONE_HISTORY:]
 
         close = float(df.loc[i, "close"])
         active_supply = [z for z in active_supply if close < float(z["top"])]
         active_demand = [z for z in active_demand if close > float(z["btm"])]
-        cur_l, cur_h, cur_c, cur_o = map(float, [df.loc[i, "low"], df.loc[i, "high"], df.loc[i, "close"], df.loc[i, "open"]])
 
-        demand_zone = _find_directional_zone("LONG", cur_l, cur_h, cur_c, active_demand, active_supply)
-        supply_zone = _find_directional_zone("SHORT", cur_l, cur_h, cur_c, active_demand, active_supply)
-        if demand_zone is not None and supply_zone is not None:
-            # Ambiguous overlap: do not guess a direction.
-            continue
-        direction = "LONG" if demand_zone is not None else "SHORT" if supply_zone is not None else None
-        trade_zone = demand_zone if direction == "LONG" else supply_zone
-        if direction is None or trade_zone is None:
-            continue
+        cur_l = float(df.loc[i, "low"])
+        cur_h = float(df.loc[i, "high"])
+        cur_c = float(df.loc[i, "close"])
+        prev_c = float(df.loc[i - 1, "close"])
+        level_pool = _build_structural_pool_at_bar(df, i, active_demand, active_supply, sr_ph, sr_pl)
 
-        # Fresh touch only: previous close must have been outside the zone.
-        prev_close = float(df.loc[i - 1, "close"])
-        if direction == "LONG":
-            if not (prev_close > float(trade_zone["top"]) and cur_l <= float(trade_zone["top"]) and cur_c >= float(trade_zone["btm"])):
-                continue
-        else:
-            if not (prev_close < float(trade_zone["btm"]) and cur_h >= float(trade_zone["btm"]) and cur_c <= float(trade_zone["top"])):
+        # Generate at most one signal per structural cluster, but preserve all
+        # independent clusters touched by this candle.
+        for direction, candidates in (("LONG", level_pool["blue"]), ("SHORT", level_pool["red"])):
+            touched = [
+                lvl for lvl in candidates
+                if _fresh_level_touch(direction, prev_c, cur_l, cur_h, cur_c, lvl)
+            ]
+            if not touched:
                 continue
 
-        # Audit-derived entry filters. These are applied only after a literal
-        # fresh zone touch, never to ordinary in-zone observations.
-        zone_age_bars = max(0, int(i - int(trade_zone.get("start", i))))
-        if zone_age_bars > MAX_ZONE_AGE_BARS:
-            continue
-        if REQUIRE_DIRECTIONAL_CANDLE:
-            # Require a real directional close. Doji candles are neutral and
-            # must not qualify as confirmation for either side.
-            if direction == "LONG" and cur_c <= cur_o:
-                continue
-            if direction == "SHORT" and cur_c >= cur_o:
-                continue
+            # Deterministic intrabar ordering: process the structure nearest to
+            # the previous close first, then strongest structure, then ID.
+            if direction == "LONG":
+                touched.sort(key=lambda x: (-float(x["upper"]), -int(x.get("strength", 1)), str(x.get("level_id", ""))))
+            else:
+                touched.sort(key=lambda x: (float(x["lower"]), -int(x.get("strength", 1)), str(x.get("level_id", ""))))
 
-        if not math.isfinite(atr) or atr <= 0:
-            continue
+            for entry_level in touched:
+                lo = float(entry_level["lower"])
+                hi = float(entry_level["upper"])
+                tier = _level_tier(entry_level)
+                # Structural protection is anchored directly beyond the entry
+                # structure; it is not another entry filter.
+                sl_buffer = max(ZONE_SL_ATR_BUFFER * atr, cur_c * 0.0002)
+                if direction == "LONG":
+                    stop = lo - sl_buffer
+                else:
+                    stop = hi + sl_buffer
+                risk = (cur_c - stop) if direction == "LONG" else (stop - cur_c)
+                if risk <= 0 or not math.isfinite(risk):
+                    continue
+                risk_pct = risk / max(cur_c, 1e-12) * 100.0
+                if risk_pct > MAX_SIGNAL_RISK_PCT:
+                    # Risk ceiling is execution safety, not a setup-quality score.
+                    continue
 
-        # Build one structural level pool from the existing, unchanged level builders.
-        # Pine S/R semantics are assigned from the confirmed pivot type; no future bars are used.
-        sr_event = _pine_sr_event_levels(df, i, sr_ph, sr_pl)
-        sr_levels = []
-        for raw_price in sr_event.get("levels", []):
-            price = float(raw_price)
-            matched = None
-            for pp in range(i, max(-1, i - SR_PRD - 1), -1):
-                if pd.notna(sr_ph.iloc[pp]) and abs(float(sr_ph.iloc[pp]) - price) <= max(1e-12, atr * 1e-8):
-                    matched = {"price": price, "semantic": "RESISTANCE", "created_idx": pp, "age_bars": i - pp, "pivot_idx": pp, "strength": SR_STRENGTH}
-                    break
-                if pd.notna(sr_pl.iloc[pp]) and abs(float(sr_pl.iloc[pp]) - price) <= max(1e-12, atr * 1e-8):
-                    matched = {"price": price, "semantic": "SUPPORT", "created_idx": pp, "age_bars": i - pp, "pivot_idx": pp, "strength": SR_STRENGTH}
-                    break
-            if matched is not None:
-                sr_levels.append(matched)
+                opposing = select_opposing_levels(
+                    direction, cur_c, level_pool["blue"], level_pool["red"], limit=2
+                )
+                obstacle = None
+                if opposing:
+                    first = opposing[0]
+                    obstacle_price = float(first["lower"]) if direction == "LONG" else float(first["upper"])
+                    obstacle = {"price": obstacle_price, "source": first.get("source", "level_cluster"), "level_id": first.get("level_id"), "level": first}
+                targets = _targets_from_nearest_obstacle(direction, cur_c, stop, atr, obstacle)
+                if targets is None:
+                    # Do not discard a valid structure touch solely because no
+                    # opposing level is currently visible. Fixed-R targets are a
+                    # technical exit fallback; the structural signal remains valid.
+                    continue
 
-        pivot_lows = [{"price": float(sr_pl.iloc[pp]), "created_idx": pp, "age_bars": i - pp} for pp in range(max(SR_RB, i - 120), i + 1) if pd.notna(sr_pl.iloc[pp])]
-        pivot_highs = [{"price": float(sr_ph.iloc[pp]), "created_idx": pp, "age_bars": i - pp} for pp in range(max(SR_RB, i - 120), i + 1) if pd.notna(sr_ph.iloc[pp])]
-        level_pool = build_level_pool(
-            demand=active_demand, supply=active_supply, support_resistance=sr_levels,
-            pivot_lows=pivot_lows, pivot_highs=pivot_highs, current_idx=i, reference_price=cur_c, atr=atr,
-        )
-        entry_level = select_entry_level_for_zone(direction, trade_zone, level_pool)
-        protective_level = select_protective_level(direction, cur_c, level_pool["blue"], level_pool["red"])
-        if protective_level is None:
-            continue
-        sl_buffer = max(ZONE_SL_ATR_BUFFER * atr, cur_c * 0.0002)
-        stop = protective_price(protective_level, direction, sl_buffer)
-        risk = (cur_c - stop) if direction == "LONG" else (stop - cur_c)
-        if risk <= 0:
-            continue
+                event_ts = int(df.loc[i, "timestamp"].timestamp() * 1000)
+                cluster_id = str(entry_level.get("level_id", ""))
+                event_id = _make_event_id(symbol or "UNKNOWN", direction, event_ts, cluster_id, cur_c)
+                zone_ctx = {
+                    "kind": "+".join(entry_level.get("member_kinds") or [entry_level.get("kind", "LEVEL")]),
+                    "level_id": cluster_id,
+                    "level_lower": lo,
+                    "level_upper": hi,
+                    "price": float(entry_level["price"]),
+                    "age_bars": entry_level.get("age_bars"),
+                    "strength": entry_level.get("strength", 1),
+                    "tier": tier,
+                    "member_level_ids": list(entry_level.get("member_level_ids") or []),
+                    "member_kinds": list(entry_level.get("member_kinds") or []),
+                }
+                signals.append({
+                    "event_id": event_id,
+                    "idx": i,
+                    "time": df.loc[i, "timestamp"].isoformat(),
+                    "type": direction,
+                    "symbol": symbol.upper(),
+                    "entry": cur_c,
+                    "sl": round(stop, 8),
+                    "tp1": round(float(targets["tp1"]), 8),
+                    "tp2": round(float(targets["tp2"]), 8),
+                    "risk_pct": round(risk_pct, 4),
+                    "risk_abs": round(risk, 8),
+                    "atr": round(float(atr), 8),
+                    "tp1_rr": round(float(targets["tp1_rr"]), 4),
+                    "tp2_rr": round(float(targets["tp2_rr"]), 4),
+                    "rr_ratio": round(float(targets["tp2_rr"]), 4),
+                    "strategy": "Zone/Structure First",
+                    "zone_id": cluster_id,
+                    "zone_tier": tier,
+                    "trigger": {
+                        "type": "STRUCTURE_TOUCH",
+                        "alma_required": False,
+                        "zone_touch": True,
+                        "fresh": True,
+                        "rule": "closed_1h_wick_touch_after_close_outside",
+                    },
+                    "zone": zone_ctx,
+                    "entry_level": entry_level,
+                    "protection_level": entry_level,
+                    "risk_model": {
+                        "sl_source": "entry_structure_lower_upper_plus_buffer",
+                        "protection_level_id": cluster_id,
+                        "protection_level_price": float(entry_level.get("price", cur_c)),
+                        "zone_sl_buffer_atr": ZONE_SL_ATR_BUFFER,
+                        "max_signal_risk_pct": MAX_SIGNAL_RISK_PCT,
+                    },
+                    "target": {
+                        "source": targets["target_source"],
+                        "obstacle_source": targets["obstacle_source"],
+                        "obstacle_price": targets["obstacle_price"],
+                        "target_levels": opposing,
+                    },
+                    "confirmation": {
+                        "alma_cross": False,
+                        "zone_touch": True,
+                        "fresh_touch": True,
+                        "previous_close": prev_c,
+                        "directional_candle_required": False,
+                        "directional_candle_ok": True,
+                        "structure_obstacle_required": False,
+                        "structure_obstacle_found": obstacle is not None,
+                        "closed_candle_only": True,
+                    },
+                    "source_bar_close": cur_c,
+                })
 
-        opposing_levels = select_opposing_levels(direction, cur_c, level_pool["blue"], level_pool["red"], limit=2)
-        obstacle = None
-        if opposing_levels:
-            first = opposing_levels[0]
-            obstacle_price = float(first["lower"]) if direction == "LONG" else float(first["upper"])
-            obstacle = {"price": obstacle_price, "source": first.get("source", "level_cluster"), "level_id": first.get("level_id"), "level": first}
-        if REQUIRE_STRUCTURE_OBSTACLE and obstacle is None:
-            continue
-        if obstacle is not None:
-            obstacle_price = float(obstacle["price"])
-            structural_distance = (obstacle_price - cur_c) if direction == "LONG" else (cur_c - obstacle_price)
-            if risk <= 0 or structural_distance <= 0 or (structural_distance / risk) < MIN_STRUCTURE_ROOM_R:
-                continue
-        risk_pct = (risk / cur_c) * 100.0
-        if risk_pct > MAX_SIGNAL_RISK_PCT:
-            continue
-        # Use the same unified opposing level pool for TP construction.
-        targets = _targets_from_nearest_obstacle(direction, cur_c, stop, atr, obstacle)
-        if targets is None:
-            continue
-        tp1 = float(targets["tp1"])
-        tp2 = float(targets["tp2"])
-        tp1_rr = float(targets["tp1_rr"])
-        tp2_rr = float(targets["tp2_rr"])
-        avg_vol = _safe_num(df.loc[i, "vol_sma20"], 0.0)
-        vol_ratio = (_safe_num(df.loc[i, "volume"]) / avg_vol) if avg_vol > 0 else None
-        event_ts = int(df.loc[i, "timestamp"].timestamp() * 1000)
-        zone_start = int(trade_zone["start"])
-        event_id = _make_event_id(symbol or "UNKNOWN", direction, event_ts, zone_start, cur_c)
-        zone_ctx = {
-            **trade_zone,
-            **_zone_context(trade_zone, i, df),
-            "kind": "DEMAND" if direction == "LONG" else "SUPPLY",
-        }
-        signals.append(
-            {
-                "event_id": event_id,
-                "idx": i,
-                "time": df.loc[i, "timestamp"].isoformat(),
-                "type": direction,
-                "symbol": symbol.upper(),
-                "entry": cur_c,
-                "sl": round(stop, 8),
-                "tp1": round(tp1, 8),
-                "tp2": round(tp2, 8),
-                "risk_pct": round(risk_pct, 4),
-                "risk_abs": round(risk, 8),
-                "atr": round(float(atr), 8),
-                "tp1_rr": round(tp1_rr, 4),
-                "tp2_rr": round(tp2_rr, 4),
-                "rr_ratio": round(tp2_rr, 4),
-                "strategy": "Demand/Supply Zone First",
-                "trigger": {
-                    "type": "ZONE_TOUCH",
-                    "alma_required": False,
-                    "alternate_timeframe": "8h",
-                    "mode": mode,
-                    "zone_touch": True,
-                    "zone_entry_rule": "fresh_touch_from_outside",
-                },
-                "zone": zone_ctx,
-                "target": {
-                    "source": targets["target_source"],
-                    "obstacle_source": targets["obstacle_source"],
-                    "obstacle_price": targets["obstacle_price"],
-                    "target_levels": opposing_levels,
-                    "tp1_fraction_to_tp2": TP1_OBSTACLE_FRACTION,
-                    "tp2_fraction_to_obstacle": TP2_OBSTACLE_FRACTION,
-                    "obstacle_buffer_atr": TP_OBSTACLE_BUFFER_ATR,
-                    "tp_max_r": TP_MAX_R,
-                },
-                "levels": {
-                    "blue": level_pool["blue"],
-                    "red": level_pool["red"],
-                    "cluster_tolerance": level_pool["cluster_tolerance"],
-                },
-                "entry_level": entry_level,
-                "protection_level": protective_level,
-                "risk_model": {
-                    "sl_source": "last_valid_same_color_level_plus_buffer",
-                    "protection_level_id": protective_level.get("level_id"),
-                    "protection_level_price": protective_level.get("price"),
-                    "protection_level_lower": protective_level.get("lower"),
-                    "protection_level_upper": protective_level.get("upper"),
-                    "zone_sl_buffer_atr": ZONE_SL_ATR_BUFFER,
-                    "max_signal_risk_pct": MAX_SIGNAL_RISK_PCT,
-                },
-                "confirmation": {
-                    "alma_cross": False,
-                    "directional_candle_required": REQUIRE_DIRECTIONAL_CANDLE,
-                    "directional_candle_ok": (cur_c >= cur_o) if direction == "LONG" else (cur_c <= cur_o),
-                    "zone_age_limit_bars": MAX_ZONE_AGE_BARS,
-                    "zone_age_bars": zone_age_bars,
-                    "minimum_structure_room_r": MIN_STRUCTURE_ROOM_R,
-                    "zone_touch": True,
-                    "volume_ratio": round(vol_ratio, 3) if vol_ratio is not None else None,
-                    "candle_body_atr": round(_safe_num(df.loc[i, "body_atr"]), 3),
-                    "range_atr": round(_safe_num(df.loc[i, "range_atr"]), 3),
-                    "bullish_candle": cur_c >= cur_o,
-                    "bearish_candle": cur_c <= cur_o,
-                },
-                "source_bar_close": cur_c,
-            }
-        )
-
-    # Persist the structural levels from the latest closed bar for diagnostics and journaling.
-    # This does not alter any level builder; it only exposes the already-computed structures
-    # through the dataframe metadata so the caller can log them even when there is no signal.
+    latest_idx = len(df) - 1
     try:
-        latest_idx = len(df) - 1
-        latest_close = float(df.loc[latest_idx, "close"])
         latest_atr = max(float(df.loc[latest_idx, "atr50"]), 1e-12)
-        sr_event = _pine_sr_event_levels(df, latest_idx, sr_ph, sr_pl)
-        sr_levels = []
-        for raw_price in sr_event.get("levels", []):
-            price = float(raw_price)
-            matched = None
-            for pp in range(latest_idx, max(-1, latest_idx - SR_PRD - 1), -1):
-                if pd.notna(sr_ph.iloc[pp]) and abs(float(sr_ph.iloc[pp]) - price) <= max(1e-12, latest_atr * 1e-8):
-                    matched = {
-                        "price": price, "semantic": "RESISTANCE", "created_idx": pp,
-                        "age_bars": latest_idx - pp, "pivot_idx": pp, "strength": SR_STRENGTH,
-                    }
-                    break
-                if pd.notna(sr_pl.iloc[pp]) and abs(float(sr_pl.iloc[pp]) - price) <= max(1e-12, latest_atr * 1e-8):
-                    matched = {
-                        "price": price, "semantic": "SUPPORT", "created_idx": pp,
-                        "age_bars": latest_idx - pp, "pivot_idx": pp, "strength": SR_STRENGTH,
-                    }
-                    break
-            if matched is not None:
-                sr_levels.append(matched)
-        pivot_lows = [
-            {"price": float(sr_pl.iloc[pp]), "created_idx": pp, "age_bars": latest_idx - pp}
-            for pp in range(max(SR_RB, latest_idx - 120), latest_idx + 1)
-            if pd.notna(sr_pl.iloc[pp])
-        ]
-        pivot_highs = [
-            {"price": float(sr_ph.iloc[pp]), "created_idx": pp, "age_bars": latest_idx - pp}
-            for pp in range(max(SR_RB, latest_idx - 120), latest_idx + 1)
-            if pd.notna(sr_ph.iloc[pp])
-        ]
-        level_snapshot = build_level_pool(
-            demand=active_demand,
-            supply=active_supply,
-            support_resistance=sr_levels,
-            pivot_lows=pivot_lows,
-            pivot_highs=pivot_highs,
-            current_idx=latest_idx,
-            reference_price=latest_close,
-            atr=latest_atr,
-        )
-        # Preserve the Pine visual High/Low Level values as diagnostics only.
-        # These are already produced by the existing, unchanged Pine SR recreation.
-        level_snapshot["high_level"] = {
-            "price": float(sr_event["highestph"]) if sr_event.get("highestph") is not None else None,
-            "source": "pine_sr_high_level",
-            "semantic": "HIGH_LEVEL",
+        latest_sr = _pine_sr_event_levels(df, latest_idx, sr_ph, sr_pl)
+        snapshot = _build_structural_pool_at_bar(df, latest_idx, active_demand, active_supply, sr_ph, sr_pl)
+        snapshot["high_level"] = {
+            "price": latest_sr.get("highestph"), "source": "pine_sr_high_level", "semantic": "HIGH_LEVEL"
         }
-        level_snapshot["low_level"] = {
-            "price": float(sr_event["lowestpl"]) if sr_event.get("lowestpl") is not None else None,
-            "source": "pine_sr_low_level",
-            "semantic": "LOW_LEVEL",
+        snapshot["low_level"] = {
+            "price": latest_sr.get("lowestpl"), "source": "pine_sr_low_level", "semantic": "LOW_LEVEL"
         }
-        level_snapshot["active_zones"] = {
-            "demand": [dict(z) for z in active_demand],
-            "supply": [dict(z) for z in active_supply],
-        }
-        df.attrs["level_snapshot"] = level_snapshot
-        df.attrs["level_snapshot_reference_price"] = latest_close
+        snapshot["active_zones"] = {"demand": [dict(z) for z in active_demand], "supply": [dict(z) for z in active_supply]}
+        df.attrs["level_snapshot"] = snapshot
+        df.attrs["level_snapshot_reference_price"] = float(df.loc[latest_idx, "close"])
     except Exception as exc:
-        # Diagnostics must never make the strategy fail.
         df.attrs["level_snapshot_error"] = f"{type(exc).__name__}: {exc}"
 
     return df, active_supply, active_demand, signals

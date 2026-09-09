@@ -11,7 +11,6 @@ import os
 import re
 import time
 import threading
-import uuid
 from email.utils import parsedate_to_datetime
 from datetime import timezone
 from decimal import (
@@ -676,11 +675,10 @@ def _trade_digest(trade_id: str) -> str:
 
 
 def _new_open_client_order_id(bx_symbol: str, trade_id: str) -> str:
-    # ENTRY ids must be unique for every new order attempt. Idempotency is
-    # provided by the position check before POST, not by reusing a client ID.
-    nonce = uuid.uuid4().hex.upper()[:12]
-    digest = hashlib.sha256(f"{bx_symbol}:{trade_id}:{nonce}".encode()).hexdigest().upper()[:10]
-    return f"EVT_OPEN_{digest}_{nonce}"
+    # Deterministic per signal. This is intentionally reused across restart/retry
+    # so the same logical entry cannot silently become a second MARKET order.
+    digest = hashlib.sha256(f"{bx_symbol}:{trade_id}".encode()).hexdigest().upper()[:18]
+    return f"EVT_OPEN_{digest}"
 
 
 def _find_recent_order_by_client_id(symbol: str, client_order_id: str, lookback_ms: int = 120_000) -> dict | None:
@@ -854,6 +852,32 @@ def open_market(
         return {"status": "error", "error": f"position_mode_query_failed: {exc}", "symbol": bx}
     client_order_id = _new_open_client_order_id(bx, trade_id)
 
+    # Idempotent restart/retry check before the POST. A previous process may have
+    # submitted this exact logical signal and crashed before writing local state.
+    existing_order = _find_recent_order_by_client_id(symbol, client_order_id)
+    if existing_order is not None:
+        return {
+            "status": "opened",
+            "symbol": bx,
+            "qty": qty,
+            "leverage": leverage,
+            "sizing_price": sizing_price,
+            "signal_price": float(price),
+            "order_reference_price": sizing_price,
+            "configured_margin_usdt": effective_margin,
+            "requested_margin_usdt": requested_margin,
+            "existing_margin_usdt": existing_margin,
+            "max_position_margin_usdt": max_margin,
+            "order_id": existing_order.get("orderId"),
+            "client_order_id": existing_order.get("clientOrderId") or client_order_id,
+            "idempotency": "client_order_id_already_exists",
+            "response": {"code": 0, "data": {"order": existing_order}},
+            "historical_order": existing_order,
+            "pre_position_qty": existing_qty,
+            "pre_position_avg_price": existing_avg,
+            "contract_multiplier": mult,
+        }
+
     params = {
         "symbol": bx,
         "side": side,
@@ -894,23 +918,34 @@ def open_market(
                     "idempotency": "client_order_id_verified_after_transport_error",
                     "response": response,
                     "historical_order": historical_order,
+                    "pre_position_qty": existing_qty,
+                    "pre_position_avg_price": existing_avg,
+                    "contract_multiplier": mult,
                 }
             try:
-                if has_open_position(symbol, direction):
-                    log.warning("[BINGX] Position found after transport error with no matching historical order; treating as unresolved-but-opened without re-POST.")
-                    return {
-                        "status": "opened",
-                        "symbol": bx,
-                        "qty": qty,
-                        "leverage": leverage,
-                        "sizing_price": sizing_price,
-                        "signal_price": float(price),
-                        "order_reference_price": sizing_price,
-                        "order_id": None,
-                        "client_order_id": client_order_id,
-                        "idempotency": "position_verified_after_transport_error_no_order_match",
-                        "response": response,
-                    }
+                post_position = get_position_directional(symbol, direction)
+                if post_position.get("status") == "found":
+                    post_qty = abs(float(post_position.get("positionAmt", 0.0) or 0.0))
+                    if post_qty > existing_qty + max(min_qty, 1e-12) / 2.0:
+                        log.warning("[BINGX] Position increased after transport error without historical order match; treating as resolved, never re-POSTing.")
+                        return {
+                            "status": "opened",
+                            "symbol": bx,
+                            "qty": qty,
+                            "leverage": leverage,
+                            "sizing_price": sizing_price,
+                            "signal_price": float(price),
+                            "order_reference_price": sizing_price,
+                            "order_id": None,
+                            "client_order_id": client_order_id,
+                            "idempotency": "position_delta_verified_after_transport_error",
+                            "response": response,
+                            "pre_position_qty": existing_qty,
+                            "pre_position_avg_price": existing_avg,
+                            "post_position_qty": post_qty,
+                            "contract_multiplier": mult,
+                        }
+                    log.error("[BINGX] Transport error with no order match and no directional position increase; refusing to attribute an existing position to this entry.")
             except Exception as exc:
                 log.error("[BINGX] Post-error position verification failed: %s", exc)
 
@@ -935,6 +970,9 @@ def open_market(
         "order_id": order_id,
         "client_order_id": order.get("clientOrderId") or client_order_id,
         "response": response,
+        "pre_position_qty": existing_qty,
+        "pre_position_avg_price": existing_avg,
+        "contract_multiplier": mult,
     }
 
 
@@ -1411,22 +1449,6 @@ def ensure_directional_protection(
         if order_id and client_id.upper().startswith("EVT_"):
             engine_owned_invalid_sl_ids.append(order_id)
 
-    if engine_owned_invalid_sl_ids:
-        for old_id in engine_owned_invalid_sl_ids:
-            try:
-                cancel_resp = cancel_order(symbol, old_id)
-            except Exception as exc:
-                return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "error": f"engine SL cleanup failed for {old_id}: {exc}"}
-            if not isinstance(cancel_resp, dict) or cancel_resp.get("code") not in (0, "0"):
-                return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "error": f"engine SL cleanup failed for {old_id}: {cancel_resp}"}
-
-        post_cleanup = get_open_protection_directional(symbol, direction)
-        if post_cleanup.get("status") != "ok":
-            return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "error": "engine SL cleanup could not be verified"}
-        remaining_ids = {str(o.get("orderId", "")) for o in post_cleanup.get("sl_orders", [])}
-        if any(old_id in remaining_ids for old_id in engine_owned_invalid_sl_ids):
-            return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "error": "engine SL cleanup not visible on exchange"}
-
     if valid_existing_sl is not None:
         sl = valid_existing_sl
         sl_result = {
@@ -1498,6 +1520,40 @@ def ensure_directional_protection(
                 "client_order_id": order.get("clientOrderId") or client_order_id,
                 "stop_price": sl_price,
                 "qty": position_qty,
+            }
+
+    # Safe replacement ordering: the new SL must already exist and be verified
+    # before any stale engine-owned SL is cancelled. Never leave the position
+    # without at least one verified SL.
+    if engine_owned_invalid_sl_ids:
+        for old_id in engine_owned_invalid_sl_ids:
+            try:
+                cancel_resp = cancel_order(symbol, old_id)
+            except Exception as exc:
+                return {
+                    "status": "SL_CLEANUP_PENDING", "symbol": symbol, "direction": direction,
+                    "avg_price": avg_price, "qty": position_qty, "sl_result": sl_result,
+                    "error": f"engine SL cleanup failed for {old_id}: {exc}",
+                }
+            if not isinstance(cancel_resp, dict) or cancel_resp.get("code") not in (0, "0"):
+                return {
+                    "status": "SL_CLEANUP_PENDING", "symbol": symbol, "direction": direction,
+                    "avg_price": avg_price, "qty": position_qty, "sl_result": sl_result,
+                    "error": f"engine SL cleanup failed for {old_id}: {cancel_resp}",
+                }
+        cleanup_verify = get_open_protection_directional(symbol, direction)
+        if cleanup_verify.get("status") != "ok":
+            return {
+                "status": "SL_CLEANUP_PENDING", "symbol": symbol, "direction": direction,
+                "avg_price": avg_price, "qty": position_qty, "sl_result": sl_result,
+                "error": "engine SL cleanup could not be verified",
+            }
+        remaining_ids = {str(o.get("orderId", "")) for o in cleanup_verify.get("sl_orders", [])}
+        if any(old_id in remaining_ids for old_id in engine_owned_invalid_sl_ids):
+            return {
+                "status": "SL_CLEANUP_PENDING", "symbol": symbol, "direction": direction,
+                "avg_price": avg_price, "qty": position_qty, "sl_result": sl_result,
+                "error": "engine SL cleanup not visible on exchange",
             }
 
     verified = get_open_protection_directional(symbol, direction)

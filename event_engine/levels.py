@@ -6,7 +6,7 @@ from typing import Any, Iterable
 
 
 DEFAULT_CLUSTER_ATR = 0.20
-DEFAULT_CLUSTER_PCT = 0.0015
+DEFAULT_CLUSTER_PCT = 0.0005
 
 
 def _num(value: Any) -> float | None:
@@ -61,13 +61,21 @@ def _within_cluster(a: dict[str, Any], b: dict[str, Any], tolerance: float) -> b
 
 
 def _cluster_levels(levels: list[dict[str, Any]], tolerance: float) -> list[dict[str, Any]]:
+    """Deterministically cluster nearby structures without transitive over-merging.
+
+    A candidate is compared to the cluster's representative price, not the expanding
+    cluster bounds. This prevents A~B and B~C from silently merging distant A/C levels.
+    """
     clusters: list[dict[str, Any]] = []
-    for level in sorted(levels, key=lambda x: float(x["price"])):
+    for level in sorted(levels, key=lambda x: (float(x["price"]), str(x.get("level_id", "")))):
         assigned = None
+        best_distance = None
         for cluster in clusters:
-            if _within_cluster(level, cluster, tolerance):
-                assigned = cluster
-                break
+            distance = abs(float(level["price"]) - float(cluster["price"]))
+            if distance <= tolerance:
+                if best_distance is None or distance < best_distance:
+                    assigned = cluster
+                    best_distance = distance
         if assigned is None:
             assigned = {
                 "members": [level],
@@ -81,8 +89,10 @@ def _cluster_levels(levels: list[dict[str, Any]], tolerance: float) -> list[dict
             assigned["members"].append(level)
             assigned["lower"] = min(float(assigned["lower"]), float(level["lower"]))
             assigned["upper"] = max(float(assigned["upper"]), float(level["upper"]))
-            assigned["price"] = (float(assigned["lower"]) + float(assigned["upper"])) / 2.0
-            assigned["strength"] = sum(int(x.get("strength", 1)) for x in assigned["members"])
+            weights = [max(1, int(x.get("strength", 1))) for x in assigned["members"]]
+            prices = [float(x["price"]) for x in assigned["members"]]
+            assigned["price"] = sum(p * w for p, w in zip(prices, weights)) / sum(weights)
+            assigned["strength"] = sum(weights)
     out: list[dict[str, Any]] = []
     for cluster in clusters:
         members = cluster["members"]
@@ -120,6 +130,8 @@ def build_level_pool(
     support_resistance: Iterable[dict[str, Any]] = (),
     pivot_lows: Iterable[dict[str, Any]] = (),
     pivot_highs: Iterable[dict[str, Any]] = (),
+    high_levels: Iterable[dict[str, Any]] = (),
+    low_levels: Iterable[dict[str, Any]] = (),
     current_idx: int | None = None,
     reference_price: float | None = None,
     atr: float | None = None,
@@ -176,6 +188,20 @@ def build_level_pool(
         pivot_status = "ACTIVE" if reference_price is None or reference_price <= price else "BROKEN"
         raw.append(_base_level(color="RED", kind="PIVOT_HIGH", source="pivot_high", price=price, age_bars=level.get("age_bars"), created_idx=level.get("created_idx"), strength=1, status=pivot_status, anchor=level.get("created_idx", price)))
 
+    # High/Low Level are separate Pine structural levels. They are not
+    # renamed into Supply/Demand and therefore keep their own semantics.
+    for level in high_levels:
+        price = _num(level.get("price"))
+        if price is None or price <= 0:
+            continue
+        raw.append(_base_level(color="RED", kind="HIGH_LEVEL", source="pine_high_level", price=price, age_bars=level.get("age_bars"), created_idx=level.get("created_idx"), strength=1, status="ACTIVE", anchor=level.get("anchor", price)))
+
+    for level in low_levels:
+        price = _num(level.get("price"))
+        if price is None or price <= 0:
+            continue
+        raw.append(_base_level(color="BLUE", kind="LOW_LEVEL", source="pine_low_level", price=price, age_bars=level.get("age_bars"), created_idx=level.get("created_idx"), strength=1, status="ACTIVE", anchor=level.get("anchor", price)))
+
     active_raw = [x for x in raw if str(x.get("status", "ACTIVE")).upper() == "ACTIVE"]
     invalid_raw = [x for x in raw if str(x.get("status", "ACTIVE")).upper() != "ACTIVE"]
     tolerance = max(float(atr or 0.0) * float(cluster_atr), max(abs(float(x["price"])) for x in active_raw) * float(cluster_pct), 1e-12) if active_raw else 1e-12
@@ -204,13 +230,34 @@ def active_levels_above(levels: Iterable[dict[str, Any]], entry: float) -> list[
 
 
 def select_protective_level(direction: str, entry: float, blue: Iterable[dict[str, Any]], red: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
+    """Select the closest same-color protective structure, including overlap.
+
+    Protection is different from an opposing target: the current entry zone may
+    legitimately contain the fill price and still define the structural
+    invalidation boundary. Opposing levels remain strict-above/strict-below.
+    """
     direction = str(direction).upper()
-    candidates = active_levels_below(blue, entry) if direction == "LONG" else active_levels_above(red, entry)
-    if not candidates:
-        return None
     if direction == "LONG":
-        return max(candidates, key=lambda x: float(x["upper"]))
-    return min(candidates, key=lambda x: float(x["lower"]))
+        candidates = [
+            x for x in blue
+            if str(x.get("status", "ACTIVE")).upper() == "ACTIVE"
+            and math.isfinite(float(x["lower"]))
+            and float(x["lower"]) < entry
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda x: (float(x["upper"]), float(x["lower"]), str(x.get("level_id", ""))))
+    if direction == "SHORT":
+        candidates = [
+            x for x in red
+            if str(x.get("status", "ACTIVE")).upper() == "ACTIVE"
+            and math.isfinite(float(x["upper"]))
+            and float(x["upper"]) > entry
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda x: (float(x["lower"]), float(x["upper"]), str(x.get("level_id", ""))))
+    return None
 
 
 def select_opposing_levels(direction: str, entry: float, blue: Iterable[dict[str, Any]], red: Iterable[dict[str, Any]], limit: int = 2) -> list[dict[str, Any]]:
