@@ -5,10 +5,10 @@ import math
 import os
 from typing import Any, Literal
 
-from .levels import build_level_snapshot, select_opposing_levels, select_protective_level, stop_from_level
-
 import numpy as np
 import pandas as pd
+
+from event_engine.levels import build_level_pool, protective_price, select_entry_level_for_zone, select_opposing_levels, select_protective_level
 
 # =============================================================================
 # Ajay R5.41 — parameters copied from the supplied Pine source
@@ -633,55 +633,6 @@ def compute_ajay_trigger(df: pd.DataFrame, mode: Literal["historical", "live"] =
     return _attach_exact_alternate_series(out, mode=mode)
 
 
-def _nearest_opposing_level(
-    direction: str,
-    entry: float,
-    active_demand: list[dict[str, Any]],
-    active_supply: list[dict[str, Any]],
-    df: pd.DataFrame,
-    current_idx: int,
-) -> dict[str, Any] | None:
-    """Find the nearest structural obstacle in the profit direction.
-
-    Primary source is the opposite Demand/Supply zone. If none exists, use the
-    most recent confirmed swing level from the same 10/10 pivot structure.
-    """
-    candidates: list[dict[str, Any]] = []
-    if direction == "LONG":
-        for z in active_supply:
-            level = _safe_num(z.get("btm"), 0.0)
-            if level > entry:
-                candidates.append({"price": level, "source": "supply_zone", "zone": dict(z)})
-        # confirmed pivot highs only; the pivot must be fully confirmed before i
-        for p in range(max(SWING_LEN, current_idx - 120), current_idx - SWING_LEN + 1):
-            h = _safe_num(df.loc[p, "high"], 0.0)
-            if h <= entry:
-                continue
-            if all(h >= _safe_num(df.loc[p-k, "high"], 0.0) for k in range(1, SWING_LEN + 1)) and all(
-                h >= _safe_num(df.loc[p+k, "high"], 0.0) for k in range(1, SWING_LEN + 1)
-            ):
-                candidates.append({"price": h, "source": "pivot_high", "pivot_idx": p})
-        if not candidates:
-            return None
-        return min(candidates, key=lambda x: float(x["price"]))
-
-    for z in active_demand:
-        level = _safe_num(z.get("top"), 0.0)
-        if 0 < level < entry:
-            candidates.append({"price": level, "source": "demand_zone", "zone": dict(z)})
-    for p in range(max(SWING_LEN, current_idx - 120), current_idx - SWING_LEN + 1):
-        l = _safe_num(df.loc[p, "low"], 0.0)
-        if l >= entry or l <= 0:
-            continue
-        if all(l <= _safe_num(df.loc[p-k, "low"], 0.0) for k in range(1, SWING_LEN + 1)) and all(
-            l <= _safe_num(df.loc[p+k, "low"], 0.0) for k in range(1, SWING_LEN + 1)
-        ):
-            candidates.append({"price": l, "source": "pivot_low", "pivot_idx": p})
-    if not candidates:
-        return None
-    return max(candidates, key=lambda x: float(x["price"]))
-
-
 def _targets_from_nearest_obstacle(
     direction: str,
     entry: float,
@@ -743,21 +694,6 @@ def _targets_from_nearest_obstacle(
     }
 
 
-def _confirmed_pivot_levels(df: pd.DataFrame, current_idx: int, lookback: int = 120) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    lows: list[dict[str, Any]] = []
-    highs: list[dict[str, Any]] = []
-    start = max(SWING_LEN, current_idx - lookback)
-    end = current_idx - SWING_LEN
-    for p in range(start, end + 1):
-        h = _safe_num(df.loc[p, "high"], 0.0)
-        l = _safe_num(df.loc[p, "low"], 0.0)
-        if h > 0 and all(h >= _safe_num(df.loc[p-k, "high"], 0.0) for k in range(1, SWING_LEN + 1)) and all(h >= _safe_num(df.loc[p+k, "high"], 0.0) for k in range(1, SWING_LEN + 1)):
-            highs.append({"price": h, "pivot_idx": p})
-        if l > 0 and all(l <= _safe_num(df.loc[p-k, "low"], 0.0) for k in range(1, SWING_LEN + 1)) and all(l <= _safe_num(df.loc[p+k, "low"], 0.0) for k in range(1, SWING_LEN + 1)):
-            lows.append({"price": l, "pivot_idx": p})
-    return lows, highs
-
-
 def generate_zone_signals(
     df: pd.DataFrame,
     symbol: str = "",
@@ -780,16 +716,9 @@ def generate_zone_signals(
     active_supply: list[dict[str, Any]] = []
     active_demand: list[dict[str, Any]] = []
     signals: list[dict[str, Any]] = []
-
-    sr_visual = compute_pine_sr_visual(df) if SR_ENABLE else {"events": []}
-    sr_events = sr_visual.get("events", []) if isinstance(sr_visual, dict) else []
-    sr_ptr = 0
-    current_sr_levels: list[float] = []
+    sr_ph, sr_pl = _pivot_series_pine(df, SR_RB)
 
     for i in range(SWING_LEN * 2, len(df)):
-        while sr_ptr < len(sr_events) and int(sr_events[sr_ptr].get("event_idx", -1)) <= i:
-            current_sr_levels = list(sr_events[sr_ptr].get("levels", []))
-            sr_ptr += 1
         p = i - SWING_LEN
         h = float(df.loc[p, "high"])
         l = float(df.loc[p, "low"])
@@ -852,51 +781,45 @@ def generate_zone_signals(
         if not math.isfinite(atr) or atr <= 0:
             continue
 
-        zone_top = float(trade_zone["top"])
-        zone_bottom = float(trade_zone["btm"])
-        pivot_lows, pivot_highs = _confirmed_pivot_levels(df, i)
-        level_snapshot = build_level_snapshot(
-            entry_price=cur_c,
-            active_demand=active_demand,
-            active_supply=active_supply,
-            sr_levels=current_sr_levels,
-            pivot_lows=pivot_lows,
-            pivot_highs=pivot_highs,
-            tolerance=max(atr * 0.05, cur_c * 0.0001),
+        # Build one structural level pool from the existing, unchanged level builders.
+        # Pine S/R semantics are assigned from the confirmed pivot type; no future bars are used.
+        sr_event = _pine_sr_event_levels(df, i, sr_ph, sr_pl)
+        sr_levels = []
+        for raw_price in sr_event.get("levels", []):
+            price = float(raw_price)
+            matched = None
+            for pp in range(i, max(-1, i - SR_PRD - 1), -1):
+                if pd.notna(sr_ph.iloc[pp]) and abs(float(sr_ph.iloc[pp]) - price) <= max(1e-12, atr * 1e-8):
+                    matched = {"price": price, "semantic": "RESISTANCE", "created_idx": pp, "age_bars": i - pp, "pivot_idx": pp, "strength": SR_STRENGTH}
+                    break
+                if pd.notna(sr_pl.iloc[pp]) and abs(float(sr_pl.iloc[pp]) - price) <= max(1e-12, atr * 1e-8):
+                    matched = {"price": price, "semantic": "SUPPORT", "created_idx": pp, "age_bars": i - pp, "pivot_idx": pp, "strength": SR_STRENGTH}
+                    break
+            if matched is not None:
+                sr_levels.append(matched)
+
+        pivot_lows = [{"price": float(sr_pl.iloc[pp]), "created_idx": pp, "age_bars": i - pp} for pp in range(max(SR_RB, i - 120), i + 1) if pd.notna(sr_pl.iloc[pp])]
+        pivot_highs = [{"price": float(sr_ph.iloc[pp]), "created_idx": pp, "age_bars": i - pp} for pp in range(max(SR_RB, i - 120), i + 1) if pd.notna(sr_ph.iloc[pp])]
+        level_pool = build_level_pool(
+            demand=active_demand, supply=active_supply, support_resistance=sr_levels,
+            pivot_lows=pivot_lows, pivot_highs=pivot_highs, current_idx=i, reference_price=cur_c, atr=atr,
         )
-        entry_level_id = f"DEM_{int(trade_zone.get('start', i))}" if direction == "LONG" else f"SUP_{int(trade_zone.get('start', i))}"
-        protective_level = select_protective_level(
-            direction, cur_c, level_snapshot, exclude_level_ids={entry_level_id}, min_distance=max(cur_c * 0.0001, 0.0)
-        )
-        if protective_level is not None:
-            stop, sl_buffer = stop_from_level(direction, protective_level, atr, ZONE_SL_ATR_BUFFER)
-            protective_level = dict(protective_level)
-            protective_level["buffer"] = round(sl_buffer, 12)
-            protective_level["protection_price"] = round(float(protective_level.get("low" if direction == "LONG" else "high", protective_level["price"])), 12)
-            protective_level["stop"] = round(stop, 12)
-        else:
-            sl_buffer = ZONE_SL_ATR_BUFFER * atr
-            stop = zone_bottom - sl_buffer if direction == "LONG" else zone_top + sl_buffer
-            protective_level = {
-                "level_id": entry_level_id,
-                "color": "BLUE" if direction == "LONG" else "RED",
-                "kind": "DEMAND" if direction == "LONG" else "SUPPLY",
-                "source": "entry_zone_fallback",
-                "price": zone_bottom if direction == "LONG" else zone_top,
-                "low": zone_bottom,
-                "high": zone_top,
-                "poi": float(trade_zone["poi"]),
-                "status": "ACTIVE",
-                "buffer": round(sl_buffer, 12),
-                "protection_price": round(float(zone_bottom if direction == "LONG" else zone_top), 12),
-                "stop": round(stop, 12),
-            }
-        risk = cur_c - stop if direction == "LONG" else stop - cur_c
+        entry_level = select_entry_level_for_zone(direction, trade_zone, level_pool)
+        protective_level = select_protective_level(direction, cur_c, level_pool["blue"], level_pool["red"])
+        if protective_level is None:
+            continue
+        sl_buffer = max(ZONE_SL_ATR_BUFFER * atr, cur_c * 0.0002)
+        stop = protective_price(protective_level, direction, sl_buffer)
+        risk = (cur_c - stop) if direction == "LONG" else (stop - cur_c)
         if risk <= 0:
             continue
 
-        opposing_levels = select_opposing_levels(direction, cur_c, level_snapshot, limit=5)
-        obstacle = _nearest_opposing_level(direction, cur_c, active_demand, active_supply, df, i)
+        opposing_levels = select_opposing_levels(direction, cur_c, level_pool["blue"], level_pool["red"], limit=2)
+        obstacle = None
+        if opposing_levels:
+            first = opposing_levels[0]
+            obstacle_price = float(first["lower"]) if direction == "LONG" else float(first["upper"])
+            obstacle = {"price": obstacle_price, "source": first.get("source", "level_cluster"), "level_id": first.get("level_id"), "level": first}
         if REQUIRE_STRUCTURE_OBSTACLE and obstacle is None:
             continue
         if obstacle is not None:
@@ -907,6 +830,7 @@ def generate_zone_signals(
         risk_pct = (risk / cur_c) * 100.0
         if risk_pct > MAX_SIGNAL_RISK_PCT:
             continue
+        # Use the same unified opposing level pool for TP construction.
         targets = _targets_from_nearest_obstacle(direction, cur_c, stop, atr, obstacle)
         if targets is None:
             continue
@@ -951,36 +875,30 @@ def generate_zone_signals(
                     "zone_entry_rule": "fresh_touch_from_outside",
                 },
                 "zone": zone_ctx,
-                "levels": {
-                    "blue": level_snapshot["blue"],
-                    "red": level_snapshot["red"],
-                    "entry_level": {
-                        "level_id": entry_level_id,
-                        "color": "BLUE" if direction == "LONG" else "RED",
-                        "kind": "DEMAND" if direction == "LONG" else "SUPPLY",
-                        "source": "entry_zone",
-                        "price": round(zone_bottom if direction == "LONG" else zone_top, 12),
-                    },
-                    "protective_level": protective_level,
-                    "opposing_candidates": opposing_levels,
-                },
-                "protection_level": protective_level,
                 "target": {
                     "source": targets["target_source"],
                     "obstacle_source": targets["obstacle_source"],
                     "obstacle_price": targets["obstacle_price"],
+                    "target_levels": opposing_levels,
                     "tp1_fraction_to_tp2": TP1_OBSTACLE_FRACTION,
                     "tp2_fraction_to_obstacle": TP2_OBSTACLE_FRACTION,
                     "obstacle_buffer_atr": TP_OBSTACLE_BUFFER_ATR,
                     "tp_max_r": TP_MAX_R,
                 },
+                "levels": {
+                    "blue": level_pool["blue"],
+                    "red": level_pool["red"],
+                    "cluster_tolerance": level_pool["cluster_tolerance"],
+                },
+                "entry_level": entry_level,
+                "protection_level": protective_level,
                 "risk_model": {
-                    "sl_source": "last_valid_same_color_level_plus_atr_buffer",
-                    "zone_sl_buffer_atr": ZONE_SL_ATR_BUFFER,
+                    "sl_source": "last_valid_same_color_level_plus_buffer",
                     "protection_level_id": protective_level.get("level_id"),
-                    "protection_level_kind": protective_level.get("kind"),
-                    "protection_level_source": protective_level.get("source"),
                     "protection_level_price": protective_level.get("price"),
+                    "protection_level_lower": protective_level.get("lower"),
+                    "protection_level_upper": protective_level.get("upper"),
+                    "zone_sl_buffer_atr": ZONE_SL_ATR_BUFFER,
                     "max_signal_risk_pct": MAX_SIGNAL_RISK_PCT,
                 },
                 "confirmation": {
@@ -1000,6 +918,58 @@ def generate_zone_signals(
                 "source_bar_close": cur_c,
             }
         )
+
+    # Persist the structural levels from the latest closed bar for diagnostics and journaling.
+    # This does not alter any level builder; it only exposes the already-computed structures
+    # through the dataframe metadata so the caller can log them even when there is no signal.
+    try:
+        latest_idx = len(df) - 1
+        latest_close = float(df.loc[latest_idx, "close"])
+        latest_atr = max(float(df.loc[latest_idx, "atr50"]), 1e-12)
+        sr_event = _pine_sr_event_levels(df, latest_idx, sr_ph, sr_pl)
+        sr_levels = []
+        for raw_price in sr_event.get("levels", []):
+            price = float(raw_price)
+            matched = None
+            for pp in range(latest_idx, max(-1, latest_idx - SR_PRD - 1), -1):
+                if pd.notna(sr_ph.iloc[pp]) and abs(float(sr_ph.iloc[pp]) - price) <= max(1e-12, latest_atr * 1e-8):
+                    matched = {
+                        "price": price, "semantic": "RESISTANCE", "created_idx": pp,
+                        "age_bars": latest_idx - pp, "pivot_idx": pp, "strength": SR_STRENGTH,
+                    }
+                    break
+                if pd.notna(sr_pl.iloc[pp]) and abs(float(sr_pl.iloc[pp]) - price) <= max(1e-12, latest_atr * 1e-8):
+                    matched = {
+                        "price": price, "semantic": "SUPPORT", "created_idx": pp,
+                        "age_bars": latest_idx - pp, "pivot_idx": pp, "strength": SR_STRENGTH,
+                    }
+                    break
+            if matched is not None:
+                sr_levels.append(matched)
+        pivot_lows = [
+            {"price": float(sr_pl.iloc[pp]), "created_idx": pp, "age_bars": latest_idx - pp}
+            for pp in range(max(SR_RB, latest_idx - 120), latest_idx + 1)
+            if pd.notna(sr_pl.iloc[pp])
+        ]
+        pivot_highs = [
+            {"price": float(sr_ph.iloc[pp]), "created_idx": pp, "age_bars": latest_idx - pp}
+            for pp in range(max(SR_RB, latest_idx - 120), latest_idx + 1)
+            if pd.notna(sr_ph.iloc[pp])
+        ]
+        df.attrs["level_snapshot"] = build_level_pool(
+            demand=active_demand,
+            supply=active_supply,
+            support_resistance=sr_levels,
+            pivot_lows=pivot_lows,
+            pivot_highs=pivot_highs,
+            current_idx=latest_idx,
+            reference_price=latest_close,
+            atr=latest_atr,
+        )
+        df.attrs["level_snapshot_reference_price"] = latest_close
+    except Exception as exc:
+        # Diagnostics must never make the strategy fail.
+        df.attrs["level_snapshot_error"] = f"{type(exc).__name__}: {exc}"
 
     return df, active_supply, active_demand, signals
 

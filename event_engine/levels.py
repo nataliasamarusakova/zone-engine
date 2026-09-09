@@ -1,251 +1,259 @@
 from __future__ import annotations
 
+import hashlib
 import math
-from typing import Any
+from typing import Any, Iterable
 
 
-def _safe_float(value: Any, default: float | None = None) -> float | None:
+DEFAULT_CLUSTER_ATR = 0.20
+DEFAULT_CLUSTER_PCT = 0.0015
+
+
+def _num(value: Any) -> float | None:
     try:
         x = float(value)
-        return x if math.isfinite(x) else default
     except (TypeError, ValueError):
-        return default
-
-
-def _zone_level(zone: dict[str, Any], side: str, source: str, zone_id: str) -> dict[str, Any] | None:
-    top = _safe_float(zone.get("top"))
-    bottom = _safe_float(zone.get("btm"))
-    poi = _safe_float(zone.get("poi"))
-    if top is None or bottom is None or poi is None:
         return None
-    if side == "BLUE":
-        price = bottom
-        high = top
-        low = bottom
-    else:
-        price = top
-        high = top
-        low = bottom
+    return x if math.isfinite(x) else None
+
+
+def _make_level_id(source: str, price: float, anchor: Any = "") -> str:
+    raw = f"{source}|{anchor}|{price:.12f}".encode("utf-8")
+    return f"LVL_{hashlib.sha1(raw).hexdigest()[:12].upper()}"
+
+
+def _base_level(
+    *,
+    color: str,
+    kind: str,
+    source: str,
+    price: float,
+    lower: float | None = None,
+    upper: float | None = None,
+    age_bars: int | None = None,
+    created_idx: int | None = None,
+    strength: int = 1,
+    status: str = "ACTIVE",
+    anchor: Any = "",
+) -> dict[str, Any]:
+    lo = price if lower is None else min(lower, price, upper if upper is not None else price)
+    hi = price if upper is None else max(upper, price, lower if lower is not None else price)
     return {
-        "level_id": zone_id,
-        "color": side,
-        "kind": "DEMAND" if side == "BLUE" else "SUPPLY",
+        "level_id": _make_level_id(source, price, anchor),
+        "color": color,
+        "kind": kind,
         "source": source,
-        "price": round(float(price), 12),
-        "low": round(float(low), 12),
-        "high": round(float(high), 12),
-        "poi": round(float(poi), 12),
-        "start_idx": int(zone.get("start", -1)),
-        "age_bars": None,
-        "status": "ACTIVE",
+        "price": float(price),
+        "lower": float(lo),
+        "upper": float(hi),
+        "age_bars": int(age_bars) if age_bars is not None else None,
+        "created_idx": int(created_idx) if created_idx is not None else None,
+        "strength": max(1, int(strength)),
+        "status": status,
     }
 
 
-def _dedupe_levels(levels: list[dict[str, Any]], tolerance: float) -> list[dict[str, Any]]:
-    if not levels:
-        return []
-    tolerance = max(float(tolerance), 0.0)
-    levels = sorted(levels, key=lambda x: float(x["price"]))
+def _within_cluster(a: dict[str, Any], b: dict[str, Any], tolerance: float) -> bool:
+    return abs(float(a["price"]) - float(b["price"])) <= tolerance or not (
+        float(a["upper"]) < float(b["lower"]) - tolerance
+        or float(b["upper"]) < float(a["lower"]) - tolerance
+    )
+
+
+def _cluster_levels(levels: list[dict[str, Any]], tolerance: float) -> list[dict[str, Any]]:
     clusters: list[dict[str, Any]] = []
-    for level in levels:
-        price = float(level["price"])
-        if not clusters or abs(price - float(clusters[-1]["price"])) > tolerance:
-            clusters.append(level)
-            continue
-        current = clusters[-1]
-        sources = list(current.get("sources", [current.get("source")]))
-        src = level.get("source")
-        if src and src not in sources:
-            sources.append(src)
-        kinds = list(current.get("kinds", [current.get("kind")]))
-        kind = level.get("kind")
-        if kind and kind not in kinds:
-            kinds.append(kind)
-        strength = max(int(current.get("strength", 1)), int(level.get("strength", 1))) + 1
-        # Keep the level closest to the cluster median; deterministic tie -> newer source entry.
-        current["strength"] = strength
-        current["sources"] = sources
-        current["kinds"] = kinds
-        current["cluster_prices"] = sorted(
-            list(current.get("cluster_prices", [current["price"]])) + [price]
-        )
-        current["price"] = round(float(sum(current["cluster_prices"]) / len(current["cluster_prices"])), 12)
-        current["low"] = min(float(current.get("low", price)), float(level.get("low", price)))
-        current["high"] = max(float(current.get("high", price)), float(level.get("high", price)))
-    for level in clusters:
-        level.setdefault("sources", [level.get("source")])
-        level.setdefault("kinds", [level.get("kind")])
-        level.setdefault("strength", 1)
-        level.setdefault("cluster_prices", [level["price"]])
-    return clusters
-
-
-def build_level_snapshot(
-    *,
-    entry_price: float,
-    active_demand: list[dict[str, Any]],
-    active_supply: list[dict[str, Any]],
-    sr_levels: list[dict[str, Any]] | list[float] | None = None,
-    pivot_lows: list[dict[str, Any]] | None = None,
-    pivot_highs: list[dict[str, Any]] | None = None,
-    tolerance: float = 0.0,
-) -> dict[str, Any]:
-    """Build a unified blue/red structural level pool from existing builders.
-
-    This function does not construct Demand/Supply/SR itself. It only normalizes
-    already-built structures so downstream logic can reason about them uniformly.
-    """
-    blue: list[dict[str, Any]] = []
-    red: list[dict[str, Any]] = []
-
-    for idx, zone in enumerate(active_demand):
-        item = _zone_level(zone, "BLUE", "demand_zone", f"DEM_{int(zone.get('start', idx))}")
-        if item:
-            item["age_bars"] = None
-            blue.append(item)
-
-    for idx, zone in enumerate(active_supply):
-        item = _zone_level(zone, "RED", "supply_zone", f"SUP_{int(zone.get('start', idx))}")
-        if item:
-            red.append(item)
-
-    for idx, raw in enumerate(sr_levels or []):
-        if isinstance(raw, dict):
-            price = _safe_float(raw.get("price"))
-            level_kind = str(raw.get("kind") or "SR").upper()
-            level_id = str(raw.get("level_id") or f"SR_{idx}")
+    for level in sorted(levels, key=lambda x: float(x["price"])):
+        assigned = None
+        for cluster in clusters:
+            if _within_cluster(level, cluster, tolerance):
+                assigned = cluster
+                break
+        if assigned is None:
+            assigned = {
+                "members": [level],
+                "lower": float(level["lower"]),
+                "upper": float(level["upper"]),
+                "price": float(level["price"]),
+                "strength": int(level.get("strength", 1)),
+            }
+            clusters.append(assigned)
         else:
-            price = _safe_float(raw)
-            level_kind = "SR"
-            level_id = f"SR_{idx}"
+            assigned["members"].append(level)
+            assigned["lower"] = min(float(assigned["lower"]), float(level["lower"]))
+            assigned["upper"] = max(float(assigned["upper"]), float(level["upper"]))
+            assigned["price"] = (float(assigned["lower"]) + float(assigned["upper"])) / 2.0
+            assigned["strength"] = sum(int(x.get("strength", 1)) for x in assigned["members"])
+    out: list[dict[str, Any]] = []
+    for cluster in clusters:
+        members = cluster["members"]
+        by_source: list[str] = []
+        for m in members:
+            src = str(m.get("kind") or m.get("source") or "UNKNOWN")
+            if src not in by_source:
+                by_source.append(src)
+        base = max(members, key=lambda x: (int(x.get("strength", 1)), x.get("created_idx") or -1))
+        color = str(base["color"])
+        kind = "CLUSTER"
+        cluster_id = _make_level_id(f"{color}_CLUSTER", float(cluster["price"]), "|".join(sorted(str(m["level_id"]) for m in members)))
+        out.append({
+            "level_id": cluster_id,
+            "color": color,
+            "kind": kind,
+            "source": "cluster",
+            "price": round(float(cluster["price"]), 12),
+            "lower": round(float(cluster["lower"]), 12),
+            "upper": round(float(cluster["upper"]), 12),
+            "age_bars": min((m["age_bars"] for m in members if m.get("age_bars") is not None), default=None),
+            "created_idx": max((m["created_idx"] for m in members if m.get("created_idx") is not None), default=None),
+            "strength": int(cluster["strength"]),
+            "status": "ACTIVE",
+            "member_level_ids": [m["level_id"] for m in members],
+            "member_kinds": by_source,
+        })
+    return out
+
+
+def build_level_pool(
+    *,
+    demand: Iterable[dict[str, Any]],
+    supply: Iterable[dict[str, Any]],
+    support_resistance: Iterable[dict[str, Any]] = (),
+    pivot_lows: Iterable[dict[str, Any]] = (),
+    pivot_highs: Iterable[dict[str, Any]] = (),
+    current_idx: int | None = None,
+    reference_price: float | None = None,
+    atr: float | None = None,
+    cluster_atr: float = DEFAULT_CLUSTER_ATR,
+    cluster_pct: float = DEFAULT_CLUSTER_PCT,
+) -> dict[str, list[dict[str, Any]]]:
+    raw: list[dict[str, Any]] = []
+
+    for z in demand:
+        lower = _num(z.get("btm"))
+        upper = _num(z.get("top"))
+        if lower is None or upper is None:
+            continue
+        start = z.get("start")
+        age = max(0, int(current_idx) - int(start)) if current_idx is not None and start is not None else None
+        raw.append(_base_level(color="BLUE", kind="DEMAND", source="demand_zone", price=(lower + upper) / 2.0, lower=lower, upper=upper, age_bars=age, created_idx=int(start) if start is not None else None, strength=2, anchor=start))
+
+    for z in supply:
+        lower = _num(z.get("btm"))
+        upper = _num(z.get("top"))
+        if lower is None or upper is None:
+            continue
+        start = z.get("start")
+        age = max(0, int(current_idx) - int(start)) if current_idx is not None and start is not None else None
+        raw.append(_base_level(color="RED", kind="SUPPLY", source="supply_zone", price=(lower + upper) / 2.0, lower=lower, upper=upper, age_bars=age, created_idx=int(start) if start is not None else None, strength=2, anchor=start))
+
+    for level in support_resistance:
+        price = _num(level.get("price"))
         if price is None or price <= 0:
             continue
-        side = "BLUE" if price < entry_price else "RED"
-        level = {
-            "level_id": level_id,
-            "color": side,
-            "kind": "SUPPORT" if side == "BLUE" else "RESISTANCE",
-            "source": "pine_sr",
-            "price": round(price, 12),
-            "low": round(price, 12),
-            "high": round(price, 12),
-            "poi": round(price, 12),
-            "start_idx": None,
-            "age_bars": None,
-            "status": "ACTIVE",
-            "pine_kind": level_kind,
-        }
-        (blue if side == "BLUE" else red).append(level)
-
-    for idx, raw in enumerate(pivot_lows or []):
-        price = _safe_float(raw.get("price") if isinstance(raw, dict) else raw)
-        if price is None or price <= 0 or price >= entry_price:
+        semantic = str(level.get("semantic") or level.get("kind") or "").upper()
+        if semantic not in {"SUPPORT", "RESISTANCE"}:
             continue
-        pidx = raw.get("pivot_idx") if isinstance(raw, dict) else None
-        blue.append({
-            "level_id": f"PL_{pidx if pidx is not None else idx}",
-            "color": "BLUE",
-            "kind": "PIVOT_LOW",
-            "source": "pivot_low",
-            "price": round(price, 12),
-            "low": round(price, 12),
-            "high": round(price, 12),
-            "poi": round(price, 12),
-            "start_idx": pidx,
-            "age_bars": None,
-            "status": "ACTIVE",
-        })
+        color = "BLUE" if semantic == "SUPPORT" else "RED"
+        sr_status = "ACTIVE"
+        if reference_price is not None:
+            if semantic == "SUPPORT" and reference_price < price:
+                sr_status = "BROKEN"
+            if semantic == "RESISTANCE" and reference_price > price:
+                sr_status = "BROKEN"
+        raw.append(_base_level(color=color, kind=semantic, source="pine_sr", price=price, age_bars=level.get("age_bars"), created_idx=level.get("created_idx"), strength=max(1, int(level.get("strength", 1))), status=sr_status, anchor=level.get("pivot_idx", price)))
 
-    for idx, raw in enumerate(pivot_highs or []):
-        price = _safe_float(raw.get("price") if isinstance(raw, dict) else raw)
-        if price is None or price <= entry_price:
+    for level in pivot_lows:
+        price = _num(level.get("price"))
+        if price is None or price <= 0:
             continue
-        pidx = raw.get("pivot_idx") if isinstance(raw, dict) else None
-        red.append({
-            "level_id": f"PH_{pidx if pidx is not None else idx}",
-            "color": "RED",
-            "kind": "PIVOT_HIGH",
-            "source": "pivot_high",
-            "price": round(price, 12),
-            "low": round(price, 12),
-            "high": round(price, 12),
-            "poi": round(price, 12),
-            "start_idx": pidx,
-            "age_bars": None,
-            "status": "ACTIVE",
-        })
+        pivot_status = "ACTIVE" if reference_price is None or reference_price >= price else "BROKEN"
+        raw.append(_base_level(color="BLUE", kind="PIVOT_LOW", source="pivot_low", price=price, age_bars=level.get("age_bars"), created_idx=level.get("created_idx"), strength=1, status=pivot_status, anchor=level.get("created_idx", price)))
 
-    blue = _dedupe_levels(blue, tolerance)
-    red = _dedupe_levels(red, tolerance)
-    blue.sort(key=lambda x: float(x["price"]), reverse=True)
+    for level in pivot_highs:
+        price = _num(level.get("price"))
+        if price is None or price <= 0:
+            continue
+        pivot_status = "ACTIVE" if reference_price is None or reference_price <= price else "BROKEN"
+        raw.append(_base_level(color="RED", kind="PIVOT_HIGH", source="pivot_high", price=price, age_bars=level.get("age_bars"), created_idx=level.get("created_idx"), strength=1, status=pivot_status, anchor=level.get("created_idx", price)))
+
+    active_raw = [x for x in raw if str(x.get("status", "ACTIVE")).upper() == "ACTIVE"]
+    invalid_raw = [x for x in raw if str(x.get("status", "ACTIVE")).upper() != "ACTIVE"]
+    tolerance = max(float(atr or 0.0) * float(cluster_atr), max(abs(float(x["price"])) for x in active_raw) * float(cluster_pct), 1e-12) if active_raw else 1e-12
+    blue = _cluster_levels([x for x in active_raw if x["color"] == "BLUE"], tolerance)
+    red = _cluster_levels([x for x in active_raw if x["color"] == "RED"], tolerance)
+    invalid = sorted(invalid_raw, key=lambda x: (x["color"], float(x["price"])))
+    blue.sort(key=lambda x: float(x["price"]))
     red.sort(key=lambda x: float(x["price"]))
-    return {
-        "entry_price": round(float(entry_price), 12),
-        "blue": blue,
-        "red": red,
-    }
+    return {"blue": blue, "red": red, "all": blue + red, "invalid": invalid, "cluster_tolerance": tolerance}
 
 
-def select_protective_level(
-    direction: str,
-    entry_price: float,
-    level_snapshot: dict[str, Any],
-    *,
-    exclude_level_ids: set[str] | None = None,
-    min_distance: float = 0.0,
-) -> dict[str, Any] | None:
-    """Select the closest same-color structural level beyond entry."""
-    direction = str(direction).upper()
-    exclude_level_ids = exclude_level_ids or set()
-    pool = level_snapshot.get("blue", []) if direction == "LONG" else level_snapshot.get("red", [])
-    entry = float(entry_price)
-    distance = max(float(min_distance), 0.0)
-    if direction == "LONG":
-        candidates = [
-            x for x in pool
-            if str(x.get("level_id")) not in exclude_level_ids
-            and _safe_float(x.get("price"), 0.0) < entry - distance
-            and x.get("status") == "ACTIVE"
-        ]
-        return max(candidates, key=lambda x: float(x["price"]), default=None)
-    candidates = [
-        x for x in pool
-        if str(x.get("level_id")) not in exclude_level_ids
-        and _safe_float(x.get("price"), 0.0) > entry + distance
-        and x.get("status") == "ACTIVE"
+def active_levels_below(levels: Iterable[dict[str, Any]], entry: float) -> list[dict[str, Any]]:
+    """Return active levels entirely below the entry, excluding levels that overlap it."""
+    return [
+        x for x in levels
+        if str(x.get("status", "ACTIVE")) == "ACTIVE" and float(x["upper"]) < entry
     ]
-    return min(candidates, key=lambda x: float(x["price"]), default=None)
 
 
-def select_opposing_levels(
-    direction: str,
-    entry_price: float,
-    level_snapshot: dict[str, Any],
-    limit: int = 5,
-) -> list[dict[str, Any]]:
+def active_levels_above(levels: Iterable[dict[str, Any]], entry: float) -> list[dict[str, Any]]:
+    """Return active levels entirely above the entry, excluding levels that overlap it."""
+    return [
+        x for x in levels
+        if str(x.get("status", "ACTIVE")) == "ACTIVE" and float(x["lower"]) > entry
+    ]
+
+
+def select_protective_level(direction: str, entry: float, blue: Iterable[dict[str, Any]], red: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
     direction = str(direction).upper()
-    entry = float(entry_price)
-    pool = level_snapshot.get("red", []) if direction == "LONG" else level_snapshot.get("blue", [])
+    candidates = active_levels_below(blue, entry) if direction == "LONG" else active_levels_above(red, entry)
+    if not candidates:
+        return None
     if direction == "LONG":
-        candidates = [x for x in pool if _safe_float(x.get("price"), 0.0) > entry and x.get("status") == "ACTIVE"]
-        candidates.sort(key=lambda x: float(x["price"]))
-    else:
-        candidates = [x for x in pool if 0 < _safe_float(x.get("price"), 0.0) < entry and x.get("status") == "ACTIVE"]
-        candidates.sort(key=lambda x: float(x["price"]), reverse=True)
-    return candidates[: max(0, int(limit))]
+        return max(candidates, key=lambda x: float(x["upper"]))
+    return min(candidates, key=lambda x: float(x["lower"]))
 
 
-def stop_from_level(direction: str, level: dict[str, Any], atr: float, buffer_atr: float = 0.10) -> tuple[float, float]:
-    """Return structural stop and buffer from a selected level."""
+def select_opposing_levels(direction: str, entry: float, blue: Iterable[dict[str, Any]], red: Iterable[dict[str, Any]], limit: int = 2) -> list[dict[str, Any]]:
     direction = str(direction).upper()
-    # For a clustered level, the stop belongs beyond the outer edge of the
-    # cluster, not at its arithmetic mean. This preserves the "behind the
-    # level" invariant even when Support/Demand/Pivot confirmations overlap.
+    candidates = active_levels_above(red, entry) if direction == "LONG" else active_levels_below(blue, entry)
     if direction == "LONG":
-        level_price = float(level.get("low", level["price"]))
+        candidates.sort(key=lambda x: float(x["lower"]))
     else:
-        level_price = float(level.get("high", level["price"]))
-    buffer = max(float(atr) * float(buffer_atr), 0.0)
-    if direction == "LONG":
-        return level_price - buffer, buffer
-    return level_price + buffer, buffer
+        candidates.sort(key=lambda x: float(x["upper"]), reverse=True)
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for level in candidates:
+        lid = str(level.get("level_id"))
+        if lid in seen:
+            continue
+        seen.add(lid)
+        out.append(level)
+        if len(out) >= max(1, int(limit)):
+            break
+    return out
+
+
+def protective_price(level: dict[str, Any], direction: str, buffer: float) -> float:
+    if str(direction).upper() == "LONG":
+        return float(level["lower"]) - float(buffer)
+    return float(level["upper"]) + float(buffer)
+
+
+def target_price_before_level(level: dict[str, Any], direction: str, buffer: float) -> float:
+    if str(direction).upper() == "LONG":
+        return float(level["lower"]) - float(buffer)
+    return float(level["upper"]) + float(buffer)
+
+
+def select_entry_level_for_zone(direction: str, zone: dict[str, Any], levels: dict[str, list[dict[str, Any]]]) -> dict[str, Any] | None:
+    direction = str(direction).upper()
+    wanted_kind = "DEMAND" if direction == "LONG" else "SUPPLY"
+    low = _num(zone.get("btm"))
+    high = _num(zone.get("top"))
+    if low is None or high is None:
+        return None
+    pool = levels.get("blue" if direction == "LONG" else "red", [])
+    matches = [x for x in pool if wanted_kind in {str(k).upper() for k in x.get("member_kinds", [])} and not (float(x["upper"]) < low or float(x["lower"]) > high)]
+    if not matches:
+        return None
+    return min(matches, key=lambda x: abs(float(x["price"]) - ((low + high) / 2.0)))
