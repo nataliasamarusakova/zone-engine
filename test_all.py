@@ -1329,7 +1329,7 @@ def test_post_fill_slippage_guard_emergency_closes(monkeypatch):
     monkeypatch.setattr(run_once, "_validate_trade_geometry", lambda s: (True, ""))
     monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {"status":"ok","sl_orders":[],"tp_orders":[]})
     monkeypatch.setattr(run_once, "_build_setup", lambda s: {"zone":{"kind":"DEMAND"}})
-    monkeypatch.setattr(run_once, "open_market", lambda *a: {"status":"opened"})
+    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: {"status":"opened"})
     monkeypatch.setattr(run_once, "wait_for_position_fill_directional", lambda *a, **k: {"status":"found","avgPrice":102.5,"positionAmt":1})
     monkeypatch.setattr(run_once, "_emergency_close_and_verify", lambda *a, **k: {"status":"closed_verified"})
     monkeypatch.setattr(run_once, "_cleanup_engine_protection", lambda *a, **k: {"status":"ok"})
@@ -2381,3 +2381,105 @@ def test_human_zone_logging_emits_each_zone_with_single_price(caplog):
     assert "–" not in text
     assert "age=" not in text
 
+
+
+def test_coin_log_separators_are_emitted_in_scan_order(monkeypatch, caplog):
+    import run_once as ro
+
+    # Verify the exact visual separator strings used by the scan loop.
+    caplog.set_level("INFO", logger="zone_engine")
+    ro.log.info("[COIN_START] BTC-USDT | ==============================")
+    ro.log.info("[ZONES] BTC-USDT | 🔵 DEMAND #1 | 77,620.01")
+    ro.log.info("[COIN_END] BTC-USDT | ================================")
+    ro.log.info("[COIN_START] ETH-USDT | ==============================")
+    ro.log.info("[ZONES] ETH-USDT | 🔵 DEMAND #1 | 2,431.61")
+    ro.log.info("[COIN_END] ETH-USDT | ================================")
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert text.index("[COIN_START] BTC-USDT") < text.index("[COIN_END] BTC-USDT")
+    assert text.index("[COIN_END] BTC-USDT") < text.index("[COIN_START] ETH-USDT")
+
+
+def test_latest_trigger_check_distinguishes_supply_from_red_resistance(caplog):
+    from run_once import _log_latest_trigger_check
+    caplog.set_level("INFO", logger="zone_engine")
+    ts = pd.date_range("2026-09-09 09:00", periods=2, freq="h", tz="UTC")
+    df = pd.DataFrame({
+        "timestamp": ts,
+        "open": [78900.0, 79500.0],
+        "high": [79000.0, 79620.0],
+        "low": [78800.0, 78800.0],
+        "close": [78950.0, 78900.0],
+        "volume": [1000.0, 1200.0],
+    })
+    demand = [{"btm": 77620.01, "top": 77703.65}]
+    supply = [{"btm": 80487.82, "top": 80559.99}]
+    levels = {
+        "red": [{"price": 79485.0, "lower": 79485.0, "upper": 79485.0, "kind": "RESISTANCE", "member_kinds": ["RESISTANCE"]}],
+        "blue": [],
+    }
+    _log_latest_trigger_check("BTC-USDT", df, demand, supply, levels)
+    text = "\n".join(r.message for r in caplog.records)
+    assert "🔴 RESISTANCE" in text
+    assert "candle_touch=YES" in text
+    assert "ENTRY_TRIGGER=NO (RESISTANCE is diagnostic only)" in text
+    assert "FRESH_DEMAND_SUPPLY_TOUCH=NO" in text
+
+
+def test_zone_strength_tiers(monkeypatch):
+    import run_once
+    assert run_once._zone_strength_tier({"zone": {"kind": "DEMAND"}}) == ("STRONG", run_once.STRONG_ZONE_MARGIN_USDT)
+    assert run_once._zone_strength_tier({"zone": {"kind": "SUPPORT"}}) == ("MEDIUM", run_once.MEDIUM_ZONE_MARGIN_USDT)
+    assert run_once._zone_strength_tier({"zone": {"kind": "PIVOT_LOW"}}) == ("WEAK", run_once.WEAK_ZONE_MARGIN_USDT)
+
+
+def test_zone_strength_default_margins_are_1_050_025():
+    import run_once
+    assert run_once.STRONG_ZONE_MARGIN_USDT == 1.0
+    assert run_once.MEDIUM_ZONE_MARGIN_USDT == 0.5
+    assert run_once.WEAK_ZONE_MARGIN_USDT == 0.25
+    assert run_once.MAX_POSITION_MARGIN_USDT == 2.5
+
+
+def test_open_market_respects_position_margin_cap(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)
+    monkeypatch.setattr(bingx, "get_contract", lambda symbol: {
+        "symbol": symbol, "quantityPrecision": 4, "tradeMinQuantity": 0.001,
+        "multiplier": 1, "maxLeverage": 10,
+    })
+    monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
+    monkeypatch.setattr(bingx, "_current_close_price", lambda symbol: 100.0)
+    monkeypatch.setattr(bingx, "_set_leverage", lambda bx_symbol, leverage, direction="LONG": True)
+    monkeypatch.setattr(bingx, "get_position_directional", lambda symbol, direction: {
+        "status": "found", "positionAmt": 0.16, "avgPrice": 100.0,
+    })
+    out = bingx.open_market("TEST-USDT", "LONG", 100.0, "EVT_CAP", margin_usdt=1.0, max_position_margin_usdt=2.5)
+    assert out["status"] == "skipped_position_margin_cap"
+    assert out["existing_margin_usdt"] == 1.6
+    assert out["remaining_margin_usdt"] == pytest.approx(0.9)
+
+
+def test_open_market_allows_same_direction_add_within_cap(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)
+    monkeypatch.setattr(bingx, "get_contract", lambda symbol: {
+        "symbol": symbol, "quantityPrecision": 3, "tradeMinQuantity": 0.001,
+        "multiplier": 1, "maxLeverage": 10,
+    })
+    monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
+    monkeypatch.setattr(bingx, "_current_close_price", lambda symbol: 100.0)
+    monkeypatch.setattr(bingx, "get_position_directional", lambda symbol, direction: {
+        "status": "found", "positionAmt": 0.10, "avgPrice": 100.0,
+    })
+    captured = {}
+    class Resp:
+        def get(self, key, default=None):
+            return {"code": 0, "data": {"order": {"orderId": "1", "clientOrderId": "CID"}}}.get(key, default)
+    def fake_request(method, path, params, **kwargs):
+        captured.update(params); return {"code": 0, "data": {"order": {"orderId": "1", "clientOrderId": "CID"}}}
+    monkeypatch.setattr(bingx, "_request", fake_request)
+    out = bingx.open_market("TEST-USDT", "LONG", 100.0, "EVT_ADD", margin_usdt=1.0, max_position_margin_usdt=2.5)
+    assert out["status"] == "opened"
+    assert out["qty"] == 0.1
+    assert out["configured_margin_usdt"] == 1.0
+    assert captured["quantity"] == "0.100"

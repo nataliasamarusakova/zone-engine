@@ -50,13 +50,17 @@ ACTIONS_PATH = DATA / "actions.jsonl"
 EXECUTION_ENABLED = os.environ.get("EXECUTION_ENABLED", "true").lower() == "true"
 MARGIN_USDT = float(os.environ.get("BINGX_MARGIN_USDT", "1"))
 MAX_TRADES_PER_CYCLE = int(os.environ.get("MAX_TRADES_PER_CYCLE", "5"))
+STRONG_ZONE_MARGIN_USDT = float(os.environ.get("STRONG_ZONE_MARGIN_USDT", "1.00"))
+MEDIUM_ZONE_MARGIN_USDT = float(os.environ.get("MEDIUM_ZONE_MARGIN_USDT", "0.50"))
+WEAK_ZONE_MARGIN_USDT = float(os.environ.get("WEAK_ZONE_MARGIN_USDT", "0.25"))
+MAX_POSITION_MARGIN_USDT = float(os.environ.get("MAX_POSITION_MARGIN_USDT", "2.50"))
 MAX_SCAN_SYMBOLS = int(os.environ.get("MAX_SCAN_SYMBOLS", "0"))
 WATCHLIST_ONLY = os.environ.get("WATCHLIST_ONLY", "true").lower() == "true"
 WATCHLIST_SYMBOLS = tuple(x.strip().upper() for x in os.environ.get(
     "WATCHLIST_SYMBOLS",
     "BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT,XRP-USDT,DOGE-USDT,TRX-USDT,HYPE-USDT,XMR-USDT,ZEC-USDT,LINK-USDT,ADA-USDT,XLM-USDT,BCH-USDT,UNI-USDT,LTC-USDT,AVAX-USDT,SUI-USDT,HBAR-USDT,TAO-USDT,ICP-USDT,ARB-USDT,POL-USDT,ETC-USDT",
 ).split(",") if x.strip())
-KLINE_LIMIT_1H = int(os.environ.get("KLINE_LIMIT_1H", "120"))
+KLINE_LIMIT_1H = int(os.environ.get("KLINE_LIMIT_1H", "1000"))
 MAX_SIGNAL_AGE_BARS = int(os.environ.get("MAX_SIGNAL_AGE_BARS", "0"))
 MAX_PRODUCTION_RISK_PCT = min(float(os.environ.get("MAX_SIGNAL_RISK_PCT", "1.50")), 1.50)
 # Production execution is strict by default: only the latest closed 1H bar may open a trade.
@@ -429,6 +433,98 @@ def _signal_matches_latest_bar(signal: dict[str, Any], latest_closed_idx: int, l
     except Exception:
         return False, "invalid_signal_time"
     return True, "ok"
+
+def _log_latest_trigger_check(symbol: str, df: pd.DataFrame, demand: list[dict], supply: list[dict], levels: dict[str, Any] | None) -> None:
+    """Explain whether the latest closed 1H candle actually touched a trade zone.
+
+    This is diagnostics only. It never changes the entry rules. In particular,
+    a red S/R resistance touch is intentionally distinguished from a Pine
+    Supply-zone touch because ZONE_ONLY entries are Demand/Supply based.
+    """
+    try:
+        if df is None or len(df) < 2:
+            return
+        i = len(df) - 1
+        o = float(df.loc[i, "open"])
+        h = float(df.loc[i, "high"])
+        l = float(df.loc[i, "low"])
+        c = float(df.loc[i, "close"])
+        prev_c = float(df.loc[i - 1, "close"])
+        log.info(
+            "[TRIGGER_CHECK] %s | CLOSED_1H O=%s H=%s L=%s C=%s | prevC=%s",
+            symbol, _fmt_num(o), _fmt_num(h), _fmt_num(l), _fmt_num(c), _fmt_num(prev_c),
+        )
+
+        def zone_touch(z: dict[str, Any], direction: str) -> tuple[bool, bool]:
+            lo = float(z.get("btm", z.get("lower")))
+            hi = float(z.get("top", z.get("upper")))
+            if direction == "LONG":
+                literal = l <= hi and h >= lo
+                fresh = prev_c > hi and l <= hi and c >= lo
+            else:
+                literal = h >= lo and l <= hi
+                fresh = prev_c < lo and h >= lo and c <= hi
+            return literal, fresh
+
+        for idx, z in enumerate(demand, 1):
+            literal, fresh = zone_touch(z, "LONG")
+            price = _fmt_zone_price(z, "DEMAND")
+            if literal or fresh:
+                log.info(
+                    "[TRIGGER_CHECK] %s | 🔵 DEMAND #%d | price=%s | touch=%s | fresh_touch=%s | directional=%s",
+                    symbol, idx, price, "YES" if literal else "NO", "YES" if fresh else "NO",
+                    "YES" if c > o else "NO",
+                )
+
+        for idx, z in enumerate(supply, 1):
+            literal, fresh = zone_touch(z, "SHORT")
+            price = _fmt_zone_price(z, "SUPPLY")
+            if literal or fresh:
+                log.info(
+                    "[TRIGGER_CHECK] %s | 🔴 SUPPLY #%d | price=%s | touch=%s | fresh_touch=%s | directional=%s",
+                    symbol, idx, price, "YES" if literal else "NO", "YES" if fresh else "NO",
+                    "YES" if c < o else "NO",
+                )
+
+        # Structural S/R is useful to explain visually plausible touches such as
+        # BTC 79,485 on TradingView. It is diagnostic only and is NOT itself an
+        # entry trigger in the current ZONE_ONLY strategy.
+        touched_structures: list[tuple[float, str, str]] = []
+        snap = levels if isinstance(levels, dict) else {}
+        for level in [*(snap.get("blue") or []), *(snap.get("red") or [])]:
+            try:
+                lo = float(level.get("lower", level.get("price")))
+                hi = float(level.get("upper", level.get("price")))
+                if l <= hi and h >= lo:
+                    icon, label = _zone_descriptor(level)
+                    touched_structures.append((lo, icon, label))
+            except (TypeError, ValueError):
+                continue
+        touched_structures.sort(key=lambda x: abs(x[0] - c))
+        for price, icon, label in touched_structures[:3]:
+            log.info(
+                "[TRIGGER_CHECK] %s | %s %s | candle_touch=YES | price=%s | ENTRY_TRIGGER=NO (%s is diagnostic only)",
+                symbol, icon, label, _fmt_num(price), label,
+            )
+
+        any_fresh = False
+        for z in demand:
+            _, fresh = zone_touch(z, "LONG")
+            any_fresh = any_fresh or fresh
+        for z in supply:
+            _, fresh = zone_touch(z, "SHORT")
+            any_fresh = any_fresh or fresh
+
+        if any_fresh:
+            log.info("[TRIGGER_CHECK] %s | FRESH_DEMAND_SUPPLY_TOUCH=YES | continue_to_setup_validation", symbol)
+        else:
+            log.info(
+                "[TRIGGER_CHECK] %s | FRESH_DEMAND_SUPPLY_TOUCH=NO | ACTION=WAIT | reason=latest_closed_1H_did_not_fresh-touch_active_demand_or_supply",
+                symbol,
+            )
+    except Exception as exc:
+        log.warning("[TRIGGER_CHECK_ERROR] %s | %s: %s", symbol, type(exc).__name__, exc)
+
 
 def _private_layer_ready() -> bool:
     ready = credentials_available()
@@ -895,6 +991,18 @@ def _emergency_close_and_verify(symbol: str, direction: str, qty: float, trade_i
 
     return {"status": "close_unverified", "attempts": attempts, "verification": verification, "remaining_qty": last_qty}
 
+def _zone_strength_tier(signal: dict[str, Any]) -> tuple[str, float]:
+    zone = signal.get("zone") if isinstance(signal.get("zone"), dict) else {}
+    kinds = {str(x).upper() for x in (zone.get("member_kinds") or [])}
+    if not kinds:
+        kinds = {str(zone.get("kind") or "").upper()}
+    if "DEMAND" in kinds or "SUPPLY" in kinds:
+        return "STRONG", STRONG_ZONE_MARGIN_USDT
+    if "SUPPORT" in kinds or "RESISTANCE" in kinds:
+        return "MEDIUM", MEDIUM_ZONE_MARGIN_USDT
+    return "WEAK", WEAK_ZONE_MARGIN_USDT
+
+
 def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     symbol = str(signal["symbol"])
     direction = str(signal["type"]).upper()
@@ -921,8 +1029,20 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         return {"status": "blocked_protection_preflight", "symbol": symbol, "direction": direction, "error": reason}
 
     setup = _build_setup(signal)
-    order = open_market(symbol, direction, entry_price, event_id)
-    if order.get("status") == "skipped_min_qty":
+    zone_tier, entry_margin = _zone_strength_tier(signal)
+    setup["entry_margin_usdt"] = entry_margin
+    setup["zone_strength_tier"] = zone_tier
+    setup["max_position_margin_usdt"] = MAX_POSITION_MARGIN_USDT
+    log.info(
+        "[POSITION_SIZING] %s %s | zone=%s | tier=%s | entry_margin=%.2f | max_position_margin=%.2f",
+        symbol, direction, (signal.get("zone") or {}).get("kind"), zone_tier, entry_margin, MAX_POSITION_MARGIN_USDT,
+    )
+    order = open_market(
+        symbol, direction, entry_price, event_id,
+        margin_usdt=entry_margin,
+        max_position_margin_usdt=MAX_POSITION_MARGIN_USDT,
+    )
+    if order.get("status") in {"skipped_min_qty", "skipped_tp_min_qty", "skipped_position_margin_cap"}:
         return order
     if order.get("status") != "opened":
         return {"status": str(order.get("status", "error")).upper(), "error": order.get("error"), "order": order}
@@ -1242,6 +1362,7 @@ def main() -> None:
 
             df, supply, demand, signals = generate_zone_signals(pd.DataFrame(bars), symbol=symbol, mode=DIAGNOSTICS_MODE)
             level_snapshot = df.attrs.get("level_snapshot") if isinstance(df.attrs.get("level_snapshot"), dict) else {}
+            _log_latest_trigger_check(symbol, df, demand, supply, level_snapshot)
             latest_price = float(df["close"].iloc[-1])
             bingx_price = _bingx_last_price(contract)
             latest_closed_idx = len(df) - 1
@@ -1396,6 +1517,9 @@ def main() -> None:
             scan_rows.append({k: v for k, v in result.items() if k != "signals"})
             fresh_signals.extend(result.get("signals", []))
 
+            # Visual separator: every coin gets its own clearly delimited log block.
+            log.info("[COIN_START] %s | ==============================", symbol)
+
             if result.get("price_position") == "ERROR":
                 log.error("[COIN_ERROR] %s | %s", symbol, result.get("error", "unknown error"))
             elif result.get("price_position") == "INSUFFICIENT_DATA":
@@ -1414,6 +1538,8 @@ def main() -> None:
                         result["active_demand"], result["active_supply"],
                     )
                 _log_human_level_map(symbol, result)
+
+            log.info("[COIN_END] %s | ================================", symbol)
 
         scanned = min(batch_start + len(batch), total)
         log.info("[SCAN_PROGRESS] %d/%d symbols | batch=%d | workers=%d", scanned, total, len(batch), min(SCAN_WORKERS, len(batch)))
