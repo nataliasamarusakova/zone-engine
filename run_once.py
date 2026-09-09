@@ -116,21 +116,46 @@ def _fmt_level_human(level: dict[str, Any]) -> str:
     return f"{kind}#{lid} {price_text}" + (f" [{', '.join(meta)}]" if meta else "")
 
 
-def _fmt_zone_human(zone: dict[str, Any], latest_idx: int | None = None) -> str:
-    lo_s, hi_s = _fmt_num(zone.get("btm")), _fmt_num(zone.get("top"))
-    if lo_s == "—" or hi_s == "—":
-        return "INVALID_ZONE"
-    age_text = ""
-    if latest_idx is not None and zone.get("start") is not None:
-        try:
-            age_text = f" age={max(0, int(latest_idx) - int(zone['start']))}"
-        except (TypeError, ValueError):
-            pass
-    return f"{lo_s}–{hi_s}{age_text}"
+def _fmt_zone_price(zone: dict[str, Any], semantic: str | None = None) -> str:
+    """Return exactly one price for a TradingView-comparable zone/level."""
+    semantic_set = {str(semantic or "").upper()}
+    semantic_set |= {str(x).upper() for x in (zone.get("member_kinds") or [])}
+    semantic_set.discard("")
+
+    if "DEMAND" in semantic_set:
+        price = zone.get("btm", zone.get("lower", zone.get("price")))
+    elif "SUPPLY" in semantic_set:
+        price = zone.get("top", zone.get("upper", zone.get("price")))
+    elif "PIVOT_LOW" in semantic_set:
+        price = zone.get("price", zone.get("lower"))
+    elif "PIVOT_HIGH" in semantic_set:
+        price = zone.get("price", zone.get("upper"))
+    else:
+        price = zone.get("price", zone.get("lower", zone.get("upper")))
+
+    try:
+        x = float(price)
+    except (TypeError, ValueError):
+        return "INVALID_LEVEL"
+    if not math.isfinite(x):
+        return "INVALID_LEVEL"
+    return f"{x:,.8f}".rstrip("0").rstrip(".")
 
 
-def _fmt_level_list(levels: list[dict[str, Any]], limit: int = 8) -> str:
-    return " | ".join(_fmt_level_human(x) for x in levels[:limit]) if levels else "—"
+def _zone_descriptor(level: dict[str, Any]) -> tuple[str, str]:
+    kinds = [str(x).upper() for x in (level.get("member_kinds") or [])]
+    if not kinds:
+        kinds = [str(level.get("kind") or level.get("source") or "LEVEL").upper()]
+    if "DEMAND" in kinds:
+        return "🔵", "DEMAND"
+    if "SUPPLY" in kinds:
+        return "🔴", "SUPPLY"
+    order = ["SUPPORT", "RESISTANCE", "PIVOT_LOW", "PIVOT_HIGH"]
+    ordered = [x for x in order if x in kinds]
+    label = "+".join(ordered or kinds)
+    blue = {"SUPPORT", "PIVOT_LOW"}
+    icon = "🔵" if all(x in blue for x in (ordered or kinds)) else "🔴"
+    return icon, label
 
 
 def _log_human_level_map(symbol: str, result: dict[str, Any]) -> None:
@@ -141,36 +166,59 @@ def _log_human_level_map(symbol: str, result: dict[str, Any]) -> None:
     zones = levels.get("active_zones") or {}
     demand = zones.get("demand") or []
     supply = zones.get("supply") or []
-    latest_idx = result.get("latest_closed_idx")
 
-    log.info("[LEVEL_MAP] %s | PRICE=%s", symbol, _fmt_num(result.get("current_price")))
-    log.info("[LEVEL_MAP] %s | BLUE | %s", symbol, _fmt_level_list(blue))
-    log.info("[LEVEL_MAP] %s | RED  | %s", symbol, _fmt_level_list(red))
-    # Human-readable zone log: one explicit line per visible zone so values can
-    # be compared directly with TradingView. Do not collapse/rename zone
-    # boundaries into HIGH/LOW structural levels.
-    if demand:
-        for idx, zone in enumerate(demand, 1):
-            log.info(
-                "[ZONES] %s | 🔵 DEMAND #%d | %s",
-                symbol, idx, _fmt_zone_human(zone, latest_idx),
-            )
+    # Human-readable comparison output: one exact price per displayed item.
+    valid_demand = [z for z in demand if _fmt_zone_price(z, "DEMAND") != "INVALID_LEVEL"]
+    valid_supply = [z for z in supply if _fmt_zone_price(z, "SUPPLY") != "INVALID_LEVEL"]
+
+    if valid_demand:
+        for idx, zone in enumerate(valid_demand, 1):
+            log.info("[ZONES] %s | 🔵 DEMAND #%d | %s", symbol, idx, _fmt_zone_price(zone, "DEMAND"))
     else:
         log.info("[ZONES] %s | 🔵 DEMAND | —", symbol)
-    if supply:
-        for idx, zone in enumerate(supply, 1):
-            log.info(
-                "[ZONES] %s | 🔴 SUPPLY #%d | %s",
-                symbol, idx, _fmt_zone_human(zone, latest_idx),
-            )
+
+    if valid_supply:
+        for idx, zone in enumerate(valid_supply, 1):
+            log.info("[ZONES] %s | 🔴 SUPPLY #%d | %s", symbol, idx, _fmt_zone_price(zone, "SUPPLY"))
     else:
         log.info("[ZONES] %s | 🔴 SUPPLY | —", symbol)
 
+    # Every other active structural level is printed in exactly the same
+    # one-price format. Demand/Supply clusters are skipped because they were
+    # already printed above.
+    other = []
+    for level in [*blue, *red]:
+        kinds = {str(x).upper() for x in (level.get("member_kinds") or [])}
+        if "DEMAND" in kinds or "SUPPLY" in kinds:
+            continue
+        if _fmt_zone_price(level) == "INVALID_LEVEL":
+            continue
+        other.append(level)
+    other.sort(key=lambda x: float(x.get("price", x.get("lower", 0.0))))
+
+    counters: dict[str, int] = {}
+    for level in other:
+        icon, label = _zone_descriptor(level)
+        counters[label] = counters.get(label, 0) + 1
+        log.info(
+            "[ZONES] %s | %s %s #%d | %s",
+            symbol, icon, label, counters[label], _fmt_zone_price(level),
+        )
+
     high = levels.get("high_level") or {}
     low = levels.get("low_level") or {}
+    high_price = _fmt_num(high.get("price"))
+    low_price = _fmt_num(low.get("price"))
+    if high_price != "—":
+        log.info("[ZONES] %s | 🔴 HIGH LEVEL | %s", symbol, high_price)
+    if low_price != "—":
+        log.info("[ZONES] %s | 🔵 LOW LEVEL | %s", symbol, low_price)
+
+    # Keep the existing diagnostics below; the [ZONES] lines above are the
+    # human-facing TradingView comparison format.
     log.info(
         "[LEVEL_MAP] %s | EXTREMES | PINE_HIGH=%s | PINE_LOW=%s | INVALID=%d",
-        symbol, _fmt_num(high.get("price")), _fmt_num(low.get("price")), len(invalid),
+        symbol, high_price, low_price, len(invalid),
     )
 
     try:
@@ -203,7 +251,6 @@ def _log_human_level_map(symbol: str, result: dict[str, Any]) -> None:
         log.info("[TRADE_MAP] %s | TP1        | %s | price=%s", symbol, _fmt_level_human(target_levels[0]) if target_levels else "—", _fmt_num(signal.get("tp1")))
         log.info("[TRADE_MAP] %s | TP2        | %s | price=%s", symbol, _fmt_level_human(target_levels[1]) if len(target_levels) > 1 else "—", _fmt_num(signal.get("tp2")))
         log.info("[TRADE_MAP] %s | RISK       | risk=%s%% | TP2_R=%s", symbol, _fmt_num(signal.get("risk_pct")), _fmt_num(signal.get("tp2_rr"), 4))
-
 
 def _load_failed_signal_ids() -> dict[str, dict[str, Any]]:
     try:

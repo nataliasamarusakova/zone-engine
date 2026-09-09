@@ -2335,41 +2335,36 @@ def test_human_level_logging_never_emits_nan_and_exposes_trade_map(caplog):
     caplog.set_level("INFO", logger="zone_engine")
     ro._log_human_level_map("BTC-USDT", result)
     text = "\n".join(record.getMessage() for record in caplog.records)
-    assert "[LEVEL_MAP] BTC-USDT | PRICE=78952.01" in text
+    assert "[ZONES] BTC-USDT | 🔵 DEMAND #1 | 77,620.01" in text
+    assert "[ZONES] BTC-USDT | 🔴 SUPPLY #1 | 80,559.99" in text
+    assert "[ZONES] BTC-USDT | 🔴 SUPPLY #2 |" not in text
     assert "NEAREST_BLUE_BELOW" in text and "78680" in text
+    assert "[ZONES] BTC-USDT | 🔵 SUPPORT+PIVOT_LOW #1 | 78,680" in text
+    assert "[ZONES] BTC-USDT | 🔴 RESISTANCE+PIVOT_HIGH #1 | 79,485" in text
+    assert "[ZONES] BTC-USDT | 🔴 HIGH LEVEL | 82300" in text
+    assert "[ZONES] BTC-USDT | 🔵 LOW LEVEL | 76264" in text
     assert "NEAREST_RED_ABOVE" in text and "79485" in text
     assert "PINE_HIGH=82300" in text and "PINE_LOW=76264" in text
-    assert "INVALID_ZONE" in text
+    assert "INVALID_ZONE" not in text
     assert "[TRADE_MAP] BTC-USDT | DIRECTION=LONG" in text
     assert "[TRADE_MAP] BTC-USDT | PROTECTION" in text
     assert "nan" not in text.lower()
 
 
-def test_human_zone_logging_emits_each_zone_with_explicit_values(caplog):
+def test_human_zone_logging_emits_each_zone_with_single_price(caplog):
     from run_once import _log_human_level_map
     result = {
         "current_price": 100.0,
-        "latest_closed_idx": 10,
-        "zones": {
-            "demand": [
-                {"btm": 95.0, "top": 96.0, "start": 9},
-                {"btm": 90.0, "top": 91.0, "start": 8},
-            ],
-            "supply": [
-                {"btm": 104.0, "top": 105.0, "start": 7},
-                {"btm": 108.0, "top": 109.0, "start": 6},
-            ],
-        },
         "levels": {
             "blue": [], "red": [], "invalid": [],
             "active_zones": {
                 "demand": [
                     {"btm": 95.0, "top": 96.0, "start": 9},
-                    {"btm": 90.0, "top": 91.0, "start": 8},
+                    {"btm": 90.25, "top": 91.0, "start": 8},
                 ],
                 "supply": [
-                    {"btm": 104.0, "top": 105.0, "start": 7},
-                    {"btm": 108.0, "top": 109.0, "start": 6},
+                    {"btm": 104.5, "top": 105.0, "start": 7},
+                    {"btm": 108.125, "top": 109.0, "start": 6},
                 ],
             },
             "high_level": {}, "low_level": {},
@@ -2379,7 +2374,10 @@ def test_human_zone_logging_emits_each_zone_with_explicit_values(caplog):
     caplog.set_level("INFO", logger="zone_engine")
     _log_human_level_map("TEST-USDT", result)
     text = "\n".join(r.message for r in caplog.records)
-    assert "[ZONES] TEST-USDT | 🔵 DEMAND #1 | 95–96 age=1" in text
-    assert "[ZONES] TEST-USDT | 🔵 DEMAND #2 | 90–91 age=2" in text
-    assert "[ZONES] TEST-USDT | 🔴 SUPPLY #1 | 104–105 age=3" in text
-    assert "[ZONES] TEST-USDT | 🔴 SUPPLY #2 | 108–109 age=4" in text
+    assert "[ZONES] TEST-USDT | 🔵 DEMAND #1 | 95" in text
+    assert "[ZONES] TEST-USDT | 🔵 DEMAND #2 | 90.25" in text
+    assert "[ZONES] TEST-USDT | 🔴 SUPPLY #1 | 105" in text
+    assert "[ZONES] TEST-USDT | 🔴 SUPPLY #2 | 109" in text
+    assert "–" not in text
+    assert "age=" not in text
+
