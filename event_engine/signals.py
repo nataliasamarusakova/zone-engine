@@ -956,7 +956,7 @@ def generate_zone_signals(
             for pp in range(max(SR_RB, latest_idx - 120), latest_idx + 1)
             if pd.notna(sr_ph.iloc[pp])
         ]
-        df.attrs["level_snapshot"] = build_level_pool(
+        level_snapshot = build_level_pool(
             demand=active_demand,
             supply=active_supply,
             support_resistance=sr_levels,
@@ -966,6 +966,23 @@ def generate_zone_signals(
             reference_price=latest_close,
             atr=latest_atr,
         )
+        # Preserve the Pine visual High/Low Level values as diagnostics only.
+        # These are already produced by the existing, unchanged Pine SR recreation.
+        level_snapshot["high_level"] = {
+            "price": float(sr_event["highestph"]) if sr_event.get("highestph") is not None else None,
+            "source": "pine_sr_high_level",
+            "semantic": "HIGH_LEVEL",
+        }
+        level_snapshot["low_level"] = {
+            "price": float(sr_event["lowestpl"]) if sr_event.get("lowestpl") is not None else None,
+            "source": "pine_sr_low_level",
+            "semantic": "LOW_LEVEL",
+        }
+        level_snapshot["active_zones"] = {
+            "demand": [dict(z) for z in active_demand],
+            "supply": [dict(z) for z in active_supply],
+        }
+        df.attrs["level_snapshot"] = level_snapshot
         df.attrs["level_snapshot_reference_price"] = latest_close
     except Exception as exc:
         # Diagnostics must never make the strategy fail.
