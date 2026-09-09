@@ -333,6 +333,19 @@ def test_open_client_order_id_is_deterministic_for_logical_signal():
     assert len(b) <= 32
 
 
+
+def test_client_order_id_collision_with_mismatched_order_is_error(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "get_all_orders", lambda *a, **k: [{
+        "clientOrderId": "EVT_OPEN_COLLIDE", "symbol": "AAA-USDT", "side": "SELL",
+        "positionSide": "SHORT", "origQty": "2.0", "status": "FILLED",
+    }])
+    assert bingx._client_order_matches_request(
+        {"symbol":"AAA-USDT","side":"SELL","positionSide":"SHORT","origQty":"2.0"},
+        direction="SHORT", position_side="SHORT", qty=1.0
+    ) is False
+
+
 def test_tp_constants_are_one_and_two_r():
     from event_engine.signals import TP1_R, TP2_R, TP1_FRACTION, TP2_FRACTION
     assert TP1_R == 0.5
@@ -457,11 +470,12 @@ def test_execute_rebases_protection_to_actual_fill_before_installing(monkeypatch
         "zone": {"kind": "SUPPLY", "btm": 99.0, "top": 104.0},
         "levels": {
             "blue": [{"level_id": "B1", "color": "BLUE", "kind": "SUPPORT", "source": "pine_sr", "price": 90.0, "lower": 89.5, "upper": 90.5, "status": "ACTIVE"}],
-            "red": [{"level_id": "R1", "color": "RED", "kind": "SUPPLY", "source": "supply_zone", "price": 104.0, "lower": 103.5, "upper": 104.5, "status": "ACTIVE"}],
+            "red": [{"level_id": "R1", "color": "RED", "kind": "SUPPLY", "source": "supply_zone", "price": 100.9, "lower": 100.8, "upper": 101.0, "status": "ACTIVE"}],
         },
         "target": {"obstacle_price": 90.0, "source": "nearest_opposing_structure"},
     }
     captured = {}
+    monkeypatch.setattr(run_once, "get_execution_reference_price", lambda *a, **k: 100.0)
     monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
     monkeypatch.setattr(run_once, "open_market", lambda *a, **k: {"status": "opened", "symbol": "TEST-USDT", "leverage": 10, "contract_multiplier": 1, "qty": 0.1})
     monkeypatch.setattr(run_once, "wait_for_position_fill_directional", lambda *a, **k: {"status": "found", "avgPrice": 95.0, "positionAmt": 0.1})
@@ -482,6 +496,56 @@ def test_execute_rebases_protection_to_actual_fill_before_installing(monkeypatch
     out = run_once.execute_new_position(signal)
     assert out["status"] == "opened_then_emergency_closed"
     assert out["error"].startswith("risk_pct_above_limit=")
+
+
+
+def test_pretrade_risk_rejection_happens_before_market(monkeypatch):
+    import run_once
+    signal = {
+        "event_id": "ZONE_PRE_RISK", "symbol": "ARB-USDT", "type": "LONG",
+        "entry": 100.0, "sl": 99.0, "tp1": 101.0, "tp2": 102.0, "risk_pct": 1.0,
+        "score": 60.0, "atr": 1.0,
+        "zone": {"kind": "SUPPORT", "level_id": "Z", "lower": 100.0, "upper": 100.0},
+        "target": {"obstacle_price": 104.0},
+        "levels": {
+            "blue": [{"level_id":"B","color":"BLUE","kind":"SUPPORT","lower":100.0,"upper":100.0,"price":100.0,"status":"ACTIVE"},
+                       {"level_id":"B2","color":"BLUE","kind":"DEMAND","lower":98.0,"upper":98.2,"price":98.1,"status":"ACTIVE"}],
+            "red": [{"level_id":"R","color":"RED","kind":"RESISTANCE","lower":112.0,"upper":112.0,"price":112.0,"status":"ACTIVE"}],
+        },
+    }
+    # Force the expected executable reference into a geometry that produces >1.5%
+    # risk after protection selection, so MARKET must never be reached.
+    monkeypatch.setattr(run_once, "get_execution_reference_price", lambda *a, **k: 103.0)
+    called = {"open": False}
+    monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {"status":"ok","sl_orders":[],"tp_orders":[]})
+    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: called.__setitem__("open", True))
+    out = run_once.execute_new_position(signal)
+    assert out["status"] == "skipped_invalid_setup"
+    assert "risk_pct_above_limit" in out["error"]
+    assert called["open"] is False
+
+
+def test_pretrade_structure_room_rejection_happens_before_market(monkeypatch):
+    import run_once
+    signal = {
+        "event_id": "ZONE_PRE_ROOM", "symbol": "SUI-USDT", "type": "LONG",
+        "entry": 100.0, "sl": 99.0, "tp1": 100.5, "tp2": 101.0, "risk_pct": 1.0,
+        "score": 60.0, "atr": 1.0,
+        "zone": {"kind": "DEMAND", "lower": 99.0, "upper": 99.5},
+        "target": {"obstacle_price": 101.0},
+        "levels": {
+            "blue": [{"level_id":"B","color":"BLUE","kind":"DEMAND","lower":99.0,"upper":99.5,"price":99.25,"status":"ACTIVE"}],
+            "red": [{"level_id":"R","color":"RED","kind":"RESISTANCE","lower":101.1,"upper":101.1,"price":101.1,"status":"ACTIVE"}],
+        },
+    }
+    monkeypatch.setattr(run_once, "get_execution_reference_price", lambda *a, **k: 100.0)
+    monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {"status":"ok","sl_orders":[],"tp_orders":[]})
+    called = {"open": False}
+    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: called.__setitem__("open", True))
+    out = run_once.execute_new_position(signal)
+    assert out["status"] == "skipped_invalid_setup"
+    assert "insufficient_structure_room" in out["error"]
+    assert called["open"] is False
 
 
 def test_invalid_setup_is_rejected_before_protection_preflight(monkeypatch):
