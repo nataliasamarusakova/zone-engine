@@ -30,6 +30,7 @@ from event_engine.bingx import (
     wait_for_position_fill_directional,
 )
 from event_engine.signals import SWING_LEN, TP1_R, TP2_R, generate_zone_signals, score_zone_signal
+from event_engine.levels import select_protective_level, stop_from_level
 from event_engine.telegram import format_signal, send as send_tg
 from event_engine.tracker import register_active_trade, update_active_trades, update_active_trade_protection
 
@@ -50,10 +51,10 @@ EXECUTION_ENABLED = os.environ.get("EXECUTION_ENABLED", "true").lower() == "true
 MARGIN_USDT = float(os.environ.get("BINGX_MARGIN_USDT", "1"))
 MAX_TRADES_PER_CYCLE = int(os.environ.get("MAX_TRADES_PER_CYCLE", "5"))
 MAX_SCAN_SYMBOLS = int(os.environ.get("MAX_SCAN_SYMBOLS", "0"))
-WATCHLIST_ONLY = os.environ.get("WATCHLIST_ONLY", "false").lower() == "true"
+WATCHLIST_ONLY = os.environ.get("WATCHLIST_ONLY", "true").lower() == "true"
 WATCHLIST_SYMBOLS = tuple(x.strip().upper() for x in os.environ.get(
     "WATCHLIST_SYMBOLS",
-    "BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT,TAO-USDT,LTC-USDT,BCH-USDT,AVAX-USDT,LINK-USDT,ETC-USDT,ADA-USDT,UNI-USDT,XRP-USDT,ICP-USDT,HYPE-USDT,DOGE-USDT,HBAR-USDT,ARB-USDT,POL-USDT,SUI-USDT",
+    "BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT,XRP-USDT,DOGE-USDT,TRX-USDT,HYPE-USDT,XMR-USDT,ZEC-USDT,LINK-USDT,ADA-USDT,XLM-USDT,BCH-USDT,UNI-USDT,LTC-USDT,AVAX-USDT,SUI-USDT,HBAR-USDT,TAO-USDT,ICP-USDT,ARB-USDT,POL-USDT,ETC-USDT",
 ).split(",") if x.strip())
 KLINE_LIMIT_1H = int(os.environ.get("KLINE_LIMIT_1H", "120"))
 MAX_SIGNAL_AGE_BARS = int(os.environ.get("MAX_SIGNAL_AGE_BARS", "0"))
@@ -520,10 +521,11 @@ def _cleanup_engine_protection(symbol: str, direction: str) -> dict[str, Any]:
     return result
 
 def _rebase_protection_after_fill(signal: dict[str, Any], avg_price: float) -> dict[str, Any]:
-    """Recalculate zone-based SL/TP from the *actual* market fill.
+    """Recalculate protection from actual fill using the selected structural level.
 
-    A market order can fill materially away from the signal/reference candle close.
-    Never submit stale absolute targets derived from the pre-fill reference price.
+    The signal-time level snapshot is retained and re-evaluated at the real fill
+    price. No new level construction happens here; only deterministic selection
+    from already-observed, closed-bar levels is allowed.
     """
     direction = str(signal["type"]).upper()
     entry = float(avg_price)
@@ -538,13 +540,48 @@ def _rebase_protection_after_fill(signal: dict[str, Any], avg_price: float) -> d
     if zone_top is None or zone_bottom is None:
         raise ValueError("zone boundaries unavailable for post-fill protection")
 
-    sl_buffer = max(atr * float(os.environ.get("ZONE_SL_ATR_BUFFER", "0.10")), entry * 0.0002)
-    if direction == "LONG":
-        zone_stop = zone_bottom - sl_buffer
-        sl = zone_stop if zone_stop < entry else entry - sl_buffer
+    protection_level = signal.get("protection_level") if isinstance(signal.get("protection_level"), dict) else None
+    if protection_level is None:
+        levels = signal.get("levels") if isinstance(signal.get("levels"), dict) else {}
+        protection_level = levels.get("protective_level") if isinstance(levels.get("protective_level"), dict) else None
+    levels = signal.get("levels") if isinstance(signal.get("levels"), dict) else {}
+    if protection_level is not None:
+        # Re-select from the signal-time pool using the actual fill. A market
+        # fill can cross a previously selected level, making the old stop
+        # geometrically invalid.
+        selected = select_protective_level(
+            direction,
+            entry,
+            levels,
+            exclude_level_ids={str((levels.get("entry_level") or {}).get("level_id") or "")},
+            min_distance=max(entry * 0.0001, 0.0),
+        ) if levels.get("blue") or levels.get("red") else None
+        if selected is not None:
+            protection_level = selected
+        sl_buffer = max(atr * float(os.environ.get("ZONE_SL_ATR_BUFFER", "0.10")), entry * 0.0002)
+        if protection_level is not None:
+            sl, sl_buffer = stop_from_level(
+                direction, protection_level, atr, float(os.environ.get("ZONE_SL_ATR_BUFFER", "0.10"))
+            )
+            protection_level = dict(protection_level)
+            protection_level["protection_price"] = float(protection_level.get("low" if direction == "LONG" else "high", protection_level["price"]))
+        else:
+            sl = zone_bottom - sl_buffer if direction == "LONG" else zone_top + sl_buffer
+        selected_protection_source = str(protection_level.get("source") or "structural_level") if protection_level else "entry_zone_fallback_legacy"
+        selected_protection_id = str(protection_level.get("level_id") or "") if protection_level else None
     else:
-        zone_stop = zone_top + sl_buffer
-        sl = zone_stop if zone_stop > entry else entry + sl_buffer
+        # Backward-compatible fallback for legacy signals that predate level snapshots.
+        sl_buffer = max(atr * float(os.environ.get("ZONE_SL_ATR_BUFFER", "0.10")), entry * 0.0002)
+        sl = zone_bottom - sl_buffer if direction == "LONG" else zone_top + sl_buffer
+        selected_protection_source = "entry_zone_fallback_legacy"
+        selected_protection_id = None
+
+    # Never allow a structural level selected at signal-time to produce an
+    # invalid-side stop after slippage crosses that level.
+    if (direction == "LONG" and sl >= entry) or (direction == "SHORT" and sl <= entry):
+        sl = entry - sl_buffer if direction == "LONG" else entry + sl_buffer
+        selected_protection_source = "actual_fill_safety_fallback"
+        selected_protection_id = None
 
     risk = abs(entry - sl)
     if risk <= 0:
@@ -610,6 +647,9 @@ def _rebase_protection_after_fill(signal: dict[str, Any], avg_price: float) -> d
         "tp2_rr": abs(tp2 - entry) / risk,
         "target_source": target_source,
         "obstacle_price": obstacle,
+        "protection_level_id": selected_protection_id,
+        "protection_level_source": selected_protection_source,
+        "protection_level_price": float(protection_level["price"]) if protection_level is not None else None,
     }
 
 
@@ -821,6 +861,13 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
             **(signal.get("target") if isinstance(signal.get("target"), dict) else {}),
             "source": rebased["target_source"],
             "obstacle_price": rebased.get("obstacle_price"),
+        },
+        "protection_level": {
+            **(signal.get("protection_level") if isinstance(signal.get("protection_level"), dict) else {}),
+            "level_id": rebased.get("protection_level_id"),
+            "source": rebased.get("protection_level_source"),
+            "price": rebased.get("protection_level_price"),
+            "stop": sl_price,
         },
     })
     valid, reason = _validate_trade_geometry(actual_signal)
@@ -1277,12 +1324,16 @@ def main() -> None:
             continue
         log.info(
             "[EXEC_SIGNAL] symbol=%s direction=%s signal_idx=%s signal_time=%s age_bars=%s "
-            "zone=%s zone_low=%s zone_high=%s target_source=%s obstacle=%s tp1=%s tp2=%s event_id=%s",
+            "zone=%s zone_low=%s zone_high=%s protection_level=%s protection_source=%s protection_price=%s "
+            "target_source=%s obstacle=%s tp1=%s tp2=%s event_id=%s",
             signal.get("symbol"), signal.get("type"), signal.get("idx"), signal.get("time"),
             signal.get("execution_age_bars", 0),
             (signal.get("zone") or {}).get("kind"),
             (signal.get("zone") or {}).get("btm"),
             (signal.get("zone") or {}).get("top"),
+            (signal.get("protection_level") or {}).get("level_id"),
+            (signal.get("protection_level") or {}).get("source"),
+            (signal.get("protection_level") or {}).get("price"),
             (signal.get("target") or {}).get("source"),
             (signal.get("target") or {}).get("obstacle_price"),
             signal.get("tp1"), signal.get("tp2"), signal.get("event_id"),

@@ -626,7 +626,7 @@ def test_zone_signal_uses_zone_boundary_stop_and_small_tps(monkeypatch):
     assert emitted
     latest = emitted[-1]
     assert latest["confirmation"]["zone_touch"] is True
-    assert latest["risk_model"]["sl_source"] == "zone_boundary_plus_atr_buffer"
+    assert latest["risk_model"]["sl_source"] == "last_valid_same_color_level_plus_atr_buffer"
     assert latest["trigger"]["alma_required"] is False
     assert latest["target"]["source"] in {"nearest_opposing_structure", "atr_rr_fallback"}
     assert latest["tp1"] < latest["tp2"]
@@ -1999,13 +1999,78 @@ def test_run_once_all_emergency_paths_cleanup_before_close():
 from run_once import WATCHLIST_ONLY, WATCHLIST_SYMBOLS
 
 
-def test_watchlist_is_exact_20_symbols():
+def test_watchlist_is_exact_24_symbols():
     expected = (
-        "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "TAO-USDT",
-        "LTC-USDT", "BCH-USDT", "AVAX-USDT", "LINK-USDT", "ETC-USDT",
-        "ADA-USDT", "UNI-USDT", "XRP-USDT", "ICP-USDT", "HYPE-USDT",
-        "DOGE-USDT", "HBAR-USDT", "ARB-USDT", "POL-USDT", "SUI-USDT",
+        "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT",
+        "DOGE-USDT", "TRX-USDT", "HYPE-USDT", "XMR-USDT", "ZEC-USDT",
+        "LINK-USDT", "ADA-USDT", "XLM-USDT", "BCH-USDT", "UNI-USDT",
+        "LTC-USDT", "AVAX-USDT", "SUI-USDT", "HBAR-USDT", "TAO-USDT",
+        "ICP-USDT", "ARB-USDT", "POL-USDT", "ETC-USDT",
     )
-    assert WATCHLIST_ONLY is False
+    assert WATCHLIST_ONLY is True
     assert WATCHLIST_SYMBOLS == expected
-    assert len(WATCHLIST_SYMBOLS) == 20
+    assert len(WATCHLIST_SYMBOLS) == 24
+
+# ---------------------------------------------------------------------------
+# Unified structural level engine regression tests
+# ---------------------------------------------------------------------------
+def test_level_engine_selects_closest_same_color_protective_level():
+    from event_engine.levels import select_protective_level, stop_from_level
+    snap = {
+        "blue": [
+            {"level_id": "B3", "color": "BLUE", "kind": "SUPPORT", "source": "pine_sr", "price": 97.0, "status": "ACTIVE"},
+            {"level_id": "B2", "color": "BLUE", "kind": "PIVOT_LOW", "source": "pivot_low", "price": 98.5, "status": "ACTIVE"},
+            {"level_id": "B1", "color": "BLUE", "kind": "DEMAND", "source": "demand_zone", "price": 99.5, "status": "ACTIVE"},
+        ],
+        "red": [],
+    }
+    level = select_protective_level("LONG", 100.0, snap, exclude_level_ids={"B1"})
+    assert level["level_id"] == "B2"
+    stop, buffer = stop_from_level("LONG", level, 1.0, 0.10)
+    assert stop == 98.4
+    assert buffer == 0.1
+
+
+def test_level_engine_short_selects_closest_red_above_entry():
+    from event_engine.levels import select_protective_level
+    snap = {
+        "blue": [],
+        "red": [
+            {"level_id": "R2", "color": "RED", "kind": "RESISTANCE", "source": "pine_sr", "price": 103.0, "status": "ACTIVE"},
+            {"level_id": "R1", "color": "RED", "kind": "SUPPLY", "source": "supply_zone", "price": 101.5, "status": "ACTIVE"},
+        ],
+    }
+    level = select_protective_level("SHORT", 100.0, snap)
+    assert level["level_id"] == "R1"
+
+
+def test_level_engine_keeps_entry_zone_as_fallback_when_no_lower_same_color():
+    from event_engine.levels import build_level_snapshot, select_protective_level
+    zone = {"top": 101.0, "btm": 100.0, "poi": 100.5, "start": 10}
+    snap = build_level_snapshot(entry_price=100.5, active_demand=[zone], active_supply=[], sr_levels=[], pivot_lows=[], pivot_highs=[])
+    assert select_protective_level("LONG", 100.5, snap, exclude_level_ids={"DEM_10"}) is None
+
+
+def test_level_engine_normalizes_existing_demand_supply_sr_and_pivots():
+    from event_engine.levels import build_level_snapshot
+    snap = build_level_snapshot(
+        entry_price=100.0,
+        active_demand=[{"top": 100.0, "btm": 99.0, "poi": 99.5, "start": 4}],
+        active_supply=[{"top": 104.0, "btm": 103.0, "poi": 103.5, "start": 8}],
+        sr_levels=[95.0, 105.0],
+        pivot_lows=[{"price": 97.0, "pivot_idx": 12}],
+        pivot_highs=[{"price": 106.0, "pivot_idx": 14}],
+    )
+    assert any(x["source"] == "demand_zone" for x in snap["blue"])
+    assert any(x["source"] == "supply_zone" for x in snap["red"])
+    assert any(x["source"] == "pine_sr" and x["kind"] == "SUPPORT" for x in snap["blue"])
+    assert any(x["source"] == "pine_sr" and x["kind"] == "RESISTANCE" for x in snap["red"])
+    assert any(x["kind"] == "PIVOT_LOW" for x in snap["blue"])
+    assert any(x["kind"] == "PIVOT_HIGH" for x in snap["red"])
+
+
+def test_zone_builder_parameters_remain_unchanged():
+    from event_engine import signals
+    assert signals.SWING_LEN == 10
+    assert signals.ZONE_HISTORY == 20
+    assert signals.BOX_WIDTH == 2.5
