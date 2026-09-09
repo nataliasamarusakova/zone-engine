@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import math
 import logging
@@ -160,6 +161,10 @@ def _zone_descriptor(level: dict[str, Any]) -> tuple[str, str]:
         return "🔵", "DEMAND"
     if "SUPPLY" in kinds:
         return "🔴", "SUPPLY"
+    if "LOW_LEVEL" in kinds:
+        return "🔵", "LOW LEVEL"
+    if "HIGH_LEVEL" in kinds:
+        return "🔴", "HIGH LEVEL"
     order = ["SUPPORT", "RESISTANCE", "PIVOT_LOW", "PIVOT_HIGH"]
     ordered = [x for x in order if x in kinds]
     label = "+".join(ordered or kinds)
@@ -199,7 +204,7 @@ def _log_human_level_map(symbol: str, result: dict[str, Any]) -> None:
     other = []
     for level in [*blue, *red]:
         kinds = {str(x).upper() for x in (level.get("member_kinds") or [])}
-        if "DEMAND" in kinds or "SUPPLY" in kinds:
+        if "DEMAND" in kinds or "SUPPLY" in kinds or "HIGH_LEVEL" in kinds or "LOW_LEVEL" in kinds:
             continue
         if _fmt_zone_price(level) == "INVALID_LEVEL":
             continue
@@ -249,18 +254,18 @@ def _log_human_level_map(symbol: str, result: dict[str, Any]) -> None:
         log.info("[LEVEL_MAP] %s | NEAREST_RED_ABOVE | %s", symbol, _fmt_level_human(above[0]) if above else "—")
         log.info("[LEVEL_MAP] %s | NEXT_RED | %s", symbol, _fmt_level_human(above[1]) if len(above) > 1 else "—")
 
-    signal = (result.get("signals") or [None])[0]
-    if isinstance(signal, dict):
+    signals = [x for x in (result.get("signals") or []) if isinstance(x, dict)]
+    for map_idx, signal in enumerate(signals, 1):
         direction = str(signal.get("type") or "?").upper()
         entry_level = signal.get("entry_level") or {}
         protection_level = signal.get("protection_level") or {}
         target_levels = ((signal.get("target") or {}).get("target_levels") or [])
-        log.info("[TRADE_MAP] %s | DIRECTION=%s", symbol, direction)
-        log.info("[TRADE_MAP] %s | ENTRY      | %s", symbol, _fmt_level_human(entry_level) if entry_level else "—")
-        log.info("[TRADE_MAP] %s | PROTECTION | %s | SL=%s", symbol, _fmt_level_human(protection_level) if protection_level else "—", _fmt_num(signal.get("sl")))
-        log.info("[TRADE_MAP] %s | TP1        | %s | price=%s", symbol, _fmt_level_human(target_levels[0]) if target_levels else "—", _fmt_num(signal.get("tp1")))
-        log.info("[TRADE_MAP] %s | TP2        | %s | price=%s", symbol, _fmt_level_human(target_levels[1]) if len(target_levels) > 1 else "—", _fmt_num(signal.get("tp2")))
-        log.info("[TRADE_MAP] %s | RISK       | risk=%s%% | TP2_R=%s", symbol, _fmt_num(signal.get("risk_pct")), _fmt_num(signal.get("tp2_rr"), 4))
+        log.info("[TRADE_MAP] %s | #%d | DIRECTION=%s", symbol, map_idx, direction)
+        log.info("[TRADE_MAP] %s | #%d | ENTRY      | %s", symbol, map_idx, _fmt_level_human(entry_level) if entry_level else "—")
+        log.info("[TRADE_MAP] %s | #%d | PROTECTION | %s | SL=%s", symbol, map_idx, _fmt_level_human(protection_level) if protection_level else "—", _fmt_num(signal.get("sl")))
+        log.info("[TRADE_MAP] %s | #%d | TP1        | %s | price=%s", symbol, map_idx, _fmt_level_human(target_levels[0]) if target_levels else "—", _fmt_num(signal.get("tp1")))
+        log.info("[TRADE_MAP] %s | #%d | TP2        | %s | price=%s", symbol, map_idx, _fmt_level_human(target_levels[1]) if len(target_levels) > 1 else "—", _fmt_num(signal.get("tp2")))
+        log.info("[TRADE_MAP] %s | #%d | RISK       | risk=%s%% | TP2_R=%s", symbol, map_idx, _fmt_num(signal.get("risk_pct")), _fmt_num(signal.get("tp2_rr"), 4))
 
 def _load_failed_signal_ids() -> dict[str, dict[str, Any]]:
     try:
@@ -440,12 +445,20 @@ def _signal_matches_latest_bar(signal: dict[str, Any], latest_closed_idx: int, l
         return False, "invalid_signal_time"
     return True, "ok"
 
-def _log_latest_trigger_check(symbol: str, df: pd.DataFrame, demand: list[dict], supply: list[dict], levels: dict[str, Any] | None) -> None:
-    """Explain whether the latest closed 1H candle actually touched a trade zone.
+def _log_latest_trigger_check(
+    symbol: str,
+    df: pd.DataFrame,
+    demand: list[dict],
+    supply: list[dict],
+    levels: dict[str, Any] | None,
+    signals: list[dict[str, Any]] | None = None,
+) -> None:
+    """Log the same structural-touch decision that drives execution.
 
-    This is diagnostics only. It never changes the entry rules. In particular,
-    a red S/R resistance touch is intentionally distinguished from a Pine
-    Supply-zone touch because ZONE_ONLY entries are Demand/Supply based.
+    There must be no second "diagnostic-only" strategy here: BLUE structures can
+    generate LONG and RED structures can generate SHORT. A structural touch is
+    an ENTRY_TRIGGER only when the canonical signal generator accepted that exact
+    level/cluster on the latest closed bar.
     """
     try:
         if df is None or len(df) < 2:
@@ -461,73 +474,67 @@ def _log_latest_trigger_check(symbol: str, df: pd.DataFrame, demand: list[dict],
             symbol, _fmt_num(o), _fmt_num(h), _fmt_num(l), _fmt_num(c), _fmt_num(prev_c),
         )
 
-        def zone_touch(z: dict[str, Any], direction: str) -> tuple[bool, bool]:
-            lo = float(z.get("btm", z.get("lower")))
-            hi = float(z.get("top", z.get("upper")))
+        snap = levels if isinstance(levels, dict) else {}
+        all_levels = [*(snap.get("blue") or []), *(snap.get("red") or [])]
+        accepted = signals or []
+        accepted_keys = {
+            (str(s.get("type", "")).upper(), str(s.get("zone_id") or (s.get("zone") or {}).get("level_id") or ""))
+            for s in accepted
+            if int(s.get("idx", -1)) == i
+        }
+
+        def touch(level: dict[str, Any], direction: str) -> tuple[bool, bool]:
+            lo = float(level.get("lower", level.get("price")))
+            hi = float(level.get("upper", level.get("price")))
+            literal = l <= hi and h >= lo
             if direction == "LONG":
-                literal = l <= hi and h >= lo
                 fresh = prev_c > hi and l <= hi and c >= lo
             else:
-                literal = h >= lo and l <= hi
                 fresh = prev_c < lo and h >= lo and c <= hi
             return literal, fresh
 
-        for idx, z in enumerate(demand, 1):
-            literal, fresh = zone_touch(z, "LONG")
-            price = _fmt_zone_price(z, "DEMAND")
-            if literal or fresh:
-                log.info(
-                    "[TRIGGER_CHECK] %s | 🔵 DEMAND #%d | price=%s | touch=%s | fresh_touch=%s | directional=%s",
-                    symbol, idx, price, "YES" if literal else "NO", "YES" if fresh else "NO",
-                    "YES" if c > o else "NO",
-                )
+        def label(level: dict[str, Any]) -> tuple[str, str]:
+            return _zone_descriptor(level)
 
-        for idx, z in enumerate(supply, 1):
-            literal, fresh = zone_touch(z, "SHORT")
-            price = _fmt_zone_price(z, "SUPPLY")
-            if literal or fresh:
-                log.info(
-                    "[TRIGGER_CHECK] %s | 🔴 SUPPLY #%d | price=%s | touch=%s | fresh_touch=%s | directional=%s",
-                    symbol, idx, price, "YES" if literal else "NO", "YES" if fresh else "NO",
-                    "YES" if c < o else "NO",
-                )
-
-        # Structural S/R is useful to explain visually plausible touches such as
-        # BTC 79,485 on TradingView. It is diagnostic only and is NOT itself an
-        # entry trigger in the current ZONE_ONLY strategy.
-        touched_structures: list[tuple[float, str, str]] = []
-        snap = levels if isinstance(levels, dict) else {}
-        for level in [*(snap.get("blue") or []), *(snap.get("red") or [])]:
-            try:
-                lo = float(level.get("lower", level.get("price")))
-                hi = float(level.get("upper", level.get("price")))
-                if l <= hi and h >= lo:
-                    icon, label = _zone_descriptor(level)
-                    touched_structures.append((lo, icon, label))
-            except (TypeError, ValueError):
+        touched_any = False
+        fresh_any = False
+        ordered = sorted(all_levels, key=lambda z: (float(z.get("price", z.get("lower", 0.0))), str(z.get("level_id", ""))))
+        seen: set[tuple[str, str]] = set()
+        for level in ordered:
+            color = str(level.get("color", "")).upper()
+            direction = "LONG" if color == "BLUE" else "SHORT" if color == "RED" else ""
+            if not direction:
                 continue
-        touched_structures.sort(key=lambda x: abs(x[0] - c))
-        for price, icon, label in touched_structures[:3]:
+            literal, fresh = touch(level, direction)
+            if not (literal or fresh):
+                continue
+            touched_any = True
+            fresh_any = fresh_any or fresh
+            icon, name = label(level)
+            zone_id = str(level.get("level_id", ""))
+            key = (direction, zone_id)
+            trigger = key in accepted_keys
+            if trigger:
+                reason = "canonical_zone_signal"
+            elif not fresh:
+                reason = "zone_already_consumed_or_not_fresh"
+            else:
+                reason = "setup_validation_rejected"
             log.info(
-                "[TRIGGER_CHECK] %s | %s %s | candle_touch=YES | price=%s | ENTRY_TRIGGER=NO (%s is diagnostic only)",
-                symbol, icon, label, _fmt_num(price), label,
+                "[TRIGGER_CHECK] %s | %s %s | price=%s | candle_touch=%s | fresh_touch=%s | ENTRY_TRIGGER=%s | side=%s | reason=%s",
+                symbol, icon, name, _fmt_zone_price(level),
+                "YES" if literal else "NO", "YES" if fresh else "NO",
+                "YES" if trigger else "NO", direction, reason,
             )
 
-        any_fresh = False
-        for z in demand:
-            _, fresh = zone_touch(z, "LONG")
-            any_fresh = any_fresh or fresh
-        for z in supply:
-            _, fresh = zone_touch(z, "SHORT")
-            any_fresh = any_fresh or fresh
-
-        if any_fresh:
-            log.info("[TRIGGER_CHECK] %s | FRESH_DEMAND_SUPPLY_TOUCH=YES | continue_to_setup_validation", symbol)
+        if fresh_any and accepted_keys:
+            log.info("[TRIGGER_CHECK] %s | FRESH_STRUCTURAL_TOUCH=YES | accepted_signals=%d", symbol, len(accepted_keys))
+        elif fresh_any:
+            log.info("[TRIGGER_CHECK] %s | FRESH_STRUCTURAL_TOUCH=YES | accepted_signals=0 | reason=setup_validation_rejected", symbol)
+        elif touched_any:
+            log.info("[TRIGGER_CHECK] %s | STRUCTURAL_TOUCH=YES | FRESH_STRUCTURAL_TOUCH=NO | ACTION=WAIT", symbol)
         else:
-            log.info(
-                "[TRIGGER_CHECK] %s | FRESH_DEMAND_SUPPLY_TOUCH=NO | ACTION=WAIT | reason=latest_closed_1H_did_not_fresh-touch_active_demand_or_supply",
-                symbol,
-            )
+            log.info("[TRIGGER_CHECK] %s | STRUCTURAL_TOUCH=NO | ACTION=WAIT", symbol)
     except Exception as exc:
         log.warning("[TRIGGER_CHECK_ERROR] %s | %s: %s", symbol, type(exc).__name__, exc)
 
@@ -1468,7 +1475,7 @@ def main() -> None:
 
             df, supply, demand, signals = generate_zone_signals(pd.DataFrame(bars), symbol=symbol, mode=DIAGNOSTICS_MODE)
             level_snapshot = df.attrs.get("level_snapshot") if isinstance(df.attrs.get("level_snapshot"), dict) else {}
-            _log_latest_trigger_check(symbol, df, demand, supply, level_snapshot)
+            _log_latest_trigger_check(symbol, df, demand, supply, level_snapshot, signals)
             latest_price = float(df["close"].iloc[-1])
             bingx_price = _bingx_last_price(contract)
             latest_closed_idx = len(df) - 1
@@ -1514,8 +1521,13 @@ def main() -> None:
                 if int(s.get("idx", -1)) == int(latest_closed_idx)
                 and pd.Timestamp(s.get("time")) == latest_closed_time
             ]
+            # The execution/rebase layer must receive the exact structural map
+            # that generated the signal. Without this, post-fill protection would
+            # look at an empty ``signal["levels"]`` object and falsely conclude
+            # that no same-color protective structure exists after a legitimate fill.
             for sig in recent:
                 sig["score"] = score_zone_signal(sig)
+                sig["levels"] = copy.deepcopy(level_snapshot)
 
             # Only validate BingX live price when a fresh signal exists. This keeps
             # the full-market scan on Binance while spending a small number of extra

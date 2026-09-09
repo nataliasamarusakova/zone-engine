@@ -2278,6 +2278,38 @@ def test_rebase_uses_last_valid_same_color_level_not_stale_zone_boundary():
 
 
 
+def test_post_fill_rebase_uses_signal_level_snapshot_from_latest_scan(monkeypatch):
+    import run_once
+    signal = {
+        "type": "LONG",
+        "entry": 12.203,
+        "sl": 12.05743849,
+        "tp1": 12.31217113,
+        "tp2": 12.42134226,
+        "risk_pct": 1.19,
+        "atr": 0.05,
+        "zone": {"kind": "PIVOT_LOW+DEMAND", "level_id": "D5", "btm": 12.073, "top": 12.1108577},
+        "levels": {
+            "blue": [{
+                "level_id": "D5", "color": "BLUE", "kind": "CLUSTER", "source": "cluster",
+                "price": 12.091928847632, "lower": 12.073, "upper": 12.110857695264,
+                "status": "ACTIVE", "member_kinds": ["PIVOT_LOW", "DEMAND"], "strength": 3,
+            }],
+            "red": [{
+                "level_id": "R1", "color": "RED", "kind": "CLUSTER", "source": "cluster",
+                "price": 12.462, "lower": 12.462, "upper": 12.462,
+                "status": "ACTIVE", "member_kinds": ["PIVOT_HIGH"], "strength": 1,
+            }],
+        },
+        "target": {"obstacle_price": 12.462},
+    }
+    out = run_once._rebase_protection_after_fill(signal, 12.164)
+    assert out["protection_level"]["level_id"] == "D5"
+    assert out["sl"] < 12.164
+    assert out["tp1"] > 12.164
+    assert out["tp2"] > out["tp1"]
+
+
 def test_level_snapshot_is_exposed_for_non_signal_scan():
     import pandas as pd
     from event_engine import signals
@@ -2366,8 +2398,8 @@ def test_human_level_logging_never_emits_nan_and_exposes_trade_map(caplog):
     assert "NEAREST_RED_ABOVE" in text and "79485" in text
     assert "PINE_HIGH=82300" in text and "PINE_LOW=76264" in text
     assert "INVALID_ZONE" not in text
-    assert "[TRADE_MAP] BTC-USDT | DIRECTION=LONG" in text
-    assert "[TRADE_MAP] BTC-USDT | PROTECTION" in text
+    assert "[TRADE_MAP] BTC-USDT | #1 | DIRECTION=LONG" in text
+    assert "[TRADE_MAP] BTC-USDT | #1 | PROTECTION" in text
     assert "nan" not in text.lower()
 
 
@@ -2434,15 +2466,19 @@ def test_latest_trigger_check_distinguishes_supply_from_red_resistance(caplog):
     demand = [{"btm": 77620.01, "top": 77703.65}]
     supply = [{"btm": 80487.82, "top": 80559.99}]
     levels = {
-        "red": [{"price": 79485.0, "lower": 79485.0, "upper": 79485.0, "kind": "RESISTANCE", "member_kinds": ["RESISTANCE"]}],
+        "red": [{"price": 79485.0, "lower": 79485.0, "upper": 79485.0, "kind": "RESISTANCE", "member_kinds": ["RESISTANCE"], "color": "RED"}],
         "blue": [],
     }
-    _log_latest_trigger_check("BTC-USDT", df, demand, supply, levels)
+    signal = {
+        "idx": 1, "type": "SHORT", "zone_id": "R1",
+    }
+    levels["red"][0]["level_id"] = "R1"
+    _log_latest_trigger_check("BTC-USDT", df, demand, supply, levels, [signal])
     text = "\n".join(r.message for r in caplog.records)
     assert "🔴 RESISTANCE" in text
     assert "candle_touch=YES" in text
-    assert "ENTRY_TRIGGER=NO (RESISTANCE is diagnostic only)" in text
-    assert "FRESH_DEMAND_SUPPLY_TOUCH=NO" in text
+    assert "ENTRY_TRIGGER=YES" in text
+    assert "diagnostic only" not in text
 
 
 def test_zone_strength_tiers(monkeypatch):
