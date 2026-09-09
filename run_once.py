@@ -1249,23 +1249,75 @@ def main() -> None:
                 blue = levels.get("blue") or []
                 red = levels.get("red") or []
                 invalid = levels.get("invalid") or []
+                zones = levels.get("active_zones") or {}
+                demand_zones = zones.get("demand") or []
+                supply_zones = zones.get("supply") or []
+
                 def _fmt_level(x: dict[str, Any]) -> str:
                     lid = str(x.get("level_id", "?"))[-8:]
                     kind = str(x.get("kind", "?"))
+                    members = "/".join(str(k) for k in (x.get("member_kinds") or []))
                     lo = float(x.get("lower", x.get("price", 0)) or 0)
                     hi = float(x.get("upper", x.get("price", 0)) or 0)
                     strength = int(x.get("strength", 1) or 1)
                     age = x.get("age_bars")
-                    age_text = f"age={age}" if age is not None else "age=?"
+                    age_text = f"A{age}" if age is not None else "A?"
+                    src_text = f"[{members}]" if members else ""
                     if abs(hi - lo) <= 1e-12:
-                        return f"{lid}:{kind}@{lo:.12g}(S{strength},{age_text})"
-                    return f"{lid}:{kind}[{lo:.12g}-{hi:.12g}](S{strength},{age_text})"
+                        return f"{lid}:{kind}{src_text}@{lo:.8g}(S{strength},{age_text})"
+                    return f"{lid}:{kind}{src_text}[{lo:.8g}-{hi:.8g}](S{strength},{age_text})"
+
+                def _fmt_zone(z: dict[str, Any]) -> str:
+                    lo = float(z.get("btm", 0) or 0)
+                    hi = float(z.get("top", 0) or 0)
+                    age = z.get("start")
+                    return f"[{lo:.8g}-{hi:.8g}]"
+
                 log.info(
-                    "[LEVELS] %s | price=%s | BLUE[%d]=%s | RED[%d]=%s | INVALID=%d tol=%s",
+                    "[ZONES] %s | DEMAND=%d %s | SUPPLY=%d %s",
+                    symbol, len(demand_zones),
+                    ",".join(_fmt_zone(z) for z in demand_zones[:6]) or "—",
+                    len(supply_zones),
+                    ",".join(_fmt_zone(z) for z in supply_zones[:6]) or "—",
+                )
+                log.info(
+                    "[LEVELS] %s | PRICE=%s | BLUE=%d %s | RED=%d %s",
                     symbol, result.get("current_price"), len(blue),
-                    ",".join(_fmt_level(x) for x in blue[:12]) or "—",
-                    len(red), ",".join(_fmt_level(x) for x in red[:12]) or "—",
+                    " | ".join(_fmt_level(x) for x in blue[:12]) or "—",
+                    len(red), " | ".join(_fmt_level(x) for x in red[:12]) or "—",
+                )
+                high_level = levels.get("high_level") or {}
+                low_level = levels.get("low_level") or {}
+                log.info(
+                    "[RANGE_LEVELS] %s | HIGH=%s | LOW=%s | INVALID=%d | tolerance=%s",
+                    symbol,
+                    f"{float(high_level['price']):.8g}" if high_level.get("price") is not None else "—",
+                    f"{float(low_level['price']):.8g}" if low_level.get("price") is not None else "—",
                     len(invalid), levels.get("cluster_tolerance"),
+                )
+                current_price = result.get("current_price")
+                nearest_blue = []
+                nearest_red = []
+                try:
+                    if current_price is not None:
+                        cp = float(current_price)
+                        nearest_blue = sorted(
+                            [x for x in blue if float(x.get("upper", x.get("price", 0)) or 0) < cp],
+                            key=lambda x: float(x.get("upper", x.get("price", 0)) or 0),
+                            reverse=True,
+                        )[:2]
+                        nearest_red = sorted(
+                            [x for x in red if float(x.get("lower", x.get("price", 0)) or 0) > cp],
+                            key=lambda x: float(x.get("lower", x.get("price", 0)) or 0),
+                        )[:2]
+                except (TypeError, ValueError):
+                    nearest_blue = []
+                    nearest_red = []
+                log.info(
+                    "[STRUCTURE] %s | BLUE_BELOW=%s | RED_ABOVE=%s",
+                    symbol,
+                    " | ".join(_fmt_level(x) for x in nearest_blue) or "—",
+                    " | ".join(_fmt_level(x) for x in nearest_red) or "—",
                 )
 
         scanned = min(batch_start + len(batch), total)
