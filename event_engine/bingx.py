@@ -701,7 +701,15 @@ def _find_recent_order_by_client_id(symbol: str, client_order_id: str, lookback_
     return None
 
 
-def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dict:
+def open_market(
+    symbol: str,
+    direction: str,
+    price: float,
+    trade_id: str,
+    *,
+    margin_usdt: float | None = None,
+    max_position_margin_usdt: float | None = None,
+) -> dict:
     direction = str(direction).upper()
     if direction not in {"LONG", "SHORT"}:
         return {"status": "error", "error": f"invalid direction={direction}"}
@@ -710,15 +718,20 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
     if not bx:
         return {"status": "error", "error": "contract_not_found"}
 
+    # Backward-compatible single-entry mode: callers that do not supply the
+    # tiered sizing/cap arguments keep the historic duplicate-position guard.
+    # Production Zone Engine passes both arguments and may scale the same
+    # directional position across distinct zones.
+    if margin_usdt is None and max_position_margin_usdt is None:
+        try:
+            if has_open_position(symbol, direction):
+                return {"status": "existing_position", "symbol": bx, "direction": direction}
+        except Exception as exc:
+            return {"status": "error", "error": f"position_check_failed: {exc}", "symbol": bx}
+
     c = get_contract(symbol) or {}
     if not contract_exists(symbol):
         return {"status": "error", "error": "contract_unavailable", "symbol": bx}
-
-    try:
-        if has_open_position(symbol, direction):
-            return {"status": "existing_position", "symbol": bx, "direction": direction}
-    except Exception as exc:
-        return {"status": "error", "error": f"position_check_failed: {exc}", "symbol": bx}
 
     try:
         prec = int(c.get("quantityPrecision") or 0)
@@ -733,7 +746,59 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
         return {"status": "error", "error": "invalid sizing price", "symbol": bx}
 
     leverage = min(LEVERAGE, MAX_LEVERAGE, max_lev)
-    qty = (MARGIN_USDT * leverage) / max(sizing_price * mult, 1e-12)
+    requested_margin = MARGIN_USDT if margin_usdt is None else float(margin_usdt)
+    max_margin = None if max_position_margin_usdt is None else float(max_position_margin_usdt)
+    if not math.isfinite(requested_margin) or requested_margin <= 0:
+        return {"status": "error", "error": "invalid requested margin", "symbol": bx}
+    if max_margin is not None and (not math.isfinite(max_margin) or max_margin <= 0):
+        return {"status": "error", "error": "invalid max position margin", "symbol": bx}
+
+    existing_qty = 0.0
+    existing_avg = 0.0
+    legacy_single_entry = margin_usdt is None and max_position_margin_usdt is None
+    if legacy_single_entry:
+        current = {"status": "not_found"}
+    else:
+        try:
+            current = get_position_directional(symbol, direction)
+        except Exception as exc:
+            current = {"status": "error", "error": str(exc)}
+    if current.get("status") == "found":
+        existing_qty = abs(float(current.get("positionAmt", 0.0) or 0.0))
+        existing_avg = float(current.get("avgPrice", 0.0) or 0.0)
+    elif current.get("status") == "error":
+        return {"status": "error", "error": f"position_check_failed: {current.get('error')}", "symbol": bx}
+
+    existing_margin = (existing_qty * (existing_avg or sizing_price) * mult) / max(leverage, 1)
+    effective_margin = requested_margin
+    if max_margin is not None:
+        remaining_margin = max_margin - existing_margin
+        if remaining_margin <= 1e-12:
+            return {
+                "status": "skipped_position_margin_cap",
+                "reason": "max_position_margin_reached",
+                "symbol": bx, "direction": direction,
+                "requested_margin_usdt": requested_margin,
+                "effective_margin_usdt": 0.0,
+                "existing_margin_usdt": existing_margin,
+                "remaining_margin_usdt": 0.0,
+                "max_position_margin_usdt": max_margin,
+                "leverage": leverage, "sizing_price": sizing_price,
+            }
+        if requested_margin > remaining_margin + 1e-12:
+            return {
+                "status": "skipped_position_margin_cap",
+                "reason": "requested_margin_exceeds_remaining_position_cap",
+                "symbol": bx, "direction": direction,
+                "requested_margin_usdt": requested_margin,
+                "effective_margin_usdt": 0.0,
+                "existing_margin_usdt": existing_margin,
+                "remaining_margin_usdt": remaining_margin,
+                "max_position_margin_usdt": max_margin,
+                "leverage": leverage, "sizing_price": sizing_price,
+            }
+
+    qty = (effective_margin * leverage) / max(sizing_price * mult, 1e-12)
     q = Decimal(str(qty)).quantize(Decimal(1).scaleb(-prec), rounding=ROUND_DOWN)
     qty = float(q)
 
@@ -755,7 +820,10 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
             "reason": "exchange_min_quantity",
             "symbol": bx, "qty": qty, "min_qty": min_qty,
             "required_margin_usdt": required_margin,
-            "configured_margin_usdt": MARGIN_USDT,
+            "configured_margin_usdt": effective_margin,
+            "requested_margin_usdt": requested_margin,
+            "existing_margin_usdt": existing_margin,
+            "max_position_margin_usdt": max_margin,
             "leverage": leverage, "sizing_price": sizing_price,
         }
 
@@ -769,7 +837,10 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
             "reason": "two_tp_min_quantity",
             "symbol": bx, "qty": qty, "min_qty": min_qty,
             "required_margin_usdt": required_margin,
-            "configured_margin_usdt": MARGIN_USDT,
+            "configured_margin_usdt": effective_margin,
+            "requested_margin_usdt": requested_margin,
+            "existing_margin_usdt": existing_margin,
+            "max_position_margin_usdt": max_margin,
             "leverage": leverage, "sizing_price": sizing_price,
         }
 
@@ -800,7 +871,7 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
         # the outcome unknown -- the order may have been created even though we
         # did not receive an ack. Never blindly retry a POST; verify the result
         # via the position instead. The pre-flight has_open_position check above
-        # guarantees any position present now was opened by THIS order.
+        # preserves idempotency by reconciling the unique client order id.
         transport_error = (
             response.get("code") == -1
             and "missing bingx credentials" not in str(response.get("msg", "")).lower()
@@ -857,6 +928,10 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
         "sizing_price": sizing_price,
         "signal_price": float(price),
         "order_reference_price": sizing_price,
+        "configured_margin_usdt": effective_margin,
+        "requested_margin_usdt": requested_margin,
+        "existing_margin_usdt": existing_margin,
+        "max_position_margin_usdt": max_margin,
         "order_id": order_id,
         "client_order_id": order.get("clientOrderId") or client_order_id,
         "response": response,
