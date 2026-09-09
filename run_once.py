@@ -84,6 +84,114 @@ def _append_jsonl(path: Path, obj: dict[str, Any]) -> None:
 
 
 
+def _fmt_num(value: Any, digits: int = 8) -> str:
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if not math.isfinite(x):
+        return "—"
+    return f"{x:.{digits}f}".rstrip("0").rstrip(".")
+
+
+def _fmt_level_human(level: dict[str, Any]) -> str:
+    lid = str(level.get("level_id") or "?")[-8:]
+    kind = str(level.get("kind") or "LEVEL").upper()
+    sources = [str(x).upper() for x in (level.get("member_kinds") or [])]
+    if not sources and level.get("source"):
+        sources = [str(level.get("source")).upper()]
+    lo = level.get("lower", level.get("price"))
+    hi = level.get("upper", level.get("price"))
+    lo_s, hi_s = _fmt_num(lo), _fmt_num(hi)
+    if lo_s == "—":
+        return f"{kind}#{lid}"
+    price_text = lo_s if hi_s == "—" or hi_s == lo_s else f"{lo_s}–{hi_s}"
+    meta = []
+    if level.get("strength") is not None:
+        meta.append(f"strength={int(level['strength'])}")
+    if level.get("age_bars") is not None:
+        meta.append(f"age={int(level['age_bars'])}")
+    if sources:
+        meta.append(f"sources={'+'.join(dict.fromkeys(sources))}")
+    return f"{kind}#{lid} {price_text}" + (f" [{', '.join(meta)}]" if meta else "")
+
+
+def _fmt_zone_human(zone: dict[str, Any], latest_idx: int | None = None) -> str:
+    lo_s, hi_s = _fmt_num(zone.get("btm")), _fmt_num(zone.get("top"))
+    if lo_s == "—" or hi_s == "—":
+        return "INVALID_ZONE"
+    age_text = ""
+    if latest_idx is not None and zone.get("start") is not None:
+        try:
+            age_text = f" age={max(0, int(latest_idx) - int(zone['start']))}"
+        except (TypeError, ValueError):
+            pass
+    return f"{lo_s}–{hi_s}{age_text}"
+
+
+def _fmt_level_list(levels: list[dict[str, Any]], limit: int = 8) -> str:
+    return " | ".join(_fmt_level_human(x) for x in levels[:limit]) if levels else "—"
+
+
+def _log_human_level_map(symbol: str, result: dict[str, Any]) -> None:
+    levels = result.get("levels") or {}
+    blue = levels.get("blue") or []
+    red = levels.get("red") or []
+    invalid = levels.get("invalid") or []
+    zones = levels.get("active_zones") or {}
+    demand = zones.get("demand") or []
+    supply = zones.get("supply") or []
+    latest_idx = result.get("latest_closed_idx")
+
+    log.info("[LEVEL_MAP] %s | PRICE=%s", symbol, _fmt_num(result.get("current_price")))
+    log.info("[LEVEL_MAP] %s | BLUE | %s", symbol, _fmt_level_list(blue))
+    log.info("[LEVEL_MAP] %s | RED  | %s", symbol, _fmt_level_list(red))
+    log.info(
+        "[LEVEL_MAP] %s | ZONES | DEMAND=%s | SUPPLY=%s",
+        symbol,
+        ", ".join(_fmt_zone_human(z, latest_idx) for z in demand[:4]) or "—",
+        ", ".join(_fmt_zone_human(z, latest_idx) for z in supply[:4]) or "—",
+    )
+
+    high = levels.get("high_level") or {}
+    low = levels.get("low_level") or {}
+    log.info(
+        "[LEVEL_MAP] %s | EXTREMES | PINE_HIGH=%s | PINE_LOW=%s | INVALID=%d",
+        symbol, _fmt_num(high.get("price")), _fmt_num(low.get("price")), len(invalid),
+    )
+
+    try:
+        cp = float(result.get("current_price"))
+    except (TypeError, ValueError):
+        cp = None
+    if cp is not None and math.isfinite(cp):
+        below = sorted(
+            [x for x in blue if float(x.get("upper", x.get("price", 0))) < cp],
+            key=lambda x: float(x.get("upper", x.get("price", 0))), reverse=True,
+        )
+        above = sorted(
+            [x for x in red if float(x.get("lower", x.get("price", 0))) > cp],
+            key=lambda x: float(x.get("lower", x.get("price", 0))),
+        )
+        log.info("[LEVEL_MAP] %s | NEAREST_BLUE_BELOW | %s", symbol, _fmt_level_human(below[0]) if below else "—")
+        log.info("[LEVEL_MAP] %s | NEXT_BLUE | %s", symbol, _fmt_level_human(below[1]) if len(below) > 1 else "—")
+        log.info("[LEVEL_MAP] %s | NEAREST_RED_ABOVE | %s", symbol, _fmt_level_human(above[0]) if above else "—")
+        log.info("[LEVEL_MAP] %s | NEXT_RED | %s", symbol, _fmt_level_human(above[1]) if len(above) > 1 else "—")
+
+    signal = (result.get("signals") or [None])[0]
+    if isinstance(signal, dict):
+        direction = str(signal.get("type") or "?").upper()
+        entry_level = signal.get("entry_level") or {}
+        protection_level = signal.get("protection_level") or {}
+        target_levels = ((signal.get("target") or {}).get("target_levels") or [])
+        log.info("[TRADE_MAP] %s | DIRECTION=%s", symbol, direction)
+        log.info("[TRADE_MAP] %s | ENTRY      | %s", symbol, _fmt_level_human(entry_level) if entry_level else "—")
+        log.info("[TRADE_MAP] %s | PROTECTION | %s | SL=%s", symbol, _fmt_level_human(protection_level) if protection_level else "—", _fmt_num(signal.get("sl")))
+        log.info("[TRADE_MAP] %s | TP1        | %s | price=%s", symbol, _fmt_level_human(target_levels[0]) if target_levels else "—", _fmt_num(signal.get("tp1")))
+        log.info("[TRADE_MAP] %s | TP2        | %s | price=%s", symbol, _fmt_level_human(target_levels[1]) if len(target_levels) > 1 else "—", _fmt_num(signal.get("tp2")))
+        log.info("[TRADE_MAP] %s | RISK       | risk=%s%% | TP2_R=%s", symbol, _fmt_num(signal.get("risk_pct")), _fmt_num(signal.get("tp2_rr"), 4))
+
+
 def _load_failed_signal_ids() -> dict[str, dict[str, Any]]:
     try:
         if not FAILED_SIGNALS_PATH.exists():
@@ -1245,80 +1353,7 @@ def main() -> None:
                         symbol, result["current_price"], result["price_position"], result["fresh_signal"],
                         result["active_demand"], result["active_supply"],
                     )
-                levels = result.get("levels") or {}
-                blue = levels.get("blue") or []
-                red = levels.get("red") or []
-                invalid = levels.get("invalid") or []
-                zones = levels.get("active_zones") or {}
-                demand_zones = zones.get("demand") or []
-                supply_zones = zones.get("supply") or []
-
-                def _fmt_level(x: dict[str, Any]) -> str:
-                    lid = str(x.get("level_id", "?"))[-8:]
-                    kind = str(x.get("kind", "?"))
-                    members = "/".join(str(k) for k in (x.get("member_kinds") or []))
-                    lo = float(x.get("lower", x.get("price", 0)) or 0)
-                    hi = float(x.get("upper", x.get("price", 0)) or 0)
-                    strength = int(x.get("strength", 1) or 1)
-                    age = x.get("age_bars")
-                    age_text = f"A{age}" if age is not None else "A?"
-                    src_text = f"[{members}]" if members else ""
-                    if abs(hi - lo) <= 1e-12:
-                        return f"{lid}:{kind}{src_text}@{lo:.8g}(S{strength},{age_text})"
-                    return f"{lid}:{kind}{src_text}[{lo:.8g}-{hi:.8g}](S{strength},{age_text})"
-
-                def _fmt_zone(z: dict[str, Any]) -> str:
-                    lo = float(z.get("btm", 0) or 0)
-                    hi = float(z.get("top", 0) or 0)
-                    age = z.get("start")
-                    return f"[{lo:.8g}-{hi:.8g}]"
-
-                log.info(
-                    "[ZONES] %s | DEMAND=%d %s | SUPPLY=%d %s",
-                    symbol, len(demand_zones),
-                    ",".join(_fmt_zone(z) for z in demand_zones[:6]) or "—",
-                    len(supply_zones),
-                    ",".join(_fmt_zone(z) for z in supply_zones[:6]) or "—",
-                )
-                log.info(
-                    "[LEVELS] %s | PRICE=%s | BLUE=%d %s | RED=%d %s",
-                    symbol, result.get("current_price"), len(blue),
-                    " | ".join(_fmt_level(x) for x in blue[:12]) or "—",
-                    len(red), " | ".join(_fmt_level(x) for x in red[:12]) or "—",
-                )
-                high_level = levels.get("high_level") or {}
-                low_level = levels.get("low_level") or {}
-                log.info(
-                    "[RANGE_LEVELS] %s | HIGH=%s | LOW=%s | INVALID=%d | tolerance=%s",
-                    symbol,
-                    f"{float(high_level['price']):.8g}" if high_level.get("price") is not None else "—",
-                    f"{float(low_level['price']):.8g}" if low_level.get("price") is not None else "—",
-                    len(invalid), levels.get("cluster_tolerance"),
-                )
-                current_price = result.get("current_price")
-                nearest_blue = []
-                nearest_red = []
-                try:
-                    if current_price is not None:
-                        cp = float(current_price)
-                        nearest_blue = sorted(
-                            [x for x in blue if float(x.get("upper", x.get("price", 0)) or 0) < cp],
-                            key=lambda x: float(x.get("upper", x.get("price", 0)) or 0),
-                            reverse=True,
-                        )[:2]
-                        nearest_red = sorted(
-                            [x for x in red if float(x.get("lower", x.get("price", 0)) or 0) > cp],
-                            key=lambda x: float(x.get("lower", x.get("price", 0)) or 0),
-                        )[:2]
-                except (TypeError, ValueError):
-                    nearest_blue = []
-                    nearest_red = []
-                log.info(
-                    "[STRUCTURE] %s | BLUE_BELOW=%s | RED_ABOVE=%s",
-                    symbol,
-                    " | ".join(_fmt_level(x) for x in nearest_blue) or "—",
-                    " | ".join(_fmt_level(x) for x in nearest_red) or "—",
-                )
+                _log_human_level_map(symbol, result)
 
         scanned = min(batch_start + len(batch), total)
         log.info("[SCAN_PROGRESS] %d/%d symbols | batch=%d | workers=%d", scanned, total, len(batch), min(SCAN_WORKERS, len(batch)))

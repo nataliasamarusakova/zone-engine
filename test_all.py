@@ -2295,3 +2295,51 @@ def test_protective_and_opposing_levels_exclude_entry_overlapping_levels():
     assert select_protective_level("SHORT", 100.0, blue, red)["level_id"] == "R_ABOVE"
     assert select_opposing_levels("LONG", 100.0, blue, red, limit=2)[0]["level_id"] == "R_ABOVE"
     assert select_opposing_levels("SHORT", 100.0, blue, red, limit=2)[0]["level_id"] == "B_BELOW"
+
+
+def test_human_level_logging_never_emits_nan_and_exposes_trade_map(caplog):
+    import run_once as ro
+
+    entry_level = {"level_id": "LVL_BLUE1", "kind": "CLUSTER", "member_kinds": ["SUPPORT"], "lower": 78680.0, "upper": 78680.0, "strength": 2, "age_bars": 10}
+    result = {
+        "current_price": 78952.01,
+        "latest_closed_idx": 119,
+        "levels": {
+            "blue": [
+                {"level_id": "LVL_BLUE1", "kind": "CLUSTER", "member_kinds": ["SUPPORT", "PIVOT_LOW"], "lower": 78680.0, "upper": 78680.0, "strength": 2, "age_bars": 10},
+                {"level_id": "LVL_BLUE2", "kind": "CLUSTER", "member_kinds": ["DEMAND", "PIVOT_LOW"], "lower": 77620.01, "upper": 77699.55, "strength": 3, "age_bars": 10},
+            ],
+            "red": [
+                {"level_id": "LVL_RED1", "kind": "CLUSTER", "member_kinds": ["RESISTANCE", "PIVOT_HIGH"], "lower": 79485.0, "upper": 79485.0, "strength": 3, "age_bars": 21},
+            ],
+            "invalid": [],
+            "high_level": {"price": 82300.0},
+            "low_level": {"price": 76264.0},
+            "active_zones": {
+                "demand": [{"btm": 77620.01, "top": 77699.55, "start": 109}],
+                "supply": [{"btm": 80487.825, "top": 80559.99, "start": 71}, {"btm": 80400.0, "top": float("nan"), "start": 70}],
+            },
+        },
+        "signals": [{
+            "type": "LONG",
+            "sl": 78500.0,
+            "tp1": 79400.0,
+            "tp2": 80000.0,
+            "risk_pct": 0.57,
+            "tp2_rr": 1.4,
+            "entry_level": entry_level,
+            "protection_level": entry_level,
+            "target": {"target_levels": [{"level_id": "LVL_RED1", "kind": "CLUSTER", "member_kinds": ["RESISTANCE"], "lower": 79485.0, "upper": 79485.0, "strength": 3, "age_bars": 21}]},
+        }],
+    }
+    caplog.set_level("INFO", logger="zone_engine")
+    ro._log_human_level_map("BTC-USDT", result)
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "[LEVEL_MAP] BTC-USDT | PRICE=78952.01" in text
+    assert "NEAREST_BLUE_BELOW" in text and "78680" in text
+    assert "NEAREST_RED_ABOVE" in text and "79485" in text
+    assert "PINE_HIGH=82300" in text and "PINE_LOW=76264" in text
+    assert "INVALID_ZONE" in text
+    assert "[TRADE_MAP] BTC-USDT | DIRECTION=LONG" in text
+    assert "[TRADE_MAP] BTC-USDT | PROTECTION" in text
+    assert "nan" not in text.lower()
