@@ -401,6 +401,10 @@ def test_post_fill_rebases_zone_protection_and_never_reuses_stale_absolute_targe
         "risk_pct": 0.28,
         "atr": 0.003,
         "zone": {"btm": 0.808258, "top": 0.8114},
+        "levels": {
+            "blue": [{"level_id": "B1", "color": "BLUE", "kind": "SUPPORT", "source": "pine_sr", "price": 0.7900, "lower": 0.7895, "upper": 0.7905, "status": "ACTIVE"}],
+            "red": [{"level_id": "R1", "color": "RED", "kind": "RESISTANCE", "source": "pine_sr", "price": 0.8110, "lower": 0.8105, "upper": 0.8115, "status": "ACTIVE"}],
+        },
         "target": {"obstacle_price": 0.8060, "source": "nearest_opposing_structure"},
     }
     out = run_once._rebase_protection_after_fill(signal, 0.7974)
@@ -421,6 +425,10 @@ def test_long_post_fill_that_slips_through_zone_stop_moves_stop_behind_fill():
         "risk_pct": 0.70,
         "atr": 0.033,
         "zone": {"btm": 4.743, "top": 4.7593},
+        "levels": {
+            "blue": [{"level_id": "B1", "color": "BLUE", "kind": "DEMAND", "source": "demand_zone", "price": 4.70, "lower": 4.69, "upper": 4.71, "status": "ACTIVE"}],
+            "red": [{"level_id": "R1", "color": "RED", "kind": "RESISTANCE", "source": "pine_sr", "price": 4.85, "lower": 4.84, "upper": 4.86, "status": "ACTIVE"}],
+        },
         "target": {"obstacle_price": 4.85, "source": "nearest_opposing_structure"},
     }
     out = run_once._rebase_protection_after_fill(signal, 4.73)
@@ -437,6 +445,10 @@ def test_execute_rebases_protection_to_actual_fill_before_installing(monkeypatch
         "entry": 100.0, "sl": 105.0, "tp1": 99.0, "tp2": 98.0, "risk_pct": 1.0,
         "score": 75, "atr": 2.0,
         "zone": {"kind": "SUPPLY", "btm": 99.0, "top": 104.0},
+        "levels": {
+            "blue": [{"level_id": "B1", "color": "BLUE", "kind": "SUPPORT", "source": "pine_sr", "price": 90.0, "lower": 89.5, "upper": 90.5, "status": "ACTIVE"}],
+            "red": [{"level_id": "R1", "color": "RED", "kind": "SUPPLY", "source": "supply_zone", "price": 104.0, "lower": 103.5, "upper": 104.5, "status": "ACTIVE"}],
+        },
         "target": {"obstacle_price": 90.0, "source": "nearest_opposing_structure"},
     }
     captured = {}
@@ -591,7 +603,7 @@ def test_no_zone_signal_is_blocked(monkeypatch):
     assert emitted == []
 
 
-def test_zone_signal_uses_zone_boundary_stop_and_small_tps(monkeypatch):
+def test_zone_signal_uses_last_same_color_structural_stop_and_targets(monkeypatch):
     import numpy as np
     import pandas as pd
     from event_engine import signals as sig
@@ -620,13 +632,19 @@ def test_zone_signal_uses_zone_boundary_stop_and_small_tps(monkeypatch):
     # so patch zone construction/selection at the deterministic insertion point.
     forced_zone = {"top": 110.5, "btm": 109.0, "poi": 109.75, "start": n - 5}
     monkeypatch.setattr(sig, "_find_directional_zone", lambda direction, cur_l, cur_h, cur_c, demand, supply: forced_zone if direction == "LONG" else None)
-    monkeypatch.setattr(sig, "_nearest_opposing_level", lambda direction, entry, active_demand, active_supply, frame, idx: {"price": 115.0, "source": "supply_zone"} if direction == "LONG" else {"price": 95.0, "source": "demand_zone"})
+    monkeypatch.setattr(sig, "build_level_pool", lambda **kwargs: {
+        "blue": [{"level_id": "B1", "color": "BLUE", "kind": "CLUSTER", "source": "cluster", "price": 109.10, "lower": 109.0, "upper": 109.2, "status": "ACTIVE", "member_kinds": ["DEMAND"], "strength": 2}],
+        "red": [{"level_id": "R1", "color": "RED", "kind": "RESISTANCE", "source": "pine_sr", "price": 115.0, "lower": 114.5, "upper": 115.5, "status": "ACTIVE", "member_kinds": ["RESISTANCE"], "strength": 2}],
+        "all": [], "cluster_tolerance": 0.1,
+    })
 
     _, _, _, emitted = sig.generate_zone_signals(df, symbol="TEST-USDT", mode="live")
     assert emitted
     latest = emitted[-1]
     assert latest["confirmation"]["zone_touch"] is True
-    assert latest["risk_model"]["sl_source"] == "last_valid_same_color_level_plus_atr_buffer"
+    assert latest["risk_model"]["sl_source"] == "last_valid_same_color_level_plus_buffer"
+    assert latest["protection_level"]["level_id"] == "B1"
+    assert latest["sl"] < 109.0
     assert latest["trigger"]["alma_required"] is False
     assert latest["target"]["source"] in {"nearest_opposing_structure", "atr_rr_fallback"}
     assert latest["tp1"] < latest["tp2"]
@@ -1999,78 +2017,173 @@ def test_run_once_all_emergency_paths_cleanup_before_close():
 from run_once import WATCHLIST_ONLY, WATCHLIST_SYMBOLS
 
 
-def test_watchlist_is_exact_24_symbols():
+def test_watchlist_is_exact_24_symbols_and_enabled():
     expected = (
-        "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT",
-        "DOGE-USDT", "TRX-USDT", "HYPE-USDT", "XMR-USDT", "ZEC-USDT",
-        "LINK-USDT", "ADA-USDT", "XLM-USDT", "BCH-USDT", "UNI-USDT",
-        "LTC-USDT", "AVAX-USDT", "SUI-USDT", "HBAR-USDT", "TAO-USDT",
-        "ICP-USDT", "ARB-USDT", "POL-USDT", "ETC-USDT",
+        "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT", "DOGE-USDT",
+        "TRX-USDT", "HYPE-USDT", "XMR-USDT", "ZEC-USDT", "LINK-USDT", "ADA-USDT",
+        "XLM-USDT", "BCH-USDT", "UNI-USDT", "LTC-USDT", "AVAX-USDT", "SUI-USDT",
+        "HBAR-USDT", "TAO-USDT", "ICP-USDT", "ARB-USDT", "POL-USDT", "ETC-USDT",
     )
     assert WATCHLIST_ONLY is True
     assert WATCHLIST_SYMBOLS == expected
     assert len(WATCHLIST_SYMBOLS) == 24
 
-# ---------------------------------------------------------------------------
-# Unified structural level engine regression tests
-# ---------------------------------------------------------------------------
-def test_level_engine_selects_closest_same_color_protective_level():
-    from event_engine.levels import select_protective_level, stop_from_level
-    snap = {
-        "blue": [
-            {"level_id": "B3", "color": "BLUE", "kind": "SUPPORT", "source": "pine_sr", "price": 97.0, "status": "ACTIVE"},
-            {"level_id": "B2", "color": "BLUE", "kind": "PIVOT_LOW", "source": "pivot_low", "price": 98.5, "status": "ACTIVE"},
-            {"level_id": "B1", "color": "BLUE", "kind": "DEMAND", "source": "demand_zone", "price": 99.5, "status": "ACTIVE"},
+
+def test_level_engine_preserves_semantic_sr_colors_and_clusters():
+    from event_engine.levels import build_level_pool, select_opposing_levels, select_protective_level, protective_price
+    pool = build_level_pool(
+        demand=[{"top": 100.5, "btm": 99.5, "start": 10}],
+        supply=[{"top": 105.5, "btm": 104.5, "start": 12}],
+        support_resistance=[
+            {"price": 100.2, "semantic": "SUPPORT", "created_idx": 11, "age_bars": 1, "strength": 2},
+            {"price": 105.0, "semantic": "RESISTANCE", "created_idx": 13, "age_bars": 1, "strength": 2},
         ],
-        "red": [],
-    }
-    level = select_protective_level("LONG", 100.0, snap, exclude_level_ids={"B1"})
-    assert level["level_id"] == "B2"
-    stop, buffer = stop_from_level("LONG", level, 1.0, 0.10)
-    assert stop == 98.4
-    assert buffer == 0.1
-
-
-def test_level_engine_short_selects_closest_red_above_entry():
-    from event_engine.levels import select_protective_level
-    snap = {
-        "blue": [],
-        "red": [
-            {"level_id": "R2", "color": "RED", "kind": "RESISTANCE", "source": "pine_sr", "price": 103.0, "status": "ACTIVE"},
-            {"level_id": "R1", "color": "RED", "kind": "SUPPLY", "source": "supply_zone", "price": 101.5, "status": "ACTIVE"},
-        ],
-    }
-    level = select_protective_level("SHORT", 100.0, snap)
-    assert level["level_id"] == "R1"
-
-
-def test_level_engine_keeps_entry_zone_as_fallback_when_no_lower_same_color():
-    from event_engine.levels import build_level_snapshot, select_protective_level
-    zone = {"top": 101.0, "btm": 100.0, "poi": 100.5, "start": 10}
-    snap = build_level_snapshot(entry_price=100.5, active_demand=[zone], active_supply=[], sr_levels=[], pivot_lows=[], pivot_highs=[])
-    assert select_protective_level("LONG", 100.5, snap, exclude_level_ids={"DEM_10"}) is None
-
-
-def test_level_engine_normalizes_existing_demand_supply_sr_and_pivots():
-    from event_engine.levels import build_level_snapshot
-    snap = build_level_snapshot(
-        entry_price=100.0,
-        active_demand=[{"top": 100.0, "btm": 99.0, "poi": 99.5, "start": 4}],
-        active_supply=[{"top": 104.0, "btm": 103.0, "poi": 103.5, "start": 8}],
-        sr_levels=[95.0, 105.0],
-        pivot_lows=[{"price": 97.0, "pivot_idx": 12}],
-        pivot_highs=[{"price": 106.0, "pivot_idx": 14}],
+        pivot_lows=[{"price": 100.1, "created_idx": 9, "age_bars": 3}],
+        pivot_highs=[{"price": 105.1, "created_idx": 14, "age_bars": 0}],
+        current_idx=14, atr=1.0,
     )
-    assert any(x["source"] == "demand_zone" for x in snap["blue"])
-    assert any(x["source"] == "supply_zone" for x in snap["red"])
-    assert any(x["source"] == "pine_sr" and x["kind"] == "SUPPORT" for x in snap["blue"])
-    assert any(x["source"] == "pine_sr" and x["kind"] == "RESISTANCE" for x in snap["red"])
-    assert any(x["kind"] == "PIVOT_LOW" for x in snap["blue"])
-    assert any(x["kind"] == "PIVOT_HIGH" for x in snap["red"])
+    assert pool["blue"] and pool["red"]
+    assert all(level["color"] == "BLUE" for level in pool["blue"])
+    assert all(level["color"] == "RED" for level in pool["red"])
+    protective = select_protective_level("LONG", 102.0, pool["blue"], pool["red"])
+    opposing = select_opposing_levels("LONG", 102.0, pool["blue"], pool["red"], limit=2)
+    assert protective is not None
+    assert opposing
+    stop = protective_price(protective, "LONG", 0.1)
+    assert stop < protective["lower"] < 102.0
 
 
-def test_zone_builder_parameters_remain_unchanged():
+def test_level_engine_short_uses_last_red_above_entry():
+    from event_engine.levels import build_level_pool, select_protective_level, protective_price
+    pool = build_level_pool(
+        demand=[], supply=[{"top": 110.5, "btm": 109.5, "start": 1}],
+        support_resistance=[{"price": 108.0, "semantic": "RESISTANCE", "created_idx": 2, "age_bars": 1, "strength": 2}],
+        pivot_highs=[{"price": 107.8, "created_idx": 3, "age_bars": 0}],
+        current_idx=3, atr=1.0,
+    )
+    protective = select_protective_level("SHORT", 105.0, pool["blue"], pool["red"])
+    assert protective is not None
+    assert protective["color"] == "RED"
+    assert protective_price(protective, "SHORT", 0.1) > protective["upper"]
+
+
+def test_level_engine_rejects_broken_semantic_levels():
+    from event_engine.levels import build_level_pool, select_protective_level
+    pool = build_level_pool(
+        demand=[], supply=[],
+        support_resistance=[
+            {"price": 100.0, "semantic": "SUPPORT", "created_idx": 1, "age_bars": 5, "strength": 2},
+            {"price": 110.0, "semantic": "RESISTANCE", "created_idx": 2, "age_bars": 4, "strength": 2},
+        ],
+        pivot_lows=[{"price": 98.0, "created_idx": 1, "age_bars": 5}],
+        pivot_highs=[{"price": 112.0, "created_idx": 2, "age_bars": 4}],
+        current_idx=5, reference_price=95.0, atr=1.0,
+    )
+    assert not pool["blue"]
+    assert pool["invalid"]
+    assert not [x for x in pool["invalid"] if x["color"] == "RED" and x["status"] == "BROKEN"]
+    assert select_protective_level("LONG", 114.0, pool["blue"], pool["red"]) is None
+
+
+def test_signal_level_snapshot_uses_same_source_for_stop_and_targets(monkeypatch):
+    from event_engine import signals as sig
+    df = _candles(120)
+    forced_zone = {"top": 110.5, "btm": 109.0, "poi": 109.75, "start": 115}
+    monkeypatch.setattr(sig, "_pine_zone_walk", lambda frame: ([], [forced_zone], [], [], []))
+    monkeypatch.setattr(sig, "_find_directional_zone", lambda direction, *args: forced_zone if direction == "LONG" else None)
+    monkeypatch.setattr(sig, "build_level_pool", lambda **kwargs: {
+        "blue": [{"level_id": "B1", "color": "BLUE", "kind": "CLUSTER", "source": "cluster", "price": 109.10, "lower": 109.0, "upper": 109.2, "status": "ACTIVE", "member_kinds": ["DEMAND"], "strength": 2}],
+        "red": [
+            {"level_id": "R1", "color": "RED", "kind": "CLUSTER", "source": "cluster", "price": 115.0, "lower": 114.5, "upper": 115.5, "status": "ACTIVE", "member_kinds": ["RESISTANCE"], "strength": 2},
+            {"level_id": "R2", "color": "RED", "kind": "CLUSTER", "source": "cluster", "price": 120.0, "lower": 119.5, "upper": 120.5, "status": "ACTIVE", "member_kinds": ["SUPPLY"], "strength": 2},
+        ], "all": [], "cluster_tolerance": 0.1,
+    })
+    monkeypatch.setattr(sig, "select_entry_level_for_zone", lambda direction, zone, pool: pool["blue"][0])
+    monkeypatch.setattr(sig, "calc_atr", lambda frame, length: pd.Series(1.0, index=frame.index))
+    # Build a deterministic latest bullish touch.
+    df.loc[len(df)-2, "close"] = 111.0
+    df.loc[len(df)-2, "open"] = 110.0
+    df.loc[len(df)-2, "high"] = 111.2
+    df.loc[len(df)-2, "low"] = 109.8
+    df.loc[len(df)-1, "close"] = 110.0
+    df.loc[len(df)-1, "open"] = 109.0
+    df.loc[len(df)-1, "low"] = 108.0
+    df.loc[len(df)-1, "high"] = 110.0
+    _, _, _, emitted = sig.generate_zone_signals(df, symbol="TEST-USDT", mode="live")
+    assert emitted
+    s = emitted[-1]
+    assert s["protection_level"]["level_id"] == "B1"
+    assert all(x["color"] == "BLUE" for x in s["levels"]["blue"])
+    assert all(x["color"] == "RED" for x in s["levels"]["red"])
+
+
+def test_run_once_uses_bingx_fallback_when_binance_history_is_stale(monkeypatch):
+    import run_once
+    now = pd.Timestamp.now(tz="UTC")
+    stale = [{"timestamp": int((now - pd.Timedelta(hours=10 + (30-i))).timestamp()*1000), "open": 100, "high": 101, "low": 99, "close": 100, "volume": 1000} for i in range(30)]
+    fresh = [{"timestamp": int((now - pd.Timedelta(hours=0.5 + (59-i))).timestamp()*1000), "open": 100, "high": 101, "low": 99, "close": 100, "volume": 1000} for i in range(60)]
+    monkeypatch.setattr(run_once, "fetch_binance_klines", lambda *a, **k: stale)
+    monkeypatch.setattr(run_once, "fetch_bingx_klines", lambda *a, **k: fresh)
+    bars, source = run_once._fetch_analysis_bars("XMR-USDT", "XMRUSDT", "binance")
+    assert source == "bingx_fallback"
+    assert len(bars) == 60
+
+
+def test_rebase_uses_last_valid_same_color_level_not_stale_zone_boundary():
+    import run_once
+    signal = {
+        "type": "LONG", "entry": 100.0, "sl": 99.0, "tp1": 101.0, "tp2": 102.0,
+        "risk_pct": 1.0, "atr": 1.0,
+        "zone": {"btm": 99.5, "top": 100.5},
+        "levels": {
+            "blue": [
+                {"level_id": "B1", "color": "BLUE", "kind": "CLUSTER", "source": "cluster", "price": 98.0, "lower": 97.5, "upper": 98.5, "status": "ACTIVE"},
+                {"level_id": "B2", "color": "BLUE", "kind": "CLUSTER", "source": "cluster", "price": 99.25, "lower": 99.0, "upper": 99.5, "status": "ACTIVE"},
+            ],
+            "red": [{"level_id": "R1", "color": "RED", "kind": "RESISTANCE", "source": "pine_sr", "price": 105.0, "lower": 104.5, "upper": 105.5, "status": "ACTIVE"}],
+        },
+    }
+    out = run_once._rebase_protection_after_fill(signal, 100.0)
+    assert out["protection_level"]["level_id"] == "B2"
+    assert out["sl"] < 99.0
+
+
+
+
+def test_level_snapshot_is_exposed_for_non_signal_scan():
+    import pandas as pd
     from event_engine import signals
-    assert signals.SWING_LEN == 10
-    assert signals.ZONE_HISTORY == 20
-    assert signals.BOX_WIDTH == 2.5
+    rows = []
+    base = 100.0
+    for i in range(180):
+        wave = 2.0 * ((i % 20) - 10) / 10.0
+        close = base + wave
+        rows.append({
+            "timestamp": pd.Timestamp("2026-01-01", tz="UTC") + pd.Timedelta(hours=i),
+            "open": close - 0.1,
+            "high": close + 0.8,
+            "low": close - 0.8,
+            "close": close,
+            "volume": 1000.0 + i,
+        })
+    df, _, _, _ = signals.generate_zone_signals(pd.DataFrame(rows), symbol="TEST-USDT", mode="historical")
+    snapshot = df.attrs.get("level_snapshot")
+    assert isinstance(snapshot, dict)
+    assert "blue" in snapshot and "red" in snapshot
+    assert "cluster_tolerance" in snapshot
+
+
+def test_protective_and_opposing_levels_exclude_entry_overlapping_levels():
+    from event_engine.levels import select_opposing_levels, select_protective_level
+    blue = [
+        {"level_id": "B_OVERLAP", "status": "ACTIVE", "lower": 99.0, "upper": 101.0, "price": 100.0},
+        {"level_id": "B_BELOW", "status": "ACTIVE", "lower": 96.0, "upper": 98.0, "price": 97.0},
+    ]
+    red = [
+        {"level_id": "R_OVERLAP", "status": "ACTIVE", "lower": 99.0, "upper": 101.0, "price": 100.0},
+        {"level_id": "R_ABOVE", "status": "ACTIVE", "lower": 102.0, "upper": 104.0, "price": 103.0},
+    ]
+    assert select_protective_level("LONG", 100.0, blue, red)["level_id"] == "B_BELOW"
+    assert select_protective_level("SHORT", 100.0, blue, red)["level_id"] == "R_ABOVE"
+    assert select_opposing_levels("LONG", 100.0, blue, red, limit=2)[0]["level_id"] == "R_ABOVE"
+    assert select_opposing_levels("SHORT", 100.0, blue, red, limit=2)[0]["level_id"] == "B_BELOW"

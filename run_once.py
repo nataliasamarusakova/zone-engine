@@ -30,7 +30,7 @@ from event_engine.bingx import (
     wait_for_position_fill_directional,
 )
 from event_engine.signals import SWING_LEN, TP1_R, TP2_R, generate_zone_signals, score_zone_signal
-from event_engine.levels import select_protective_level, stop_from_level
+from event_engine.levels import protective_price, select_opposing_levels, select_protective_level
 from event_engine.telegram import format_signal, send as send_tg
 from event_engine.tracker import register_active_trade, update_active_trades, update_active_trade_protection
 
@@ -285,6 +285,39 @@ def _price_position(price: float, demand: list[dict], supply: list[dict]) -> str
     return "⚪ Вне зон (Ждать)"
 
 
+def _fetch_analysis_bars(symbol: str, binance_symbol: str, provider: str) -> tuple[list[dict[str, Any]], str]:
+    """Load fresh 1H analysis bars, falling back to BingX when Binance history is stale.
+
+    The primary provider remains unchanged; fallback only activates for stale Binance
+    history so a listed BingX asset is not rejected merely because Binance Spot lacks
+    current candles for it.
+    """
+    source = "bingx" if provider == "bingx" else "binance_spot"
+    bars = (fetch_bingx_klines(symbol, "1h", limit=KLINE_LIMIT_1H, retryable=False)
+            if provider == "bingx"
+            else fetch_binance_klines(binance_symbol, "1h", limit=KLINE_LIMIT_1H, retryable=False))
+    min_bars = SWING_LEN * 2 + 10
+    if len(bars) < min_bars:
+        return bars, source
+    latest_ts = pd.to_datetime(bars[-1]["timestamp"], unit="ms", utc=True)
+    if latest_ts.tzinfo is None:
+        latest_ts = latest_ts.tz_localize("UTC")
+    age_h = max(0.0, (pd.Timestamp.now(tz="UTC") - latest_ts).total_seconds() / 3600.0)
+    if provider == "binance" and age_h > MAX_DATA_STALENESS_HOURS:
+        try:
+            bx_bars = fetch_bingx_klines(symbol, "1h", limit=KLINE_LIMIT_1H, retryable=False)
+            if len(bx_bars) >= min_bars:
+                bx_latest = pd.to_datetime(bx_bars[-1]["timestamp"], unit="ms", utc=True)
+                if bx_latest.tzinfo is None:
+                    bx_latest = bx_latest.tz_localize("UTC")
+                bx_age_h = max(0.0, (pd.Timestamp.now(tz="UTC") - bx_latest).total_seconds() / 3600.0)
+                if bx_age_h <= MAX_DATA_STALENESS_HOURS:
+                    return bx_bars, "bingx_fallback"
+        except Exception as exc:
+            log.warning("[DATA_FALLBACK_FAILED] %s | %s", symbol, exc)
+    return bars, source
+
+
 def _bingx_last_price(contract: dict[str, Any]) -> float | None:
     for key in ("lastPrice", "last", "price", "markPrice"):
         try:
@@ -431,6 +464,9 @@ def _build_setup(signal: dict[str, Any]) -> dict[str, Any]:
         ],
         "target_price": float(signal["tp2"]),
         "zone": signal.get("zone", {}),
+        "levels": signal.get("levels", {}),
+        "entry_level": signal.get("entry_level"),
+        "protection_level": signal.get("protection_level"),
         "confirmation": signal.get("confirmation", {}),
         "score": float(signal.get("score", 0.0)),
         "event_time": signal.get("time"),
@@ -521,77 +557,35 @@ def _cleanup_engine_protection(symbol: str, direction: str) -> dict[str, Any]:
     return result
 
 def _rebase_protection_after_fill(signal: dict[str, Any], avg_price: float) -> dict[str, Any]:
-    """Recalculate protection from actual fill using the selected structural level.
+    """Recalculate zone-based SL/TP from the *actual* market fill.
 
-    The signal-time level snapshot is retained and re-evaluated at the real fill
-    price. No new level construction happens here; only deterministic selection
-    from already-observed, closed-bar levels is allowed.
+    A market order can fill materially away from the signal/reference candle close.
+    Never submit stale absolute targets derived from the pre-fill reference price.
     """
     direction = str(signal["type"]).upper()
     entry = float(avg_price)
-    zone = signal.get("zone") if isinstance(signal.get("zone"), dict) else {}
     target = signal.get("target") if isinstance(signal.get("target"), dict) else {}
+    levels = signal.get("levels") if isinstance(signal.get("levels"), dict) else {}
     atr = float(signal.get("atr", 0.0) or 0.0)
     if entry <= 0:
         raise ValueError("actual fill price must be positive")
 
-    zone_top = float(zone.get("top")) if zone.get("top") is not None else None
-    zone_bottom = float(zone.get("btm")) if zone.get("btm") is not None else None
-    if zone_top is None or zone_bottom is None:
-        raise ValueError("zone boundaries unavailable for post-fill protection")
-
-    protection_level = signal.get("protection_level") if isinstance(signal.get("protection_level"), dict) else None
-    if protection_level is None:
-        levels = signal.get("levels") if isinstance(signal.get("levels"), dict) else {}
-        protection_level = levels.get("protective_level") if isinstance(levels.get("protective_level"), dict) else None
-    levels = signal.get("levels") if isinstance(signal.get("levels"), dict) else {}
-    if protection_level is not None:
-        # Re-select from the signal-time pool using the actual fill. A market
-        # fill can cross a previously selected level, making the old stop
-        # geometrically invalid.
-        selected = select_protective_level(
-            direction,
-            entry,
-            levels,
-            exclude_level_ids={str((levels.get("entry_level") or {}).get("level_id") or "")},
-            min_distance=max(entry * 0.0001, 0.0),
-        ) if levels.get("blue") or levels.get("red") else None
-        if selected is not None:
-            protection_level = selected
-        sl_buffer = max(atr * float(os.environ.get("ZONE_SL_ATR_BUFFER", "0.10")), entry * 0.0002)
-        if protection_level is not None:
-            sl, sl_buffer = stop_from_level(
-                direction, protection_level, atr, float(os.environ.get("ZONE_SL_ATR_BUFFER", "0.10"))
-            )
-            protection_level = dict(protection_level)
-            protection_level["protection_price"] = float(protection_level.get("low" if direction == "LONG" else "high", protection_level["price"]))
-        else:
-            sl = zone_bottom - sl_buffer if direction == "LONG" else zone_top + sl_buffer
-        selected_protection_source = str(protection_level.get("source") or "structural_level") if protection_level else "entry_zone_fallback_legacy"
-        selected_protection_id = str(protection_level.get("level_id") or "") if protection_level else None
-    else:
-        # Backward-compatible fallback for legacy signals that predate level snapshots.
-        sl_buffer = max(atr * float(os.environ.get("ZONE_SL_ATR_BUFFER", "0.10")), entry * 0.0002)
-        sl = zone_bottom - sl_buffer if direction == "LONG" else zone_top + sl_buffer
-        selected_protection_source = "entry_zone_fallback_legacy"
-        selected_protection_id = None
-
-    # Never allow a structural level selected at signal-time to produce an
-    # invalid-side stop after slippage crosses that level.
-    if (direction == "LONG" and sl >= entry) or (direction == "SHORT" and sl <= entry):
-        sl = entry - sl_buffer if direction == "LONG" else entry + sl_buffer
-        selected_protection_source = "actual_fill_safety_fallback"
-        selected_protection_id = None
-
+    blue = list(levels.get("blue", [])) if isinstance(levels.get("blue"), list) else []
+    red = list(levels.get("red", [])) if isinstance(levels.get("red"), list) else []
+    protective_level = select_protective_level(direction, entry, blue, red)
+    if protective_level is None:
+        raise ValueError("no valid same-color protective level at actual fill")
+    sl_buffer = max(atr * float(os.environ.get("ZONE_SL_ATR_BUFFER", "0.10")), entry * 0.0002)
+    sl = protective_price(protective_level, direction, sl_buffer)
     risk = abs(entry - sl)
     if risk <= 0:
         raise ValueError("post-fill risk is non-positive")
 
-    obstacle = target.get("obstacle_price")
-    try:
-        obstacle = float(obstacle) if obstacle is not None else None
-    except (TypeError, ValueError):
-        obstacle = None
+    opposing = select_opposing_levels(direction, entry, blue, red, limit=2)
+    obstacle = None
+    if opposing:
+        first = opposing[0]
+        obstacle = float(first["lower"]) if direction == "LONG" else float(first["upper"])
 
     obstacle_buffer = max(atr * float(os.environ.get("TP_OBSTACLE_BUFFER_ATR", "0.10")), entry * 0.0002)
     tp1_r = float(os.environ.get("TP1_R", "0.5"))
@@ -647,9 +641,8 @@ def _rebase_protection_after_fill(signal: dict[str, Any], avg_price: float) -> d
         "tp2_rr": abs(tp2 - entry) / risk,
         "target_source": target_source,
         "obstacle_price": obstacle,
-        "protection_level_id": selected_protection_id,
-        "protection_level_source": selected_protection_source,
-        "protection_level_price": float(protection_level["price"]) if protection_level is not None else None,
+        "protection_level": protective_level,
+        "target_levels": opposing,
     }
 
 
@@ -861,13 +854,12 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
             **(signal.get("target") if isinstance(signal.get("target"), dict) else {}),
             "source": rebased["target_source"],
             "obstacle_price": rebased.get("obstacle_price"),
+            "target_levels": rebased.get("target_levels", []),
         },
-        "protection_level": {
-            **(signal.get("protection_level") if isinstance(signal.get("protection_level"), dict) else {}),
-            "level_id": rebased.get("protection_level_id"),
-            "source": rebased.get("protection_level_source"),
-            "price": rebased.get("protection_level_price"),
-            "stop": sl_price,
+        "protection_level": rebased.get("protection_level"),
+        "level_selection_after_fill": {
+            "protection_level_id": (rebased.get("protection_level") or {}).get("level_id"),
+            "target_level_ids": [x.get("level_id") for x in rebased.get("target_levels", [])],
         },
     })
     valid, reason = _validate_trade_geometry(actual_signal)
@@ -880,6 +872,9 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     setup["entry_reference"] = avg_price
     setup["invalidation_price"] = sl_price
     setup["risk_pct"] = actual_risk_pct
+    setup["protection_level"] = rebased.get("protection_level")
+    setup["target_levels"] = rebased.get("target_levels", [])
+    setup["level_selection_after_fill"] = actual_signal.get("level_selection_after_fill")
     setup["target_rr"] = actual_signal["tp2_rr"]
     setup["planned_weighted_rr"] = actual_signal["tp1_rr"] * 0.50 + actual_signal["tp2_rr"] * 0.50
     setup["tp_levels"] = [
@@ -1057,12 +1052,7 @@ def main() -> None:
 
             binance_symbol = str(meta.get("binance_symbol") or "")
             provider = str(meta.get("market_provider") or "binance").lower()
-            if provider == "bingx":
-                bars = fetch_bingx_klines(symbol, "1h", limit=KLINE_LIMIT_1H, retryable=False)
-                source_name = "bingx"
-            else:
-                bars = fetch_binance_klines(binance_symbol, "1h", limit=KLINE_LIMIT_1H, retryable=False)
-                source_name = "binance_spot"
+            bars, source_name = _fetch_analysis_bars(symbol, binance_symbol, provider)
             min_bars = SWING_LEN * 2 + 10
             if len(bars) < min_bars:
                 return {
@@ -1073,6 +1063,7 @@ def main() -> None:
                 }
 
             df, supply, demand, signals = generate_zone_signals(pd.DataFrame(bars), symbol=symbol, mode=DIAGNOSTICS_MODE)
+            level_snapshot = df.attrs.get("level_snapshot") if isinstance(df.attrs.get("level_snapshot"), dict) else {}
             latest_price = float(df["close"].iloc[-1])
             bingx_price = _bingx_last_price(contract)
             latest_closed_idx = len(df) - 1
@@ -1091,7 +1082,7 @@ def main() -> None:
                 return {
                     "symbol": symbol,
                     "current_price": latest_price,
-                    "binance_price": latest_price,
+                    "binance_price": latest_price if source_name == "binance_spot" else None,
                     "bingx_price": bingx_price,
                     "market_spread_pct": None,
                     "market_source": source_name,
@@ -1102,6 +1093,7 @@ def main() -> None:
                     "active_demand": len(demand),
                     "active_supply": len(supply),
                     "zones": {"demand": demand, "supply": supply},
+                    "levels": level_snapshot,
                     "last_signal_count": 0,
                     "latest_closed_idx": int(latest_closed_idx),
                     "latest_closed_time": latest_closed_time.isoformat(),
@@ -1148,7 +1140,7 @@ def main() -> None:
             spread_pct = _market_spread_pct(
                 binance_live_price if binance_live_price is not None else latest_price,
                 bingx_price,
-            ) if provider == "binance" else None
+            ) if provider == "binance" and source_name == "binance_spot" else None
             if spread_pct is not None and spread_pct > MAX_MARKET_SPREAD_PCT:
                 log.warning("[MARKET_SPREAD] %s | Binance=%.12g | BingX=%.12g | spread=%.4f%% > %.4f%%", symbol, latest_price, bingx_price, spread_pct, MAX_MARKET_SPREAD_PCT)
                 recent = []
@@ -1180,6 +1172,7 @@ def main() -> None:
                 "active_demand": len(demand),
                 "active_supply": len(supply),
                 "zones": {"demand": demand, "supply": supply},
+                "levels": level_snapshot,
                 "last_signal_count": len(recent),
                 "latest_closed_idx": int(latest_closed_idx),
                 "latest_closed_time": latest_closed_time.isoformat(),
@@ -1245,6 +1238,16 @@ def main() -> None:
                         symbol, result["current_price"], result["price_position"], result["fresh_signal"],
                         result["active_demand"], result["active_supply"],
                     )
+                    levels = result.get("levels") or {}
+                    blue = levels.get("blue") or []
+                    red = levels.get("red") or []
+                    if blue or red:
+                        log.info(
+                            "[LEVELS] %s | BLUE=%s | RED=%s",
+                            symbol,
+                            ",".join(f'{x.get("kind")}:{float(x.get("price", 0)):.12g}' for x in blue[:8]),
+                            ",".join(f'{x.get("kind")}:{float(x.get("price", 0)):.12g}' for x in red[:8]),
+                        )
 
         scanned = min(batch_start + len(batch), total)
         log.info("[SCAN_PROGRESS] %d/%d symbols | batch=%d | workers=%d", scanned, total, len(batch), min(SCAN_WORKERS, len(batch)))
@@ -1324,16 +1327,16 @@ def main() -> None:
             continue
         log.info(
             "[EXEC_SIGNAL] symbol=%s direction=%s signal_idx=%s signal_time=%s age_bars=%s "
-            "zone=%s zone_low=%s zone_high=%s protection_level=%s protection_source=%s protection_price=%s "
-            "target_source=%s obstacle=%s tp1=%s tp2=%s event_id=%s",
+            "zone=%s zone_low=%s zone_high=%s entry_level=%s protection_level=%s "
+            "target_levels=%s target_source=%s obstacle=%s tp1=%s tp2=%s event_id=%s",
             signal.get("symbol"), signal.get("type"), signal.get("idx"), signal.get("time"),
             signal.get("execution_age_bars", 0),
             (signal.get("zone") or {}).get("kind"),
             (signal.get("zone") or {}).get("btm"),
             (signal.get("zone") or {}).get("top"),
+            (signal.get("entry_level") or {}).get("level_id"),
             (signal.get("protection_level") or {}).get("level_id"),
-            (signal.get("protection_level") or {}).get("source"),
-            (signal.get("protection_level") or {}).get("price"),
+            [x.get("level_id") for x in (signal.get("target", {}).get("target_levels") or [])],
             (signal.get("target") or {}).get("source"),
             (signal.get("target") or {}).get("obstacle_price"),
             signal.get("tp1"), signal.get("tp2"), signal.get("event_id"),
