@@ -6,6 +6,10 @@ import logging
 import os
 import time
 import uuid
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows development fallback
+    fcntl = None
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -24,6 +28,7 @@ from event_engine.bingx import (
     get_position_mode,
     get_position_directional,
     get_open_protection_directional,
+    LEVERAGE,
     cancel_order,
     close_position_market,
     open_market,
@@ -32,7 +37,7 @@ from event_engine.bingx import (
 from event_engine.signals import SWING_LEN, TP1_R, TP2_R, generate_zone_signals, score_zone_signal
 from event_engine.levels import protective_price, select_opposing_levels, select_protective_level
 from event_engine.telegram import format_signal, send as send_tg
-from event_engine.tracker import register_active_trade, update_active_trades, update_active_trade_protection
+from event_engine.tracker import get_active_trade_id, process_structural_exits, recover_exchange_position, register_active_trade, update_active_trades, update_active_trade_protection
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("zone_engine")
@@ -46,6 +51,7 @@ FAILED_SIGNAL_MAX_RETRIES = max(1, int(os.environ.get("FAILED_SIGNAL_MAX_RETRIES
 FAILED_SIGNAL_RETRY_BASE_SEC = max(1, int(os.environ.get("FAILED_SIGNAL_RETRY_BASE_SEC", "300")))
 FAILED_SIGNAL_RETRY_MAX_SEC = max(FAILED_SIGNAL_RETRY_BASE_SEC, int(os.environ.get("FAILED_SIGNAL_RETRY_MAX_SEC", str(3600))))
 ACTIONS_PATH = DATA / "actions.jsonl"
+EXECUTION_LOCK_PATH = DATA / "execution.lock"
 
 EXECUTION_ENABLED = os.environ.get("EXECUTION_ENABLED", "true").lower() == "true"
 MARGIN_USDT = float(os.environ.get("BINGX_MARGIN_USDT", "1"))
@@ -662,6 +668,52 @@ def reconcile_all_open_positions() -> None:
         trade = active.get(key)
         stop_loss_pct = float((trade or {}).get("planned_risk_pct") or 1.0)
         setup = (trade or {}).get("setup", {}) if isinstance(trade, dict) else {}
+        if trade is None:
+            try:
+                existing_protection = get_open_protection_directional(symbol, side)
+            except Exception as exc:
+                existing_protection = {"status": "error", "error": str(exc), "sl_orders": [], "tp_orders": []}
+            structural_sl = None
+            engine_sl = None
+            if existing_protection.get("status") == "ok":
+                for sl_order in existing_protection.get("sl_orders", []):
+                    cid = str(sl_order.get("clientOrderId", "")).upper()
+                    try:
+                        candidate = float(sl_order.get("stopPrice", 0) or sl_order.get("price", 0) or 0)
+                    except (TypeError, ValueError):
+                        candidate = 0.0
+                    if cid.startswith("EVT_") and candidate > 0 and ((side == "LONG" and candidate < avg) or (side == "SHORT" and candidate > avg)):
+                        structural_sl = candidate
+                        engine_sl = sl_order
+                        break
+            recovered_event_id = f"RECON_{symbol.replace('-', '')}_{side}"
+            setup = {
+                "strategy": "Zone/Structure First",
+                "event_time": pd.Timestamp.now(tz="UTC").isoformat(),
+                "entry_reference": avg,
+                "signal_price": avg,
+                "invalidation_price": structural_sl,
+                "risk_pct": stop_loss_pct,
+                "tp_levels": [],
+                "recovery": True,
+            }
+            recover_exchange_position(
+                recovered_event_id, symbol, side, avg, qty,
+                sl_order={
+                    "status": "recovered_existing",
+                    "order_id": str((engine_sl or {}).get("orderId", "")),
+                    "client_order_id": str((engine_sl or {}).get("clientOrderId", "")),
+                    "stop_price": structural_sl,
+                    "qty": abs(float((engine_sl or {}).get("origQty", qty) or qty)),
+                } if engine_sl else {},
+                tp_orders=list(existing_protection.get("tp_orders", [])) if existing_protection.get("status") == "ok" else [],
+            )
+            active = _load_active_trades_file()
+            trade = active.get(key)
+            log.warning("[RECON_RECOVERED] %s %s | exchange position restored to local aggregate state qty=%.12g avg=%.12g", symbol, side, qty, avg)
+
+        setup = (trade or {}).get("setup", {}) if isinstance(trade, dict) else setup
+        stop_loss_pct = float((trade or {}).get("planned_risk_pct") or stop_loss_pct or 1.0)
         tp_levels = setup.get("tp_levels") if isinstance(setup.get("tp_levels"), list) else None
         if not tp_levels:
             risk_pct = max(stop_loss_pct, 0.05)
@@ -1097,6 +1149,56 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
 
     avg_price = float(position["avgPrice"])
     qty = abs(float(position["positionAmt"]))
+    pre_qty = abs(float(order.get("pre_position_qty", 0.0) or 0.0))
+    added_qty = qty - pre_qty
+    if pre_qty > 0 and added_qty <= max(1e-12, pre_qty * 1e-9):
+        # A confirmed existing position without an observable increase is not a
+        # proof that this signal's MARKET order filled. Never register it again.
+        return {
+            "status": "ENTRY_STATE_UNVERIFIED",
+            "error": f"position did not increase after entry order: pre={pre_qty:.12g} post={qty:.12g}",
+            "order": order,
+            "position": position,
+        }
+    added_qty = qty if pre_qty <= 0 else added_qty
+
+    # The requested margin cap is checked before POST, but market fills can move
+    # against the requested sizing price. Re-apply the hard cap to the authoritative
+    # post-fill position before installing protection or persisting the trade.
+    max_position_margin = order.get("max_position_margin_usdt")
+    if max_position_margin is not None:
+        try:
+            max_position_margin = float(max_position_margin)
+        except (TypeError, ValueError):
+            max_position_margin = MAX_POSITION_MARGIN_USDT
+        try:
+            mult = float(order.get("contract_multiplier", 1.0) or 1.0)
+            leverage_used = float(order.get("leverage", LEVERAGE) or LEVERAGE)
+            actual_total_margin = (qty * avg_price * mult) / max(leverage_used, 1.0)
+        except (TypeError, ValueError, ZeroDivisionError):
+            actual_total_margin = float("inf")
+    else:
+        actual_total_margin = 0.0
+    if max_position_margin is not None and actual_total_margin > max_position_margin + 1e-9:
+        reason = (
+            f"actual_position_margin={actual_total_margin:.8f} > max={max_position_margin:.8f}"
+        )
+        log.critical("[SAFETY_CLOSE] %s %s | post-fill margin cap exceeded | %s", symbol, direction, reason)
+        cleanup = _cancel_engine_protection_before_emergency_close(symbol, direction)
+        rollback_qty = added_qty if added_qty > 0 else qty
+        close_result = _emergency_close_and_verify(symbol, direction, rollback_qty, event_id)
+        return {
+            "status": "opened_then_margin_cap_rollback",
+            "error": reason,
+            "actual_position_margin_usdt": actual_total_margin,
+            "max_position_margin_usdt": max_position_margin,
+            "order": order,
+            "position": position,
+            "close": close_result,
+            "protection_cleanup": cleanup,
+            "executed_signal": dict(signal),
+        }
+
     # Abort on materially adverse market-entry slippage. Once a market order is
     # filled, accepting a severely worse price can invalidate the signal geometry
     # before protection is even submitted. Roll back safely instead of widening risk.
@@ -1186,9 +1288,10 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         [x.get("level_id") for x in rebased.get("target_levels", [])],
     )
 
+    aggregate_trade_id = get_active_trade_id(symbol, direction) or event_id
     protection = ensure_directional_protection(
         symbol, direction, avg_price, qty,
-        actual_risk_pct, setup["tp_levels"], trade_id=event_id,
+        actual_risk_pct, setup["tp_levels"], trade_id=aggregate_trade_id,
         requested_sl_price=sl_price,
     )
     if protection.get("status") != "PROTECTED":
@@ -1228,6 +1331,9 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         score=float(signal.get("score", 0.0)),
         setup={**setup, "protection_status": protection.get("status"), "protection_result": protection},
         requested_entry_price=entry_price,
+        entry_margin_usdt=entry_margin,
+        zone_id=str(signal.get("zone_id") or (signal.get("zone") or {}).get("level_id") or ""),
+        entry_leg_qty=added_qty,
     )
 
     return {
@@ -1475,6 +1581,13 @@ def main() -> None:
                 "last_signal_count": len(recent),
                 "latest_closed_idx": int(latest_closed_idx),
                 "latest_closed_time": latest_closed_time.isoformat(),
+                "latest_ohlc": {
+                    "open": float(df.loc[latest_closed_idx, "open"]),
+                    "high": float(df.loc[latest_closed_idx, "high"]),
+                    "low": float(df.loc[latest_closed_idx, "low"]),
+                    "close": float(df.loc[latest_closed_idx, "close"]),
+                    "prev_close": float(df.loc[latest_closed_idx - 1, "close"]) if latest_closed_idx > 0 else float(df.loc[latest_closed_idx, "close"]),
+                },
                 "signals": recent,
             }
         except Exception as exc:
@@ -1553,17 +1666,26 @@ def main() -> None:
         total, scan_errors, scan_skips, len(fresh_signals), time.time() - started,
     )
 
-    # Execution safety: choose exactly ONE zone signal per symbol, namely the
-    # newest fresh-touch bar. Never allow an older setup to compete with a newer
-    # setup because of score sorting.
-    latest_by_symbol: dict[str, dict[str, Any]] = {}
+    if private_ready:
+        try:
+            exit_result = process_structural_exits(scan_rows)
+            log.info("[STRUCTURE_EXIT_SUMMARY] %s", exit_result)
+        except Exception as exc:
+            log.exception("[STRUCTURE_EXIT] processing failed: %s", exc)
+
+    # Execution safety: keep one candidate per (symbol, side, structural cluster),
+    # not one candidate per symbol. Independent structures may legitimately add
+    # to the same directional position on one closed candle.
+    latest_by_zone: dict[tuple[str, str, str], dict[str, Any]] = {}
     for signal in fresh_signals:
         symbol_key = str(signal["symbol"]).upper()
-        previous = latest_by_symbol.get(symbol_key)
+        zone_id = str(signal.get("zone_id") or (signal.get("zone") or {}).get("level_id") or "")
+        key = (symbol_key, str(signal["type"]).upper(), zone_id)
+        previous = latest_by_zone.get(key)
         candidate_key = (int(signal["idx"]), float(signal.get("score", 0.0)))
         previous_key = (int(previous["idx"]), float(previous.get("score", 0.0))) if previous else None
         if previous is None or candidate_key > previous_key:
-            latest_by_symbol[symbol_key] = signal
+            latest_by_zone[key] = signal
 
     executable: list[dict[str, Any]] = []
     latest_index_by_symbol = {
@@ -1576,7 +1698,7 @@ def main() -> None:
         for r in scan_rows
         if r.get("latest_closed_time") is not None
     }
-    for signal in latest_by_symbol.values():
+    for signal in latest_by_zone.values():
         symbol_key = str(signal["symbol"]).upper()
         latest_closed_idx = latest_index_by_symbol.get(symbol_key)
         if latest_closed_idx is None:
@@ -1605,12 +1727,23 @@ def main() -> None:
         failed_record = failed_ids.get(signal["event_id"])
         if signal["event_id"] in successful_ids or _failed_signal_is_blocked(failed_record):
             continue
-        if key in open_keys or opposite in open_keys:
+        # Same-direction additions are allowed; open_market enforces the total
+        # directional margin cap. Opposite-side positions remain blocked by the
+        # strategy to avoid accidental reversal/netting even in HEDGE mode.
+        if opposite in open_keys:
+            log.info("[REJECT] %s | %s | reason=opposite_position_exists", signal["symbol"], signal["type"])
             continue
         executable.append(signal)
 
-    # Safety ordering: newest signal bar first; score only breaks ties.
-    executable.sort(key=lambda x: (-int(x["idx"]), -float(x.get("score", 0.0))))
+    # Deterministic same-candle order: nearest structural price first, then
+    # stronger cluster. This is a defined rule; never rely on dict/list order.
+    executable.sort(key=lambda x: (
+        -int(x["idx"]),
+        0 if str(x.get("type", "")).upper() == "LONG" else 1,
+        -float((x.get("zone") or {}).get("price", x.get("entry", 0.0))),
+        -float(x.get("zone_strength", x.get("score", 0.0))),
+        str(x.get("zone_id") or ""),
+    ))
 
     executed = 0
     for signal in executable[:MAX_TRADES_PER_CYCLE]:
@@ -1647,7 +1780,36 @@ def main() -> None:
             })
             _send_signal(signal, blocked)
             continue
-        execution = execute_new_position(signal)
+        # Cross-process serialization covers the check -> MARKET POST critical
+        # section. GitHub Actions also serializes this workflow, but the engine
+        # must remain safe when invoked by another scheduler/process.
+        DATA.mkdir(parents=True, exist_ok=True)
+        lockf = EXECUTION_LOCK_PATH.open("a+", encoding="utf-8")
+        try:
+            if fcntl is not None:
+                fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+            refreshed_successful = _load_successful_trade_ids()
+            if signal["event_id"] in refreshed_successful:
+                execution = {"status": "ALREADY_EXECUTED", "event_id": signal["event_id"]}
+            else:
+                current_positions = get_positions(timeout_sec=float(os.environ.get("RECONCILIATION_HTTP_TIMEOUT_SEC", "5")), retryable=False)
+                current_keys = _position_keys(current_positions)
+                bx_key = (str(get_contract(signal["symbol"])["symbol"]).upper(), str(signal["type"]).upper()) if get_contract(signal["symbol"]) else (str(signal["symbol"]).upper(), str(signal["type"]).upper())
+                opp_key = (bx_key[0], "SHORT" if bx_key[1] == "LONG" else "LONG")
+                if opp_key in current_keys:
+                    execution = {"status": "OPPOSITE_POSITION_EXISTS", "symbol": signal["symbol"], "direction": signal["type"]}
+                else:
+                    execution = execute_new_position(signal)
+        except Exception as exc:
+            log.exception("[EXEC_TECHNICAL_ERROR] %s %s | %s", signal["symbol"], signal["type"], exc)
+            execution = {"status": "EXECUTION_EXCEPTION", "error": str(exc)}
+        finally:
+            if fcntl is not None:
+                try:
+                    fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+            lockf.close()
         execution_status = str(execution.get("status", ""))
         if execution_status in {"skipped_min_qty", "skipped_tp_min_qty", "skipped_invalid_setup"}:
             log.warning(
