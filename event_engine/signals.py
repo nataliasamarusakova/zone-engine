@@ -5,6 +5,8 @@ import math
 import os
 from typing import Any, Literal
 
+from .levels import build_level_snapshot, select_opposing_levels, select_protective_level, stop_from_level
+
 import numpy as np
 import pandas as pd
 
@@ -741,6 +743,21 @@ def _targets_from_nearest_obstacle(
     }
 
 
+def _confirmed_pivot_levels(df: pd.DataFrame, current_idx: int, lookback: int = 120) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    lows: list[dict[str, Any]] = []
+    highs: list[dict[str, Any]] = []
+    start = max(SWING_LEN, current_idx - lookback)
+    end = current_idx - SWING_LEN
+    for p in range(start, end + 1):
+        h = _safe_num(df.loc[p, "high"], 0.0)
+        l = _safe_num(df.loc[p, "low"], 0.0)
+        if h > 0 and all(h >= _safe_num(df.loc[p-k, "high"], 0.0) for k in range(1, SWING_LEN + 1)) and all(h >= _safe_num(df.loc[p+k, "high"], 0.0) for k in range(1, SWING_LEN + 1)):
+            highs.append({"price": h, "pivot_idx": p})
+        if l > 0 and all(l <= _safe_num(df.loc[p-k, "low"], 0.0) for k in range(1, SWING_LEN + 1)) and all(l <= _safe_num(df.loc[p+k, "low"], 0.0) for k in range(1, SWING_LEN + 1)):
+            lows.append({"price": l, "pivot_idx": p})
+    return lows, highs
+
+
 def generate_zone_signals(
     df: pd.DataFrame,
     symbol: str = "",
@@ -764,7 +781,15 @@ def generate_zone_signals(
     active_demand: list[dict[str, Any]] = []
     signals: list[dict[str, Any]] = []
 
+    sr_visual = compute_pine_sr_visual(df) if SR_ENABLE else {"events": []}
+    sr_events = sr_visual.get("events", []) if isinstance(sr_visual, dict) else []
+    sr_ptr = 0
+    current_sr_levels: list[float] = []
+
     for i in range(SWING_LEN * 2, len(df)):
+        while sr_ptr < len(sr_events) and int(sr_events[sr_ptr].get("event_idx", -1)) <= i:
+            current_sr_levels = list(sr_events[sr_ptr].get("levels", []))
+            sr_ptr += 1
         p = i - SWING_LEN
         h = float(df.loc[p, "high"])
         l = float(df.loc[p, "low"])
@@ -829,16 +854,48 @@ def generate_zone_signals(
 
         zone_top = float(trade_zone["top"])
         zone_bottom = float(trade_zone["btm"])
-        sl_buffer = ZONE_SL_ATR_BUFFER * atr
-        if direction == "LONG":
-            stop = zone_bottom - sl_buffer
-            risk = cur_c - stop
+        pivot_lows, pivot_highs = _confirmed_pivot_levels(df, i)
+        level_snapshot = build_level_snapshot(
+            entry_price=cur_c,
+            active_demand=active_demand,
+            active_supply=active_supply,
+            sr_levels=current_sr_levels,
+            pivot_lows=pivot_lows,
+            pivot_highs=pivot_highs,
+            tolerance=max(atr * 0.05, cur_c * 0.0001),
+        )
+        entry_level_id = f"DEM_{int(trade_zone.get('start', i))}" if direction == "LONG" else f"SUP_{int(trade_zone.get('start', i))}"
+        protective_level = select_protective_level(
+            direction, cur_c, level_snapshot, exclude_level_ids={entry_level_id}, min_distance=max(cur_c * 0.0001, 0.0)
+        )
+        if protective_level is not None:
+            stop, sl_buffer = stop_from_level(direction, protective_level, atr, ZONE_SL_ATR_BUFFER)
+            protective_level = dict(protective_level)
+            protective_level["buffer"] = round(sl_buffer, 12)
+            protective_level["protection_price"] = round(float(protective_level.get("low" if direction == "LONG" else "high", protective_level["price"])), 12)
+            protective_level["stop"] = round(stop, 12)
         else:
-            stop = zone_top + sl_buffer
-            risk = stop - cur_c
+            sl_buffer = ZONE_SL_ATR_BUFFER * atr
+            stop = zone_bottom - sl_buffer if direction == "LONG" else zone_top + sl_buffer
+            protective_level = {
+                "level_id": entry_level_id,
+                "color": "BLUE" if direction == "LONG" else "RED",
+                "kind": "DEMAND" if direction == "LONG" else "SUPPLY",
+                "source": "entry_zone_fallback",
+                "price": zone_bottom if direction == "LONG" else zone_top,
+                "low": zone_bottom,
+                "high": zone_top,
+                "poi": float(trade_zone["poi"]),
+                "status": "ACTIVE",
+                "buffer": round(sl_buffer, 12),
+                "protection_price": round(float(zone_bottom if direction == "LONG" else zone_top), 12),
+                "stop": round(stop, 12),
+            }
+        risk = cur_c - stop if direction == "LONG" else stop - cur_c
         if risk <= 0:
             continue
 
+        opposing_levels = select_opposing_levels(direction, cur_c, level_snapshot, limit=5)
         obstacle = _nearest_opposing_level(direction, cur_c, active_demand, active_supply, df, i)
         if REQUIRE_STRUCTURE_OBSTACLE and obstacle is None:
             continue
@@ -894,6 +951,20 @@ def generate_zone_signals(
                     "zone_entry_rule": "fresh_touch_from_outside",
                 },
                 "zone": zone_ctx,
+                "levels": {
+                    "blue": level_snapshot["blue"],
+                    "red": level_snapshot["red"],
+                    "entry_level": {
+                        "level_id": entry_level_id,
+                        "color": "BLUE" if direction == "LONG" else "RED",
+                        "kind": "DEMAND" if direction == "LONG" else "SUPPLY",
+                        "source": "entry_zone",
+                        "price": round(zone_bottom if direction == "LONG" else zone_top, 12),
+                    },
+                    "protective_level": protective_level,
+                    "opposing_candidates": opposing_levels,
+                },
+                "protection_level": protective_level,
                 "target": {
                     "source": targets["target_source"],
                     "obstacle_source": targets["obstacle_source"],
@@ -904,8 +975,12 @@ def generate_zone_signals(
                     "tp_max_r": TP_MAX_R,
                 },
                 "risk_model": {
-                    "sl_source": "zone_boundary_plus_atr_buffer",
+                    "sl_source": "last_valid_same_color_level_plus_atr_buffer",
                     "zone_sl_buffer_atr": ZONE_SL_ATR_BUFFER,
+                    "protection_level_id": protective_level.get("level_id"),
+                    "protection_level_kind": protective_level.get("kind"),
+                    "protection_level_source": protective_level.get("source"),
+                    "protection_level_price": protective_level.get("price"),
                     "max_signal_risk_pct": MAX_SIGNAL_RISK_PCT,
                 },
                 "confirmation": {
