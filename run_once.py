@@ -1,16 +1,11 @@
 from __future__ import annotations
 
-import copy
 import json
 import math
 import logging
 import os
 import time
 import uuid
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows development fallback
-    fcntl = None
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -29,17 +24,14 @@ from event_engine.bingx import (
     get_position_mode,
     get_position_directional,
     get_open_protection_directional,
-    get_execution_reference_price,
-    LEVERAGE,
     cancel_order,
     close_position_market,
     open_market,
     wait_for_position_fill_directional,
 )
 from event_engine.signals import SWING_LEN, TP1_R, TP2_R, generate_zone_signals, score_zone_signal
-from event_engine.levels import protective_price, select_opposing_levels, select_protective_level
 from event_engine.telegram import format_signal, send as send_tg
-from event_engine.tracker import get_active_trade_id, process_structural_exits, recover_exchange_position, register_active_trade, update_active_trades, update_active_trade_protection
+from event_engine.tracker import register_active_trade, update_active_trades, update_active_trade_protection
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("zone_engine")
@@ -53,22 +45,17 @@ FAILED_SIGNAL_MAX_RETRIES = max(1, int(os.environ.get("FAILED_SIGNAL_MAX_RETRIES
 FAILED_SIGNAL_RETRY_BASE_SEC = max(1, int(os.environ.get("FAILED_SIGNAL_RETRY_BASE_SEC", "300")))
 FAILED_SIGNAL_RETRY_MAX_SEC = max(FAILED_SIGNAL_RETRY_BASE_SEC, int(os.environ.get("FAILED_SIGNAL_RETRY_MAX_SEC", str(3600))))
 ACTIONS_PATH = DATA / "actions.jsonl"
-EXECUTION_LOCK_PATH = DATA / "execution.lock"
 
 EXECUTION_ENABLED = os.environ.get("EXECUTION_ENABLED", "true").lower() == "true"
 MARGIN_USDT = float(os.environ.get("BINGX_MARGIN_USDT", "1"))
 MAX_TRADES_PER_CYCLE = int(os.environ.get("MAX_TRADES_PER_CYCLE", "5"))
-STRONG_ZONE_MARGIN_USDT = float(os.environ.get("STRONG_ZONE_MARGIN_USDT", "1.00"))
-MEDIUM_ZONE_MARGIN_USDT = float(os.environ.get("MEDIUM_ZONE_MARGIN_USDT", "0.50"))
-WEAK_ZONE_MARGIN_USDT = float(os.environ.get("WEAK_ZONE_MARGIN_USDT", "0.25"))
-MAX_POSITION_MARGIN_USDT = float(os.environ.get("MAX_POSITION_MARGIN_USDT", "2.50"))
 MAX_SCAN_SYMBOLS = int(os.environ.get("MAX_SCAN_SYMBOLS", "0"))
-WATCHLIST_ONLY = os.environ.get("WATCHLIST_ONLY", "true").lower() == "true"
+WATCHLIST_ONLY = os.environ.get("WATCHLIST_ONLY", "false").lower() == "true"
 WATCHLIST_SYMBOLS = tuple(x.strip().upper() for x in os.environ.get(
     "WATCHLIST_SYMBOLS",
-    "BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT,XRP-USDT,DOGE-USDT,TRX-USDT,HYPE-USDT,XMR-USDT,ZEC-USDT,LINK-USDT,ADA-USDT,XLM-USDT,BCH-USDT,UNI-USDT,LTC-USDT,AVAX-USDT,SUI-USDT,HBAR-USDT,TAO-USDT,ICP-USDT,ARB-USDT,POL-USDT,ETC-USDT",
+    "BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT,TAO-USDT,LTC-USDT,BCH-USDT,AVAX-USDT,LINK-USDT,ETC-USDT,ADA-USDT,UNI-USDT,XRP-USDT,ICP-USDT,HYPE-USDT,DOGE-USDT,HBAR-USDT,ARB-USDT,POL-USDT,SUI-USDT",
 ).split(",") if x.strip())
-KLINE_LIMIT_1H = int(os.environ.get("KLINE_LIMIT_1H", "1000"))
+KLINE_LIMIT_1H = int(os.environ.get("KLINE_LIMIT_1H", "120"))
 MAX_SIGNAL_AGE_BARS = int(os.environ.get("MAX_SIGNAL_AGE_BARS", "0"))
 MAX_PRODUCTION_RISK_PCT = min(float(os.environ.get("MAX_SIGNAL_RISK_PCT", "1.50")), 1.50)
 # Production execution is strict by default: only the latest closed 1H bar may open a trade.
@@ -95,178 +82,6 @@ def _append_jsonl(path: Path, obj: dict[str, Any]) -> None:
         fh.write(json.dumps(obj, ensure_ascii=False, default=str) + "\n")
 
 
-
-def _fmt_num(value: Any, digits: int = 8) -> str:
-    try:
-        x = float(value)
-    except (TypeError, ValueError):
-        return "—"
-    if not math.isfinite(x):
-        return "—"
-    return f"{x:.{digits}f}".rstrip("0").rstrip(".")
-
-
-def _fmt_level_human(level: dict[str, Any]) -> str:
-    lid = str(level.get("level_id") or "?")[-8:]
-    kind = str(level.get("kind") or "LEVEL").upper()
-    sources = [str(x).upper() for x in (level.get("member_kinds") or [])]
-    if not sources and level.get("source"):
-        sources = [str(level.get("source")).upper()]
-    lo = level.get("lower", level.get("price"))
-    hi = level.get("upper", level.get("price"))
-    lo_s, hi_s = _fmt_num(lo), _fmt_num(hi)
-    if lo_s == "—":
-        return f"{kind}#{lid}"
-    price_text = lo_s if hi_s == "—" or hi_s == lo_s else f"{lo_s}–{hi_s}"
-    meta = []
-    if level.get("strength") is not None:
-        meta.append(f"strength={int(level['strength'])}")
-    if level.get("age_bars") is not None:
-        meta.append(f"age={int(level['age_bars'])}")
-    if sources:
-        meta.append(f"sources={'+'.join(dict.fromkeys(sources))}")
-    return f"{kind}#{lid} {price_text}" + (f" [{', '.join(meta)}]" if meta else "")
-
-
-def _fmt_zone_price(zone: dict[str, Any], semantic: str | None = None) -> str:
-    """Return exactly one price for a TradingView-comparable zone/level."""
-    semantic_set = {str(semantic or "").upper()}
-    semantic_set |= {str(x).upper() for x in (zone.get("member_kinds") or [])}
-    semantic_set.discard("")
-
-    if "DEMAND" in semantic_set:
-        price = zone.get("btm", zone.get("lower", zone.get("price")))
-    elif "SUPPLY" in semantic_set:
-        price = zone.get("top", zone.get("upper", zone.get("price")))
-    elif "PIVOT_LOW" in semantic_set:
-        price = zone.get("price", zone.get("lower"))
-    elif "PIVOT_HIGH" in semantic_set:
-        price = zone.get("price", zone.get("upper"))
-    else:
-        price = zone.get("price", zone.get("lower", zone.get("upper")))
-
-    try:
-        x = float(price)
-    except (TypeError, ValueError):
-        return "INVALID_LEVEL"
-    if not math.isfinite(x):
-        return "INVALID_LEVEL"
-    return f"{x:,.8f}".rstrip("0").rstrip(".")
-
-
-def _zone_descriptor(level: dict[str, Any]) -> tuple[str, str]:
-    kinds = [str(x).upper() for x in (level.get("member_kinds") or [])]
-    if not kinds:
-        kinds = [str(level.get("kind") or level.get("source") or "LEVEL").upper()]
-    if "DEMAND" in kinds:
-        return "🔵", "DEMAND"
-    if "SUPPLY" in kinds:
-        return "🔴", "SUPPLY"
-    if "LOW_LEVEL" in kinds:
-        return "🔵", "LOW LEVEL"
-    if "HIGH_LEVEL" in kinds:
-        return "🔴", "HIGH LEVEL"
-    order = ["SUPPORT", "RESISTANCE", "PIVOT_LOW", "PIVOT_HIGH"]
-    ordered = [x for x in order if x in kinds]
-    label = "+".join(ordered or kinds)
-    blue = {"SUPPORT", "PIVOT_LOW"}
-    icon = "🔵" if all(x in blue for x in (ordered or kinds)) else "🔴"
-    return icon, label
-
-
-def _log_human_level_map(symbol: str, result: dict[str, Any]) -> None:
-    levels = result.get("levels") or {}
-    blue = levels.get("blue") or []
-    red = levels.get("red") or []
-    invalid = levels.get("invalid") or []
-    zones = levels.get("active_zones") or {}
-    demand = zones.get("demand") or []
-    supply = zones.get("supply") or []
-
-    # Human-readable comparison output: one exact price per displayed item.
-    valid_demand = [z for z in demand if _fmt_zone_price(z, "DEMAND") != "INVALID_LEVEL"]
-    valid_supply = [z for z in supply if _fmt_zone_price(z, "SUPPLY") != "INVALID_LEVEL"]
-
-    if valid_demand:
-        for idx, zone in enumerate(valid_demand, 1):
-            log.info("[ZONES] %s | 🔵 DEMAND #%d | %s", symbol, idx, _fmt_zone_price(zone, "DEMAND"))
-    else:
-        log.info("[ZONES] %s | 🔵 DEMAND | —", symbol)
-
-    if valid_supply:
-        for idx, zone in enumerate(valid_supply, 1):
-            log.info("[ZONES] %s | 🔴 SUPPLY #%d | %s", symbol, idx, _fmt_zone_price(zone, "SUPPLY"))
-    else:
-        log.info("[ZONES] %s | 🔴 SUPPLY | —", symbol)
-
-    # Every other active structural level is printed in exactly the same
-    # one-price format. Demand/Supply clusters are skipped because they were
-    # already printed above.
-    other = []
-    for level in [*blue, *red]:
-        kinds = {str(x).upper() for x in (level.get("member_kinds") or [])}
-        if "DEMAND" in kinds or "SUPPLY" in kinds or "HIGH_LEVEL" in kinds or "LOW_LEVEL" in kinds:
-            continue
-        if _fmt_zone_price(level) == "INVALID_LEVEL":
-            continue
-        other.append(level)
-    other.sort(key=lambda x: float(x.get("price", x.get("lower", 0.0))))
-
-    counters: dict[str, int] = {}
-    for level in other:
-        icon, label = _zone_descriptor(level)
-        counters[label] = counters.get(label, 0) + 1
-        log.info(
-            "[ZONES] %s | %s %s #%d | %s",
-            symbol, icon, label, counters[label], _fmt_zone_price(level),
-        )
-
-    high = levels.get("high_level") or {}
-    low = levels.get("low_level") or {}
-    high_price = _fmt_num(high.get("price"))
-    low_price = _fmt_num(low.get("price"))
-    if high_price != "—":
-        log.info("[ZONES] %s | 🔴 HIGH LEVEL | %s", symbol, high_price)
-    if low_price != "—":
-        log.info("[ZONES] %s | 🔵 LOW LEVEL | %s", symbol, low_price)
-
-    # Keep the existing diagnostics below; the [ZONES] lines above are the
-    # human-facing TradingView comparison format.
-    log.info(
-        "[LEVEL_MAP] %s | EXTREMES | PINE_HIGH=%s | PINE_LOW=%s | INVALID=%d",
-        symbol, high_price, low_price, len(invalid),
-    )
-
-    try:
-        cp = float(result.get("current_price"))
-    except (TypeError, ValueError):
-        cp = None
-    if cp is not None and math.isfinite(cp):
-        below = sorted(
-            [x for x in blue if float(x.get("upper", x.get("price", 0))) < cp],
-            key=lambda x: float(x.get("upper", x.get("price", 0))), reverse=True,
-        )
-        above = sorted(
-            [x for x in red if float(x.get("lower", x.get("price", 0))) > cp],
-            key=lambda x: float(x.get("lower", x.get("price", 0))),
-        )
-        log.info("[LEVEL_MAP] %s | NEAREST_BLUE_BELOW | %s", symbol, _fmt_level_human(below[0]) if below else "—")
-        log.info("[LEVEL_MAP] %s | NEXT_BLUE | %s", symbol, _fmt_level_human(below[1]) if len(below) > 1 else "—")
-        log.info("[LEVEL_MAP] %s | NEAREST_RED_ABOVE | %s", symbol, _fmt_level_human(above[0]) if above else "—")
-        log.info("[LEVEL_MAP] %s | NEXT_RED | %s", symbol, _fmt_level_human(above[1]) if len(above) > 1 else "—")
-
-    signals = [x for x in (result.get("signals") or []) if isinstance(x, dict)]
-    for map_idx, signal in enumerate(signals, 1):
-        direction = str(signal.get("type") or "?").upper()
-        entry_level = signal.get("entry_level") or {}
-        protection_level = signal.get("protection_level") or {}
-        target_levels = ((signal.get("target") or {}).get("target_levels") or [])
-        log.info("[TRADE_MAP] %s | #%d | DIRECTION=%s", symbol, map_idx, direction)
-        log.info("[TRADE_MAP] %s | #%d | ENTRY      | %s", symbol, map_idx, _fmt_level_human(entry_level) if entry_level else "—")
-        log.info("[TRADE_MAP] %s | #%d | PROTECTION | %s | SL=%s", symbol, map_idx, _fmt_level_human(protection_level) if protection_level else "—", _fmt_num(signal.get("sl")))
-        log.info("[TRADE_MAP] %s | #%d | TP1        | %s | price=%s", symbol, map_idx, _fmt_level_human(target_levels[0]) if target_levels else "—", _fmt_num(signal.get("tp1")))
-        log.info("[TRADE_MAP] %s | #%d | TP2        | %s | price=%s", symbol, map_idx, _fmt_level_human(target_levels[1]) if len(target_levels) > 1 else "—", _fmt_num(signal.get("tp2")))
-        log.info("[TRADE_MAP] %s | #%d | RISK       | risk=%s%% | TP2_R=%s", symbol, map_idx, _fmt_num(signal.get("risk_pct")), _fmt_num(signal.get("tp2_rr"), 4))
 
 def _load_failed_signal_ids() -> dict[str, dict[str, Any]]:
     try:
@@ -446,100 +261,6 @@ def _signal_matches_latest_bar(signal: dict[str, Any], latest_closed_idx: int, l
         return False, "invalid_signal_time"
     return True, "ok"
 
-def _log_latest_trigger_check(
-    symbol: str,
-    df: pd.DataFrame,
-    demand: list[dict],
-    supply: list[dict],
-    levels: dict[str, Any] | None,
-    signals: list[dict[str, Any]] | None = None,
-) -> None:
-    """Log the same structural-touch decision that drives execution.
-
-    There must be no second "diagnostic-only" strategy here: BLUE structures can
-    generate LONG and RED structures can generate SHORT. A structural touch is
-    an ENTRY_TRIGGER only when the canonical signal generator accepted that exact
-    level/cluster on the latest closed bar.
-    """
-    try:
-        if df is None or len(df) < 2:
-            return
-        i = len(df) - 1
-        o = float(df.loc[i, "open"])
-        h = float(df.loc[i, "high"])
-        l = float(df.loc[i, "low"])
-        c = float(df.loc[i, "close"])
-        prev_c = float(df.loc[i - 1, "close"])
-        log.info(
-            "[TRIGGER_CHECK] %s | CLOSED_1H O=%s H=%s L=%s C=%s | prevC=%s",
-            symbol, _fmt_num(o), _fmt_num(h), _fmt_num(l), _fmt_num(c), _fmt_num(prev_c),
-        )
-
-        snap = levels if isinstance(levels, dict) else {}
-        all_levels = [*(snap.get("blue") or []), *(snap.get("red") or [])]
-        accepted = signals or []
-        accepted_keys = {
-            (str(s.get("type", "")).upper(), str(s.get("zone_id") or (s.get("zone") or {}).get("level_id") or ""))
-            for s in accepted
-            if int(s.get("idx", -1)) == i
-        }
-
-        def touch(level: dict[str, Any], direction: str) -> tuple[bool, bool]:
-            lo = float(level.get("lower", level.get("price")))
-            hi = float(level.get("upper", level.get("price")))
-            literal = l <= hi and h >= lo
-            if direction == "LONG":
-                fresh = prev_c > hi and l <= hi and c >= lo
-            else:
-                fresh = prev_c < lo and h >= lo and c <= hi
-            return literal, fresh
-
-        def label(level: dict[str, Any]) -> tuple[str, str]:
-            return _zone_descriptor(level)
-
-        touched_any = False
-        fresh_any = False
-        ordered = sorted(all_levels, key=lambda z: (float(z.get("price", z.get("lower", 0.0))), str(z.get("level_id", ""))))
-        seen: set[tuple[str, str]] = set()
-        for level in ordered:
-            color = str(level.get("color", "")).upper()
-            direction = "LONG" if color == "BLUE" else "SHORT" if color == "RED" else ""
-            if not direction:
-                continue
-            literal, fresh = touch(level, direction)
-            if not (literal or fresh):
-                continue
-            touched_any = True
-            fresh_any = fresh_any or fresh
-            icon, name = label(level)
-            zone_id = str(level.get("level_id", ""))
-            key = (direction, zone_id)
-            trigger = key in accepted_keys
-            if trigger:
-                reason = "canonical_zone_signal"
-            elif not fresh:
-                reason = "zone_already_consumed_or_not_fresh"
-            else:
-                reason = "setup_validation_rejected"
-            log.info(
-                "[TRIGGER_CHECK] %s | %s %s | price=%s | candle_touch=%s | fresh_touch=%s | ENTRY_TRIGGER=%s | side=%s | reason=%s",
-                symbol, icon, name, _fmt_zone_price(level),
-                "YES" if literal else "NO", "YES" if fresh else "NO",
-                "YES" if trigger else "NO", direction, reason,
-            )
-
-        if fresh_any and accepted_keys:
-            log.info("[TRIGGER_CHECK] %s | FRESH_STRUCTURAL_TOUCH=YES | accepted_signals=%d", symbol, len(accepted_keys))
-        elif fresh_any:
-            log.info("[TRIGGER_CHECK] %s | FRESH_STRUCTURAL_TOUCH=YES | accepted_signals=0 | reason=setup_validation_rejected", symbol)
-        elif touched_any:
-            log.info("[TRIGGER_CHECK] %s | STRUCTURAL_TOUCH=YES | FRESH_STRUCTURAL_TOUCH=NO | ACTION=WAIT", symbol)
-        else:
-            log.info("[TRIGGER_CHECK] %s | STRUCTURAL_TOUCH=NO | ACTION=WAIT", symbol)
-    except Exception as exc:
-        log.warning("[TRIGGER_CHECK_ERROR] %s | %s: %s", symbol, type(exc).__name__, exc)
-
-
 def _private_layer_ready() -> bool:
     ready = credentials_available()
     if not ready:
@@ -561,39 +282,6 @@ def _price_position(price: float, demand: list[dict], supply: list[dict]) -> str
     if in_sup:
         return "🔴 В зоне SUPPLY"
     return "⚪ Вне зон (Ждать)"
-
-
-def _fetch_analysis_bars(symbol: str, binance_symbol: str, provider: str) -> tuple[list[dict[str, Any]], str]:
-    """Load fresh 1H analysis bars, falling back to BingX when Binance history is stale.
-
-    The primary provider remains unchanged; fallback only activates for stale Binance
-    history so a listed BingX asset is not rejected merely because Binance Spot lacks
-    current candles for it.
-    """
-    source = "bingx" if provider == "bingx" else "binance_spot"
-    bars = (fetch_bingx_klines(symbol, "1h", limit=KLINE_LIMIT_1H, retryable=False)
-            if provider == "bingx"
-            else fetch_binance_klines(binance_symbol, "1h", limit=KLINE_LIMIT_1H, retryable=False))
-    min_bars = SWING_LEN * 2 + 10
-    if len(bars) < min_bars:
-        return bars, source
-    latest_ts = pd.to_datetime(bars[-1]["timestamp"], unit="ms", utc=True)
-    if latest_ts.tzinfo is None:
-        latest_ts = latest_ts.tz_localize("UTC")
-    age_h = max(0.0, (pd.Timestamp.now(tz="UTC") - latest_ts).total_seconds() / 3600.0)
-    if provider == "binance" and age_h > MAX_DATA_STALENESS_HOURS:
-        try:
-            bx_bars = fetch_bingx_klines(symbol, "1h", limit=KLINE_LIMIT_1H, retryable=False)
-            if len(bx_bars) >= min_bars:
-                bx_latest = pd.to_datetime(bx_bars[-1]["timestamp"], unit="ms", utc=True)
-                if bx_latest.tzinfo is None:
-                    bx_latest = bx_latest.tz_localize("UTC")
-                bx_age_h = max(0.0, (pd.Timestamp.now(tz="UTC") - bx_latest).total_seconds() / 3600.0)
-                if bx_age_h <= MAX_DATA_STALENESS_HOURS:
-                    return bx_bars, "bingx_fallback"
-        except Exception as exc:
-            log.warning("[DATA_FALLBACK_FAILED] %s | %s", symbol, exc)
-    return bars, source
 
 
 def _bingx_last_price(contract: dict[str, Any]) -> float | None:
@@ -676,52 +364,6 @@ def reconcile_all_open_positions() -> None:
         trade = active.get(key)
         stop_loss_pct = float((trade or {}).get("planned_risk_pct") or 1.0)
         setup = (trade or {}).get("setup", {}) if isinstance(trade, dict) else {}
-        if trade is None:
-            try:
-                existing_protection = get_open_protection_directional(symbol, side)
-            except Exception as exc:
-                existing_protection = {"status": "error", "error": str(exc), "sl_orders": [], "tp_orders": []}
-            structural_sl = None
-            engine_sl = None
-            if existing_protection.get("status") == "ok":
-                for sl_order in existing_protection.get("sl_orders", []):
-                    cid = str(sl_order.get("clientOrderId", "")).upper()
-                    try:
-                        candidate = float(sl_order.get("stopPrice", 0) or sl_order.get("price", 0) or 0)
-                    except (TypeError, ValueError):
-                        candidate = 0.0
-                    if cid.startswith("EVT_") and candidate > 0 and ((side == "LONG" and candidate < avg) or (side == "SHORT" and candidate > avg)):
-                        structural_sl = candidate
-                        engine_sl = sl_order
-                        break
-            recovered_event_id = f"RECON_{symbol.replace('-', '')}_{side}"
-            setup = {
-                "strategy": "Zone/Structure First",
-                "event_time": pd.Timestamp.now(tz="UTC").isoformat(),
-                "entry_reference": avg,
-                "signal_price": avg,
-                "invalidation_price": structural_sl,
-                "risk_pct": stop_loss_pct,
-                "tp_levels": [],
-                "recovery": True,
-            }
-            recover_exchange_position(
-                recovered_event_id, symbol, side, avg, qty,
-                sl_order={
-                    "status": "recovered_existing",
-                    "order_id": str((engine_sl or {}).get("orderId", "")),
-                    "client_order_id": str((engine_sl or {}).get("clientOrderId", "")),
-                    "stop_price": structural_sl,
-                    "qty": abs(float((engine_sl or {}).get("origQty", qty) or qty)),
-                } if engine_sl else {},
-                tp_orders=list(existing_protection.get("tp_orders", [])) if existing_protection.get("status") == "ok" else [],
-            )
-            active = _load_active_trades_file()
-            trade = active.get(key)
-            log.warning("[RECON_RECOVERED] %s %s | exchange position restored to local aggregate state qty=%.12g avg=%.12g", symbol, side, qty, avg)
-
-        setup = (trade or {}).get("setup", {}) if isinstance(trade, dict) else setup
-        stop_loss_pct = float((trade or {}).get("planned_risk_pct") or stop_loss_pct or 1.0)
         tp_levels = setup.get("tp_levels") if isinstance(setup.get("tp_levels"), list) else None
         if not tp_levels:
             risk_pct = max(stop_loss_pct, 0.05)
@@ -744,12 +386,7 @@ def reconcile_all_open_positions() -> None:
             tp_levels = []
 
         try:
-            stored_sl = (setup.get("invalidation_price") if isinstance(setup, dict) else None)
-            result = ensure_directional_protection(
-                symbol, side, avg, qty, stop_loss_pct, tp_levels,
-                trade_id=(trade or {}).get("event_id") or key,
-                requested_sl_price=stored_sl,
-            )
+            result = ensure_directional_protection(symbol, side, avg, qty, stop_loss_pct, tp_levels, trade_id=(trade or {}).get("event_id") or key)
             if result.get("status") in {"PROTECTED", "SL_ONLY"}:
                 if trade:
                     update_active_trade_protection(symbol, side, result.get("tp_orders", []), result.get("sl_result", {}), result.get("effective_tp_levels", []), result.get("tp_mode"), result.get("effective_weighted_rr"))
@@ -793,9 +430,6 @@ def _build_setup(signal: dict[str, Any]) -> dict[str, Any]:
         ],
         "target_price": float(signal["tp2"]),
         "zone": signal.get("zone", {}),
-        "levels": signal.get("levels", {}),
-        "entry_level": signal.get("entry_level"),
-        "protection_level": signal.get("protection_level"),
         "confirmation": signal.get("confirmation", {}),
         "score": float(signal.get("score", 0.0)),
         "event_time": signal.get("time"),
@@ -886,35 +520,41 @@ def _cleanup_engine_protection(symbol: str, direction: str) -> dict[str, Any]:
     return result
 
 def _rebase_protection_after_fill(signal: dict[str, Any], avg_price: float) -> dict[str, Any]:
-    """Recalculate structural SL/TP from the *actual* market fill.
+    """Recalculate zone-based SL/TP from the *actual* market fill.
 
     A market order can fill materially away from the signal/reference candle close.
     Never submit stale absolute targets derived from the pre-fill reference price.
     """
     direction = str(signal["type"]).upper()
     entry = float(avg_price)
+    zone = signal.get("zone") if isinstance(signal.get("zone"), dict) else {}
     target = signal.get("target") if isinstance(signal.get("target"), dict) else {}
-    levels = signal.get("levels") if isinstance(signal.get("levels"), dict) else {}
     atr = float(signal.get("atr", 0.0) or 0.0)
     if entry <= 0:
         raise ValueError("actual fill price must be positive")
 
-    blue = list(levels.get("blue", [])) if isinstance(levels.get("blue"), list) else []
-    red = list(levels.get("red", [])) if isinstance(levels.get("red"), list) else []
-    protective_level = select_protective_level(direction, entry, blue, red)
-    if protective_level is None:
-        raise ValueError("no valid same-color protective level at actual fill")
+    zone_top = float(zone.get("top")) if zone.get("top") is not None else None
+    zone_bottom = float(zone.get("btm")) if zone.get("btm") is not None else None
+    if zone_top is None or zone_bottom is None:
+        raise ValueError("zone boundaries unavailable for post-fill protection")
+
     sl_buffer = max(atr * float(os.environ.get("ZONE_SL_ATR_BUFFER", "0.10")), entry * 0.0002)
-    sl = protective_price(protective_level, direction, sl_buffer)
+    if direction == "LONG":
+        zone_stop = zone_bottom - sl_buffer
+        sl = zone_stop if zone_stop < entry else entry - sl_buffer
+    else:
+        zone_stop = zone_top + sl_buffer
+        sl = zone_stop if zone_stop > entry else entry + sl_buffer
+
     risk = abs(entry - sl)
     if risk <= 0:
         raise ValueError("post-fill risk is non-positive")
 
-    opposing = select_opposing_levels(direction, entry, blue, red, limit=2)
-    obstacle = None
-    if opposing:
-        first = opposing[0]
-        obstacle = float(first["lower"]) if direction == "LONG" else float(first["upper"])
+    obstacle = target.get("obstacle_price")
+    try:
+        obstacle = float(obstacle) if obstacle is not None else None
+    except (TypeError, ValueError):
+        obstacle = None
 
     obstacle_buffer = max(atr * float(os.environ.get("TP_OBSTACLE_BUFFER_ATR", "0.10")), entry * 0.0002)
     tp1_r = float(os.environ.get("TP1_R", "0.5"))
@@ -970,8 +610,6 @@ def _rebase_protection_after_fill(signal: dict[str, Any], avg_price: float) -> d
         "tp2_rr": abs(tp2 - entry) / risk,
         "target_source": target_source,
         "obstacle_price": obstacle,
-        "protection_level": protective_level,
-        "target_levels": opposing,
     }
 
 
@@ -1051,18 +689,6 @@ def _emergency_close_and_verify(symbol: str, direction: str, qty: float, trade_i
 
     return {"status": "close_unverified", "attempts": attempts, "verification": verification, "remaining_qty": last_qty}
 
-def _zone_strength_tier(signal: dict[str, Any]) -> tuple[str, float]:
-    zone = signal.get("zone") if isinstance(signal.get("zone"), dict) else {}
-    kinds = {str(x).upper() for x in (zone.get("member_kinds") or [])}
-    if not kinds:
-        kinds = {str(zone.get("kind") or "").upper()}
-    if "DEMAND" in kinds or "SUPPLY" in kinds:
-        return "STRONG", STRONG_ZONE_MARGIN_USDT
-    if "SUPPORT" in kinds or "RESISTANCE" in kinds:
-        return "MEDIUM", MEDIUM_ZONE_MARGIN_USDT
-    return "WEAK", WEAK_ZONE_MARGIN_USDT
-
-
 def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     symbol = str(signal["symbol"])
     direction = str(signal["type"]).upper()
@@ -1089,62 +715,8 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         return {"status": "blocked_protection_preflight", "symbol": symbol, "direction": direction, "error": reason}
 
     setup = _build_setup(signal)
-    zone_tier, entry_margin = _zone_strength_tier(signal)
-
-    # Pre-trade structural/risk feasibility at the freshest executable reference
-    # price. Real scan-generated signals carry a complete structural `levels` snapshot;
-    # only those signals can be deterministically pre-rebased before MARKET. Synthetic
-    # or legacy callers without that snapshot must still reach the normal post-fill
-    # safety checks rather than being rejected merely because the local test fixture
-    # cannot reconstruct exchange structure.
-    if isinstance(signal.get("levels"), dict) and signal.get("levels"):
-        try:
-            execution_reference = get_execution_reference_price(symbol) or float(signal.get("entry", 0.0))
-        except Exception:
-            execution_reference = float(signal.get("entry", 0.0))
-        try:
-            expected_rebased = _rebase_protection_after_fill(signal, execution_reference)
-            expected_signal = dict(signal)
-            expected_signal.update({
-                "entry": float(execution_reference),
-                "sl": float(expected_rebased["sl"]),
-                "tp1": float(expected_rebased["tp1"]),
-                "tp2": float(expected_rebased["tp2"]),
-                "risk_pct": float(expected_rebased["risk_pct"]),
-                "risk_abs": float(expected_rebased["risk_abs"]),
-                "target": {
-                    **(signal.get("target") if isinstance(signal.get("target"), dict) else {}),
-                    "source": expected_rebased.get("target_source"),
-                    "obstacle_price": expected_rebased.get("obstacle_price"),
-                    "target_levels": expected_rebased.get("target_levels", []),
-                },
-                "protection_level": expected_rebased.get("protection_level"),
-            })
-            valid_expected, expected_reason = _validate_trade_geometry(expected_signal)
-            if not valid_expected:
-                log.warning("[EXEC_SKIPPED_PRETRADE] %s %s | %s", symbol, direction, expected_reason)
-                return {"status": "skipped_invalid_setup", "error": expected_reason, "symbol": symbol, "direction": direction, "stage": "pretrade_rebase"}
-        except Exception as exc:
-            log.warning("[EXEC_SKIPPED_PRETRADE] %s %s | protection/structure feasibility failed before MARKET: %s", symbol, direction, exc)
-            return {"status": "skipped_invalid_setup", "error": str(exc), "symbol": symbol, "direction": direction, "stage": "pretrade_rebase"}
-    else:
-        log.debug("[EXEC_PRECHECK_BYPASS] %s %s | no structural level snapshot; relying on post-fill authoritative checks", symbol, direction)
-
-    setup = _build_setup(signal)
-    zone_tier, entry_margin = _zone_strength_tier(signal)
-    setup["entry_margin_usdt"] = entry_margin
-    setup["zone_strength_tier"] = zone_tier
-    setup["max_position_margin_usdt"] = MAX_POSITION_MARGIN_USDT
-    log.info(
-        "[POSITION_SIZING] %s %s | zone=%s | tier=%s | entry_margin=%.2f | max_position_margin=%.2f",
-        symbol, direction, (signal.get("zone") or {}).get("kind"), zone_tier, entry_margin, MAX_POSITION_MARGIN_USDT,
-    )
-    order = open_market(
-        symbol, direction, entry_price, event_id,
-        margin_usdt=entry_margin,
-        max_position_margin_usdt=MAX_POSITION_MARGIN_USDT,
-    )
-    if order.get("status") in {"skipped_min_qty", "skipped_tp_min_qty", "skipped_position_margin_cap"}:
+    order = open_market(symbol, direction, entry_price, event_id)
+    if order.get("status") == "skipped_min_qty":
         return order
     if order.get("status") != "opened":
         return {"status": str(order.get("status", "error")).upper(), "error": order.get("error"), "order": order}
@@ -1199,56 +771,6 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
 
     avg_price = float(position["avgPrice"])
     qty = abs(float(position["positionAmt"]))
-    pre_qty = abs(float(order.get("pre_position_qty", 0.0) or 0.0))
-    added_qty = qty - pre_qty
-    if pre_qty > 0 and added_qty <= max(1e-12, pre_qty * 1e-9):
-        # A confirmed existing position without an observable increase is not a
-        # proof that this signal's MARKET order filled. Never register it again.
-        return {
-            "status": "ENTRY_STATE_UNVERIFIED",
-            "error": f"position did not increase after entry order: pre={pre_qty:.12g} post={qty:.12g}",
-            "order": order,
-            "position": position,
-        }
-    added_qty = qty if pre_qty <= 0 else added_qty
-
-    # The requested margin cap is checked before POST, but market fills can move
-    # against the requested sizing price. Re-apply the hard cap to the authoritative
-    # post-fill position before installing protection or persisting the trade.
-    max_position_margin = order.get("max_position_margin_usdt")
-    if max_position_margin is not None:
-        try:
-            max_position_margin = float(max_position_margin)
-        except (TypeError, ValueError):
-            max_position_margin = MAX_POSITION_MARGIN_USDT
-        try:
-            mult = float(order.get("contract_multiplier", 1.0) or 1.0)
-            leverage_used = float(order.get("leverage", LEVERAGE) or LEVERAGE)
-            actual_total_margin = (qty * avg_price * mult) / max(leverage_used, 1.0)
-        except (TypeError, ValueError, ZeroDivisionError):
-            actual_total_margin = float("inf")
-    else:
-        actual_total_margin = 0.0
-    if max_position_margin is not None and actual_total_margin > max_position_margin + 1e-9:
-        reason = (
-            f"actual_position_margin={actual_total_margin:.8f} > max={max_position_margin:.8f}"
-        )
-        log.critical("[SAFETY_CLOSE] %s %s | post-fill margin cap exceeded | %s", symbol, direction, reason)
-        cleanup = _cancel_engine_protection_before_emergency_close(symbol, direction)
-        rollback_qty = added_qty if added_qty > 0 else qty
-        close_result = _emergency_close_and_verify(symbol, direction, rollback_qty, event_id)
-        return {
-            "status": "opened_then_margin_cap_rollback",
-            "error": reason,
-            "actual_position_margin_usdt": actual_total_margin,
-            "max_position_margin_usdt": max_position_margin,
-            "order": order,
-            "position": position,
-            "close": close_result,
-            "protection_cleanup": cleanup,
-            "executed_signal": dict(signal),
-        }
-
     # Abort on materially adverse market-entry slippage. Once a market order is
     # filled, accepting a severely worse price can invalidate the signal geometry
     # before protection is even submitted. Roll back safely instead of widening risk.
@@ -1299,12 +821,6 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
             **(signal.get("target") if isinstance(signal.get("target"), dict) else {}),
             "source": rebased["target_source"],
             "obstacle_price": rebased.get("obstacle_price"),
-            "target_levels": rebased.get("target_levels", []),
-        },
-        "protection_level": rebased.get("protection_level"),
-        "level_selection_after_fill": {
-            "protection_level_id": (rebased.get("protection_level") or {}).get("level_id"),
-            "target_level_ids": [x.get("level_id") for x in rebased.get("target_levels", [])],
         },
     })
     valid, reason = _validate_trade_geometry(actual_signal)
@@ -1317,9 +833,6 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     setup["entry_reference"] = avg_price
     setup["invalidation_price"] = sl_price
     setup["risk_pct"] = actual_risk_pct
-    setup["protection_level"] = rebased.get("protection_level")
-    setup["target_levels"] = rebased.get("target_levels", [])
-    setup["level_selection_after_fill"] = actual_signal.get("level_selection_after_fill")
     setup["target_rr"] = actual_signal["tp2_rr"]
     setup["planned_weighted_rr"] = actual_signal["tp1_rr"] * 0.50 + actual_signal["tp2_rr"] * 0.50
     setup["tp_levels"] = [
@@ -1329,20 +842,14 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     setup["target_price"] = tp2_price
 
     log.info(
-        "[EXEC_POST_FILL_REBASED] %s %s | fill=%s sl=%s tp1=%s tp2=%s tp1_rr=%.3f tp2_rr=%.3f target_source=%s "
-        "protective_level=%s entry_level=%s target_levels=%s",
+        "[EXEC_POST_FILL_REBASED] %s %s | fill=%s sl=%s tp1=%s tp2=%s tp1_rr=%.3f tp2_rr=%.3f target_source=%s",
         symbol, direction, avg_price, sl_price, tp1_price, tp2_price,
         actual_signal["tp1_rr"], actual_signal["tp2_rr"], rebased["target_source"],
-        (rebased.get("protection_level") or {}).get("level_id"),
-        (actual_signal.get("entry_level") or {}).get("level_id"),
-        [x.get("level_id") for x in rebased.get("target_levels", [])],
     )
 
-    aggregate_trade_id = get_active_trade_id(symbol, direction) or event_id
     protection = ensure_directional_protection(
         symbol, direction, avg_price, qty,
-        actual_risk_pct, setup["tp_levels"], trade_id=aggregate_trade_id,
-        requested_sl_price=sl_price,
+        actual_risk_pct, setup["tp_levels"], trade_id=event_id,
     )
     if protection.get("status") != "PROTECTED":
         log.critical("[SAFETY_CLOSE] %s %s | mandatory protection incomplete | %s", symbol, direction, protection)
@@ -1381,9 +888,6 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         score=float(signal.get("score", 0.0)),
         setup={**setup, "protection_status": protection.get("status"), "protection_result": protection},
         requested_entry_price=entry_price,
-        entry_margin_usdt=entry_margin,
-        zone_id=str(signal.get("zone_id") or (signal.get("zone") or {}).get("level_id") or ""),
-        entry_leg_qty=added_qty,
     )
 
     return {
@@ -1506,7 +1010,12 @@ def main() -> None:
 
             binance_symbol = str(meta.get("binance_symbol") or "")
             provider = str(meta.get("market_provider") or "binance").lower()
-            bars, source_name = _fetch_analysis_bars(symbol, binance_symbol, provider)
+            if provider == "bingx":
+                bars = fetch_bingx_klines(symbol, "1h", limit=KLINE_LIMIT_1H, retryable=False)
+                source_name = "bingx"
+            else:
+                bars = fetch_binance_klines(binance_symbol, "1h", limit=KLINE_LIMIT_1H, retryable=False)
+                source_name = "binance_spot"
             min_bars = SWING_LEN * 2 + 10
             if len(bars) < min_bars:
                 return {
@@ -1517,8 +1026,6 @@ def main() -> None:
                 }
 
             df, supply, demand, signals = generate_zone_signals(pd.DataFrame(bars), symbol=symbol, mode=DIAGNOSTICS_MODE)
-            level_snapshot = df.attrs.get("level_snapshot") if isinstance(df.attrs.get("level_snapshot"), dict) else {}
-            _log_latest_trigger_check(symbol, df, demand, supply, level_snapshot, signals)
             latest_price = float(df["close"].iloc[-1])
             bingx_price = _bingx_last_price(contract)
             latest_closed_idx = len(df) - 1
@@ -1537,7 +1044,7 @@ def main() -> None:
                 return {
                     "symbol": symbol,
                     "current_price": latest_price,
-                    "binance_price": latest_price if source_name == "binance_spot" else None,
+                    "binance_price": latest_price,
                     "bingx_price": bingx_price,
                     "market_spread_pct": None,
                     "market_source": source_name,
@@ -1548,7 +1055,6 @@ def main() -> None:
                     "active_demand": len(demand),
                     "active_supply": len(supply),
                     "zones": {"demand": demand, "supply": supply},
-                    "levels": level_snapshot,
                     "last_signal_count": 0,
                     "latest_closed_idx": int(latest_closed_idx),
                     "latest_closed_time": latest_closed_time.isoformat(),
@@ -1564,13 +1070,8 @@ def main() -> None:
                 if int(s.get("idx", -1)) == int(latest_closed_idx)
                 and pd.Timestamp(s.get("time")) == latest_closed_time
             ]
-            # The execution/rebase layer must receive the exact structural map
-            # that generated the signal. Without this, post-fill protection would
-            # look at an empty ``signal["levels"]`` object and falsely conclude
-            # that no same-color protective structure exists after a legitimate fill.
             for sig in recent:
                 sig["score"] = score_zone_signal(sig)
-                sig["levels"] = copy.deepcopy(level_snapshot)
 
             # Only validate BingX live price when a fresh signal exists. This keeps
             # the full-market scan on Binance while spending a small number of extra
@@ -1600,7 +1101,7 @@ def main() -> None:
             spread_pct = _market_spread_pct(
                 binance_live_price if binance_live_price is not None else latest_price,
                 bingx_price,
-            ) if provider == "binance" and source_name == "binance_spot" else None
+            ) if provider == "binance" else None
             if spread_pct is not None and spread_pct > MAX_MARKET_SPREAD_PCT:
                 log.warning("[MARKET_SPREAD] %s | Binance=%.12g | BingX=%.12g | spread=%.4f%% > %.4f%%", symbol, latest_price, bingx_price, spread_pct, MAX_MARKET_SPREAD_PCT)
                 recent = []
@@ -1632,17 +1133,9 @@ def main() -> None:
                 "active_demand": len(demand),
                 "active_supply": len(supply),
                 "zones": {"demand": demand, "supply": supply},
-                "levels": level_snapshot,
                 "last_signal_count": len(recent),
                 "latest_closed_idx": int(latest_closed_idx),
                 "latest_closed_time": latest_closed_time.isoformat(),
-                "latest_ohlc": {
-                    "open": float(df.loc[latest_closed_idx, "open"]),
-                    "high": float(df.loc[latest_closed_idx, "high"]),
-                    "low": float(df.loc[latest_closed_idx, "low"]),
-                    "close": float(df.loc[latest_closed_idx, "close"]),
-                    "prev_close": float(df.loc[latest_closed_idx - 1, "close"]) if latest_closed_idx > 0 else float(df.loc[latest_closed_idx, "close"]),
-                },
                 "signals": recent,
             }
         except Exception as exc:
@@ -1671,8 +1164,8 @@ def main() -> None:
                 except Exception as exc:  # defensive: scan_one already catches errors
                     result = {
                         "symbol": symbol, "current_price": None, "binance_price": None, "bingx_price": None, "market_spread_pct": None,
-                        "market_source": "unknown", "binance_symbol": analysis_meta.get(symbol, {}).get("binance_symbol"),
-                        "asset_class": analysis_meta.get(symbol, {}).get("asset_class", "UNKNOWN"), "price_position": "ERROR",
+                "market_source": source_name, "binance_symbol": analysis_meta.get(symbol, {}).get("binance_symbol"),
+                "asset_class": analysis_meta.get(symbol, {}).get("asset_class", "UNKNOWN"), "price_position": "ERROR",
                         "fresh_signal": "—", "active_demand": 0, "active_supply": 0,
                         "zones": {"demand": [], "supply": []}, "last_signal_count": 0,
                         "error": f"{type(exc).__name__}: {exc}", "signals": [], "exception": exc,
@@ -1685,9 +1178,6 @@ def main() -> None:
             scan_rows.append({k: v for k, v in result.items() if k != "signals"})
             fresh_signals.extend(result.get("signals", []))
 
-            # Visual separator: every coin gets its own clearly delimited log block.
-            log.info("[COIN_START] %s | ==============================", symbol)
-
             if result.get("price_position") == "ERROR":
                 log.error("[COIN_ERROR] %s | %s", symbol, result.get("error", "unknown error"))
             elif result.get("price_position") == "INSUFFICIENT_DATA":
@@ -1695,6 +1185,9 @@ def main() -> None:
             elif result.get("price_position") == "CONTRACT_NOT_FOUND":
                 log.warning("[COIN_SKIP] %s | contract not found in BingX cache", symbol)
             else:
+                # Log only active symbols: a current Pine signal or a price inside
+                # an active Demand/Supply zone. Inactive "outside zones" symbols
+                # are intentionally omitted from runtime logs.
                 is_active = (
                     result.get("fresh_signal") not in {None, "—"}
                     or result.get("price_position") in {"🟢 В зоне DEMAND", "🔴 В зоне SUPPLY"}
@@ -1705,9 +1198,6 @@ def main() -> None:
                         symbol, result["current_price"], result["price_position"], result["fresh_signal"],
                         result["active_demand"], result["active_supply"],
                     )
-                _log_human_level_map(symbol, result)
-
-            log.info("[COIN_END] %s | ================================", symbol)
 
         scanned = min(batch_start + len(batch), total)
         log.info("[SCAN_PROGRESS] %d/%d symbols | batch=%d | workers=%d", scanned, total, len(batch), min(SCAN_WORKERS, len(batch)))
@@ -1721,26 +1211,17 @@ def main() -> None:
         total, scan_errors, scan_skips, len(fresh_signals), time.time() - started,
     )
 
-    if private_ready:
-        try:
-            exit_result = process_structural_exits(scan_rows)
-            log.info("[STRUCTURE_EXIT_SUMMARY] %s", exit_result)
-        except Exception as exc:
-            log.exception("[STRUCTURE_EXIT] processing failed: %s", exc)
-
-    # Execution safety: keep one candidate per (symbol, side, structural cluster),
-    # not one candidate per symbol. Independent structures may legitimately add
-    # to the same directional position on one closed candle.
-    latest_by_zone: dict[tuple[str, str, str], dict[str, Any]] = {}
+    # Execution safety: choose exactly ONE zone signal per symbol, namely the
+    # newest fresh-touch bar. Never allow an older setup to compete with a newer
+    # setup because of score sorting.
+    latest_by_symbol: dict[str, dict[str, Any]] = {}
     for signal in fresh_signals:
         symbol_key = str(signal["symbol"]).upper()
-        zone_id = str(signal.get("zone_id") or (signal.get("zone") or {}).get("level_id") or "")
-        key = (symbol_key, str(signal["type"]).upper(), zone_id)
-        previous = latest_by_zone.get(key)
+        previous = latest_by_symbol.get(symbol_key)
         candidate_key = (int(signal["idx"]), float(signal.get("score", 0.0)))
         previous_key = (int(previous["idx"]), float(previous.get("score", 0.0))) if previous else None
         if previous is None or candidate_key > previous_key:
-            latest_by_zone[key] = signal
+            latest_by_symbol[symbol_key] = signal
 
     executable: list[dict[str, Any]] = []
     latest_index_by_symbol = {
@@ -1753,7 +1234,7 @@ def main() -> None:
         for r in scan_rows
         if r.get("latest_closed_time") is not None
     }
-    for signal in latest_by_zone.values():
+    for signal in latest_by_symbol.values():
         symbol_key = str(signal["symbol"]).upper()
         latest_closed_idx = latest_index_by_symbol.get(symbol_key)
         if latest_closed_idx is None:
@@ -1782,23 +1263,12 @@ def main() -> None:
         failed_record = failed_ids.get(signal["event_id"])
         if signal["event_id"] in successful_ids or _failed_signal_is_blocked(failed_record):
             continue
-        # Same-direction additions are allowed; open_market enforces the total
-        # directional margin cap. Opposite-side positions remain blocked by the
-        # strategy to avoid accidental reversal/netting even in HEDGE mode.
-        if opposite in open_keys:
-            log.info("[REJECT] %s | %s | reason=opposite_position_exists", signal["symbol"], signal["type"])
+        if key in open_keys or opposite in open_keys:
             continue
         executable.append(signal)
 
-    # Deterministic same-candle order: nearest structural price first, then
-    # stronger cluster. This is a defined rule; never rely on dict/list order.
-    executable.sort(key=lambda x: (
-        -int(x["idx"]),
-        0 if str(x.get("type", "")).upper() == "LONG" else 1,
-        -float((x.get("zone") or {}).get("price", x.get("entry", 0.0))),
-        -float(x.get("zone_strength", x.get("score", 0.0))),
-        str(x.get("zone_id") or ""),
-    ))
+    # Safety ordering: newest signal bar first; score only breaks ties.
+    executable.sort(key=lambda x: (-int(x["idx"]), -float(x.get("score", 0.0))))
 
     executed = 0
     for signal in executable[:MAX_TRADES_PER_CYCLE]:
@@ -1807,16 +1277,12 @@ def main() -> None:
             continue
         log.info(
             "[EXEC_SIGNAL] symbol=%s direction=%s signal_idx=%s signal_time=%s age_bars=%s "
-            "zone=%s zone_low=%s zone_high=%s entry_level=%s protection_level=%s "
-            "target_levels=%s target_source=%s obstacle=%s tp1=%s tp2=%s event_id=%s",
+            "zone=%s zone_low=%s zone_high=%s target_source=%s obstacle=%s tp1=%s tp2=%s event_id=%s",
             signal.get("symbol"), signal.get("type"), signal.get("idx"), signal.get("time"),
             signal.get("execution_age_bars", 0),
             (signal.get("zone") or {}).get("kind"),
             (signal.get("zone") or {}).get("btm"),
             (signal.get("zone") or {}).get("top"),
-            (signal.get("entry_level") or {}).get("level_id"),
-            (signal.get("protection_level") or {}).get("level_id"),
-            [x.get("level_id") for x in (signal.get("target", {}).get("target_levels") or [])],
             (signal.get("target") or {}).get("source"),
             (signal.get("target") or {}).get("obstacle_price"),
             signal.get("tp1"), signal.get("tp2"), signal.get("event_id"),
@@ -1835,36 +1301,7 @@ def main() -> None:
             })
             _send_signal(signal, blocked)
             continue
-        # Cross-process serialization covers the check -> MARKET POST critical
-        # section. GitHub Actions also serializes this workflow, but the engine
-        # must remain safe when invoked by another scheduler/process.
-        DATA.mkdir(parents=True, exist_ok=True)
-        lockf = EXECUTION_LOCK_PATH.open("a+", encoding="utf-8")
-        try:
-            if fcntl is not None:
-                fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
-            refreshed_successful = _load_successful_trade_ids()
-            if signal["event_id"] in refreshed_successful:
-                execution = {"status": "ALREADY_EXECUTED", "event_id": signal["event_id"]}
-            else:
-                current_positions = get_positions(timeout_sec=float(os.environ.get("RECONCILIATION_HTTP_TIMEOUT_SEC", "5")), retryable=False)
-                current_keys = _position_keys(current_positions)
-                bx_key = (str(get_contract(signal["symbol"])["symbol"]).upper(), str(signal["type"]).upper()) if get_contract(signal["symbol"]) else (str(signal["symbol"]).upper(), str(signal["type"]).upper())
-                opp_key = (bx_key[0], "SHORT" if bx_key[1] == "LONG" else "LONG")
-                if opp_key in current_keys:
-                    execution = {"status": "OPPOSITE_POSITION_EXISTS", "symbol": signal["symbol"], "direction": signal["type"]}
-                else:
-                    execution = execute_new_position(signal)
-        except Exception as exc:
-            log.exception("[EXEC_TECHNICAL_ERROR] %s %s | %s", signal["symbol"], signal["type"], exc)
-            execution = {"status": "EXECUTION_EXCEPTION", "error": str(exc)}
-        finally:
-            if fcntl is not None:
-                try:
-                    fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
-                except Exception:
-                    pass
-            lockf.close()
+        execution = execute_new_position(signal)
         execution_status = str(execution.get("status", ""))
         if execution_status in {"skipped_min_qty", "skipped_tp_min_qty", "skipped_invalid_setup"}:
             log.warning(

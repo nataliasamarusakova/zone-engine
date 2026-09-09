@@ -67,10 +67,7 @@ def test_zone_signal_schema():
             assert s["risk_pct"] > 0
         assert s["event_id"].startswith("ZONE_")
         if s["zone"]:
-            assert any(k in {"DEMAND", "SUPPLY", "SUPPORT", "RESISTANCE", "PIVOT_LOW", "PIVOT_HIGH", "HIGH_LEVEL", "LOW_LEVEL"}
-                       for k in str(s["zone"]["kind"]).split("+"))
-            assert s["zone"].get("level_id")
-            assert s["zone"].get("tier") in {"STRONG", "MEDIUM", "WEAK"}
+            assert s["zone"]["kind"] in {"DEMAND", "SUPPLY"}
         assert s["confirmation"]["alma_cross"] is False
         assert s["trigger"]["alma_required"] is False
 
@@ -80,7 +77,7 @@ def test_long_tp_ordering_and_rr():
         "symbol": "TEST-USDT", "type": "LONG", "entry": 100.0, "sl": 95.0,
         "tp1": 107.5, "tp2": 115.0, "risk_pct": 5.0,
         "zone": {"kind": "DEMAND", "age_bars": 10, "impulse_atr": 2.0},
-        "confirmation": {"alma_cross": True, "zone_touch": True, "volume_ratio": 1.5, "candle_body_atr": 1.0},
+        "confirmation": {"alma_cross": True, "zone_touch": True, "volume_ratio": 1.5, "candle_body_atr": 1.0, "range_atr": 1.2, "rejection_ok": True, "rejection_score": 80.0, "htf_regime": "LONG"},
     }
     assert signal["tp1"] < signal["tp2"]
     assert RR_RATIO == 3.0
@@ -94,7 +91,7 @@ def test_short_tp_ordering():
         "symbol": "TEST-USDT", "type": "SHORT", "entry": 100.0, "sl": 105.0,
         "tp1": 92.5, "tp2": 85.0, "risk_pct": 5.0,
         "zone": {"kind": "SUPPLY", "age_bars": 20, "impulse_atr": 1.5},
-        "confirmation": {"alma_cross": True, "zone_touch": True, "volume_ratio": 1.2, "candle_body_atr": 0.8},
+        "confirmation": {"alma_cross": True, "zone_touch": True, "volume_ratio": 1.2, "candle_body_atr": 0.8, "range_atr": 1.0, "rejection_ok": True, "rejection_score": 80.0, "htf_regime": "SHORT"},
     }
     assert signal["tp1"] > signal["tp2"]
     assert score_zone_signal(signal) >= 70
@@ -294,21 +291,16 @@ def test_execute_emergency_closes_when_protection_fails(monkeypatch):
         "status": "ok", "sl_orders": [], "tp_orders": []
     })
     monkeypatch.setattr(run_once, "open_market", lambda *a, **k: {
-        "status": "opened", "symbol": "TEST-USDT", "qty": 0.1, "leverage": 10, "contract_multiplier": 1
+        "status": "opened", "symbol": "TEST-USDT", "qty": 1.0
     })
     monkeypatch.setattr(run_once, "wait_for_position_fill_directional", lambda *a, **k: {
-        "status": "found", "avgPrice": 100.0, "positionAmt": 0.1
-    })
-    monkeypatch.setattr(run_once, "_rebase_protection_after_fill", lambda *a, **k: {
-        "sl": 99.0, "tp1": 100.5, "tp2": 101.0, "risk_abs": 1.0, "risk_pct": 1.0,
-        "tp1_rr": 0.5, "tp2_rr": 1.0, "target_source": "test", "obstacle_price": 110.0,
-        "target_levels": [], "protection_level": None,
+        "status": "found", "avgPrice": 100.0, "positionAmt": 1.0
     })
     monkeypatch.setattr(run_once, "ensure_directional_protection", lambda *a, **k: {
         "status": "PROTECTION_FAILED", "error": "TP2 failed", "sl_result": {}, "tp_orders": []
     })
     position_states = iter([
-        {"status": "found", "positionAmt": 0.1, "avgPrice": 100.0},
+        {"status": "found", "positionAmt": 1.0},
         {"status": "not_found"},
     ])
     monkeypatch.setattr(run_once, "get_position_directional", lambda *a, **k: next(position_states, {"status": "not_found"}))
@@ -322,28 +314,13 @@ def test_execute_emergency_closes_when_protection_fails(monkeypatch):
     assert closed.get("called") is True
 
 
-def test_open_client_order_id_is_deterministic_for_logical_signal():
+def test_open_client_order_id_is_unique():
     from event_engine import bingx
     a = bingx._new_open_client_order_id("ALT-USDT", "ZONE_TEST")
     b = bingx._new_open_client_order_id("ALT-USDT", "ZONE_TEST")
-    assert a == b
-    assert a.startswith("EVT_OPEN_")
-    assert len(a) <= 32
+    assert a != b
     assert len(a) <= 32
     assert len(b) <= 32
-
-
-
-def test_client_order_id_collision_with_mismatched_order_is_error(monkeypatch):
-    from event_engine import bingx
-    monkeypatch.setattr(bingx, "get_all_orders", lambda *a, **k: [{
-        "clientOrderId": "EVT_OPEN_COLLIDE", "symbol": "AAA-USDT", "side": "SELL",
-        "positionSide": "SHORT", "origQty": "2.0", "status": "FILLED",
-    }])
-    assert bingx._client_order_matches_request(
-        {"symbol":"AAA-USDT","side":"SELL","positionSide":"SHORT","origQty":"2.0"},
-        direction="SHORT", position_side="SHORT", qty=1.0
-    ) is False
 
 
 def test_tp_constants_are_one_and_two_r():
@@ -424,10 +401,6 @@ def test_post_fill_rebases_zone_protection_and_never_reuses_stale_absolute_targe
         "risk_pct": 0.28,
         "atr": 0.003,
         "zone": {"btm": 0.808258, "top": 0.8114},
-        "levels": {
-            "blue": [{"level_id": "B1", "color": "BLUE", "kind": "SUPPORT", "source": "pine_sr", "price": 0.7900, "lower": 0.7895, "upper": 0.7905, "status": "ACTIVE"}],
-            "red": [{"level_id": "R1", "color": "RED", "kind": "RESISTANCE", "source": "pine_sr", "price": 0.8110, "lower": 0.8105, "upper": 0.8115, "status": "ACTIVE"}],
-        },
         "target": {"obstacle_price": 0.8060, "source": "nearest_opposing_structure"},
     }
     out = run_once._rebase_protection_after_fill(signal, 0.7974)
@@ -448,10 +421,6 @@ def test_long_post_fill_that_slips_through_zone_stop_moves_stop_behind_fill():
         "risk_pct": 0.70,
         "atr": 0.033,
         "zone": {"btm": 4.743, "top": 4.7593},
-        "levels": {
-            "blue": [{"level_id": "B1", "color": "BLUE", "kind": "DEMAND", "source": "demand_zone", "price": 4.70, "lower": 4.69, "upper": 4.71, "status": "ACTIVE"}],
-            "red": [{"level_id": "R1", "color": "RED", "kind": "RESISTANCE", "source": "pine_sr", "price": 4.85, "lower": 4.84, "upper": 4.86, "status": "ACTIVE"}],
-        },
         "target": {"obstacle_price": 4.85, "source": "nearest_opposing_structure"},
     }
     out = run_once._rebase_protection_after_fill(signal, 4.73)
@@ -468,84 +437,24 @@ def test_execute_rebases_protection_to_actual_fill_before_installing(monkeypatch
         "entry": 100.0, "sl": 105.0, "tp1": 99.0, "tp2": 98.0, "risk_pct": 1.0,
         "score": 75, "atr": 2.0,
         "zone": {"kind": "SUPPLY", "btm": 99.0, "top": 104.0},
-        "levels": {
-            "blue": [{"level_id": "B1", "color": "BLUE", "kind": "SUPPORT", "source": "pine_sr", "price": 90.0, "lower": 89.5, "upper": 90.5, "status": "ACTIVE"}],
-            "red": [{"level_id": "R1", "color": "RED", "kind": "SUPPLY", "source": "supply_zone", "price": 100.9, "lower": 100.8, "upper": 101.0, "status": "ACTIVE"}],
-        },
         "target": {"obstacle_price": 90.0, "source": "nearest_opposing_structure"},
     }
     captured = {}
-    monkeypatch.setattr(run_once, "get_execution_reference_price", lambda *a, **k: 100.0)
     monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
-    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: {"status": "opened", "symbol": "TEST-USDT", "leverage": 10, "contract_multiplier": 1, "qty": 0.1})
-    monkeypatch.setattr(run_once, "wait_for_position_fill_directional", lambda *a, **k: {"status": "found", "avgPrice": 95.0, "positionAmt": 0.1})
+    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: {"status": "opened", "symbol": "TEST-USDT"})
+    monkeypatch.setattr(run_once, "wait_for_position_fill_directional", lambda *a, **k: {"status": "found", "avgPrice": 95.0, "positionAmt": 1.0})
     def fake_protection(*args, **kwargs):
         captured["avg"] = args[2]
         captured["levels"] = args[5]
         return {"status": "PROTECTED", "tp_orders": [], "sl_result": {}}
     monkeypatch.setattr(run_once, "ensure_directional_protection", fake_protection)
     monkeypatch.setattr(run_once, "register_active_trade", lambda *a, **k: None)
-    position_states = iter([
-        {"status": "not_found"},
-        {"status": "found", "positionAmt": 1.0, "avgPrice": 95.0},
-        {"status": "found", "positionAmt": 1.0, "avgPrice": 95.0},
-    ])
-    monkeypatch.setattr(run_once, "get_position_directional", lambda *a, **k: next(position_states, {"status": "not_found"}))
+    monkeypatch.setattr(run_once, "get_position_directional", lambda *a, **k: {"status": "found", "positionAmt": 1.0})
     monkeypatch.setattr(run_once, "close_position_market", lambda *a, **k: {"status": "closed"})
     monkeypatch.setattr(run_once, "_cleanup_engine_protection", lambda *a, **k: {"status": "ok"})
     out = run_once.execute_new_position(signal)
     assert out["status"] == "opened_then_emergency_closed"
     assert out["error"].startswith("risk_pct_above_limit=")
-
-
-
-def test_pretrade_risk_rejection_happens_before_market(monkeypatch):
-    import run_once
-    signal = {
-        "event_id": "ZONE_PRE_RISK", "symbol": "ARB-USDT", "type": "LONG",
-        "entry": 100.0, "sl": 99.0, "tp1": 101.0, "tp2": 102.0, "risk_pct": 1.0,
-        "score": 60.0, "atr": 1.0,
-        "zone": {"kind": "SUPPORT", "level_id": "Z", "lower": 100.0, "upper": 100.0},
-        "target": {"obstacle_price": 104.0},
-        "levels": {
-            "blue": [{"level_id":"B","color":"BLUE","kind":"SUPPORT","lower":100.0,"upper":100.0,"price":100.0,"status":"ACTIVE"},
-                       {"level_id":"B2","color":"BLUE","kind":"DEMAND","lower":98.0,"upper":98.2,"price":98.1,"status":"ACTIVE"}],
-            "red": [{"level_id":"R","color":"RED","kind":"RESISTANCE","lower":112.0,"upper":112.0,"price":112.0,"status":"ACTIVE"}],
-        },
-    }
-    # Force the expected executable reference into a geometry that produces >1.5%
-    # risk after protection selection, so MARKET must never be reached.
-    monkeypatch.setattr(run_once, "get_execution_reference_price", lambda *a, **k: 103.0)
-    called = {"open": False}
-    monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {"status":"ok","sl_orders":[],"tp_orders":[]})
-    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: called.__setitem__("open", True))
-    out = run_once.execute_new_position(signal)
-    assert out["status"] == "skipped_invalid_setup"
-    assert "risk_pct_above_limit" in out["error"]
-    assert called["open"] is False
-
-
-def test_pretrade_structure_room_rejection_happens_before_market(monkeypatch):
-    import run_once
-    signal = {
-        "event_id": "ZONE_PRE_ROOM", "symbol": "SUI-USDT", "type": "LONG",
-        "entry": 100.0, "sl": 99.0, "tp1": 100.5, "tp2": 101.0, "risk_pct": 1.0,
-        "score": 60.0, "atr": 1.0,
-        "zone": {"kind": "DEMAND", "lower": 99.0, "upper": 99.5},
-        "target": {"obstacle_price": 101.0},
-        "levels": {
-            "blue": [{"level_id":"B","color":"BLUE","kind":"DEMAND","lower":99.0,"upper":99.5,"price":99.25,"status":"ACTIVE"}],
-            "red": [{"level_id":"R","color":"RED","kind":"RESISTANCE","lower":101.1,"upper":101.1,"price":101.1,"status":"ACTIVE"}],
-        },
-    }
-    monkeypatch.setattr(run_once, "get_execution_reference_price", lambda *a, **k: 100.0)
-    monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {"status":"ok","sl_orders":[],"tp_orders":[]})
-    called = {"open": False}
-    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: called.__setitem__("open", True))
-    out = run_once.execute_new_position(signal)
-    assert out["status"] == "skipped_invalid_setup"
-    assert "insufficient_structure_room" in out["error"]
-    assert called["open"] is False
 
 
 def test_invalid_setup_is_rejected_before_protection_preflight(monkeypatch):
@@ -682,7 +591,7 @@ def test_no_zone_signal_is_blocked(monkeypatch):
     assert emitted == []
 
 
-def test_zone_signal_uses_last_same_color_structural_stop_and_targets(monkeypatch):
+def test_zone_signal_uses_zone_boundary_stop_and_small_tps(monkeypatch):
     import numpy as np
     import pandas as pd
     from event_engine import signals as sig
@@ -700,30 +609,26 @@ def test_zone_signal_uses_last_same_color_structural_stop_and_targets(monkeypatc
     high[-1] = 110.0
     low[-1] = 108.0
     volume = np.full(n, 1000.0)
+    volume[-1] = 2000.0
     df = pd.DataFrame({"timestamp": ts, "open": open_, "high": high, "low": low, "close": close, "volume": volume})
     # Supply a deterministic Demand zone touching the latest bar.
     def forced_walk(frame):
         demand = [{"top": 110.5, "btm": 109.0, "poi": 109.75, "start": len(frame)-5}]
         return [], demand, [], [], []
     monkeypatch.setattr(sig, "_pine_zone_walk", forced_walk)
+    monkeypatch.setattr(sig, "_attach_htf_regime", lambda frame: frame.assign(htf_regime="LONG"))
 
     # With a forced zone walk, generate_zone_signals builds its own active zone,
     # so patch zone construction/selection at the deterministic insertion point.
     forced_zone = {"top": 110.5, "btm": 109.0, "poi": 109.75, "start": n - 5}
     monkeypatch.setattr(sig, "_find_directional_zone", lambda direction, cur_l, cur_h, cur_c, demand, supply: forced_zone if direction == "LONG" else None)
-    monkeypatch.setattr(sig, "build_level_pool", lambda **kwargs: {
-        "blue": [{"level_id": "B1", "color": "BLUE", "kind": "CLUSTER", "source": "cluster", "price": 109.10, "lower": 109.0, "upper": 109.2, "status": "ACTIVE", "member_kinds": ["DEMAND"], "strength": 2}],
-        "red": [{"level_id": "R1", "color": "RED", "kind": "RESISTANCE", "source": "pine_sr", "price": 115.0, "lower": 114.5, "upper": 115.5, "status": "ACTIVE", "member_kinds": ["RESISTANCE"], "strength": 2}],
-        "all": [], "cluster_tolerance": 0.1,
-    })
+    monkeypatch.setattr(sig, "_nearest_opposing_level", lambda direction, entry, active_demand, active_supply, frame, idx: {"price": 115.0, "source": "supply_zone"} if direction == "LONG" else {"price": 95.0, "source": "demand_zone"})
 
     _, _, _, emitted = sig.generate_zone_signals(df, symbol="TEST-USDT", mode="live")
     assert emitted
     latest = emitted[-1]
     assert latest["confirmation"]["zone_touch"] is True
-    assert latest["risk_model"]["sl_source"] == "entry_structure_lower_upper_plus_buffer"
-    assert latest["protection_level"]["level_id"] == "B1"
-    assert latest["sl"] < 109.0
+    assert latest["risk_model"]["sl_source"] == "zone_boundary_plus_atr_buffer"
     assert latest["trigger"]["alma_required"] is False
     assert latest["target"]["source"] in {"nearest_opposing_structure", "atr_rr_fallback"}
     assert latest["tp1"] < latest["tp2"]
@@ -892,9 +797,9 @@ def test_live_mode_uses_partial_current_8h_not_final_dataset_close():
     close1 = [100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 200.0]
     df1 = pd.DataFrame({
         "timestamp": ts1,
-        "open": [100.0] * 7 + [199.0],
+        "open": [100.0] * 8,
         "high": [c + 0.5 for c in close1],
-        "low": [min(100.0, c) - 0.5 for c in close1],
+        "low": [c - 0.5 for c in close1],
         "close": close1,
         "volume": [1.0] * 8,
     })
@@ -1105,114 +1010,6 @@ def test_sl_order_validation_is_one_sided_and_be_allows_entry():
     assert bingx._validate_sl_order_for_position({"type":"STOP_MARKET","stopPrice":"101","origQty":"1"}, "SHORT", 100.0)
     assert not bingx._validate_sl_order_for_position({"type":"STOP_MARKET","stopPrice":"99.8","origQty":"1"}, "SHORT", 100.0)
 
-
-
-
-def test_post_fill_execution_passes_structural_stop_to_protection(monkeypatch):
-    import run_once
-    signal = {
-        "event_id":"ZONE_STRUCTURAL_STOP", "symbol":"TEST-USDT", "type":"LONG",
-        "entry":100.0, "sl":99.0, "tp1":101.0, "tp2":102.0, "risk_pct":1.0, "score":80,
-        "atr":1.0, "zone":{"kind":"DEMAND","btm":98.0,"top":100.0},
-        "target":{"obstacle_price":104.0},
-    }
-    captured = {}
-    monkeypatch.setattr(run_once, "_validate_trade_geometry", lambda s: (True, "ok"))
-    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: {"status":"opened","symbol":"TEST-USDT"})
-    monkeypatch.setattr(run_once, "wait_for_position_fill_directional", lambda *a, **k: {"status":"found","avgPrice":100.0,"positionAmt":1.0})
-    monkeypatch.setattr(run_once, "_rebase_protection_after_fill", lambda s, avg: {
-        "sl":97.5,"tp1":101.0,"tp2":102.0,"risk_abs":2.5,"risk_pct":2.5,
-        "tp1_rr":0.4,"tp2_rr":0.8,"target_source":"test","obstacle_price":104.0,
-        "protection_level":{"level_id":"B1"}, "target_levels":[{"level_id":"R1"}],
-    })
-    monkeypatch.setattr(run_once, "ensure_directional_protection", lambda *a, **k: captured.update(k) or {"status":"PROTECTED","tp_orders":[],"sl_result":{},"effective_tp_levels":[]})
-    monkeypatch.setattr(run_once, "register_active_trade", lambda *a, **k: None)
-    monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {"status":"ok","sl_orders":[],"tp_orders":[]})
-    out=run_once.execute_new_position(signal)
-    assert out["status"] == "opened_protected"
-    assert captured["requested_sl_price"] == 97.5
-
-def test_crossed_tp_market_fallback_is_reduce_only_in_one_way(monkeypatch):
-    from event_engine import bingx
-    monkeypatch.setattr(bingx, "to_bx_symbol", lambda s: s)
-    monkeypatch.setattr(bingx, "get_contract", lambda s: {"quantityPrecision": 3, "pricePrecision": 2, "tradeMinQuantity": 0.001})
-    monkeypatch.setattr(bingx, "position_side_param", lambda d: "BOTH")
-    state = {"sl_orders": [], "tp_orders": []}
-    def protection(*a, **k):
-        return {"status":"ok","sl_orders":list(state["sl_orders"]),"tp_orders":list(state["tp_orders"])}
-    monkeypatch.setattr(bingx, "get_open_protection_directional", protection)
-    monkeypatch.setattr(bingx, "_current_close_price", lambda s: 101.0)
-    monkeypatch.setattr(bingx, "_verify_market_reduce_order", lambda *a, **k: {"status":"verified","executed_qty":0.5,"reduced_qty":0.5,"remaining_qty":0.5})
-    monkeypatch.setattr(bingx, "_verify_open_order", lambda *a, **k: {"status":"verified","order":{"orderId":"V","clientOrderId":k.get("client_order_id"),"type":k.get("order_kind"),"stopPrice":k.get("expected_price"),"origQty":k.get("expected_qty")}})
-    seen=[]
-    def req(method, path, params):
-        seen.append(dict(params))
-        order={"orderId":f"O{len(seen)}","clientOrderId":params["clientOrderId"],"type":params["type"],"stopPrice":params.get("stopPrice"),"origQty":params["quantity"]}
-        if params["type"] == "STOP_MARKET":
-            state["sl_orders"]=[order]
-        elif params["type"] == "TAKE_PROFIT_MARKET":
-            state["tp_orders"].append(order)
-        return {"code":0,"data":{"order":order}}
-    monkeypatch.setattr(bingx, "_request", req)
-    out=bingx.ensure_directional_protection("AAA-USDT","LONG",100.0,1.0,1.0,[{"leg":"tp1","pnl_pct":0.5,"close_fraction":0.5},{"leg":"tp2","pnl_pct":1.0,"close_fraction":0.5}],trade_id="T",requested_sl_price=98.0)
-    assert out["status"] in {"PROTECTED", "PROTECTION_FAILED"}
-    crossed=[x for x in seen if x["type"]=="MARKET"]
-    assert crossed and crossed[-1]["reduceOnly"]=="true"
-
-def test_protection_uses_structural_stop_price_on_entry_and_restart(monkeypatch):
-    from event_engine import bingx
-    monkeypatch.setattr(bingx, "to_bx_symbol", lambda s: s)
-    monkeypatch.setattr(bingx, "get_contract", lambda s: {"quantityPrecision": 3, "pricePrecision": 2, "tradeMinQuantity": 0.001})
-    monkeypatch.setattr(bingx, "position_side_param", lambda d: "BOTH")
-    state = {"sl_orders": [], "tp_orders": []}
-    def get_protection(*a, **k):
-        return {"status": "ok", "sl_orders": list(state["sl_orders"]), "tp_orders": list(state["tp_orders"])}
-    monkeypatch.setattr(bingx, "get_open_protection_directional", get_protection)
-    monkeypatch.setattr(bingx, "_verify_open_order", lambda *a, **k: {"status": "verified", "order": {"orderId": "SL1", "clientOrderId": k.get("client_order_id", ""), "stopPrice": k.get("expected_price", 0), "origQty": k.get("expected_qty", 0)}})
-    calls=[]
-    def req(method, path, params):
-        calls.append(params)
-        state["sl_orders"] = [{"orderId":"SL1","clientOrderId":params["clientOrderId"],"type":params["type"],"stopPrice":params["stopPrice"],"origQty":params["quantity"]}]
-        return {"code":0, "data":{"order":{"orderId":"SL1","clientOrderId":params["clientOrderId"]}}}
-    monkeypatch.setattr(bingx, "_request", req)
-    out=bingx.ensure_directional_protection("AAA-USDT","LONG",100.0,1.0,1.0,[],trade_id="T",requested_sl_price=96.5)
-    assert out["status"] == "PROTECTED"
-    assert abs(float(calls[-1]["stopPrice"]) - 96.5) < 1e-9
-    assert calls[-1]["reduceOnly"] == "true"
-
-
-def test_protection_adds_reduce_only_to_one_way_tp(monkeypatch):
-    from event_engine import bingx
-    monkeypatch.setattr(bingx, "to_bx_symbol", lambda s: s)
-    monkeypatch.setattr(bingx, "get_contract", lambda s: {"quantityPrecision": 3, "pricePrecision": 2, "tradeMinQuantity": 0.001})
-    monkeypatch.setattr(bingx, "position_side_param", lambda d: "BOTH")
-    state = {"sl_orders": [], "tp_orders": []}
-    def get_protection(*a, **k):
-        return {"status":"ok", "sl_orders": list(state["sl_orders"]), "tp_orders": list(state["tp_orders"])}
-    monkeypatch.setattr(bingx, "get_open_protection_directional", get_protection)
-    seen=[]
-    def req(method, path, params):
-        seen.append(dict(params))
-        order = {"orderId":f"O{len(seen)}","clientOrderId":params["clientOrderId"],"type":params["type"],"stopPrice":params.get("stopPrice"),"origQty":params["quantity"]}
-        if params["type"] == "STOP_MARKET":
-            state["sl_orders"] = [order]
-        else:
-            state["tp_orders"].append(order)
-        return {"code":0,"data":{"order":order}}
-    monkeypatch.setattr(bingx, "_request", req)
-    monkeypatch.setattr(bingx, "_verify_open_order", lambda *a, **k: {"status":"verified","order":{"orderId":"V","clientOrderId":k.get("client_order_id"),"stopPrice":k.get("expected_price"),"origQty":k.get("expected_qty")}})
-    monkeypatch.setattr(bingx, "_current_close_price", lambda s: 99.0)
-    out=bingx.ensure_directional_protection("AAA-USDT","LONG",100.0,1.0,1.0,[{"leg":"tp1","pnl_pct":1.0,"close_fraction":1.0}],trade_id="T",requested_sl_price=98.5)
-    assert out["status"] == "PROTECTED"
-    assert any(x["type"]=="STOP_MARKET" and x.get("reduceOnly")=="true" for x in seen)
-    assert any(x["type"]=="TAKE_PROFIT_MARKET" and x.get("reduceOnly")=="true" for x in seen)
-
-
-def test_analytics_line_contains_all_structural_levels():
-    from event_engine.analytics import _line
-    line=_line({"symbol":"BTC-USDT","current_price":100.0,"price_position":"OUT","fresh_signal":"—","active_demand":1,"active_supply":1,"market_source":"binance_spot","levels":{"blue":[{"level_id":"B123456789","kind":"SUPPORT","lower":98,"upper":99,"strength":3,"age_bars":4}],"red":[{"level_id":"R123456789","kind":"RESISTANCE","lower":102,"upper":103,"strength":2,"age_bars":6}]}})
-    assert "BLUE=" in line and "SUPPORT" in line and "RED=" in line and "RESISTANCE" in line
-
 def test_workflow_risk_cap_is_not_accidentally_25_percent():
     from pathlib import Path
     workflow = Path('.github/workflows/event-engine.yml').read_text(encoding='utf-8')
@@ -1408,7 +1205,7 @@ def test_post_fill_slippage_guard_emergency_closes(monkeypatch):
     monkeypatch.setattr(run_once, "_validate_trade_geometry", lambda s: (True, ""))
     monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {"status":"ok","sl_orders":[],"tp_orders":[]})
     monkeypatch.setattr(run_once, "_build_setup", lambda s: {"zone":{"kind":"DEMAND"}})
-    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: {"status":"opened"})
+    monkeypatch.setattr(run_once, "open_market", lambda *a: {"status":"opened"})
     monkeypatch.setattr(run_once, "wait_for_position_fill_directional", lambda *a, **k: {"status":"found","avgPrice":102.5,"positionAmt":1})
     monkeypatch.setattr(run_once, "_emergency_close_and_verify", lambda *a, **k: {"status":"closed_verified"})
     monkeypatch.setattr(run_once, "_cleanup_engine_protection", lambda *a, **k: {"status":"ok"})
@@ -1850,7 +1647,6 @@ def test_tracker_sends_and_records_close_notification(monkeypatch, tmp_path):
     }
     (tmp_path / "active_trades.json").write_text(json.dumps({trade["event_id"]: trade}), encoding="utf-8")
     monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: {"status": "not_found"})
-    monkeypatch.setattr(tracker, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
     monkeypatch.setattr(tracker, "fetch_klines", lambda *a, **k: [])
     monkeypatch.setattr(tracker, "get_all_orders", lambda *a, **k: [{
         "orderId": "CLOSE1", "status": "FILLED", "side": "SELL", "type": "MARKET",
@@ -1901,7 +1697,6 @@ def test_tracker_sends_negative_close_notification(monkeypatch, tmp_path):
     }
     (tmp_path / "active_trades.json").write_text(json.dumps({trade["event_id"]: trade}), encoding="utf-8")
     monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: {"status": "not_found"})
-    monkeypatch.setattr(tracker, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
     monkeypatch.setattr(tracker, "fetch_klines", lambda *a, **k: [])
     monkeypatch.setattr(tracker, "get_all_orders", lambda *a, **k: [{
         "orderId": "CLOSE_NEG", "status": "FILLED", "side": "SELL", "type": "MARKET",
@@ -1991,7 +1786,6 @@ def test_be_failure_notification_is_truthful_for_verified_close(monkeypatch):
 
 def test_emergency_be_rollback_verifies_order_before_final_unverified(monkeypatch):
     from event_engine import tracker
-    monkeypatch.setattr(tracker, "_cancel_engine_protection_before_emergency_close", lambda *a, **k: {"status": "ok", "cancelled": [], "errors": []})
     monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: next(states))
     states = iter([
         {"status": "found", "positionAmt": 1.0},
@@ -2207,540 +2001,72 @@ def test_run_once_all_emergency_paths_cleanup_before_close():
 from run_once import WATCHLIST_ONLY, WATCHLIST_SYMBOLS
 
 
-def test_watchlist_is_exact_24_symbols_and_enabled():
+def test_watchlist_is_exact_20_symbols():
     expected = (
-        "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT", "DOGE-USDT",
-        "TRX-USDT", "HYPE-USDT", "XMR-USDT", "ZEC-USDT", "LINK-USDT", "ADA-USDT",
-        "XLM-USDT", "BCH-USDT", "UNI-USDT", "LTC-USDT", "AVAX-USDT", "SUI-USDT",
-        "HBAR-USDT", "TAO-USDT", "ICP-USDT", "ARB-USDT", "POL-USDT", "ETC-USDT",
+        "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "TAO-USDT",
+        "LTC-USDT", "BCH-USDT", "AVAX-USDT", "LINK-USDT", "ETC-USDT",
+        "ADA-USDT", "UNI-USDT", "XRP-USDT", "ICP-USDT", "HYPE-USDT",
+        "DOGE-USDT", "HBAR-USDT", "ARB-USDT", "POL-USDT", "SUI-USDT",
     )
-    assert WATCHLIST_ONLY is True
+    assert WATCHLIST_ONLY is False
     assert WATCHLIST_SYMBOLS == expected
-    assert len(WATCHLIST_SYMBOLS) == 24
+    assert len(WATCHLIST_SYMBOLS) == 20
 
 
-def test_level_engine_preserves_semantic_sr_colors_and_clusters():
-    from event_engine.levels import build_level_pool, select_opposing_levels, select_protective_level, protective_price
-    pool = build_level_pool(
-        demand=[{"top": 100.5, "btm": 99.5, "start": 10}],
-        supply=[{"top": 105.5, "btm": 104.5, "start": 12}],
-        support_resistance=[
-            {"price": 100.2, "semantic": "SUPPORT", "created_idx": 11, "age_bars": 1, "strength": 2},
-            {"price": 105.0, "semantic": "RESISTANCE", "created_idx": 13, "age_bars": 1, "strength": 2},
-        ],
-        pivot_lows=[{"price": 100.1, "created_idx": 9, "age_bars": 3}],
-        pivot_highs=[{"price": 105.1, "created_idx": 14, "age_bars": 0}],
-        current_idx=14, atr=1.0,
-    )
-    assert pool["blue"] and pool["red"]
-    assert all(level["color"] == "BLUE" for level in pool["blue"])
-    assert all(level["color"] == "RED" for level in pool["red"])
-    protective = select_protective_level("LONG", 102.0, pool["blue"], pool["red"])
-    opposing = select_opposing_levels("LONG", 102.0, pool["blue"], pool["red"], limit=2)
-    assert protective is not None
-    assert opposing
-    stop = protective_price(protective, "LONG", 0.1)
-    assert stop < protective["lower"] < 102.0
-
-
-def test_level_engine_short_uses_last_red_above_entry():
-    from event_engine.levels import build_level_pool, select_protective_level, protective_price
-    pool = build_level_pool(
-        demand=[], supply=[{"top": 110.5, "btm": 109.5, "start": 1}],
-        support_resistance=[{"price": 108.0, "semantic": "RESISTANCE", "created_idx": 2, "age_bars": 1, "strength": 2}],
-        pivot_highs=[{"price": 107.8, "created_idx": 3, "age_bars": 0}],
-        current_idx=3, atr=1.0,
-    )
-    protective = select_protective_level("SHORT", 105.0, pool["blue"], pool["red"])
-    assert protective is not None
-    assert protective["color"] == "RED"
-    assert protective_price(protective, "SHORT", 0.1) > protective["upper"]
-
-
-def test_level_engine_rejects_broken_semantic_levels():
-    from event_engine.levels import build_level_pool, select_protective_level
-    pool = build_level_pool(
-        demand=[], supply=[],
-        support_resistance=[
-            {"price": 100.0, "semantic": "SUPPORT", "created_idx": 1, "age_bars": 5, "strength": 2},
-            {"price": 110.0, "semantic": "RESISTANCE", "created_idx": 2, "age_bars": 4, "strength": 2},
-        ],
-        pivot_lows=[{"price": 98.0, "created_idx": 1, "age_bars": 5}],
-        pivot_highs=[{"price": 112.0, "created_idx": 2, "age_bars": 4}],
-        current_idx=5, reference_price=95.0, atr=1.0,
-    )
-    assert not pool["blue"]
-    assert pool["invalid"]
-    assert not [x for x in pool["invalid"] if x["color"] == "RED" and x["status"] == "BROKEN"]
-    assert select_protective_level("LONG", 114.0, pool["blue"], pool["red"]) is None
-
-
-def test_signal_level_snapshot_uses_same_source_for_stop_and_targets(monkeypatch):
+def test_candle_quality_accepts_rejection_and_displacement():
     from event_engine import signals as sig
-    df = _candles(120)
-    forced_zone = {"top": 110.5, "btm": 109.0, "poi": 109.75, "start": 115}
-    monkeypatch.setattr(sig, "_pine_zone_walk", lambda frame: ([], [forced_zone], [], [], []))
-    monkeypatch.setattr(sig, "_find_directional_zone", lambda direction, *args: forced_zone if direction == "LONG" else None)
-    monkeypatch.setattr(sig, "build_level_pool", lambda **kwargs: {
-        "blue": [{"level_id": "B1", "color": "BLUE", "kind": "CLUSTER", "source": "cluster", "price": 109.10, "lower": 109.0, "upper": 109.2, "status": "ACTIVE", "member_kinds": ["DEMAND"], "strength": 2}],
-        "red": [
-            {"level_id": "R1", "color": "RED", "kind": "CLUSTER", "source": "cluster", "price": 115.0, "lower": 114.5, "upper": 115.5, "status": "ACTIVE", "member_kinds": ["RESISTANCE"], "strength": 2},
-            {"level_id": "R2", "color": "RED", "kind": "CLUSTER", "source": "cluster", "price": 120.0, "lower": 119.5, "upper": 120.5, "status": "ACTIVE", "member_kinds": ["SUPPLY"], "strength": 2},
-        ], "all": [], "cluster_tolerance": 0.1,
-    })
-    monkeypatch.setattr(sig, "select_entry_level_for_zone", lambda direction, zone, pool: pool["blue"][0])
-    monkeypatch.setattr(sig, "calc_atr", lambda frame, length: pd.Series(1.0, index=frame.index))
-    # Build a deterministic latest bullish touch.
-    df.loc[len(df)-2, "close"] = 111.0
-    df.loc[len(df)-2, "open"] = 110.0
-    df.loc[len(df)-2, "high"] = 111.2
-    df.loc[len(df)-2, "low"] = 109.8
-    df.loc[len(df)-1, "close"] = 110.0
-    df.loc[len(df)-1, "open"] = 109.0
-    df.loc[len(df)-1, "low"] = 108.0
-    df.loc[len(df)-1, "high"] = 110.0
-    _, _, _, emitted = sig.generate_zone_signals(df, symbol="TEST-USDT", mode="live")
-    assert emitted
-    s = emitted[-1]
-    assert s["protection_level"]["level_id"] == "B1"
-    assert s["entry_level"]["color"] == "BLUE"
-    assert s["target"]["target_levels"]
-    assert all(x["color"] == "BLUE" for x in s["target"]["target_levels"]) is False
-    assert all(x["color"] == "RED" for x in s["target"]["target_levels"])
+    rejection = sig._candle_quality(100.0, 101.0, 97.0, 100.5, "LONG")
+    assert rejection["rejection_ok"] is True
+    displacement = sig._candle_quality(100.0, 103.0, 99.8, 103.0, "LONG")
+    assert displacement["displacement"] is True
+    short = sig._candle_quality(100.0, 102.0, 97.0, 98.0, "SHORT")
+    assert short["rejection_ok"] is True
 
 
-def test_run_once_uses_bingx_fallback_when_binance_history_is_stale(monkeypatch):
-    import run_once
-    now = pd.Timestamp.now(tz="UTC")
-    stale = [{"timestamp": int((now - pd.Timedelta(hours=10 + (30-i))).timestamp()*1000), "open": 100, "high": 101, "low": 99, "close": 100, "volume": 1000} for i in range(30)]
-    fresh = [{"timestamp": int((now - pd.Timedelta(hours=0.5 + (59-i))).timestamp()*1000), "open": 100, "high": 101, "low": 99, "close": 100, "volume": 1000} for i in range(60)]
-    monkeypatch.setattr(run_once, "fetch_binance_klines", lambda *a, **k: stale)
-    monkeypatch.setattr(run_once, "fetch_bingx_klines", lambda *a, **k: fresh)
-    bars, source = run_once._fetch_analysis_bars("XMR-USDT", "XMRUSDT", "binance")
-    assert source == "bingx_fallback"
-    assert len(bars) == 60
-
-
-def test_rebase_uses_last_valid_same_color_level_not_stale_zone_boundary():
-    import run_once
+def test_score_directional_quality_dimensions():
+    from event_engine import signals as sig
     signal = {
-        "type": "LONG", "entry": 100.0, "sl": 99.0, "tp1": 101.0, "tp2": 102.0,
-        "risk_pct": 1.0, "atr": 1.0,
-        "zone": {"btm": 99.5, "top": 100.5},
-        "levels": {
-            "blue": [
-                {"level_id": "B1", "color": "BLUE", "kind": "CLUSTER", "source": "cluster", "price": 98.0, "lower": 97.5, "upper": 98.5, "status": "ACTIVE"},
-                {"level_id": "B2", "color": "BLUE", "kind": "CLUSTER", "source": "cluster", "price": 99.25, "lower": 99.0, "upper": 99.5, "status": "ACTIVE"},
-            ],
-            "red": [{"level_id": "R1", "color": "RED", "kind": "RESISTANCE", "source": "pine_sr", "price": 105.0, "lower": 104.5, "upper": 105.5, "status": "ACTIVE"}],
+        "type": "SHORT",
+        "zone": {"age_bars": 5},
+        "confirmation": {
+            "zone_touch": True,
+            "volume_ratio": 1.5,
+            "range_atr": 1.2,
+            "candle_body_atr": 0.9,
+            "rejection_ok": True,
+            "rejection_score": 85.0,
+            "htf_regime": "SHORT",
         },
     }
-    out = run_once._rebase_protection_after_fill(signal, 100.0)
-    assert out["protection_level"]["level_id"] == "B2"
-    assert out["sl"] < 99.0
+    assert sig.score_zone_signal(signal) >= 75
 
 
-
-
-def test_post_fill_rebase_uses_signal_level_snapshot_from_latest_scan(monkeypatch):
-    import run_once
-    signal = {
-        "type": "LONG",
-        "entry": 12.203,
-        "sl": 12.05743849,
-        "tp1": 12.31217113,
-        "tp2": 12.42134226,
-        "risk_pct": 1.19,
-        "atr": 0.05,
-        "zone": {"kind": "PIVOT_LOW+DEMAND", "level_id": "D5", "btm": 12.073, "top": 12.1108577},
-        "levels": {
-            "blue": [{
-                "level_id": "D5", "color": "BLUE", "kind": "CLUSTER", "source": "cluster",
-                "price": 12.091928847632, "lower": 12.073, "upper": 12.110857695264,
-                "status": "ACTIVE", "member_kinds": ["PIVOT_LOW", "DEMAND"], "strength": 3,
-            }],
-            "red": [{
-                "level_id": "R1", "color": "RED", "kind": "CLUSTER", "source": "cluster",
-                "price": 12.462, "lower": 12.462, "upper": 12.462,
-                "status": "ACTIVE", "member_kinds": ["PIVOT_HIGH"], "strength": 1,
-            }],
-        },
-        "target": {"obstacle_price": 12.462},
-    }
-    out = run_once._rebase_protection_after_fill(signal, 12.164)
-    assert out["protection_level"]["level_id"] == "D5"
-    assert out["sl"] < 12.164
-    assert out["tp1"] > 12.164
-    assert out["tp2"] > out["tp1"]
-
-
-def test_level_snapshot_is_exposed_for_non_signal_scan():
-    import pandas as pd
-    from event_engine import signals
-    rows = []
-    base = 100.0
-    for i in range(180):
-        wave = 2.0 * ((i % 20) - 10) / 10.0
-        close = base + wave
-        rows.append({
-            "timestamp": pd.Timestamp("2026-01-01", tz="UTC") + pd.Timedelta(hours=i),
-            "open": close - 0.1,
-            "high": close + 0.8,
-            "low": close - 0.8,
-            "close": close,
-            "volume": 1000.0 + i,
-        })
-    df, _, _, _ = signals.generate_zone_signals(pd.DataFrame(rows), symbol="TEST-USDT", mode="historical")
-    snapshot = df.attrs.get("level_snapshot")
-    assert isinstance(snapshot, dict)
-    assert "blue" in snapshot and "red" in snapshot
-    assert "cluster_tolerance" in snapshot
-
-
-def test_protective_includes_entry_overlapping_level_but_opposing_levels_remain_strict():
-    from event_engine.levels import select_opposing_levels, select_protective_level
-    blue = [
-        {"level_id": "B_OVERLAP", "status": "ACTIVE", "lower": 99.0, "upper": 101.0, "price": 100.0},
-        {"level_id": "B_BELOW", "status": "ACTIVE", "lower": 96.0, "upper": 98.0, "price": 97.0},
-    ]
-    red = [
-        {"level_id": "R_OVERLAP", "status": "ACTIVE", "lower": 99.0, "upper": 101.0, "price": 100.0},
-        {"level_id": "R_ABOVE", "status": "ACTIVE", "lower": 102.0, "upper": 104.0, "price": 103.0},
-    ]
-    assert select_protective_level("LONG", 100.0, blue, red)["level_id"] == "B_OVERLAP"
-    assert select_protective_level("SHORT", 100.0, blue, red)["level_id"] == "R_OVERLAP"
-    assert select_opposing_levels("LONG", 100.0, blue, red, limit=2)[0]["level_id"] == "R_ABOVE"
-    assert select_opposing_levels("SHORT", 100.0, blue, red, limit=2)[0]["level_id"] == "B_BELOW"
-
-
-def test_human_level_logging_never_emits_nan_and_exposes_trade_map(caplog):
-    import run_once as ro
-
-    entry_level = {"level_id": "LVL_BLUE1", "kind": "CLUSTER", "member_kinds": ["SUPPORT"], "lower": 78680.0, "upper": 78680.0, "strength": 2, "age_bars": 10}
-    result = {
-        "current_price": 78952.01,
-        "latest_closed_idx": 119,
-        "levels": {
-            "blue": [
-                {"level_id": "LVL_BLUE1", "kind": "CLUSTER", "member_kinds": ["SUPPORT", "PIVOT_LOW"], "lower": 78680.0, "upper": 78680.0, "strength": 2, "age_bars": 10},
-                {"level_id": "LVL_BLUE2", "kind": "CLUSTER", "member_kinds": ["DEMAND", "PIVOT_LOW"], "lower": 77620.01, "upper": 77699.55, "strength": 3, "age_bars": 10},
-            ],
-            "red": [
-                {"level_id": "LVL_RED1", "kind": "CLUSTER", "member_kinds": ["RESISTANCE", "PIVOT_HIGH"], "lower": 79485.0, "upper": 79485.0, "strength": 3, "age_bars": 21},
-            ],
-            "invalid": [],
-            "high_level": {"price": 82300.0},
-            "low_level": {"price": 76264.0},
-            "active_zones": {
-                "demand": [{"btm": 77620.01, "top": 77699.55, "start": 109}],
-                "supply": [{"btm": 80487.825, "top": 80559.99, "start": 71}, {"btm": 80400.0, "top": float("nan"), "start": 70}],
-            },
-        },
-        "signals": [{
-            "type": "LONG",
-            "sl": 78500.0,
-            "tp1": 79400.0,
-            "tp2": 80000.0,
-            "risk_pct": 0.57,
-            "tp2_rr": 1.4,
-            "entry_level": entry_level,
-            "protection_level": entry_level,
-            "target": {"target_levels": [{"level_id": "LVL_RED1", "kind": "CLUSTER", "member_kinds": ["RESISTANCE"], "lower": 79485.0, "upper": 79485.0, "strength": 3, "age_bars": 21}]},
-        }],
-    }
-    caplog.set_level("INFO", logger="zone_engine")
-    ro._log_human_level_map("BTC-USDT", result)
-    text = "\n".join(record.getMessage() for record in caplog.records)
-    assert "[ZONES] BTC-USDT | 🔵 DEMAND #1 | 77,620.01" in text
-    assert "[ZONES] BTC-USDT | 🔴 SUPPLY #1 | 80,559.99" in text
-    assert "[ZONES] BTC-USDT | 🔴 SUPPLY #2 |" not in text
-    assert "NEAREST_BLUE_BELOW" in text and "78680" in text
-    assert "[ZONES] BTC-USDT | 🔵 SUPPORT+PIVOT_LOW #1 | 78,680" in text
-    assert "[ZONES] BTC-USDT | 🔴 RESISTANCE+PIVOT_HIGH #1 | 79,485" in text
-    assert "[ZONES] BTC-USDT | 🔴 HIGH LEVEL | 82300" in text
-    assert "[ZONES] BTC-USDT | 🔵 LOW LEVEL | 76264" in text
-    assert "NEAREST_RED_ABOVE" in text and "79485" in text
-    assert "PINE_HIGH=82300" in text and "PINE_LOW=76264" in text
-    assert "INVALID_ZONE" not in text
-    assert "[TRADE_MAP] BTC-USDT | #1 | DIRECTION=LONG" in text
-    assert "[TRADE_MAP] BTC-USDT | #1 | PROTECTION" in text
-    assert "nan" not in text.lower()
-
-
-def test_human_zone_logging_emits_each_zone_with_single_price(caplog):
-    from run_once import _log_human_level_map
-    result = {
-        "current_price": 100.0,
-        "levels": {
-            "blue": [], "red": [], "invalid": [],
-            "active_zones": {
-                "demand": [
-                    {"btm": 95.0, "top": 96.0, "start": 9},
-                    {"btm": 90.25, "top": 91.0, "start": 8},
-                ],
-                "supply": [
-                    {"btm": 104.5, "top": 105.0, "start": 7},
-                    {"btm": 108.125, "top": 109.0, "start": 6},
-                ],
-            },
-            "high_level": {}, "low_level": {},
-        },
-        "signals": [],
-    }
-    caplog.set_level("INFO", logger="zone_engine")
-    _log_human_level_map("TEST-USDT", result)
-    text = "\n".join(r.message for r in caplog.records)
-    assert "[ZONES] TEST-USDT | 🔵 DEMAND #1 | 95" in text
-    assert "[ZONES] TEST-USDT | 🔵 DEMAND #2 | 90.25" in text
-    assert "[ZONES] TEST-USDT | 🔴 SUPPLY #1 | 105" in text
-    assert "[ZONES] TEST-USDT | 🔴 SUPPLY #2 | 109" in text
-    assert "–" not in text
-    assert "age=" not in text
-
-
-
-def test_coin_log_separators_are_emitted_in_scan_order(monkeypatch, caplog):
-    import run_once as ro
-
-    # Verify the exact visual separator strings used by the scan loop.
-    caplog.set_level("INFO", logger="zone_engine")
-    ro.log.info("[COIN_START] BTC-USDT | ==============================")
-    ro.log.info("[ZONES] BTC-USDT | 🔵 DEMAND #1 | 77,620.01")
-    ro.log.info("[COIN_END] BTC-USDT | ================================")
-    ro.log.info("[COIN_START] ETH-USDT | ==============================")
-    ro.log.info("[ZONES] ETH-USDT | 🔵 DEMAND #1 | 2,431.61")
-    ro.log.info("[COIN_END] ETH-USDT | ================================")
-    text = "\n".join(r.getMessage() for r in caplog.records)
-    assert text.index("[COIN_START] BTC-USDT") < text.index("[COIN_END] BTC-USDT")
-    assert text.index("[COIN_END] BTC-USDT") < text.index("[COIN_START] ETH-USDT")
-
-
-def test_latest_trigger_check_distinguishes_supply_from_red_resistance(caplog):
-    from run_once import _log_latest_trigger_check
-    caplog.set_level("INFO", logger="zone_engine")
-    ts = pd.date_range("2026-09-09 09:00", periods=2, freq="h", tz="UTC")
+def test_htf_regime_does_not_use_current_developing_bucket():
+    from event_engine import signals as sig
+    ts = pd.date_range("2026-01-01", periods=240, freq="h", tz="UTC")
+    close = np.linspace(100.0, 150.0, len(ts))
     df = pd.DataFrame({
         "timestamp": ts,
-        "open": [78900.0, 79500.0],
-        "high": [79000.0, 79620.0],
-        "low": [78800.0, 78800.0],
-        "close": [78950.0, 78900.0],
-        "volume": [1000.0, 1200.0],
+        "open": close,
+        "high": close + 0.5,
+        "low": close - 0.5,
+        "close": close,
+        "volume": 1000.0,
     })
-    demand = [{"btm": 77620.01, "top": 77703.65}]
-    supply = [{"btm": 80487.82, "top": 80559.99}]
-    levels = {
-        "red": [{"price": 79485.0, "lower": 79485.0, "upper": 79485.0, "kind": "RESISTANCE", "member_kinds": ["RESISTANCE"], "color": "RED"}],
-        "blue": [],
-    }
-    signal = {
-        "idx": 1, "type": "SHORT", "zone_id": "R1",
-    }
-    levels["red"][0]["level_id"] = "R1"
-    _log_latest_trigger_check("BTC-USDT", df, demand, supply, levels, [signal])
-    text = "\n".join(r.message for r in caplog.records)
-    assert "🔴 RESISTANCE" in text
-    assert "candle_touch=YES" in text
-    assert "ENTRY_TRIGGER=YES" in text
-    assert "diagnostic only" not in text
+    out = sig._attach_htf_regime(df)
+    assert "htf_regime" in out.columns
+    assert set(out["htf_regime"].dropna().unique()).issubset({"LONG", "SHORT", "NEUTRAL"})
 
 
-def test_zone_strength_tiers(monkeypatch):
-    import run_once
-    assert run_once._zone_strength_tier({"zone": {"kind": "DEMAND"}}) == ("STRONG", run_once.STRONG_ZONE_MARGIN_USDT)
-    assert run_once._zone_strength_tier({"zone": {"kind": "SUPPORT"}}) == ("MEDIUM", run_once.MEDIUM_ZONE_MARGIN_USDT)
-    assert run_once._zone_strength_tier({"zone": {"kind": "PIVOT_LOW"}}) == ("WEAK", run_once.WEAK_ZONE_MARGIN_USDT)
-
-
-def test_zone_strength_default_margins_are_1_050_025():
-    import run_once
-    assert run_once.STRONG_ZONE_MARGIN_USDT == 1.0
-    assert run_once.MEDIUM_ZONE_MARGIN_USDT == 0.5
-    assert run_once.WEAK_ZONE_MARGIN_USDT == 0.25
-    assert run_once.MAX_POSITION_MARGIN_USDT == 2.5
-
-
-def test_open_market_respects_position_margin_cap(monkeypatch):
-    from event_engine import bingx
-    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)
-    monkeypatch.setattr(bingx, "get_contract", lambda symbol: {
-        "symbol": symbol, "quantityPrecision": 4, "tradeMinQuantity": 0.001,
-        "multiplier": 1, "maxLeverage": 10,
-    })
-    monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
-    monkeypatch.setattr(bingx, "_current_close_price", lambda symbol: 100.0)
-    monkeypatch.setattr(bingx, "_set_leverage", lambda bx_symbol, leverage, direction="LONG": True)
-    monkeypatch.setattr(bingx, "get_position_directional", lambda symbol, direction: {
-        "status": "found", "positionAmt": 0.16, "avgPrice": 100.0,
-    })
-    out = bingx.open_market("TEST-USDT", "LONG", 100.0, "EVT_CAP", margin_usdt=1.0, max_position_margin_usdt=2.5)
-    assert out["status"] == "skipped_position_margin_cap"
-    assert out["existing_margin_usdt"] == 1.6
-    assert out["remaining_margin_usdt"] == pytest.approx(0.9)
-
-
-def test_open_market_allows_same_direction_add_within_cap(monkeypatch):
-    from event_engine import bingx
-    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)
-    monkeypatch.setattr(bingx, "get_contract", lambda symbol: {
-        "symbol": symbol, "quantityPrecision": 3, "tradeMinQuantity": 0.001,
-        "multiplier": 1, "maxLeverage": 10,
-    })
-    monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
-    monkeypatch.setattr(bingx, "_current_close_price", lambda symbol: 100.0)
-    monkeypatch.setattr(bingx, "get_position_directional", lambda symbol, direction: {
-        "status": "found", "positionAmt": 0.10, "avgPrice": 100.0,
-    })
-    captured = {}
-    class Resp:
-        def get(self, key, default=None):
-            return {"code": 0, "data": {"order": {"orderId": "1", "clientOrderId": "CID"}}}.get(key, default)
-    def fake_request(method, path, params, **kwargs):
-        captured.update(params); return {"code": 0, "data": {"order": {"orderId": "1", "clientOrderId": "CID"}}}
-    monkeypatch.setattr(bingx, "_request", fake_request)
-    out = bingx.open_market("TEST-USDT", "LONG", 100.0, "EVT_ADD", margin_usdt=1.0, max_position_margin_usdt=2.5)
-    assert out["status"] == "opened"
-    assert out["qty"] == 0.1
-    assert out["configured_margin_usdt"] == 1.0
-    assert captured["quantity"] == "0.100"
-
-
-def test_structural_level_tier_is_based_on_semantics_not_score():
-    from event_engine.signals import _level_tier
-    assert _level_tier({"member_kinds": ["SUPPORT", "PIVOT_LOW"]}) == "MEDIUM"
-    assert _level_tier({"member_kinds": ["DEMAND", "SUPPORT"]}) == "STRONG"
-    assert _level_tier({"member_kinds": ["PIVOT_LOW"]}) == "WEAK"
-    assert _level_tier({"member_kinds": ["LOW_LEVEL"]}) == "WEAK"
-
-
-def test_fresh_level_touch_is_one_signal_while_inside():
-    from event_engine.signals import _fresh_level_touch
-    level = {"lower": 99.0, "upper": 100.0}
-    assert _fresh_level_touch("LONG", 101.0, 98.5, 101.5, 99.5, level) is True
-    assert _fresh_level_touch("LONG", 99.5, 98.5, 101.5, 99.5, level) is False
-    assert _fresh_level_touch("LONG", 99.0, 98.5, 101.5, 99.5, level) is False
-
-
-def test_high_low_levels_are_first_class_structures():
-    from event_engine.levels import build_level_pool
-    pool = build_level_pool(
-        demand=[], supply=[], support_resistance=[], pivot_lows=[], pivot_highs=[],
-        high_levels=[{"price": 120.0}], low_levels=[{"price": 80.0}],
-        current_idx=100, reference_price=100.0, atr=10.0,
-    )
-    assert any("HIGH_LEVEL" in x.get("member_kinds", []) for x in pool["red"])
-    assert any("LOW_LEVEL" in x.get("member_kinds", []) for x in pool["blue"])
-
-
-def test_cluster_does_not_transitively_merge_far_levels():
-    from event_engine.levels import _cluster_levels, _base_level
-    levels = [
-        _base_level(color="BLUE", kind="SUPPORT", source="t", price=100.0, strength=1, anchor=1),
-        _base_level(color="BLUE", kind="PIVOT_LOW", source="t", price=100.9, strength=1, anchor=2),
-        _base_level(color="BLUE", kind="LOW_LEVEL", source="t", price=101.8, strength=1, anchor=3),
-    ]
-    clusters = _cluster_levels(levels, tolerance=1.0)
-    # Representative-price clustering prevents 100.0~100.9~101.8 from becoming
-    # one giant cluster solely because the middle point bridged the gap.
-    assert len(clusters) == 2
-
-
-def test_open_market_ambiguous_error_requires_position_delta(monkeypatch):
+def test_rollback_client_order_id_is_unique(monkeypatch):
     from event_engine import bingx
     monkeypatch.setattr(bingx, "to_bx_symbol", lambda s: s)
-    monkeypatch.setattr(bingx, "contract_exists", lambda s: True)
-    monkeypatch.setattr(bingx, "get_contract", lambda s: {"symbol": s, "quantityPrecision": 3, "tradeMinQuantity": 0.001, "multiplier": 1, "maxLeverage": 10})
-    monkeypatch.setattr(bingx, "_current_close_price", lambda s: 100.0)
-    monkeypatch.setattr(bingx, "_set_leverage", lambda *a, **k: True)
+    monkeypatch.setattr(bingx, "get_contract", lambda s: {"quantityPrecision": 3})
     monkeypatch.setattr(bingx, "position_side_param", lambda d: "BOTH")
-    monkeypatch.setattr(bingx, "get_position_directional", lambda *a, **k: {"status": "found", "positionAmt": 0.1, "avgPrice": 100.0})
-    monkeypatch.setattr(bingx, "_find_recent_order_by_client_id", lambda *a, **k: None)
-    monkeypatch.setattr(bingx, "_request", lambda *a, **k: {"code": -1, "msg": "Read timed out"})
-    out = bingx.open_market("TEST-USDT", "LONG", 100.0, "EVT_AMBIG", margin_usdt=1.0, max_position_margin_usdt=2.5)
-    assert out["status"] == "error"
-
-
-def test_execute_allows_same_direction_add(monkeypatch):
-    import run_once
-    signal = {
-        "event_id": "ZONE_ADD", "symbol": "TEST-USDT", "type": "LONG", "entry": 100.0,
-        "sl": 95.0, "tp1": 102.5, "tp2": 105.0, "risk_pct": 1.0, "score": 80,
-        "zone": {"kind": "SUPPORT", "level_id": "LVL_ADD", "member_kinds": ["SUPPORT"]},
-        "target": {"obstacle_price": 110.0},
-    }
-    monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
-    monkeypatch.setattr(run_once, "get_position_directional", lambda *a, **k: {"status": "found", "positionAmt": 0.5, "avgPrice": 100.0})
-    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: {"status": "opened", "qty": 0.75, "pre_position_qty": 0.5})
-    monkeypatch.setattr(run_once, "wait_for_position_fill_directional", lambda *a, **k: {"status": "found", "avgPrice": 100.0, "positionAmt": 0.75})
-    monkeypatch.setattr(run_once, "_rebase_protection_after_fill", lambda *a, **k: {
-        "sl": 99.0, "tp1": 100.5, "tp2": 101.0, "risk_abs": 1.0, "risk_pct": 1.0,
-        "tp1_rr": 0.5, "tp2_rr": 1.0, "target_source": "test", "obstacle_price": 110.0,
-        "target_levels": [], "protection_level": {"level_id": "LVL_ADD"},
-    })
-    monkeypatch.setattr(run_once, "ensure_directional_protection", lambda *a, **k: {"status": "PROTECTED", "tp_orders": [], "sl_result": {}, "effective_tp_levels": []})
-    registered = {}
-    monkeypatch.setattr(run_once, "get_active_trade_id", lambda *a, **k: "AGGREGATE")
-    monkeypatch.setattr(run_once, "register_active_trade", lambda *a, **k: registered.update(k))
-    result = run_once.execute_new_position(signal)
-    assert result["status"] == "opened_protected"
-    assert registered["event_id"] == "ZONE_ADD"
-    assert registered["entry_leg_qty"] == 0.25
-
-
-def test_register_active_trade_add_uses_weighted_average_price(tmp_path, monkeypatch):
-    from event_engine import tracker
-    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", tmp_path / "active_trades.json")
-    monkeypatch.setattr(tracker, "TRADES_PATH", tmp_path / "trades.jsonl")
-    monkeypatch.setattr(tracker, "ACTIONS_PATH", tmp_path / "actions.jsonl")
-    tracker.register_active_trade("E1", "BTC-USDT", "BTC", "LONG", 100.0, 1.0, [], {}, "ENTRY", entry_margin_usdt=1.0, entry_leg_qty=1.0)
-    tracker.register_active_trade("E2", "BTC-USDT", "BTC", "LONG", 110.0, 2.0, [], {}, "ADD", entry_margin_usdt=0.5, entry_leg_qty=1.0)
-    state = tracker._load_active_trades()
-    assert "BTC-USDT:LONG" in state
-    trade = state["BTC-USDT:LONG"]
-    assert trade["initial_qty"] == 2.0
-    assert abs(trade["actual_entry_price"] - 105.0) < 1e-12
-    assert len(trade["entry_legs"]) == 2
-
-
-def test_reconcile_recovers_exchange_only_position(monkeypatch, tmp_path):
-    import run_once
-    run_once.DATA = tmp_path
-    monkeypatch.setattr(run_once, "get_positions", lambda **k: [{"symbol": "BTC-USDT", "positionSide": "LONG", "positionAmt": "1", "avgPrice": "100"}])
-    monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
-    from event_engine import tracker
-    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", tmp_path / "active_trades.json")
-    monkeypatch.setattr(tracker, "TRADES_PATH", tmp_path / "trades.jsonl")
-    monkeypatch.setattr(tracker, "ACTIONS_PATH", tmp_path / "actions.jsonl")
-    monkeypatch.setattr(run_once, "ensure_directional_protection", lambda *a, **k: {"status": "PROTECTED", "tp_orders": [], "sl_result": {}})
-    monkeypatch.setattr(run_once, "update_active_trade_protection", lambda *a, **k: True)
-    run_once.reconcile_all_open_positions()
-    state = tracker._load_active_trades()
-    assert "BTC-USDT:LONG" in state
-    assert state["BTC-USDT:LONG"]["remaining_qty"] == 1.0
-    assert state["BTC-USDT:LONG"]["actual_entry_price"] == 100.0
-
-
-def test_tracker_requires_protection_cleanup_before_close_journal(monkeypatch, tmp_path):
-    from event_engine import tracker
-    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", tmp_path / "active_trades.json")
-    monkeypatch.setattr(tracker, "TRADES_PATH", tmp_path / "trades.jsonl")
-    monkeypatch.setattr(tracker, "ACTIONS_PATH", tmp_path / "actions.jsonl")
-    trade = {
-        "event_id": "EVT_CLEANUP_ORDER", "symbol": "AAA-USDT", "direction": "LONG", "name": "AAA",
-        "entry_price": 100.0, "actual_entry_price": 100.0, "initial_qty": 1.0, "remaining_qty": 1.0, "entry_ts": 0,
-        "closed": False, "tp_orders": [], "sl_order": {},
-        "hit_legs": [], "tp_filled_qty": {}, "realized_pnl_qty": 0.0, "realized_pnl_weighted_sum": 0.0,
-        "peak_pnl_pct": 0.0, "mae_pct": 0.0, "max_drawdown_pct": 0.0, "setup": {}, "planned_weighted_rr": 0.0,
-        "timeframe": "1h",
-    }
-    (tmp_path / "active_trades.json").write_text(json.dumps({"EVT_CLEANUP_ORDER": trade}), encoding="utf-8")
-    states = iter([{"status": "not_found"}])
-    monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: next(states, {"status": "not_found"}))
-    monkeypatch.setattr(tracker, "fetch_klines", lambda *a, **k: [])
-    monkeypatch.setattr(tracker, "get_all_orders", lambda *a, **k: [])
-    monkeypatch.setattr(tracker, "_get_exit_from_sl", lambda *a, **k: (None, None))
-    monkeypatch.setattr(tracker, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [{"orderId": "SL1", "clientOrderId": "EVT_SL"}], "tp_orders": [{"orderId": "TP1", "clientOrderId": "EVT_TP"}]})
-    monkeypatch.setattr(tracker, "cancel_order", lambda *a, **k: {"code": 1, "msg": "cannot cancel"})
-    monkeypatch.setattr(tracker, "send_tg", lambda *a, **k: True)
-    tracker.update_active_trades()
-    assert not (tmp_path / "trades.jsonl").exists() or "TRADE_CLOSE" not in (tmp_path / "trades.jsonl").read_text(encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(bingx, "_request", lambda method, path, params: calls.append(dict(params)) or {"code": 0})
+    bingx.close_position_market("AAA-USDT", "LONG", 1.0, trade_id="T")
+    bingx.close_position_market("AAA-USDT", "LONG", 1.0, trade_id="T")
+    ids = [c["clientOrderId"] for c in calls]
+    assert ids[0] != ids[1]
+    assert ids[0].startswith("EVT_") and "_RB_" in ids[0]
