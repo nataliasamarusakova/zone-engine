@@ -1026,6 +1026,114 @@ def test_sl_order_validation_is_one_sided_and_be_allows_entry():
     assert bingx._validate_sl_order_for_position({"type":"STOP_MARKET","stopPrice":"101","origQty":"1"}, "SHORT", 100.0)
     assert not bingx._validate_sl_order_for_position({"type":"STOP_MARKET","stopPrice":"99.8","origQty":"1"}, "SHORT", 100.0)
 
+
+
+
+def test_post_fill_execution_passes_structural_stop_to_protection(monkeypatch):
+    import run_once
+    signal = {
+        "event_id":"ZONE_STRUCTURAL_STOP", "symbol":"TEST-USDT", "type":"LONG",
+        "entry":100.0, "sl":99.0, "tp1":101.0, "tp2":102.0, "risk_pct":1.0, "score":80,
+        "atr":1.0, "zone":{"kind":"DEMAND","btm":98.0,"top":100.0},
+        "target":{"obstacle_price":104.0},
+    }
+    captured = {}
+    monkeypatch.setattr(run_once, "_validate_trade_geometry", lambda s: (True, "ok"))
+    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: {"status":"opened","symbol":"TEST-USDT"})
+    monkeypatch.setattr(run_once, "wait_for_position_fill_directional", lambda *a, **k: {"status":"found","avgPrice":100.0,"positionAmt":1.0})
+    monkeypatch.setattr(run_once, "_rebase_protection_after_fill", lambda s, avg: {
+        "sl":97.5,"tp1":101.0,"tp2":102.0,"risk_abs":2.5,"risk_pct":2.5,
+        "tp1_rr":0.4,"tp2_rr":0.8,"target_source":"test","obstacle_price":104.0,
+        "protection_level":{"level_id":"B1"}, "target_levels":[{"level_id":"R1"}],
+    })
+    monkeypatch.setattr(run_once, "ensure_directional_protection", lambda *a, **k: captured.update(k) or {"status":"PROTECTED","tp_orders":[],"sl_result":{},"effective_tp_levels":[]})
+    monkeypatch.setattr(run_once, "register_active_trade", lambda *a, **k: None)
+    monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {"status":"ok","sl_orders":[],"tp_orders":[]})
+    out=run_once.execute_new_position(signal)
+    assert out["status"] == "opened_protected"
+    assert captured["requested_sl_price"] == 97.5
+
+def test_crossed_tp_market_fallback_is_reduce_only_in_one_way(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda s: s)
+    monkeypatch.setattr(bingx, "get_contract", lambda s: {"quantityPrecision": 3, "pricePrecision": 2, "tradeMinQuantity": 0.001})
+    monkeypatch.setattr(bingx, "position_side_param", lambda d: "BOTH")
+    state = {"sl_orders": [], "tp_orders": []}
+    def protection(*a, **k):
+        return {"status":"ok","sl_orders":list(state["sl_orders"]),"tp_orders":list(state["tp_orders"])}
+    monkeypatch.setattr(bingx, "get_open_protection_directional", protection)
+    monkeypatch.setattr(bingx, "_current_close_price", lambda s: 101.0)
+    monkeypatch.setattr(bingx, "_verify_market_reduce_order", lambda *a, **k: {"status":"verified","executed_qty":0.5,"reduced_qty":0.5,"remaining_qty":0.5})
+    monkeypatch.setattr(bingx, "_verify_open_order", lambda *a, **k: {"status":"verified","order":{"orderId":"V","clientOrderId":k.get("client_order_id"),"type":k.get("order_kind"),"stopPrice":k.get("expected_price"),"origQty":k.get("expected_qty")}})
+    seen=[]
+    def req(method, path, params):
+        seen.append(dict(params))
+        order={"orderId":f"O{len(seen)}","clientOrderId":params["clientOrderId"],"type":params["type"],"stopPrice":params.get("stopPrice"),"origQty":params["quantity"]}
+        if params["type"] == "STOP_MARKET":
+            state["sl_orders"]=[order]
+        elif params["type"] == "TAKE_PROFIT_MARKET":
+            state["tp_orders"].append(order)
+        return {"code":0,"data":{"order":order}}
+    monkeypatch.setattr(bingx, "_request", req)
+    out=bingx.ensure_directional_protection("AAA-USDT","LONG",100.0,1.0,1.0,[{"leg":"tp1","pnl_pct":0.5,"close_fraction":0.5},{"leg":"tp2","pnl_pct":1.0,"close_fraction":0.5}],trade_id="T",requested_sl_price=98.0)
+    assert out["status"] in {"PROTECTED", "PROTECTION_FAILED"}
+    crossed=[x for x in seen if x["type"]=="MARKET"]
+    assert crossed and crossed[-1]["reduceOnly"]=="true"
+
+def test_protection_uses_structural_stop_price_on_entry_and_restart(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda s: s)
+    monkeypatch.setattr(bingx, "get_contract", lambda s: {"quantityPrecision": 3, "pricePrecision": 2, "tradeMinQuantity": 0.001})
+    monkeypatch.setattr(bingx, "position_side_param", lambda d: "BOTH")
+    state = {"sl_orders": [], "tp_orders": []}
+    def get_protection(*a, **k):
+        return {"status": "ok", "sl_orders": list(state["sl_orders"]), "tp_orders": list(state["tp_orders"])}
+    monkeypatch.setattr(bingx, "get_open_protection_directional", get_protection)
+    monkeypatch.setattr(bingx, "_verify_open_order", lambda *a, **k: {"status": "verified", "order": {"orderId": "SL1", "clientOrderId": k.get("client_order_id", ""), "stopPrice": k.get("expected_price", 0), "origQty": k.get("expected_qty", 0)}})
+    calls=[]
+    def req(method, path, params):
+        calls.append(params)
+        state["sl_orders"] = [{"orderId":"SL1","clientOrderId":params["clientOrderId"],"type":params["type"],"stopPrice":params["stopPrice"],"origQty":params["quantity"]}]
+        return {"code":0, "data":{"order":{"orderId":"SL1","clientOrderId":params["clientOrderId"]}}}
+    monkeypatch.setattr(bingx, "_request", req)
+    out=bingx.ensure_directional_protection("AAA-USDT","LONG",100.0,1.0,1.0,[],trade_id="T",requested_sl_price=96.5)
+    assert out["status"] == "PROTECTED"
+    assert abs(float(calls[-1]["stopPrice"]) - 96.5) < 1e-9
+    assert calls[-1]["reduceOnly"] == "true"
+
+
+def test_protection_adds_reduce_only_to_one_way_tp(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda s: s)
+    monkeypatch.setattr(bingx, "get_contract", lambda s: {"quantityPrecision": 3, "pricePrecision": 2, "tradeMinQuantity": 0.001})
+    monkeypatch.setattr(bingx, "position_side_param", lambda d: "BOTH")
+    state = {"sl_orders": [], "tp_orders": []}
+    def get_protection(*a, **k):
+        return {"status":"ok", "sl_orders": list(state["sl_orders"]), "tp_orders": list(state["tp_orders"])}
+    monkeypatch.setattr(bingx, "get_open_protection_directional", get_protection)
+    seen=[]
+    def req(method, path, params):
+        seen.append(dict(params))
+        order = {"orderId":f"O{len(seen)}","clientOrderId":params["clientOrderId"],"type":params["type"],"stopPrice":params.get("stopPrice"),"origQty":params["quantity"]}
+        if params["type"] == "STOP_MARKET":
+            state["sl_orders"] = [order]
+        else:
+            state["tp_orders"].append(order)
+        return {"code":0,"data":{"order":order}}
+    monkeypatch.setattr(bingx, "_request", req)
+    monkeypatch.setattr(bingx, "_verify_open_order", lambda *a, **k: {"status":"verified","order":{"orderId":"V","clientOrderId":k.get("client_order_id"),"stopPrice":k.get("expected_price"),"origQty":k.get("expected_qty")}})
+    monkeypatch.setattr(bingx, "_current_close_price", lambda s: 99.0)
+    out=bingx.ensure_directional_protection("AAA-USDT","LONG",100.0,1.0,1.0,[{"leg":"tp1","pnl_pct":1.0,"close_fraction":1.0}],trade_id="T",requested_sl_price=98.5)
+    assert out["status"] == "PROTECTED"
+    assert any(x["type"]=="STOP_MARKET" and x.get("reduceOnly")=="true" for x in seen)
+    assert any(x["type"]=="TAKE_PROFIT_MARKET" and x.get("reduceOnly")=="true" for x in seen)
+
+
+def test_analytics_line_contains_all_structural_levels():
+    from event_engine.analytics import _line
+    line=_line({"symbol":"BTC-USDT","current_price":100.0,"price_position":"OUT","fresh_signal":"—","active_demand":1,"active_supply":1,"market_source":"binance_spot","levels":{"blue":[{"level_id":"B123456789","kind":"SUPPORT","lower":98,"upper":99,"strength":3,"age_bars":4}],"red":[{"level_id":"R123456789","kind":"RESISTANCE","lower":102,"upper":103,"strength":2,"age_bars":6}]}})
+    assert "BLUE=" in line and "SUPPORT" in line and "RED=" in line and "RESISTANCE" in line
+
 def test_workflow_risk_cap_is_not_accidentally_25_percent():
     from pathlib import Path
     workflow = Path('.github/workflows/event-engine.yml').read_text(encoding='utf-8')

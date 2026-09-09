@@ -420,7 +420,12 @@ def reconcile_all_open_positions() -> None:
             tp_levels = []
 
         try:
-            result = ensure_directional_protection(symbol, side, avg, qty, stop_loss_pct, tp_levels, trade_id=(trade or {}).get("event_id") or key)
+            stored_sl = (setup.get("invalidation_price") if isinstance(setup, dict) else None)
+            result = ensure_directional_protection(
+                symbol, side, avg, qty, stop_loss_pct, tp_levels,
+                trade_id=(trade or {}).get("event_id") or key,
+                requested_sl_price=stored_sl,
+            )
             if result.get("status") in {"PROTECTED", "SL_ONLY"}:
                 if trade:
                     update_active_trade_protection(symbol, side, result.get("tp_orders", []), result.get("sl_result", {}), result.get("effective_tp_levels", []), result.get("tp_mode"), result.get("effective_weighted_rr"))
@@ -557,7 +562,7 @@ def _cleanup_engine_protection(symbol: str, direction: str) -> dict[str, Any]:
     return result
 
 def _rebase_protection_after_fill(signal: dict[str, Any], avg_price: float) -> dict[str, Any]:
-    """Recalculate zone-based SL/TP from the *actual* market fill.
+    """Recalculate structural SL/TP from the *actual* market fill.
 
     A market order can fill materially away from the signal/reference candle close.
     Never submit stale absolute targets derived from the pre-fill reference price.
@@ -884,14 +889,19 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     setup["target_price"] = tp2_price
 
     log.info(
-        "[EXEC_POST_FILL_REBASED] %s %s | fill=%s sl=%s tp1=%s tp2=%s tp1_rr=%.3f tp2_rr=%.3f target_source=%s",
+        "[EXEC_POST_FILL_REBASED] %s %s | fill=%s sl=%s tp1=%s tp2=%s tp1_rr=%.3f tp2_rr=%.3f target_source=%s "
+        "protective_level=%s entry_level=%s target_levels=%s",
         symbol, direction, avg_price, sl_price, tp1_price, tp2_price,
         actual_signal["tp1_rr"], actual_signal["tp2_rr"], rebased["target_source"],
+        (rebased.get("protection_level") or {}).get("level_id"),
+        (actual_signal.get("entry_level") or {}).get("level_id"),
+        [x.get("level_id") for x in rebased.get("target_levels", [])],
     )
 
     protection = ensure_directional_protection(
         symbol, direction, avg_price, qty,
         actual_risk_pct, setup["tp_levels"], trade_id=event_id,
+        requested_sl_price=sl_price,
     )
     if protection.get("status") != "PROTECTED":
         log.critical("[SAFETY_CLOSE] %s %s | mandatory protection incomplete | %s", symbol, direction, protection)
@@ -1204,8 +1214,8 @@ def main() -> None:
                 except Exception as exc:  # defensive: scan_one already catches errors
                     result = {
                         "symbol": symbol, "current_price": None, "binance_price": None, "bingx_price": None, "market_spread_pct": None,
-                "market_source": source_name, "binance_symbol": analysis_meta.get(symbol, {}).get("binance_symbol"),
-                "asset_class": analysis_meta.get(symbol, {}).get("asset_class", "UNKNOWN"), "price_position": "ERROR",
+                        "market_source": "unknown", "binance_symbol": analysis_meta.get(symbol, {}).get("binance_symbol"),
+                        "asset_class": analysis_meta.get(symbol, {}).get("asset_class", "UNKNOWN"), "price_position": "ERROR",
                         "fresh_signal": "—", "active_demand": 0, "active_supply": 0,
                         "zones": {"demand": [], "supply": []}, "last_signal_count": 0,
                         "error": f"{type(exc).__name__}: {exc}", "signals": [], "exception": exc,
@@ -1225,9 +1235,6 @@ def main() -> None:
             elif result.get("price_position") == "CONTRACT_NOT_FOUND":
                 log.warning("[COIN_SKIP] %s | contract not found in BingX cache", symbol)
             else:
-                # Log only active symbols: a current Pine signal or a price inside
-                # an active Demand/Supply zone. Inactive "outside zones" symbols
-                # are intentionally omitted from runtime logs.
                 is_active = (
                     result.get("fresh_signal") not in {None, "—"}
                     or result.get("price_position") in {"🟢 В зоне DEMAND", "🔴 В зоне SUPPLY"}
@@ -1238,16 +1245,28 @@ def main() -> None:
                         symbol, result["current_price"], result["price_position"], result["fresh_signal"],
                         result["active_demand"], result["active_supply"],
                     )
-                    levels = result.get("levels") or {}
-                    blue = levels.get("blue") or []
-                    red = levels.get("red") or []
-                    if blue or red:
-                        log.info(
-                            "[LEVELS] %s | BLUE=%s | RED=%s",
-                            symbol,
-                            ",".join(f'{x.get("kind")}:{float(x.get("price", 0)):.12g}' for x in blue[:8]),
-                            ",".join(f'{x.get("kind")}:{float(x.get("price", 0)):.12g}' for x in red[:8]),
-                        )
+                levels = result.get("levels") or {}
+                blue = levels.get("blue") or []
+                red = levels.get("red") or []
+                invalid = levels.get("invalid") or []
+                def _fmt_level(x: dict[str, Any]) -> str:
+                    lid = str(x.get("level_id", "?"))[-8:]
+                    kind = str(x.get("kind", "?"))
+                    lo = float(x.get("lower", x.get("price", 0)) or 0)
+                    hi = float(x.get("upper", x.get("price", 0)) or 0)
+                    strength = int(x.get("strength", 1) or 1)
+                    age = x.get("age_bars")
+                    age_text = f"age={age}" if age is not None else "age=?"
+                    if abs(hi - lo) <= 1e-12:
+                        return f"{lid}:{kind}@{lo:.12g}(S{strength},{age_text})"
+                    return f"{lid}:{kind}[{lo:.12g}-{hi:.12g}](S{strength},{age_text})"
+                log.info(
+                    "[LEVELS] %s | price=%s | BLUE[%d]=%s | RED[%d]=%s | INVALID=%d tol=%s",
+                    symbol, result.get("current_price"), len(blue),
+                    ",".join(_fmt_level(x) for x in blue[:12]) or "—",
+                    len(red), ",".join(_fmt_level(x) for x in red[:12]) or "—",
+                    len(invalid), levels.get("cluster_tolerance"),
+                )
 
         scanned = min(batch_start + len(batch), total)
         log.info("[SCAN_PROGRESS] %d/%d symbols | batch=%d | workers=%d", scanned, total, len(batch), min(SCAN_WORKERS, len(batch)))
