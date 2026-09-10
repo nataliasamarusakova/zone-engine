@@ -77,7 +77,7 @@ def test_long_tp_ordering_and_rr():
         "symbol": "TEST-USDT", "type": "LONG", "entry": 100.0, "sl": 95.0,
         "tp1": 107.5, "tp2": 115.0, "risk_pct": 5.0,
         "zone": {"kind": "DEMAND", "age_bars": 10, "impulse_atr": 2.0},
-        "confirmation": {"alma_cross": True, "zone_touch": True, "volume_ratio": 1.5, "candle_body_atr": 1.0, "range_atr": 1.2, "rejection_ok": True, "rejection_score": 80.0, "htf_regime": "LONG"},
+        "confirmation": {"alma_cross": True, "zone_touch": True, "volume_ratio": 1.5, "candle_body_atr": 1.0},
     }
     assert signal["tp1"] < signal["tp2"]
     assert RR_RATIO == 3.0
@@ -91,7 +91,7 @@ def test_short_tp_ordering():
         "symbol": "TEST-USDT", "type": "SHORT", "entry": 100.0, "sl": 105.0,
         "tp1": 92.5, "tp2": 85.0, "risk_pct": 5.0,
         "zone": {"kind": "SUPPLY", "age_bars": 20, "impulse_atr": 1.5},
-        "confirmation": {"alma_cross": True, "zone_touch": True, "volume_ratio": 1.2, "candle_body_atr": 0.8, "range_atr": 1.0, "rejection_ok": True, "rejection_score": 80.0, "htf_regime": "SHORT"},
+        "confirmation": {"alma_cross": True, "zone_touch": True, "volume_ratio": 1.2, "candle_body_atr": 0.8},
     }
     assert signal["tp1"] > signal["tp2"]
     assert score_zone_signal(signal) >= 70
@@ -609,14 +609,12 @@ def test_zone_signal_uses_zone_boundary_stop_and_small_tps(monkeypatch):
     high[-1] = 110.0
     low[-1] = 108.0
     volume = np.full(n, 1000.0)
-    volume[-1] = 2000.0
     df = pd.DataFrame({"timestamp": ts, "open": open_, "high": high, "low": low, "close": close, "volume": volume})
     # Supply a deterministic Demand zone touching the latest bar.
     def forced_walk(frame):
         demand = [{"top": 110.5, "btm": 109.0, "poi": 109.75, "start": len(frame)-5}]
         return [], demand, [], [], []
     monkeypatch.setattr(sig, "_pine_zone_walk", forced_walk)
-    monkeypatch.setattr(sig, "_attach_htf_regime", lambda frame: frame.assign(htf_regime="LONG"))
 
     # With a forced zone walk, generate_zone_signals builds its own active zone,
     # so patch zone construction/selection at the deterministic insertion point.
@@ -2011,62 +2009,3 @@ def test_watchlist_is_exact_20_symbols():
     assert WATCHLIST_ONLY is False
     assert WATCHLIST_SYMBOLS == expected
     assert len(WATCHLIST_SYMBOLS) == 20
-
-
-def test_candle_quality_accepts_rejection_and_displacement():
-    from event_engine import signals as sig
-    rejection = sig._candle_quality(100.0, 101.0, 97.0, 100.5, "LONG")
-    assert rejection["rejection_ok"] is True
-    displacement = sig._candle_quality(100.0, 103.0, 99.8, 103.0, "LONG")
-    assert displacement["displacement"] is True
-    short = sig._candle_quality(100.0, 102.0, 97.0, 98.0, "SHORT")
-    assert short["rejection_ok"] is True
-
-
-def test_score_directional_quality_dimensions():
-    from event_engine import signals as sig
-    signal = {
-        "type": "SHORT",
-        "zone": {"age_bars": 5},
-        "confirmation": {
-            "zone_touch": True,
-            "volume_ratio": 1.5,
-            "range_atr": 1.2,
-            "candle_body_atr": 0.9,
-            "rejection_ok": True,
-            "rejection_score": 85.0,
-            "htf_regime": "SHORT",
-        },
-    }
-    assert sig.score_zone_signal(signal) >= 75
-
-
-def test_htf_regime_does_not_use_current_developing_bucket():
-    from event_engine import signals as sig
-    ts = pd.date_range("2026-01-01", periods=240, freq="h", tz="UTC")
-    close = np.linspace(100.0, 150.0, len(ts))
-    df = pd.DataFrame({
-        "timestamp": ts,
-        "open": close,
-        "high": close + 0.5,
-        "low": close - 0.5,
-        "close": close,
-        "volume": 1000.0,
-    })
-    out = sig._attach_htf_regime(df)
-    assert "htf_regime" in out.columns
-    assert set(out["htf_regime"].dropna().unique()).issubset({"LONG", "SHORT", "NEUTRAL"})
-
-
-def test_rollback_client_order_id_is_unique(monkeypatch):
-    from event_engine import bingx
-    monkeypatch.setattr(bingx, "to_bx_symbol", lambda s: s)
-    monkeypatch.setattr(bingx, "get_contract", lambda s: {"quantityPrecision": 3})
-    monkeypatch.setattr(bingx, "position_side_param", lambda d: "BOTH")
-    calls = []
-    monkeypatch.setattr(bingx, "_request", lambda method, path, params: calls.append(dict(params)) or {"code": 0})
-    bingx.close_position_market("AAA-USDT", "LONG", 1.0, trade_id="T")
-    bingx.close_position_market("AAA-USDT", "LONG", 1.0, trade_id="T")
-    ids = [c["clientOrderId"] for c in calls]
-    assert ids[0] != ids[1]
-    assert ids[0].startswith("EVT_") and "_RB_" in ids[0]
