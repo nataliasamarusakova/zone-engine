@@ -643,11 +643,7 @@ def close_position_market(symbol: str, direction: str, qty: float, *, reduce_onl
     if position_side == "BOTH" and reduce_only:
         params["reduceOnly"] = "true"
     if trade_id:
-        # Every MARKET rollback attempt gets a fresh clientOrderId. Reusing the
-        # same rollback id after a partial/ambiguous exchange response can be
-        # rejected by BingX as a duplicate id even though the position is still open.
-        nonce = uuid.uuid4().hex.upper()[:10]
-        params["clientOrderId"] = f"EVT_{_trade_digest(trade_id)}_RB_{nonce}"
+        params["clientOrderId"] = f"EVT_{_trade_digest(trade_id)}_ROLLBACK"
     resp = _request("POST", ORDER_PATH, params)
     if not isinstance(resp, dict) or resp.get("code") != 0:
         return {"status": "error", "error": f"close failed: code={resp.get('code') if isinstance(resp, dict) else None} msg={resp.get('msg') if isinstance(resp, dict) else resp}", "response": resp}

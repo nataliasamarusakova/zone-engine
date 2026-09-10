@@ -47,20 +47,6 @@ MIN_STRUCTURE_ROOM_R = float(os.environ.get("MIN_STRUCTURE_ROOM_R", "1.20"))
 REQUIRE_DIRECTIONAL_CANDLE = os.environ.get("REQUIRE_DIRECTIONAL_CANDLE", "true").lower() == "true"
 REQUIRE_STRUCTURE_OBSTACLE = os.environ.get("REQUIRE_STRUCTURE_OBSTACLE", "true").lower() == "true"
 
-# Production quality gates. These are intentionally explicit and configurable:
-# the audit showed that volume/range quality and directional asymmetry contain
-# more signal than candle body size or zone age alone.
-REQUIRE_REJECTION_CONFIRMATION = os.environ.get("REQUIRE_REJECTION_CONFIRMATION", "true").lower() == "true"
-MIN_VOLUME_RATIO = max(0.0, float(os.environ.get("MIN_VOLUME_RATIO", "1.20")))
-MIN_RANGE_ATR = max(0.0, float(os.environ.get("MIN_RANGE_ATR", "1.00")))
-MIN_REJECTION_WICK_RATIO = max(0.0, min(float(os.environ.get("MIN_REJECTION_WICK_RATIO", "0.20")), 0.90))
-MIN_REJECTION_CLOSE_LOCATION = max(0.50, min(float(os.environ.get("MIN_REJECTION_CLOSE_LOCATION", "0.60")), 0.95))
-MIN_DISPLACEMENT_BODY_RANGE_RATIO = max(0.0, min(float(os.environ.get("MIN_DISPLACEMENT_BODY_RANGE_RATIO", "0.55")), 0.99))
-REQUIRE_HTF_REGIME = os.environ.get("REQUIRE_HTF_REGIME", "true").lower() == "true"
-HTF_EMA_LEN = max(2, int(os.environ.get("HTF_EMA_LEN", "10")))
-MIN_SETUP_SCORE_LONG = max(0.0, min(float(os.environ.get("MIN_SETUP_SCORE_LONG", "75")), 100.0))
-MIN_SETUP_SCORE_SHORT = max(0.0, min(float(os.environ.get("MIN_SETUP_SCORE_SHORT", "65")), 100.0))
-
 # When an Ajay ALMA signal has no directional Demand/Supply zone touching the
 # signal bar, production still needs a deterministic protective stop. This
 # fallback is deliberately expressed in ATR rather than inventing a zone.
@@ -465,100 +451,6 @@ def _pine_zone_walk(df: pd.DataFrame) -> tuple[list[dict[str, Any]], list[dict[s
     return supply, demand, supply_bos, demand_bos, snapshots
 
 
-def _candle_quality(open_price: float, high: float, low: float, close: float,
-                    direction: str) -> dict[str, float | bool]:
-    """Return rejection/displacement metrics for the trigger candle.
-
-    A plain bullish/bearish close is deliberately not enough: the candle must
-    show either wick rejection from the zone or genuine directional displacement.
-    """
-    candle_range = max(high - low, 0.0)
-    body = abs(close - open_price)
-    upper_wick = max(0.0, high - max(open_price, close))
-    lower_wick = max(0.0, min(open_price, close) - low)
-    close_location = ((close - low) / candle_range) if candle_range > 0 else 0.5
-    body_range_ratio = (body / candle_range) if candle_range > 0 else 0.0
-    upper_wick_ratio = (upper_wick / candle_range) if candle_range > 0 else 0.0
-    lower_wick_ratio = (lower_wick / candle_range) if candle_range > 0 else 0.0
-
-    if direction == "LONG":
-        wick_rejection = (
-            lower_wick_ratio >= MIN_REJECTION_WICK_RATIO
-            and close_location >= MIN_REJECTION_CLOSE_LOCATION
-        )
-        displacement = (
-            body_range_ratio >= MIN_DISPLACEMENT_BODY_RANGE_RATIO
-            and close_location >= max(0.70, MIN_REJECTION_CLOSE_LOCATION)
-            and close > open_price
-        )
-        rejection_score = min(100.0, 50.0 * close_location + 50.0 * max(lower_wick_ratio, body_range_ratio))
-    else:
-        wick_rejection = (
-            upper_wick_ratio >= MIN_REJECTION_WICK_RATIO
-            and close_location <= (1.0 - MIN_REJECTION_CLOSE_LOCATION)
-        )
-        displacement = (
-            body_range_ratio >= MIN_DISPLACEMENT_BODY_RANGE_RATIO
-            and close_location <= min(0.30, 1.0 - MIN_REJECTION_CLOSE_LOCATION)
-            and close < open_price
-        )
-        rejection_score = min(100.0, 50.0 * (1.0 - close_location) + 50.0 * max(upper_wick_ratio, body_range_ratio))
-
-    return {
-        "range": candle_range,
-        "body": body,
-        "upper_wick": upper_wick,
-        "lower_wick": lower_wick,
-        "close_location": close_location,
-        "body_range_ratio": body_range_ratio,
-        "upper_wick_ratio": upper_wick_ratio,
-        "lower_wick_ratio": lower_wick_ratio,
-        "wick_rejection": bool(wick_rejection),
-        "displacement": bool(displacement),
-        "rejection_ok": bool(wick_rejection or displacement),
-        "rejection_score": rejection_score,
-    }
-
-
-def _attach_htf_regime(df: pd.DataFrame) -> pd.DataFrame:
-    """Attach a leak-free direction from the last *completed* 8H candle.
-
-    The current 1H candle is never allowed to read the final close of its own
-    developing 8H bucket. For each 1H bar we map the previous completed 8H
-    close/EMA state instead.
-    """
-    out = _normalize_1h(df)
-    tf = _aggregate_8h(out)
-    tf["htf_ema"] = tf["close"].ewm(span=HTF_EMA_LEN, adjust=False, min_periods=HTF_EMA_LEN).mean()
-    tf["prev_close"] = tf["close"].shift(1)
-    tf["prev_ema"] = tf["htf_ema"].shift(1)
-    tf["prev_prev_ema"] = tf["htf_ema"].shift(2)
-    tf["prev_regime"] = "NEUTRAL"
-    long_mask = (
-        tf["prev_close"].notna()
-        & tf["prev_ema"].notna()
-        & tf["prev_prev_ema"].notna()
-        & (tf["prev_close"] >= tf["prev_ema"])
-        & (tf["prev_ema"] >= tf["prev_prev_ema"])
-    )
-    short_mask = (
-        tf["prev_close"].notna()
-        & tf["prev_ema"].notna()
-        & tf["prev_prev_ema"].notna()
-        & (tf["prev_close"] <= tf["prev_ema"])
-        & (tf["prev_ema"] <= tf["prev_prev_ema"])
-    )
-    tf.loc[long_mask, "prev_regime"] = "LONG"
-    tf.loc[short_mask, "prev_regime"] = "SHORT"
-    mapped = tf.set_index("bucket")[["prev_regime", "prev_close", "prev_ema"]]
-    out["_htf_bucket"] = out["timestamp"].dt.floor("8h")
-    out = out.join(mapped, on="_htf_bucket")
-    out.rename(columns={"prev_regime": "htf_regime", "prev_close": "htf_prev_close", "prev_ema": "htf_prev_ema"}, inplace=True)
-    out["htf_regime"] = out["htf_regime"].fillna("NEUTRAL")
-    out.drop(columns=["_htf_bucket"], inplace=True, errors="ignore")
-    return out
-
-
 def _zone_context(zone: dict[str, Any], current_idx: int, df: pd.DataFrame) -> dict[str, Any]:
     start = int(zone["start"])
     move_idx = min(start + 6, current_idx)
@@ -868,7 +760,6 @@ def generate_zone_signals(
     # Keep ALMA columns available for diagnostics/backward-compatible analytics,
     # but they are deliberately NOT an entry condition in this version.
     df = _attach_exact_alternate_series(df, mode=mode)
-    df = _attach_htf_regime(df)
     active_supply: list[dict[str, Any]] = []
     active_demand: list[dict[str, Any]] = []
     signals: list[dict[str, Any]] = []
@@ -923,19 +814,6 @@ def generate_zone_signals(
         # Audit-derived entry filters. These are applied only after a literal
         # fresh zone touch, never to ordinary in-zone observations.
         zone_age_bars = max(0, int(i - int(trade_zone.get("start", i))))
-        avg_vol = _safe_num(df.loc[i, "vol_sma20"], 0.0)
-        vol_ratio = (_safe_num(df.loc[i, "volume"]) / avg_vol) if avg_vol > 0 else None
-        candle_q = _candle_quality(cur_o, cur_h, cur_l, cur_c, direction)
-        htf_regime = str(df.loc[i, "htf_regime"] or "NEUTRAL").upper()
-        range_atr = _safe_num(df.loc[i, "range_atr"], 0.0)
-        if vol_ratio is None or vol_ratio < MIN_VOLUME_RATIO:
-            continue
-        if range_atr < MIN_RANGE_ATR:
-            continue
-        if REQUIRE_REJECTION_CONFIRMATION and not bool(candle_q["rejection_ok"]):
-            continue
-        if REQUIRE_HTF_REGIME and htf_regime != direction:
-            continue
         if zone_age_bars > MAX_ZONE_AGE_BARS:
             continue
         if REQUIRE_DIRECTIONAL_CANDLE:
@@ -979,6 +857,8 @@ def generate_zone_signals(
         tp2 = float(targets["tp2"])
         tp1_rr = float(targets["tp1_rr"])
         tp2_rr = float(targets["tp2_rr"])
+        avg_vol = _safe_num(df.loc[i, "vol_sma20"], 0.0)
+        vol_ratio = (_safe_num(df.loc[i, "volume"]) / avg_vol) if avg_vol > 0 else None
         event_ts = int(df.loc[i, "timestamp"].timestamp() * 1000)
         zone_start = int(trade_zone["start"])
         event_id = _make_event_id(symbol or "UNKNOWN", direction, event_ts, zone_start, cur_c)
@@ -987,24 +867,6 @@ def generate_zone_signals(
             **_zone_context(trade_zone, i, df),
             "kind": "DEMAND" if direction == "LONG" else "SUPPLY",
         }
-        # Calculate the enhanced score before accepting the signal. This makes
-        # the direction-specific threshold a real quality gate, not just telemetry.
-        score_preview = score_zone_signal({
-            "type": direction,
-            "zone": zone_ctx,
-            "confirmation": {
-                "zone_touch": True,
-                "volume_ratio": vol_ratio,
-                "candle_body_atr": _safe_num(df.loc[i, "body_atr"]),
-                "range_atr": range_atr,
-                "rejection_ok": bool(candle_q["rejection_ok"]),
-                "rejection_score": _safe_num(candle_q["rejection_score"]),
-                "htf_regime": htf_regime,
-            },
-        })
-        min_score = MIN_SETUP_SCORE_LONG if direction == "LONG" else MIN_SETUP_SCORE_SHORT
-        if score_preview < min_score:
-            continue
         signals.append(
             {
                 "event_id": event_id,
@@ -1046,19 +908,6 @@ def generate_zone_signals(
                     "zone_sl_buffer_atr": ZONE_SL_ATR_BUFFER,
                     "max_signal_risk_pct": MAX_SIGNAL_RISK_PCT,
                 },
-                "quality_model": {
-                    "min_volume_ratio": MIN_VOLUME_RATIO,
-                    "min_range_atr": MIN_RANGE_ATR,
-                    "rejection_required": REQUIRE_REJECTION_CONFIRMATION,
-                    "min_rejection_wick_ratio": MIN_REJECTION_WICK_RATIO,
-                    "min_rejection_close_location": MIN_REJECTION_CLOSE_LOCATION,
-                    "min_displacement_body_range_ratio": MIN_DISPLACEMENT_BODY_RANGE_RATIO,
-                    "htf_regime_required": REQUIRE_HTF_REGIME,
-                    "htf_ema_len": HTF_EMA_LEN,
-                    "min_setup_score_long": MIN_SETUP_SCORE_LONG,
-                    "min_setup_score_short": MIN_SETUP_SCORE_SHORT,
-                    "accepted_score": score_preview,
-                },
                 "confirmation": {
                     "alma_cross": False,
                     "directional_candle_required": REQUIRE_DIRECTIONAL_CANDLE,
@@ -1069,17 +918,7 @@ def generate_zone_signals(
                     "zone_touch": True,
                     "volume_ratio": round(vol_ratio, 3) if vol_ratio is not None else None,
                     "candle_body_atr": round(_safe_num(df.loc[i, "body_atr"]), 3),
-                    "range_atr": round(range_atr, 3),
-                    "close_location": round(float(candle_q["close_location"]), 3),
-                    "body_range_ratio": round(float(candle_q["body_range_ratio"]), 3),
-                    "upper_wick_ratio": round(float(candle_q["upper_wick_ratio"]), 3),
-                    "lower_wick_ratio": round(float(candle_q["lower_wick_ratio"]), 3),
-                    "wick_rejection": bool(candle_q["wick_rejection"]),
-                    "displacement": bool(candle_q["displacement"]),
-                    "rejection_ok": bool(candle_q["rejection_ok"]),
-                    "rejection_score": round(float(candle_q["rejection_score"]), 2),
-                    "htf_regime": htf_regime,
-                    "htf_regime_required": REQUIRE_HTF_REGIME,
+                    "range_atr": round(_safe_num(df.loc[i, "range_atr"]), 3),
                     "bullish_candle": cur_c >= cur_o,
                     "bearish_candle": cur_c <= cur_o,
                 },
@@ -1090,47 +929,20 @@ def generate_zone_signals(
     return df, active_supply, active_demand, signals
 
 def score_zone_signal(signal: dict[str, Any]) -> float:
-    """Score the complete zone setup using the audited quality dimensions."""
+    """Research-only setup score; never changes the zone entry trigger."""
     confirmation = signal.get("confirmation", {})
     zone = signal.get("zone", {})
-    direction = str(signal.get("type", "")).upper()
-    score = 40.0
-
+    score = 50.0
     if confirmation.get("zone_touch"):
         score += 10.0
-
     vol_ratio = _safe_num(confirmation.get("volume_ratio"), 0.0)
     if vol_ratio >= 2.0:
-        score += 15.0
-    elif vol_ratio >= MIN_VOLUME_RATIO:
         score += 10.0
-
-    range_atr = _safe_num(confirmation.get("range_atr"), 0.0)
-    if range_atr >= max(1.50, MIN_RANGE_ATR):
-        score += 10.0
-    elif range_atr >= MIN_RANGE_ATR:
-        score += 7.0
-
+    elif vol_ratio >= 1.2:
+        score += 5.0
     body = _safe_num(confirmation.get("candle_body_atr"), 0.0)
     if body >= 0.8:
-        score += 3.0
-
-    rejection_ok = bool(confirmation.get("rejection_ok", False))
-    if rejection_ok:
-        score += 10.0
-
-    htf_regime = str(confirmation.get("htf_regime", "NEUTRAL")).upper()
-    if htf_regime == direction and direction in {"LONG", "SHORT"}:
-        score += 12.0
-
-    rejection_score = _safe_num(confirmation.get("rejection_score"), 0.0)
-    if rejection_score >= 80.0:
         score += 5.0
-
-    age = int(zone.get("age_bars", 9999) or 9999)
-    if age <= min(MAX_ZONE_AGE_BARS, 12):
+    if int(zone.get("age_bars", 9999) or 9999) <= 36:
         score += 5.0
-    elif age <= MAX_ZONE_AGE_BARS:
-        score += 2.0
-
     return min(score, 100.0)
