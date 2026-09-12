@@ -49,7 +49,7 @@
     "peak_pnl_pct": 0.3786889527291703,
     "mae_pct": -0.2481065552363667,
     "max_drawdown_pct": -0.626795507965537,
-    "current_pnl_pct": -0.0914076782449734,
+    "current_pnl_pct": -0.052232958997125066,
     "score": 65.0,
     "event_type": "SUPPLY_ZONE_TOUCH",
     "timeframe": "1h",
@@ -206,10 +206,10 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1789199832749,
+    "last_observation_ts": 1789200179954,
     "last_exchange_avg_price": 0.07658,
     "current_position_qty": 130.56,
-    "protection_last_updated_ts": 1789199855481
+    "protection_last_updated_ts": 1789200196161
   },
   "ZONE_FD2EFE95ECCA0D902983D0BA": {
     "event_id": "ZONE_FD2EFE95ECCA0D902983D0BA",
@@ -261,7 +261,7 @@
     "peak_pnl_pct": 0.13491635186185186,
     "mae_pct": -0.6475984889368515,
     "max_drawdown_pct": -0.7825148407987033,
-    "current_pnl_pct": -0.18888289260658558,
+    "current_pnl_pct": -0.2158661629789466,
     "score": 65.0,
     "event_type": "SUPPLY_ZONE_TOUCH",
     "timeframe": "1h",
@@ -418,10 +418,10 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1789199832749,
+    "last_observation_ts": 1789200179954,
     "last_exchange_avg_price": 0.003706,
     "current_position_qty": 2696.8,
-    "protection_last_updated_ts": 1789199856363
+    "protection_last_updated_ts": 1789200196646
   },
   "ZONE_52E1340DE9AAE487A48F81DC": {
     "event_id": "ZONE_52E1340DE9AAE487A48F81DC",
@@ -630,9 +630,221 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1789199832749,
+    "last_observation_ts": 1789200179954,
     "last_exchange_avg_price": 0.2653,
     "current_position_qty": 37.0,
-    "protection_last_updated_ts": 1789199856838
+    "protection_last_updated_ts": 1789200197126
+  },
+  "ZONE_78663CDB559D3D46409423DC": {
+    "event_id": "ZONE_78663CDB559D3D46409423DC",
+    "symbol": "ALPINE-USDT",
+    "name": "ALPINE-USDT",
+    "direction": "SHORT",
+    "entry_price": 0.3353,
+    "actual_entry_price": 0.3353,
+    "requested_entry_price": 0.336,
+    "signal_reference_price": 0.336,
+    "pre_order_reference_price": 0.336,
+    "entry_slippage_pct": -0.20833333333334345,
+    "adverse_entry_slippage_pct": 0.20833333333334345,
+    "initial_qty": 29.824,
+    "remaining_qty": 29.824,
+    "entry_ts": 1789200179591,
+    "tp_orders": [
+      {
+        "leg": "tp1",
+        "status": "already_exists",
+        "order_id": "2098683774509867008",
+        "client_order_id": "evt_6b6eb842cb113162_tp1",
+        "price": 0.333,
+        "qty": 14.912,
+        "pnl_pct": 0.6743334327467916
+      },
+      {
+        "leg": "tp2",
+        "status": "already_exists",
+        "order_id": "2098683778913886208",
+        "client_order_id": "evt_6b6eb842cb113162_tp2",
+        "price": 0.3308,
+        "qty": 14.912,
+        "pnl_pct": 1.3486668654935996
+      }
+    ],
+    "sl_order": {
+      "status": "already_exists",
+      "order_id": "2098683769275375616",
+      "client_order_id": "evt_6b6eb842cb113162_sl",
+      "stop_price": 0.3383,
+      "qty": 29.824
+    },
+    "hit_legs": [],
+    "be_activated": false,
+    "be_activation_ts": null,
+    "be_required": false,
+    "be_last_error": null,
+    "peak_pnl_pct": 0.0,
+    "mae_pct": 0.0,
+    "max_drawdown_pct": 0.0,
+    "current_pnl_pct": 0.0,
+    "score": 65.0,
+    "event_type": "SUPPLY_ZONE_TOUCH",
+    "timeframe": "1h",
+    "research": {
+      "source": "BingX 1H demand_supply zone engine"
+    },
+    "setup": {
+      "strategy": "Demand/Supply Zone First",
+      "signal_price": 0.336,
+      "entry_reference": 0.3353,
+      "invalidation_price": 0.33831472,
+      "risk_pct": 0.8991112436623998,
+      "target_rr": 1.5,
+      "planned_weighted_rr": 1.1249999999999953,
+      "tp_levels": [
+        {
+          "leg": "tp1",
+          "pnl_pct": 0.6743334327467916,
+          "close_fraction": 0.5,
+          "price": 0.33303896
+        },
+        {
+          "leg": "tp2",
+          "pnl_pct": 1.3486668654935996,
+          "close_fraction": 0.5,
+          "price": 0.33077791999999995
+        }
+      ],
+      "target_price": 0.33077791999999995,
+      "zone": {
+        "top": 0.338,
+        "btm": 0.3371861259018901,
+        "poi": 0.33759306295094504,
+        "start": 982,
+        "start_idx": 982,
+        "age_bars": 16,
+        "impulse_atr": 0.607,
+        "kind": "SUPPLY"
+      },
+      "confirmation": {
+        "alma_cross": false,
+        "directional_candle_required": true,
+        "directional_candle_ok": true,
+        "zone_age_limit_bars": 30,
+        "zone_age_bars": 16,
+        "minimum_structure_room_r": 1.2,
+        "zone_touch": true,
+        "volume_ratio": 0.198,
+        "candle_body_atr": 0.318,
+        "range_atr": 0.635,
+        "bullish_candle": false,
+        "bearish_candle": true
+      },
+      "score": 65.0,
+      "event_time": "2026-09-12T07:00:00+00:00",
+      "protection_status": "PROTECTED",
+      "protection_result": {
+        "status": "PROTECTED",
+        "symbol": "ALPINE-USDT",
+        "bx_symbol": "ALPINE-USDT",
+        "direction": "SHORT",
+        "avg_price": 0.3353,
+        "qty": 29.824,
+        "tp_mode": "multi_tp",
+        "effective_tp_levels": [
+          {
+            "leg": "tp1",
+            "pnl_pct": 0.6743334327467916,
+            "close_fraction": 0.5,
+            "qty": 14.912
+          },
+          {
+            "leg": "tp2",
+            "pnl_pct": 1.3486668654935996,
+            "close_fraction": 0.5,
+            "qty": 14.912
+          }
+        ],
+        "effective_weighted_rr": 1.1249999999999953,
+        "tp_orders": [
+          {
+            "leg": "tp1",
+            "status": "created",
+            "order_id": "2098683774509867008",
+            "client_order_id": "evt_6b6eb842cb113162_tp1",
+            "price": 0.333,
+            "qty": 14.912,
+            "pnl_pct": 0.6743334327467916
+          },
+          {
+            "leg": "tp2",
+            "status": "created",
+            "order_id": "2098683778913886208",
+            "client_order_id": "evt_6b6eb842cb113162_tp2",
+            "price": 0.3308,
+            "qty": 14.912,
+            "pnl_pct": 1.3486668654935996
+          }
+        ],
+        "sl_result": {
+          "status": "created",
+          "order_id": "2098683769275375616",
+          "client_order_id": "EVT_6B6EB842CB113162_SL",
+          "stop_price": 0.33831472,
+          "qty": 29.824
+        }
+      }
+    },
+    "planned_risk_pct": 0.8991112436623998,
+    "planned_target_rr": 1.5,
+    "planned_weighted_rr": 1.1249999999999953,
+    "planned_entry_reference": 0.3353,
+    "planned_invalidation_price": 0.33831472,
+    "planned_target_price": 0.33077791999999995,
+    "tp_levels": [
+      {
+        "leg": "tp1",
+        "pnl_pct": 0.6743334327467916,
+        "close_fraction": 0.5,
+        "price": 0.33303896
+      },
+      {
+        "leg": "tp2",
+        "pnl_pct": 1.3486668654935996,
+        "close_fraction": 0.5,
+        "price": 0.33077791999999995
+      }
+    ],
+    "effective_tp_levels": [
+      {
+        "leg": "tp1",
+        "pnl_pct": 0.6743334327467916,
+        "close_fraction": 0.5,
+        "qty": 14.912
+      },
+      {
+        "leg": "tp2",
+        "pnl_pct": 1.3486668654935996,
+        "close_fraction": 0.5,
+        "qty": 14.912
+      }
+    ],
+    "tp_mode": "multi_tp",
+    "effective_weighted_rr": 1.1249999999999953,
+    "tp_filled_qty": {},
+    "realized_pnl_qty": 0.0,
+    "realized_pnl_weighted_sum": 0.0,
+    "last_tp_exec_price": null,
+    "last_close_exec_price": null,
+    "realized_pnl_pct": null,
+    "realized_rr": null,
+    "exit_price": null,
+    "exit_reason": null,
+    "closed_ts": null,
+    "duration_min": null,
+    "closed": false,
+    "last_observation_ts": 1789200179954,
+    "last_exchange_avg_price": 0.3353,
+    "current_position_qty": 29.824,
+    "protection_last_updated_ts": 1789200198116
   }
 }
