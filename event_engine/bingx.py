@@ -47,6 +47,7 @@ POSITION_PATH = os.environ.get("BINGX_POSITIONS_PATH", "/openApi/swap/v2/user/po
 LEVERAGE_PATH = "/openApi/swap/v2/trade/leverage"
 POSITION_MODE_PATH = "/openApi/swap/v1/positionSide/dual"
 OPEN_ORDERS_PATH = "/openApi/swap/v2/trade/openOrders"
+BOOK_TICKER_PATH = "/openApi/swap/v2/quote/bookTicker"
 
 CACHE = {
     "ts": 0.0,
@@ -56,6 +57,8 @@ CACHE = {
 TTL = 3600
 SERVER_TIME_OFFSET_MS = 0
 _POSITION_MODE_CACHE: dict[str, Any] = {"ts": 0.0, "dual": None}
+_BOOK_TICKER_LOCK = threading.Lock()
+_LAST_BOOK_TICKER_TS = 0.0
 
 # Requests Session is not used concurrently across scan worker threads.
 # Public scan requests get one Session per worker thread, each with a small bounded
@@ -612,7 +615,7 @@ def get_all_orders(
     return _normalize_orders_list(resp)
 
 
-def close_position_market(symbol: str, direction: str, qty: float, *, reduce_only: bool = True, trade_id: str | None = None) -> dict:
+def close_position_market(symbol: str, direction: str, qty: float, *, reduce_only: bool = True, trade_id: str | None = None, attempt_id: str | None = None) -> dict:
     """Close an existing directional position with a MARKET order. Used only as
     a safety rollback when mandatory protection cannot be established."""
     direction = str(direction).upper()
@@ -643,7 +646,8 @@ def close_position_market(symbol: str, direction: str, qty: float, *, reduce_onl
     if position_side == "BOTH" and reduce_only:
         params["reduceOnly"] = "true"
     if trade_id:
-        params["clientOrderId"] = f"EVT_{_trade_digest(trade_id)}_ROLLBACK"
+        nonce = str(attempt_id or uuid.uuid4().hex).upper()[:12]
+        params["clientOrderId"] = f"EVT_{_trade_digest(trade_id)}_RB_{nonce}"[:40]
     resp = _request("POST", ORDER_PATH, params)
     if not isinstance(resp, dict) or resp.get("code") != 0:
         return {"status": "error", "error": f"close failed: code={resp.get('code') if isinstance(resp, dict) else None} msg={resp.get('msg') if isinstance(resp, dict) else resp}", "response": resp}
@@ -701,7 +705,7 @@ def _find_recent_order_by_client_id(symbol: str, client_order_id: str, lookback_
     return None
 
 
-def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dict:
+def open_market(symbol: str, direction: str, price: float, trade_id: str, *, execution_quote: dict[str, Any] | None = None) -> dict:
     direction = str(direction).upper()
     if direction not in {"LONG", "SHORT"}:
         return {"status": "error", "error": f"invalid direction={direction}"}
@@ -728,7 +732,17 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
     except (TypeError, ValueError) as exc:
         return {"status": "error", "error": f"invalid contract parameters: {exc}", "symbol": bx}
 
-    sizing_price = _current_close_price(symbol) or float(price)
+    if not isinstance(execution_quote, dict) or execution_quote.get("status") != "ok":
+        execution_quote = get_execution_quote(symbol)
+    if execution_quote.get("status") != "ok":
+        return {
+            "status": "error",
+            "error": execution_quote.get("error", "execution quote unavailable"),
+            "symbol": bx,
+        }
+    bid = float(execution_quote["bid"])
+    ask = float(execution_quote["ask"])
+    sizing_price = ask if direction == "LONG" else bid
     if sizing_price <= 0:
         return {"status": "error", "error": "invalid sizing price", "symbol": bx}
 
@@ -745,7 +759,7 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
             "status": "error",
             "error": "calculated quantity is <= 0",
             "symbol": bx, "qty": qty, "min_qty": min_qty,
-            "leverage": leverage, "sizing_price": sizing_price,
+            "leverage": leverage, "sizing_price": sizing_price, "execution_quote": execution_quote,
         }
     if min_qty > 0 and qty < min_qty:
         required_margin = (min_qty * sizing_price * mult) / max(leverage, 1)
@@ -757,21 +771,23 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
             "required_margin_usdt": required_margin,
             "configured_margin_usdt": MARGIN_USDT,
             "leverage": leverage, "sizing_price": sizing_price,
+            "execution_quote": execution_quote,
         }
-
-    # This engine always opens two TP legs. Refuse the entry before MARKET
-    # submission when exchange granularity cannot represent both legs.
-    if min_qty > 0 and qty < (min_qty * 2.0):
-        required_margin = (min_qty * 2.0 * sizing_price * mult) / max(leverage, 1)
+    # Current strategy requires two TP legs. Do not open a position that can
+    # never be split into two exchange-valid quantities.
+    if min_qty > 0 and qty < (2.0 * min_qty):
+        required_margin = (2.0 * min_qty * sizing_price * mult) / max(leverage, 1)
         return {
             "status": "skipped_tp_min_qty",
-            "error": f"qty={qty} cannot support 2 TP legs at min_qty={min_qty}",
-            "reason": "two_tp_min_quantity",
+            "error": f"qty={qty} cannot support 2 TP legs with min_qty={min_qty}",
+            "reason": "tp_two_leg_min_quantity",
             "symbol": bx, "qty": qty, "min_qty": min_qty,
             "required_margin_usdt": required_margin,
             "configured_margin_usdt": MARGIN_USDT,
             "leverage": leverage, "sizing_price": sizing_price,
+            "execution_quote": execution_quote,
         }
+
 
     if not _set_leverage(bx, leverage, direction):
         return {"status": "error", "error": f"failed to set leverage={leverage} for {direction}", "symbol": bx, "leverage": leverage}
@@ -822,6 +838,7 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
                     "client_order_id": historical_order.get("clientOrderId") or client_order_id,
                     "idempotency": "client_order_id_verified_after_transport_error",
                     "response": response,
+                    "execution_quote": execution_quote,
                     "historical_order": historical_order,
                 }
             try:
@@ -839,6 +856,7 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
                         "client_order_id": client_order_id,
                         "idempotency": "position_verified_after_transport_error_no_order_match",
                         "response": response,
+                        "execution_quote": execution_quote,
                     }
             except Exception as exc:
                 log.error("[BINGX] Post-error position verification failed: %s", exc)
@@ -860,6 +878,7 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str) -> dic
         "order_id": order_id,
         "client_order_id": order.get("clientOrderId") or client_order_id,
         "response": response,
+        "execution_quote": execution_quote,
     }
 
 
@@ -1089,6 +1108,68 @@ def _tp_leg_from_order(order: dict, expected_leg: str, expected_price: float, pr
     if f"_{expected_leg}_" in f"_{client_id}_":
         return actual_formatted == expected_formatted
     return False
+
+
+def get_execution_quote(symbol: str, *, min_interval_sec: float | None = None, reference_price: float | None = None) -> dict[str, Any]:
+    """Return BingX top-of-book bid/ask immediately before a market entry.
+
+    This is deliberately separate from the signal price and from the 1m candle
+    close. It is the reference used to distinguish signal drift from actual
+    MARKET execution slippage. The small local throttle respects the documented
+    bookTicker rate limit without changing strategy logic.
+    """
+    global _LAST_BOOK_TICKER_TS
+    bx = to_bx_symbol(symbol)
+    if not bx:
+        return {"status": "error", "error": "contract_not_found", "symbol": symbol}
+    try:
+        interval = float(
+            os.environ.get("BINGX_BOOK_TICKER_MIN_INTERVAL_SEC", "1.05")
+            if min_interval_sec is None else min_interval_sec
+        )
+    except (TypeError, ValueError):
+        interval = 1.05
+    interval = max(0.0, interval)
+    with _BOOK_TICKER_LOCK:
+        wait = interval - (time.monotonic() - _LAST_BOOK_TICKER_TS)
+        if wait > 0:
+            time.sleep(wait)
+        resp = _request(
+            "GET", BOOK_TICKER_PATH, {"symbol": bx}, signed=True,
+            timeout_sec=float(os.environ.get("BINGX_BOOK_TICKER_TIMEOUT_SEC", "3")),
+            retryable=False,
+        )
+        _LAST_BOOK_TICKER_TS = time.monotonic()
+    if not isinstance(resp, dict) or resp.get("code") != 0:
+        return {
+            "status": "error",
+            "error": f"bookTicker failed: code={resp.get('code') if isinstance(resp, dict) else None} msg={resp.get('msg') if isinstance(resp, dict) else resp}",
+            "symbol": bx,
+            "response": resp,
+        }
+    data = resp.get("data")
+    if isinstance(data, list):
+        row = next((x for x in data if str(x.get("symbol", "")).upper() == bx), None)
+    else:
+        row = data if isinstance(data, dict) else None
+    if not isinstance(row, dict):
+        return {"status": "error", "error": "bookTicker response missing symbol data", "symbol": bx, "response": resp}
+    try:
+        bid = float(row.get("bidPrice", 0) or 0)
+        ask = float(row.get("askPrice", 0) or 0)
+    except (TypeError, ValueError):
+        return {"status": "error", "error": "bookTicker returned non-numeric bid/ask", "symbol": bx, "response": resp}
+    if not (math.isfinite(bid) and math.isfinite(ask) and bid > 0 and ask > 0 and ask >= bid):
+        return {"status": "error", "error": f"bookTicker invalid bid/ask: bid={bid} ask={ask}", "symbol": bx, "response": resp}
+    return {
+        "status": "ok",
+        "symbol": bx,
+        "bid": bid,
+        "ask": ask,
+        "spread_pct": ((ask - bid) / bid * 100.0) if bid > 0 else None,
+        "time": row.get("time"),
+        "last_price": row.get("lastPrice"),
+    }
 
 
 def _current_close_price(symbol: str) -> float | None:
@@ -1363,6 +1444,19 @@ def ensure_directional_protection(
     else:
         sl_price = avg_price * (1.0 - stop_loss_pct / 100.0) if direction == "LONG" else avg_price * (1.0 + stop_loss_pct / 100.0)
         client_order_id = build_sl_client_order_id(trade_id)
+        current_price = _current_close_price(symbol)
+        if current_price is not None:
+            sl_side_valid = (sl_price < current_price) if direction == "LONG" else (sl_price > current_price)
+            if not sl_side_valid:
+                return {
+                    "status": "PROTECTION_FAILED",
+                    "symbol": symbol,
+                    "direction": direction,
+                    "avg_price": avg_price,
+                    "qty": position_qty,
+                    "error": f"stop_price_crossed_before_post: sl={sl_price} current={current_price}",
+                    "current_price": current_price,
+                }
         params = {
             "symbol": bx_symbol,
             "side": "SELL" if direction == "LONG" else "BUY",

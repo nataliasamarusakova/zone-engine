@@ -307,16 +307,25 @@ def register_active_trade(
     signal_reference_price = _safe_float((setup or {}).get("signal_price"), 0.0) if isinstance(setup, dict) else 0.0
     if signal_reference_price <= 0:
         signal_reference_price = _safe_float(setup_metrics.get("entry_reference"), 0.0)
-    pre_order_reference_price = _safe_float((setup or {}).get("pre_order_reference_price"), 0.0) if isinstance(setup, dict) else 0.0
+    pre_order_reference_price = _safe_float((setup or {}).get("execution_reference_price"), 0.0) if isinstance(setup, dict) else 0.0
+    signal_drift_pct = _safe_float((setup or {}).get("signal_drift_pct"), 0.0) if isinstance(setup, dict) else 0.0
+    execution_slippage_pct = (setup or {}).get("execution_slippage_pct") if isinstance(setup, dict) else None
+    execution_slippage_pct = _safe_float(execution_slippage_pct, 0.0) if execution_slippage_pct is not None else None
+
+    # From this version onward, entry_slippage_pct means actual MARKET fill
+    # versus the top-of-book price captured immediately before the order. The
+    # old implementation compared the fill to the stale signal price and mixed
+    # signal drift with execution slippage.
     entry_slippage_pct = None
     adverse_entry_slippage_pct = None
-
-    if requested_price is not None and requested_price > 0:
-        entry_slippage_pct = (actual_entry_price - requested_price) / requested_price * 100.0
+    if pre_order_reference_price > 0:
+        entry_slippage_pct = (actual_entry_price - pre_order_reference_price) / pre_order_reference_price * 100.0
         if direction == "LONG":
             adverse_entry_slippage_pct = max(0.0, entry_slippage_pct)
         else:
             adverse_entry_slippage_pct = max(0.0, -entry_slippage_pct)
+    if execution_slippage_pct is not None:
+        adverse_entry_slippage_pct = execution_slippage_pct
 
     trades[event_id] = {
         "event_id": event_id,
@@ -328,6 +337,8 @@ def register_active_trade(
         "requested_entry_price": requested_price,
         "signal_reference_price": signal_reference_price if signal_reference_price > 0 else None,
         "pre_order_reference_price": pre_order_reference_price if pre_order_reference_price > 0 else requested_price,
+        "signal_drift_pct": signal_drift_pct,
+        "execution_slippage_pct": execution_slippage_pct,
         "entry_slippage_pct": entry_slippage_pct,
         "adverse_entry_slippage_pct": adverse_entry_slippage_pct,
         "initial_qty": actual_qty,
