@@ -48,6 +48,8 @@ LEVERAGE_PATH = "/openApi/swap/v2/trade/leverage"
 POSITION_MODE_PATH = "/openApi/swap/v1/positionSide/dual"
 OPEN_ORDERS_PATH = "/openApi/swap/v2/trade/openOrders"
 BOOK_TICKER_PATH = "/openApi/swap/v2/quote/bookTicker"
+TICKER_PATH = "/openApi/swap/v2/quote/ticker"
+DEPTH_PATH = "/openApi/swap/v2/quote/depth"
 
 CACHE = {
     "ts": 0.0,
@@ -1110,13 +1112,77 @@ def _tp_leg_from_order(order: dict, expected_leg: str, expected_price: float, pr
     return False
 
 
-def get_execution_quote(symbol: str, *, min_interval_sec: float | None = None, reference_price: float | None = None) -> dict[str, Any]:
-    """Return BingX top-of-book bid/ask immediately before a market entry.
+def _valid_quote(bid: float, ask: float) -> bool:
+    return (
+        math.isfinite(bid)
+        and math.isfinite(ask)
+        and bid > 0
+        and ask > 0
+        and ask >= bid
+    )
 
-    This is deliberately separate from the signal price and from the 1m candle
-    close. It is the reference used to distinguish signal drift from actual
-    MARKET execution slippage. The small local throttle respects the documented
-    bookTicker rate limit without changing strategy logic.
+
+def _parse_top_of_book_payload(resp: Any, symbol: str, source: str) -> tuple[float, float, Any] | None:
+    if not isinstance(resp, dict) or resp.get("code") != 0:
+        return None
+    data = resp.get("data")
+    row: dict[str, Any] | None = None
+    if isinstance(data, list):
+        row = next((x for x in data if isinstance(x, dict) and str(x.get("symbol", "")).upper() == symbol), None)
+        if row is None and len(data) == 1 and isinstance(data[0], dict):
+            row = data[0]
+    elif isinstance(data, dict):
+        row = data
+    if not isinstance(row, dict):
+        return None
+    try:
+        bid = float(row.get("bidPrice", 0) or 0)
+        ask = float(row.get("askPrice", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if not _valid_quote(bid, ask):
+        return None
+    return bid, ask, row.get("time")
+
+
+def _parse_depth_top(resp: Any) -> tuple[float, float, Any] | None:
+    if not isinstance(resp, dict) or resp.get("code") != 0:
+        return None
+    data = resp.get("data")
+    if not isinstance(data, dict):
+        return None
+    bids = data.get("bids") or []
+    asks = data.get("asks") or []
+
+    def _price(level: Any) -> float | None:
+        try:
+            if isinstance(level, (list, tuple)) and level:
+                return float(level[0])
+            if isinstance(level, dict):
+                return float(level.get("price") or level.get("p") or 0)
+        except (TypeError, ValueError):
+            return None
+        return None
+
+    bid = next((p for p in (_price(x) for x in bids) if p and math.isfinite(p) and p > 0), None)
+    ask = next((p for p in (_price(x) for x in asks) if p and math.isfinite(p) and p > 0), None)
+    if bid is None or ask is None or not _valid_quote(bid, ask):
+        return None
+    return bid, ask, data.get("T") or data.get("timestamp") or data.get("time")
+
+
+def _quote_error(source: str, resp: Any, symbol: str) -> str:
+    code = resp.get("code") if isinstance(resp, dict) else None
+    msg = resp.get("msg") if isinstance(resp, dict) else None
+    return f"{source} unavailable: code={code} msg={msg or 'invalid response'}"
+
+
+def get_execution_quote(symbol: str, *, min_interval_sec: float | None = None, reference_price: float | None = None) -> dict[str, Any]:
+    """Return a valid BingX executable top-of-book quote immediately before entry.
+
+    Fallback order is BingX-only: bookTicker -> ticker -> depth. No Binance or
+    candle-close fallback is allowed because entry safety must be based on the
+    execution venue's live market.
     """
     global _LAST_BOOK_TICKER_TS
     bx = to_bx_symbol(symbol)
@@ -1130,45 +1196,62 @@ def get_execution_quote(symbol: str, *, min_interval_sec: float | None = None, r
     except (TypeError, ValueError):
         interval = 1.05
     interval = max(0.0, interval)
+
+    def _call(path: str) -> Any:
+        return _request(
+            "GET", path, {"symbol": bx}, signed=True,
+            timeout_sec=float(os.environ.get("BINGX_BOOK_TICKER_TIMEOUT_SEC", "3")),
+            retryable=False,
+        )
+
     with _BOOK_TICKER_LOCK:
         wait = interval - (time.monotonic() - _LAST_BOOK_TICKER_TS)
         if wait > 0:
             time.sleep(wait)
-        resp = _request(
-            "GET", BOOK_TICKER_PATH, {"symbol": bx}, signed=True,
-            timeout_sec=float(os.environ.get("BINGX_BOOK_TICKER_TIMEOUT_SEC", "3")),
-            retryable=False,
-        )
+        attempts: list[tuple[str, Any]] = []
+        resp = _call(BOOK_TICKER_PATH)
         _LAST_BOOK_TICKER_TS = time.monotonic()
-    if not isinstance(resp, dict) or resp.get("code") != 0:
-        return {
-            "status": "error",
-            "error": f"bookTicker failed: code={resp.get('code') if isinstance(resp, dict) else None} msg={resp.get('msg') if isinstance(resp, dict) else resp}",
-            "symbol": bx,
-            "response": resp,
-        }
-    data = resp.get("data")
-    if isinstance(data, list):
-        row = next((x for x in data if str(x.get("symbol", "")).upper() == bx), None)
-    else:
-        row = data if isinstance(data, dict) else None
-    if not isinstance(row, dict):
-        return {"status": "error", "error": "bookTicker response missing symbol data", "symbol": bx, "response": resp}
-    try:
-        bid = float(row.get("bidPrice", 0) or 0)
-        ask = float(row.get("askPrice", 0) or 0)
-    except (TypeError, ValueError):
-        return {"status": "error", "error": "bookTicker returned non-numeric bid/ask", "symbol": bx, "response": resp}
-    if not (math.isfinite(bid) and math.isfinite(ask) and bid > 0 and ask > 0 and ask >= bid):
-        return {"status": "error", "error": f"bookTicker invalid bid/ask: bid={bid} ask={ask}", "symbol": bx, "response": resp}
+        attempts.append(("bookTicker", resp))
+
+        parsed = _parse_top_of_book_payload(resp, bx, "bookTicker")
+        if parsed is not None:
+            bid, ask, quote_time = parsed
+            return {
+                "status": "ok", "symbol": bx, "bid": bid, "ask": ask,
+                "spread_pct": ((ask - bid) / bid * 100.0) if bid > 0 else None,
+                "time": quote_time, "last_price": None, "quote_source": "bookTicker",
+            }
+
+        ticker_resp = _call(TICKER_PATH)
+        attempts.append(("ticker", ticker_resp))
+        parsed = _parse_top_of_book_payload(ticker_resp, bx, "ticker")
+        if parsed is not None:
+            bid, ask, quote_time = parsed
+            log.warning("[EXEC_QUOTE_FALLBACK] %s | bookTicker invalid/unavailable -> ticker", bx)
+            return {
+                "status": "ok", "symbol": bx, "bid": bid, "ask": ask,
+                "spread_pct": ((ask - bid) / bid * 100.0) if bid > 0 else None,
+                "time": quote_time, "last_price": None, "quote_source": "ticker",
+            }
+
+        depth_resp = _call(DEPTH_PATH)
+        attempts.append(("depth", depth_resp))
+        parsed = _parse_depth_top(depth_resp)
+        if parsed is not None:
+            bid, ask, quote_time = parsed
+            log.warning("[EXEC_QUOTE_FALLBACK] %s | bookTicker/ticker invalid -> depth", bx)
+            return {
+                "status": "ok", "symbol": bx, "bid": bid, "ask": ask,
+                "spread_pct": ((ask - bid) / bid * 100.0) if bid > 0 else None,
+                "time": quote_time, "last_price": None, "quote_source": "depth",
+            }
+
+    details = "; ".join(_quote_error(source, response, bx) for source, response in attempts)
     return {
-        "status": "ok",
+        "status": "error",
+        "error": f"BingX executable quote unavailable after bookTicker->ticker->depth | {details}",
         "symbol": bx,
-        "bid": bid,
-        "ask": ask,
-        "spread_pct": ((ask - bid) / bid * 100.0) if bid > 0 else None,
-        "time": row.get("time"),
-        "last_price": row.get("lastPrice"),
+        "quote_sources_attempted": [source for source, _ in attempts],
     }
 
 
