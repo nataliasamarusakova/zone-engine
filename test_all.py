@@ -2104,3 +2104,59 @@ def test_watchlist_is_exact_20_symbols():
     assert WATCHLIST_ONLY is False
     assert WATCHLIST_SYMBOLS == expected
     assert len(WATCHLIST_SYMBOLS) == 20
+
+
+def test_get_execution_quote_falls_back_from_bookticker_to_ticker(monkeypatch):
+    from event_engine import bingx
+    calls = []
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)
+    responses = [
+        {"code": 0, "data": {"symbol": "FLOKI-USDT", "bidPrice": "0", "askPrice": "0"}},
+        {"code": 0, "data": [{"symbol": "FLOKI-USDT", "bidPrice": "0.00002460", "askPrice": "0.00002461", "time": 123}]},
+    ]
+    def fake_request(method, path, params, signed=True, **kwargs):
+        calls.append(path)
+        return responses.pop(0)
+    monkeypatch.setattr(bingx, "_request", fake_request)
+    monkeypatch.setenv("BINGX_BOOK_TICKER_MIN_INTERVAL_SEC", "0")
+    out = bingx.get_execution_quote("FLOKI-USDT")
+    assert out["status"] == "ok"
+    assert out["quote_source"] == "ticker"
+    assert out["bid"] == 0.00002460
+    assert out["ask"] == 0.00002461
+    assert calls == [bingx.BOOK_TICKER_PATH, bingx.TICKER_PATH]
+
+
+def test_get_execution_quote_falls_back_to_depth(monkeypatch):
+    from event_engine import bingx
+    calls = []
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)
+    responses = [
+        {"code": 0, "data": {"symbol": "S-USDT", "bidPrice": "0", "askPrice": "0"}},
+        {"code": 0, "data": {"symbol": "S-USDT", "bidPrice": "0", "askPrice": "0"}},
+        {"code": 0, "data": {"bids": [["0.02690", "10"]], "asks": [["0.02691", "11"]], "T": 456}},
+    ]
+    def fake_request(method, path, params, signed=True, **kwargs):
+        calls.append(path)
+        return responses.pop(0)
+    monkeypatch.setattr(bingx, "_request", fake_request)
+    monkeypatch.setenv("BINGX_BOOK_TICKER_MIN_INTERVAL_SEC", "0")
+    out = bingx.get_execution_quote("S-USDT")
+    assert out["status"] == "ok"
+    assert out["quote_source"] == "depth"
+    assert out["bid"] == 0.02690
+    assert out["ask"] == 0.02691
+    assert calls == [bingx.BOOK_TICKER_PATH, bingx.TICKER_PATH, bingx.DEPTH_PATH]
+
+
+def test_get_execution_quote_blocks_when_all_bingx_sources_invalid(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)
+    def fake_request(method, path, params, signed=True, **kwargs):
+        return {"code": 0, "data": {"symbol": "TEST-USDT", "bidPrice": "0", "askPrice": "0"}}
+    monkeypatch.setattr(bingx, "_request", fake_request)
+    monkeypatch.setenv("BINGX_BOOK_TICKER_MIN_INTERVAL_SEC", "0")
+    out = bingx.get_execution_quote("TEST-USDT")
+    assert out["status"] == "error"
+    assert "bookTicker->ticker->depth" in out["error"]
+    assert out["quote_sources_attempted"] == ["bookTicker", "ticker", "depth"]
