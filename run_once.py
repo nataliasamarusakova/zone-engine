@@ -6,6 +6,7 @@ import logging
 import os
 import time
 import uuid
+import fcntl
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,9 @@ FAILED_SIGNAL_MAX_RETRIES = max(1, int(os.environ.get("FAILED_SIGNAL_MAX_RETRIES
 FAILED_SIGNAL_RETRY_BASE_SEC = max(1, int(os.environ.get("FAILED_SIGNAL_RETRY_BASE_SEC", "300")))
 FAILED_SIGNAL_RETRY_MAX_SEC = max(FAILED_SIGNAL_RETRY_BASE_SEC, int(os.environ.get("FAILED_SIGNAL_RETRY_MAX_SEC", str(3600))))
 ACTIONS_PATH = DATA / "actions.jsonl"
+EVENT_CLAIMS_PATH = DATA / "event_execution_claims.json"
+EVENT_CLAIMS_LOCK_PATH = DATA / "event_execution_claims.json.lock"
+EVENT_CLAIM_LEASE_SEC = max(60, int(os.environ.get("EVENT_CLAIM_LEASE_SEC", "900")))
 
 EXECUTION_ENABLED = os.environ.get("EXECUTION_ENABLED", "true").lower() == "true"
 MARGIN_USDT = float(os.environ.get("BINGX_MARGIN_USDT", "1"))
@@ -107,6 +111,125 @@ def _load_failed_signal_ids() -> dict[str, dict[str, Any]]:
     except Exception as exc:
         log.warning("[FAILED_SIGNALS] load failed: %s", exc)
         return {}
+
+
+def _load_event_claims_unlocked() -> dict[str, dict[str, Any]]:
+    if not EVENT_CLAIMS_PATH.exists():
+        return {}
+    try:
+        raw = json.loads(EVENT_CLAIMS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): v for k, v in raw.items() if isinstance(v, dict)}
+
+
+def _write_event_claims_unlocked(raw: dict[str, dict[str, Any]]) -> None:
+    DATA.mkdir(parents=True, exist_ok=True)
+    tmp = EVENT_CLAIMS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, EVENT_CLAIMS_PATH)
+
+
+def _claim_event_for_execution(event_id: str) -> tuple[bool, str, str]:
+    """Atomically claim an event so one setup cannot execute twice concurrently.
+
+    Returns (claimed, reason, attempt_id). Retryable failures release the claim;
+    terminal failures/successes retain it. A stale in-flight claim expires via lease.
+    """
+    event_id = str(event_id)
+    attempt_id = uuid.uuid4().hex.upper()[:16]
+    now = int(time.time())
+    lock_fh = None
+    try:
+        DATA.mkdir(parents=True, exist_ok=True)
+        with EVENT_CLAIMS_LOCK_PATH.open("a+", encoding="utf-8") as lock_fh:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            raw = _load_event_claims_unlocked()
+            existing = raw.get(event_id)
+            if isinstance(existing, dict):
+                state = str(existing.get("state", "")).lower()
+                if state in {"terminal", "completed"}:
+                    return False, state, ""
+                lease_until = int(existing.get("lease_until", 0) or 0)
+                if state == "in_flight" and lease_until > now:
+                    return False, "in_flight", ""
+            raw[event_id] = {
+                "state": "in_flight",
+                "attempt_id": attempt_id,
+                "claimed_at": now,
+                "lease_until": now + EVENT_CLAIM_LEASE_SEC,
+            }
+            _write_event_claims_unlocked(raw)
+            return True, "claimed", attempt_id
+    except Exception as exc:
+        log.error("[EVENT_CLAIM] failed for %s: %s", event_id, exc)
+        return False, "claim_error", ""
+    finally:
+        if lock_fh is not None:
+            try:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+
+
+def _finalize_event_claim(event_id: str, attempt_id: str, *, terminal: bool, status: str) -> None:
+    """Finalize or release an execution claim without overwriting another attempt."""
+    event_id = str(event_id)
+    lock_fh = None
+    try:
+        DATA.mkdir(parents=True, exist_ok=True)
+        with EVENT_CLAIMS_LOCK_PATH.open("a+", encoding="utf-8") as lock_fh:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            raw = _load_event_claims_unlocked()
+            existing = raw.get(event_id)
+            if not isinstance(existing, dict) or str(existing.get("attempt_id")) != str(attempt_id):
+                return
+            if terminal:
+                raw[event_id] = {
+                    "state": "terminal",
+                    "attempt_id": attempt_id,
+                    "finalized_at": int(time.time()),
+                    "status": str(status),
+                }
+            else:
+                raw.pop(event_id, None)
+            _write_event_claims_unlocked(raw)
+    except Exception as exc:
+        log.warning("[EVENT_CLAIM] finalize failed for %s: %s", event_id, exc)
+    finally:
+        if lock_fh is not None:
+            try:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+
+
+def _load_terminal_event_ids() -> set[str]:
+    """Recover terminal execution identities from the append-only trade journal."""
+    if not TRADES_PATH.exists():
+        return set()
+    out: set[str] = set()
+    terminal_statuses = {
+        "skipped_stale_signal",
+        "skipped_tp_min_qty",
+        "skipped_min_qty",
+        "skipped_invalid_setup",
+        "opened_then_emergency_closed",
+    }
+    for line in TRADES_PATH.read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if not row.get("event_id"):
+            continue
+        result = row.get("result", {}) if isinstance(row.get("result"), dict) else {}
+        status = str(result.get("status", row.get("status", ""))).lower()
+        if status in terminal_statuses:
+            out.add(str(row["event_id"]))
+    return out
 
 
 def _failed_signal_is_blocked(record: dict[str, Any] | None, now: int | None = None) -> bool:
@@ -740,7 +863,7 @@ def _validate_exchange_price_distinctness(signal: dict[str, Any]) -> tuple[bool,
 def _is_terminal_execution_failure(execution: dict[str, Any]) -> bool:
     status = str(execution.get("status", "")).lower()
     error = str(execution.get("error", "")).lower()
-    if status in {"skipped_stale_signal", "skipped_tp_min_qty", "skipped_min_qty", "skipped_invalid_setup"}:
+    if status in {"skipped_stale_signal", "skipped_tp_min_qty", "skipped_min_qty", "skipped_invalid_setup", "opened_then_emergency_closed"}:
         return True
     terminal_fragments = (
         "risk_pct_above_limit",
@@ -1110,6 +1233,7 @@ def main() -> None:
         log.error("[SCAN] No eligible symbols for signal scan")
 
     successful_ids = _load_successful_trade_ids()
+    terminal_event_ids = _load_terminal_event_ids()
     failed_ids = _load_failed_signal_ids()
     if private_ready:
         try:
@@ -1389,8 +1513,9 @@ def main() -> None:
         bx_symbol = str((bx or {}).get("symbol", signal["symbol"])).upper()
         key = (bx_symbol, signal["type"])
         opposite = (bx_symbol, "SHORT" if signal["type"] == "LONG" else "LONG")
-        failed_record = failed_ids.get(signal["event_id"])
-        if signal["event_id"] in successful_ids or _failed_signal_is_blocked(failed_record):
+        event_id = str(signal["event_id"])
+        failed_record = failed_ids.get(event_id)
+        if event_id in successful_ids or event_id in terminal_event_ids or _failed_signal_is_blocked(failed_record):
             continue
         if key in open_keys or opposite in open_keys:
             continue
@@ -1430,7 +1555,13 @@ def main() -> None:
             })
             _send_signal(signal, blocked)
             continue
+        event_id = str(signal["event_id"])
+        claimed, claim_reason, attempt_id = _claim_event_for_execution(event_id)
+        if not claimed:
+            log.info("[EXEC_SKIP_CLAIM] %s %s | event_id=%s reason=%s", signal["symbol"], signal["type"], event_id, claim_reason)
+            continue
         execution = execute_new_position(signal)
+        execution["attempt_id"] = attempt_id
         execution_status = str(execution.get("status", ""))
         if execution_status in {"skipped_min_qty", "skipped_tp_min_qty", "skipped_invalid_setup"}:
             log.warning(
@@ -1441,13 +1572,26 @@ def main() -> None:
         elif execution_status != "opened_protected":
             log.error("[EXEC_FAILED] %s %s | status=%s | error=%s | order=%s", signal["symbol"], signal["type"], execution_status, execution.get("error"), execution.get("order"))
             if execution_status not in {"DISABLED", "BLOCKED_MISSING_CREDENTIALS"}:
+                terminal_failure = _is_terminal_execution_failure(execution)
                 _mark_failed_signal(
                     signal["event_id"], execution_status, execution.get("error", ""),
-                    force_terminal=_is_terminal_execution_failure(execution),
+                    force_terminal=terminal_failure,
                 )
+            else:
+                terminal_failure = False
+        else:
+            terminal_failure = False
+        if execution_status == "opened_protected":
+            _finalize_event_claim(event_id, attempt_id, terminal=True, status=execution_status)
+        elif _is_terminal_execution_failure(execution):
+            terminal_event_ids.add(event_id)
+            _finalize_event_claim(event_id, attempt_id, terminal=True, status=execution_status)
+        else:
+            _finalize_event_claim(event_id, attempt_id, terminal=False, status=execution_status)
         _append_jsonl(TRADES_PATH, {
             "record_type": "TRADE_OPEN",
             "event_id": signal["event_id"],
+            "attempt_id": execution.get("attempt_id"),
             "symbol": signal["symbol"],
             "direction": signal["type"],
             "score": signal["score"],

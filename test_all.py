@@ -59,6 +59,8 @@ def _isolate_runtime_state(monkeypatch, tmp_path):
     monkeypatch.setattr(run_once, "DATA", runtime_data)
     monkeypatch.setattr(run_once, "TRADES_PATH", runtime_data / "trades.jsonl")
     monkeypatch.setattr(run_once, "FAILED_SIGNALS_PATH", runtime_data / "failed_signals.json")
+    monkeypatch.setattr(run_once, "EVENT_CLAIMS_PATH", runtime_data / "event_execution_claims.json")
+    monkeypatch.setattr(run_once, "EVENT_CLAIMS_LOCK_PATH", runtime_data / "event_execution_claims.json.lock")
     monkeypatch.setattr(run_once, "ACTIONS_PATH", runtime_data / "actions.jsonl")
 
     monkeypatch.setattr(analytics, "DATA_DIR", runtime_data)
@@ -2160,3 +2162,27 @@ def test_get_execution_quote_blocks_when_all_bingx_sources_invalid(monkeypatch):
     assert out["status"] == "error"
     assert "bookTicker->ticker->depth" in out["error"]
     assert out["quote_sources_attempted"] == ["bookTicker", "ticker", "depth"]
+
+
+def test_event_execution_claim_is_idempotent_after_terminal_finalize():
+    import run_once
+    ok, reason, attempt = run_once._claim_event_for_execution("ZONE_TEST_TERMINAL")
+    assert ok is True
+    assert reason == "claimed"
+    assert attempt
+    run_once._finalize_event_claim("ZONE_TEST_TERMINAL", attempt, terminal=True, status="skipped_stale_signal")
+    ok2, reason2, attempt2 = run_once._claim_event_for_execution("ZONE_TEST_TERMINAL")
+    assert ok2 is False
+    assert reason2 == "terminal"
+    assert attempt2 == ""
+
+
+def test_event_execution_claim_blocks_second_in_flight_attempt():
+    import run_once
+    ok, reason, attempt = run_once._claim_event_for_execution("ZONE_TEST_INFLIGHT")
+    assert ok is True
+    ok2, reason2, attempt2 = run_once._claim_event_for_execution("ZONE_TEST_INFLIGHT")
+    assert ok2 is False
+    assert reason2 == "in_flight"
+    assert attempt2 == ""
+    run_once._finalize_event_claim("ZONE_TEST_INFLIGHT", attempt, terminal=False, status="execution_quote_unavailable")
