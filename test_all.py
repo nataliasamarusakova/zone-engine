@@ -21,14 +21,51 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _disable_real_telegram_for_all_tests(monkeypatch):
-    """Tests must never send real Telegram messages when CI secrets are present."""
-    from event_engine import tracker
-    monkeypatch.setattr(tracker, "send_tg", lambda *args, **kwargs: True)
-    # run_once signal notifications are also disabled by default; tests that
-    # explicitly exercise delivery may override this fixture locally.
+def _isolate_runtime_state(monkeypatch, tmp_path):
+    """Tests must never read/write the repository's production data/ files."""
+    from event_engine import analytics, tracker
     import run_once
+
+    runtime_data = tmp_path / "data"
+    runtime_data.mkdir(parents=True, exist_ok=True)
+
+    # Notifications are never sent by tests.
+    monkeypatch.setattr(tracker, "send_tg", lambda *args, **kwargs: True)
     monkeypatch.setattr(run_once, "send_tg", lambda *args, **kwargs: True)
+    # Execution tests get a deterministic quote matching their signal unless they
+    # explicitly override this helper to test drift/slippage behaviour.
+    monkeypatch.setattr(
+        run_once,
+        "get_execution_quote",
+        lambda symbol, **kwargs: {
+            "status": "ok",
+            "symbol": symbol,
+            "bid": float(kwargs.get("reference_price", 100.0)),
+            "ask": float(kwargs.get("reference_price", 100.0)),
+            "spread_pct": 0.0,
+        },
+    )
+    monkeypatch.setattr(run_once, "get_contract", lambda symbol: {
+        "symbol": symbol, "pricePrecision": 8, "quantityPrecision": 4,
+        "tradeMinQuantity": 0.0001, "maxLeverage": 10,
+    })
+
+    # Redirect every mutable runtime journal/state path used by the testable modules.
+    monkeypatch.setattr(tracker, "DATA", runtime_data)
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", runtime_data / "active_trades.json")
+    monkeypatch.setattr(tracker, "TRADES_PATH", runtime_data / "trades.jsonl")
+    monkeypatch.setattr(tracker, "ACTIONS_PATH", runtime_data / "actions.jsonl")
+
+    monkeypatch.setattr(run_once, "DATA", runtime_data)
+    monkeypatch.setattr(run_once, "TRADES_PATH", runtime_data / "trades.jsonl")
+    monkeypatch.setattr(run_once, "FAILED_SIGNALS_PATH", runtime_data / "failed_signals.json")
+    monkeypatch.setattr(run_once, "ACTIONS_PATH", runtime_data / "actions.jsonl")
+
+    monkeypatch.setattr(analytics, "DATA_DIR", runtime_data)
+    monkeypatch.setattr(analytics, "SCAN_JSONL", runtime_data / "scan_history.jsonl")
+    monkeypatch.setattr(analytics, "SIGNALS_JSONL", runtime_data / "signal_history.jsonl")
+    monkeypatch.setattr(analytics, "LATEST_SCAN_JSON", runtime_data / "latest_scan.json")
+    monkeypatch.setattr(analytics, "LATEST_SCAN_TXT", runtime_data / "latest_scan.txt")
 
 
 def _candles(n: int = 100) -> pd.DataFrame:
@@ -215,6 +252,9 @@ def test_bingx_min_qty_is_nonfatal_skip(monkeypatch):
     monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
     monkeypatch.setattr(bingx, "has_open_position", lambda symbol, direction: False)
     monkeypatch.setattr(bingx, "_current_close_price", lambda symbol: 93.368)
+    monkeypatch.setattr(bingx, "get_execution_quote", lambda symbol, **kwargs: {
+        "status": "ok", "symbol": symbol, "bid": 93.368, "ask": 93.368, "spread_pct": 0.0
+    })
     monkeypatch.setenv("BINGX_MARGIN_USDT", "1")
     monkeypatch.setenv("BINGX_LEVERAGE", "10")
     result = bingx.open_market("NCFXNZD2JPY-USDT", "SHORT", 93.368, "TEST")
@@ -441,7 +481,8 @@ def test_execute_rebases_protection_to_actual_fill_before_installing(monkeypatch
     }
     captured = {}
     monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
-    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: {"status": "opened", "symbol": "TEST-USDT"})
+    opened = {"value": False}
+    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: opened.__setitem__("value", True) or {"status": "opened", "symbol": "TEST-USDT"})
     monkeypatch.setattr(run_once, "wait_for_position_fill_directional", lambda *a, **k: {"status": "found", "avgPrice": 95.0, "positionAmt": 1.0})
     def fake_protection(*args, **kwargs):
         captured["avg"] = args[2]
@@ -453,8 +494,59 @@ def test_execute_rebases_protection_to_actual_fill_before_installing(monkeypatch
     monkeypatch.setattr(run_once, "close_position_market", lambda *a, **k: {"status": "closed"})
     monkeypatch.setattr(run_once, "_cleanup_engine_protection", lambda *a, **k: {"status": "ok"})
     out = run_once.execute_new_position(signal)
+    # The new execution preflight must reject the setup before MARKET because
+    # the current executable price makes its risk exceed the production cap.
+    assert out["status"] == "skipped_invalid_setup"
+    assert out["error"].startswith("pre_entry_current_price_geometry: risk_pct_above_limit=")
+    assert opened["value"] is False
+
+
+def test_stale_signal_is_blocked_before_market(monkeypatch):
+    import run_once
+    signal = {
+        "event_id": "ZONE_TEST_STALE", "symbol": "TEST-USDT", "type": "LONG",
+        "entry": 100.0, "sl": 95.0, "tp1": 102.5, "tp2": 105.0, "risk_pct": 1.0,
+        "score": 75, "atr": 2.0,
+        "zone": {"kind": "DEMAND", "btm": 95.0, "top": 100.0},
+        "target": {"obstacle_price": 112.0},
+    }
+    monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
+    monkeypatch.setattr(run_once, "get_execution_quote", lambda *a, **k: {
+        "status": "ok", "bid": 102.0, "ask": 102.1, "spread_pct": 0.098
+    })
+    opened = {"value": False}
+    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: opened.__setitem__("value", True) or {"status": "opened"})
+    out = run_once.execute_new_position(signal)
+    assert out["status"] == "skipped_stale_signal"
+    assert opened["value"] is False
+    assert out["signal_drift_pct"] > run_once.MAX_ENTRY_SLIPPAGE_PCT
+
+
+def test_execution_slippage_is_measured_from_pre_entry_quote(monkeypatch):
+    import run_once
+    signal = {
+        "event_id": "ZONE_TEST_SLIP", "symbol": "TEST-USDT", "type": "LONG",
+        "entry": 100.0, "sl": 95.0, "tp1": 102.5, "tp2": 105.0, "risk_pct": 1.0,
+        "score": 75, "atr": 0.1,
+        "zone": {"kind": "DEMAND", "btm": 99.5, "top": 100.0},
+        "target": {"obstacle_price": 112.0},
+    }
+    monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
+    monkeypatch.setattr(run_once, "get_execution_quote", lambda *a, **k: {
+        "status": "ok", "bid": 99.9, "ask": 100.0, "spread_pct": 0.100
+    })
+    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: {"status": "opened", "symbol": "TEST-USDT"})
+    monkeypatch.setattr(run_once, "wait_for_position_fill_directional", lambda *a, **k: {"status": "found", "avgPrice": 101.5, "positionAmt": 1.0})
+    states = iter([{"status": "found", "positionAmt": 1.0}, {"status": "not_found"}])
+    monkeypatch.setattr(run_once, "get_position_directional", lambda *a, **k: next(states, {"status": "not_found"}))
+    monkeypatch.setattr(run_once, "close_position_market", lambda *a, **k: {"status": "closed"})
+    monkeypatch.setattr(run_once, "_cancel_engine_protection_before_emergency_close", lambda *a, **k: {"status": "ok"})
+    monkeypatch.setattr(run_once, "_cleanup_engine_protection", lambda *a, **k: {"status": "ok"})
+    out = run_once.execute_new_position(signal)
     assert out["status"] == "opened_then_emergency_closed"
-    assert out["error"].startswith("risk_pct_above_limit=")
+    assert out["error"].startswith("execution_slippage_pct=")
+    assert abs(out["execution_slippage_pct"] - 1.5) < 1e-9
+    assert out["signal_drift_pct"] == 0.0
 
 
 def test_invalid_setup_is_rejected_before_protection_preflight(monkeypatch):
@@ -994,6 +1086,9 @@ def test_open_market_blocks_two_tp_min_quantity_before_order(monkeypatch):
     })
     monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
     monkeypatch.setattr(bingx, "_current_close_price", lambda symbol: 1000.0)
+    monkeypatch.setattr(bingx, "get_execution_quote", lambda symbol, **kwargs: {
+        "status": "ok", "symbol": symbol, "bid": 1000.0, "ask": 1000.0, "spread_pct": 0.0
+    })
     monkeypatch.setattr(bingx, "has_open_position", lambda *args, **kwargs: False)
     out = bingx.open_market("BNB-USDT", "LONG", 1000.0, "EVT_TEST")
     assert out["status"] == "skipped_tp_min_qty"
@@ -1203,13 +1298,13 @@ def test_post_fill_slippage_guard_emergency_closes(monkeypatch):
     monkeypatch.setattr(run_once, "_validate_trade_geometry", lambda s: (True, ""))
     monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {"status":"ok","sl_orders":[],"tp_orders":[]})
     monkeypatch.setattr(run_once, "_build_setup", lambda s: {"zone":{"kind":"DEMAND"}})
-    monkeypatch.setattr(run_once, "open_market", lambda *a: {"status":"opened"})
+    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: {"status":"opened"})
     monkeypatch.setattr(run_once, "wait_for_position_fill_directional", lambda *a, **k: {"status":"found","avgPrice":102.5,"positionAmt":1})
     monkeypatch.setattr(run_once, "_emergency_close_and_verify", lambda *a, **k: {"status":"closed_verified"})
     monkeypatch.setattr(run_once, "_cleanup_engine_protection", lambda *a, **k: {"status":"ok"})
     out = run_once.execute_new_position(signal)
     assert out["status"] == "opened_then_emergency_closed"
-    assert "adverse_entry_slippage" in out["error"]
+    assert "execution_slippage_pct" in out["error"]
 
 def test_wait_for_position_fill_retries_transient_errors(monkeypatch):
     from event_engine import bingx
@@ -1855,10 +1950,10 @@ def test_runtime_state_paths_are_project_root_relative(tmp_path, monkeypatch):
     expected = (tmp_path / "unused").resolve()
     project_root = Path(run_once.__file__).resolve().parent
 
-    assert run_once.DATA == project_root / "data"
-    assert tracker.DATA == project_root / "data"
-    assert analytics.DATA_DIR == project_root / "data"
-    assert run_once.DATA != Path.cwd() / "data"
+    assert run_once.PROJECT_ROOT / "data" == project_root / "data"
+    assert tracker.PROJECT_ROOT / "data" == project_root / "data"
+    assert analytics.PROJECT_ROOT / "data" == project_root / "data"
+    assert (run_once.PROJECT_ROOT / "data") != Path.cwd() / "data"
     assert expected != project_root / "data"
 
 

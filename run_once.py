@@ -24,6 +24,7 @@ from event_engine.bingx import (
     get_position_mode,
     get_position_directional,
     get_open_protection_directional,
+    get_execution_quote,
     cancel_order,
     close_position_market,
     open_market,
@@ -123,7 +124,7 @@ def _failed_signal_is_blocked(record: dict[str, Any] | None, now: int | None = N
     return next_retry_at <= 0 or now < next_retry_at
 
 
-def _mark_failed_signal(event_id: str, status: str, error: str = "") -> None:
+def _mark_failed_signal(event_id: str, status: str, error: str = "", *, force_terminal: bool = False) -> None:
     try:
         DATA.mkdir(parents=True, exist_ok=True)
         raw = _load_failed_signal_ids()
@@ -131,7 +132,7 @@ def _mark_failed_signal(event_id: str, status: str, error: str = "") -> None:
         retry_count = int(previous.get("retry_count", 0) or 0) + 1
         now = int(time.time())
         delay = min(FAILED_SIGNAL_RETRY_MAX_SEC, FAILED_SIGNAL_RETRY_BASE_SEC * (2 ** max(0, retry_count - 1)))
-        terminal = retry_count >= FAILED_SIGNAL_MAX_RETRIES
+        terminal = bool(force_terminal) or retry_count >= FAILED_SIGNAL_MAX_RETRIES
         raw[str(event_id)] = {
             "ts": now,
             "status": str(status),
@@ -159,7 +160,7 @@ def _execution_outcome_category(status: str) -> str:
         return "PROTECTION_FAILURE"
     if "UNVERIFIED" in value or "TIMEOUT" in value:
         return "EXECUTION_UNVERIFIED"
-    if value in {"ENTRY_NOT_FILLED", "SKIPPED_MIN_QTY", "SKIPPED_TP_MIN_QTY", "SKIPPED_INVALID_SETUP", "BLOCKED_PROTECTION_PREFLIGHT"}:
+    if value in {"ENTRY_NOT_FILLED", "SKIPPED_MIN_QTY", "SKIPPED_TP_MIN_QTY", "SKIPPED_INVALID_SETUP", "SKIPPED_STALE_SIGNAL", "EXECUTION_QUOTE_UNAVAILABLE", "BLOCKED_PROTECTION_PREFLIGHT"}:
         return "EXECUTION_BLOCKED"
     if value in {"ERROR", "OPENED", "DISABLED", "BLOCKED_MISSING_CREDENTIALS"} or value.endswith("_FAILED") or value.startswith("FAILED"):
         return "EXECUTION_FAILURE"
@@ -689,6 +690,70 @@ def _emergency_close_and_verify(symbol: str, direction: str, qty: float, trade_i
 
     return {"status": "close_unverified", "attempts": attempts, "verification": verification, "remaining_qty": last_qty}
 
+def _adverse_signal_drift_pct(signal_entry: float, executable_price: float, direction: str) -> float:
+    """Distance the current executable price has moved against the original signal."""
+    if signal_entry <= 0 or executable_price <= 0:
+        return float("inf")
+    if direction == "LONG":
+        return max(0.0, executable_price - signal_entry) / signal_entry * 100.0
+    return max(0.0, signal_entry - executable_price) / signal_entry * 100.0
+
+
+def _build_actual_signal_from_rebase(signal: dict[str, Any], rebased: dict[str, Any]) -> dict[str, Any]:
+    actual_signal = dict(signal)
+    actual_signal.update({
+        "entry": float(rebased.get("entry", signal.get("entry"))),
+        "sl": float(rebased["sl"]),
+        "tp1": float(rebased["tp1"]),
+        "tp2": float(rebased["tp2"]),
+        "risk_pct": float(rebased["risk_pct"]),
+        "risk_abs": float(rebased["risk_abs"]),
+        "tp1_rr": float(rebased["tp1_rr"]),
+        "tp2_rr": float(rebased["tp2_rr"]),
+        "target": {
+            **(signal.get("target") if isinstance(signal.get("target"), dict) else {}),
+            "source": rebased["target_source"],
+            "obstacle_price": rebased.get("obstacle_price"),
+        },
+    })
+    return actual_signal
+
+
+def _validate_exchange_price_distinctness(signal: dict[str, Any]) -> tuple[bool, str]:
+    """Ensure SL/TP survive exchange pricePrecision rounding as distinct prices."""
+    try:
+        contract = get_contract(signal["symbol"]) or {}
+        price_precision = int(contract.get("pricePrecision") or 0)
+        fmt = lambda x: f"{float(x):.{price_precision}f}"
+        entry, sl, tp1, tp2 = (float(signal[k]) for k in ("entry", "sl", "tp1", "tp2"))
+    except (KeyError, TypeError, ValueError) as exc:
+        return False, f"price_precision_validation_failed: {exc}"
+    if fmt(entry) == fmt(sl):
+        return False, f"SL collapses to entry at pricePrecision={price_precision}: entry={fmt(entry)} sl={fmt(sl)}"
+    if fmt(entry) == fmt(tp1):
+        return False, f"TP1 collapses to entry at pricePrecision={price_precision}: entry={fmt(entry)} tp1={fmt(tp1)}"
+    if fmt(entry) == fmt(tp2) or fmt(tp1) == fmt(tp2):
+        return False, f"TP levels collapse at pricePrecision={price_precision}: entry={fmt(entry)} tp1={fmt(tp1)} tp2={fmt(tp2)}"
+    return True, "ok"
+
+
+def _is_terminal_execution_failure(execution: dict[str, Any]) -> bool:
+    status = str(execution.get("status", "")).lower()
+    error = str(execution.get("error", "")).lower()
+    if status in {"skipped_stale_signal", "skipped_tp_min_qty", "skipped_min_qty", "skipped_invalid_setup"}:
+        return True
+    terminal_fragments = (
+        "risk_pct_above_limit",
+        "insufficient_structure_room",
+        "signal_drift",
+        "execution_slippage",
+        "collapses to entry",
+        "missing_structural_obstacle",
+        "calculated quantity is <= 0",
+    )
+    return any(fragment in error for fragment in terminal_fragments)
+
+
 def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     symbol = str(signal["symbol"])
     direction = str(signal["type"]).upper()
@@ -714,8 +779,60 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         log.error("[EXEC_BLOCKED_PROTECTION_PRECHECK] %s %s | %s", symbol, direction, reason)
         return {"status": "blocked_protection_preflight", "symbol": symbol, "direction": direction, "error": reason}
 
+    # Revalidate against the actual BingX top-of-book immediately before MARKET.
+    # The previous implementation validated the stale signal price and only
+    # discovered changed risk/structure after the fill.
+    execution_quote = get_execution_quote(symbol, reference_price=entry_price)
+    if execution_quote.get("status") != "ok":
+        reason = execution_quote.get("error", "execution quote unavailable")
+        log.error("[EXEC_BLOCKED_QUOTE] %s %s | %s", symbol, direction, reason)
+        return {"status": "execution_quote_unavailable", "error": reason, "symbol": symbol, "direction": direction}
+
+    executable_price = float(execution_quote["ask"] if direction == "LONG" else execution_quote["bid"])
+    signal_drift_pct = _adverse_signal_drift_pct(entry_price, executable_price, direction)
+    if signal_drift_pct > MAX_ENTRY_SLIPPAGE_PCT:
+        reason = f"signal_drift_pct={signal_drift_pct:.4f}% > {MAX_ENTRY_SLIPPAGE_PCT:.4f}%"
+        log.warning("[EXEC_REJECT_STALE] %s %s | %s | signal=%s executable=%s", symbol, direction, reason, entry_price, executable_price)
+        return {
+            "status": "skipped_stale_signal",
+            "error": reason,
+            "symbol": symbol,
+            "direction": direction,
+            "signal_price": entry_price,
+            "pre_entry_bid": execution_quote.get("bid"),
+            "pre_entry_ask": execution_quote.get("ask"),
+            "execution_reference_price": executable_price,
+            "signal_drift_pct": signal_drift_pct,
+        }
+
+    try:
+        preflight_rebased = _rebase_protection_after_fill(signal, executable_price)
+        preflight_rebased.setdefault("entry", executable_price)
+        preflight_signal = _build_actual_signal_from_rebase(signal, preflight_rebased)
+    except Exception as exc:
+        reason = f"pre-entry protection rebase failed: {exc}"
+        log.warning("[EXEC_REJECT_GEOMETRY] %s %s | %s", symbol, direction, reason)
+        return {"status": "skipped_invalid_setup", "error": reason, "symbol": symbol, "direction": direction}
+
+    valid, reason = _validate_trade_geometry(preflight_signal)
+    if not valid:
+        log.warning("[EXEC_REJECT_GEOMETRY] %s %s | %s", symbol, direction, reason)
+        return {
+            "status": "skipped_invalid_setup",
+            "error": f"pre_entry_current_price_geometry: {reason}",
+            "symbol": symbol,
+            "direction": direction,
+            "signal_price": entry_price,
+            "execution_reference_price": executable_price,
+            "signal_drift_pct": signal_drift_pct,
+        }
+    distinct, reason = _validate_exchange_price_distinctness(preflight_signal)
+    if not distinct:
+        log.warning("[EXEC_REJECT_PRECISION] %s %s | %s", symbol, direction, reason)
+        return {"status": "skipped_invalid_setup", "error": reason, "symbol": symbol, "direction": direction}
+
     setup = _build_setup(signal)
-    order = open_market(symbol, direction, entry_price, event_id)
+    order = open_market(symbol, direction, entry_price, event_id, execution_quote=execution_quote)
     if order.get("status") == "skipped_min_qty":
         return order
     if order.get("status") != "opened":
@@ -771,23 +888,38 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
 
     avg_price = float(position["avgPrice"])
     qty = abs(float(position["positionAmt"]))
-    # Abort on materially adverse market-entry slippage. Once a market order is
-    # filled, accepting a severely worse price can invalidate the signal geometry
-    # before protection is even submitted. Roll back safely instead of widening risk.
+    pre_entry_bid = float(execution_quote["bid"])
+    pre_entry_ask = float(execution_quote["ask"])
+    executable_reference_price = pre_entry_ask if direction == "LONG" else pre_entry_bid
     try:
-        adverse_slippage_pct = (
-            max(0.0, avg_price - entry_price) / entry_price * 100.0
+        execution_slippage_pct = (
+            max(0.0, avg_price - pre_entry_ask) / pre_entry_ask * 100.0
             if direction == "LONG"
-            else max(0.0, entry_price - avg_price) / entry_price * 100.0
+            else max(0.0, pre_entry_bid - avg_price) / pre_entry_bid * 100.0
         )
     except (TypeError, ValueError, ZeroDivisionError):
-        adverse_slippage_pct = float("inf")
-    if adverse_slippage_pct > MAX_ENTRY_SLIPPAGE_PCT:
-        reason = f"adverse_entry_slippage={adverse_slippage_pct:.4f}% > {MAX_ENTRY_SLIPPAGE_PCT:.4f}%"
+        execution_slippage_pct = float("inf")
+
+    if execution_slippage_pct > MAX_ENTRY_SLIPPAGE_PCT:
+        reason = f"execution_slippage_pct={execution_slippage_pct:.4f}% > {MAX_ENTRY_SLIPPAGE_PCT:.4f}%"
         log.critical("[SAFETY_CLOSE] %s %s | %s", symbol, direction, reason)
         cleanup = _cancel_engine_protection_before_emergency_close(symbol, direction)
         close_result = _emergency_close_and_verify(symbol, direction, qty, event_id)
-        return {"status": "opened_then_emergency_closed", "error": reason, "order": order, "position": position, "close": close_result, "protection_cleanup": cleanup, "executed_signal": dict(signal)}
+        return {
+            "status": "opened_then_emergency_closed",
+            "error": reason,
+            "order": order,
+            "position": position,
+            "close": close_result,
+            "protection_cleanup": cleanup,
+            "signal_price": entry_price,
+            "pre_entry_bid": pre_entry_bid,
+            "pre_entry_ask": pre_entry_ask,
+            "execution_reference_price": executable_reference_price,
+            "signal_drift_pct": signal_drift_pct,
+            "execution_slippage_pct": execution_slippage_pct,
+            "executed_signal": dict(signal),
+        }
 
     # Recalculate ALL absolute protection levels from the real market fill.
     # Never submit targets computed from the stale signal/reference close.
@@ -807,22 +939,13 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     actual_risk_pct = float(rebased["risk_pct"])
     tp1_pnl_pct = (abs(tp1_price - avg_price) / avg_price) * 100.0
     tp2_pnl_pct = (abs(tp2_price - avg_price) / avg_price) * 100.0
-    actual_signal = dict(signal)
-    actual_signal.update({
-        "entry": avg_price,
-        "sl": sl_price,
-        "tp1": tp1_price,
-        "tp2": tp2_price,
-        "risk_pct": actual_risk_pct,
-        "risk_abs": actual_risk_abs,
-        "tp1_rr": float(rebased["tp1_rr"]),
-        "tp2_rr": float(rebased["tp2_rr"]),
-        "target": {
-            **(signal.get("target") if isinstance(signal.get("target"), dict) else {}),
-            "source": rebased["target_source"],
-            "obstacle_price": rebased.get("obstacle_price"),
-        },
-    })
+    actual_signal = _build_actual_signal_from_rebase(signal, rebased)
+    distinct, precision_reason = _validate_exchange_price_distinctness(actual_signal)
+    if not distinct:
+        log.critical("[SAFETY_CLOSE] %s %s | invalid exchange-rounded protection geometry | %s", symbol, direction, precision_reason)
+        cleanup = _cancel_engine_protection_before_emergency_close(symbol, direction)
+        close_result = _emergency_close_and_verify(symbol, direction, qty, event_id)
+        return {"status": "opened_then_emergency_closed", "error": precision_reason, "order": order, "position": position, "close": close_result, "protection_cleanup": cleanup, "executed_signal": actual_signal}
     valid, reason = _validate_trade_geometry(actual_signal)
     if not valid:
         log.critical("[SAFETY_CLOSE] %s %s | invalid post-fill protection geometry | %s", symbol, direction, reason)
@@ -831,6 +954,12 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         return {"status": "opened_then_emergency_closed", "error": reason, "order": order, "position": position, "close": close_result, "protection_cleanup": cleanup, "executed_signal": actual_signal}
 
     setup["entry_reference"] = avg_price
+    setup["signal_price"] = entry_price
+    setup["pre_entry_bid"] = pre_entry_bid
+    setup["pre_entry_ask"] = pre_entry_ask
+    setup["execution_reference_price"] = executable_reference_price
+    setup["signal_drift_pct"] = signal_drift_pct
+    setup["execution_slippage_pct"] = execution_slippage_pct
     setup["invalidation_price"] = sl_price
     setup["risk_pct"] = actual_risk_pct
     setup["target_rr"] = actual_signal["tp2_rr"]
@@ -1312,7 +1441,10 @@ def main() -> None:
         elif execution_status != "opened_protected":
             log.error("[EXEC_FAILED] %s %s | status=%s | error=%s | order=%s", signal["symbol"], signal["type"], execution_status, execution.get("error"), execution.get("order"))
             if execution_status not in {"DISABLED", "BLOCKED_MISSING_CREDENTIALS"}:
-                _mark_failed_signal(signal["event_id"], execution_status, execution.get("error", ""))
+                _mark_failed_signal(
+                    signal["event_id"], execution_status, execution.get("error", ""),
+                    force_terminal=_is_terminal_execution_failure(execution),
+                )
         _append_jsonl(TRADES_PATH, {
             "record_type": "TRADE_OPEN",
             "event_id": signal["event_id"],
