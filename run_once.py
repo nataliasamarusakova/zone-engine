@@ -7,6 +7,7 @@ import os
 import time
 import uuid
 import fcntl
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -31,7 +32,8 @@ from event_engine.bingx import (
     open_market,
     wait_for_position_fill_directional,
 )
-from event_engine.signals import SWING_LEN, TP1_R, TP2_R, generate_zone_signals, score_zone_signal
+from event_engine.signals import STRATEGY_VERSION, SWING_LEN, TP1_PCT, TP2_PCT, generate_zone_signals, score_zone_signal, _nearest_opposing_level, _signal_forensics
+from event_engine.fundamental_assets import FUNDAMENTAL_ASSET_SYMBOLS
 from event_engine.telegram import format_signal, send as send_tg
 from event_engine.tracker import register_active_trade, update_active_trades, update_active_trade_protection
 
@@ -62,7 +64,12 @@ WATCHLIST_SYMBOLS = tuple(x.strip().upper() for x in os.environ.get(
 ).split(",") if x.strip())
 KLINE_LIMIT_1H = int(os.environ.get("KLINE_LIMIT_1H", "120"))
 MAX_SIGNAL_AGE_BARS = int(os.environ.get("MAX_SIGNAL_AGE_BARS", "0"))
-MAX_PRODUCTION_RISK_PCT = min(float(os.environ.get("MAX_SIGNAL_RISK_PCT", "5.00")), 5.00)
+FIXED_STOP_PCT = float(os.environ.get("FIXED_STOP_PCT", "10.00"))
+MAX_PRODUCTION_RISK_PCT = min(float(os.environ.get("MAX_SIGNAL_RISK_PCT", str(FIXED_STOP_PCT))), FIXED_STOP_PCT)
+MIN_STRUCTURE_ROOM_R = float(os.environ.get("MIN_STRUCTURE_ROOM_R", "1.20"))
+REQUIRE_STRUCTURE_OBSTACLE = os.environ.get("REQUIRE_STRUCTURE_OBSTACLE", "false").lower() == "true"
+MAX_ZONE_AGE_BARS = int(os.environ.get("MAX_ZONE_AGE_BARS", "30"))
+REQUIRE_DIRECTIONAL_CANDLE = os.environ.get("REQUIRE_DIRECTIONAL_CANDLE", "false").lower() == "true"
 # Production execution is strict by default: only the latest closed 1H bar may open a trade.
 EXECUTION_MAX_SIGNAL_AGE_BARS = int(os.environ.get("EXECUTION_MAX_SIGNAL_AGE_BARS", "0"))
 DIAGNOSTICS_MODE = os.environ.get("DIAGNOSTICS_MODE", "historical").strip().lower()
@@ -79,6 +86,14 @@ RECONCILIATION_MAX_SECONDS = float(os.environ.get("RECONCILIATION_MAX_SECONDS", 
 # Also reject stale market data so a symbol with an old/delisted Binance series cannot
 # masquerade as a fresh signal merely because its DataFrame index is zero-based.
 MAX_DATA_STALENESS_HOURS = float(os.environ.get("MAX_DATA_STALENESS_HOURS", "2.0"))
+# Zone geometry remains 1H; trigger detection runs on closed 5m bars so a short
+# midpoint visit cannot be missed merely because the 1H candle later closes elsewhere.
+KLINE_LIMIT_5M = int(os.environ.get("KLINE_LIMIT_5M", "144"))  # 12h of 5m bars
+MAX_5M_TRIGGER_AGE_MINUTES = float(os.environ.get("MAX_5M_TRIGGER_AGE_MINUTES", "15"))
+INITIAL_5M_TRIGGER_LOOKBACK_MINUTES = float(os.environ.get("INITIAL_5M_TRIGGER_LOOKBACK_MINUTES", "15"))
+ZONE_VISIT_STATE_PATH = DATA / "zone_visit_state.json"
+ZONE_VISIT_STATE_LOCK_PATH = DATA / "zone_visit_state.json.lock"
+ZONE_VISIT_STATE_VERSION = 1
 
 
 def _append_jsonl(path: Path, obj: dict[str, Any]) -> None:
@@ -331,22 +346,357 @@ def get_scan_symbols() -> list[str]:
         if symbol:
             available.add(symbol)
 
+    # Strategic universe is ALWAYS limited to the curated 150-asset fundamental
+    # whitelist. WATCHLIST_ONLY can only make that universe smaller; it can never
+    # reintroduce an asset outside the whitelist.
+    fundamental_available = available.intersection(FUNDAMENTAL_ASSET_SYMBOLS)
     if WATCHLIST_ONLY:
-        # Keep the order from the configured watchlist so the runtime log is
-        # deterministic and manual checking is straightforward.
-        symbols = [s for s in WATCHLIST_SYMBOLS if s in available]
-        missing = [s for s in WATCHLIST_SYMBOLS if s not in available]
+        symbols = [s for s in WATCHLIST_SYMBOLS if s in fundamental_available]
+        missing = [s for s in WATCHLIST_SYMBOLS if s not in fundamental_available]
         if missing:
-            log.warning("[WATCHLIST_MISSING] symbols_not_active=%s", ",".join(missing))
-        if MAX_SCAN_SYMBOLS > 0:
-            symbols = symbols[:MAX_SCAN_SYMBOLS]
-        return symbols
-
-    symbols = sorted(available)
+            log.warning("[WATCHLIST_MISSING] symbols_not_active_or_not_whitelisted=%s", ",".join(missing))
+    else:
+        symbols = sorted(fundamental_available)
     if MAX_SCAN_SYMBOLS > 0:
         symbols = symbols[:MAX_SCAN_SYMBOLS]
+    log.info("[UNIVERSE] fundamental_whitelist=%d active_bingx=%d", len(FUNDAMENTAL_ASSET_SYMBOLS), len(symbols))
     return symbols
 
+
+
+def _zone_visit_key(zone: dict[str, Any], kind: str) -> str:
+    """Stable identity for one 1H zone across repeated scans."""
+    return f"{kind.upper()}:{int(zone.get('start', -1))}:{float(zone.get('top', 0.0)):.12f}:{float(zone.get('btm', 0.0)):.12f}"
+
+
+def _load_zone_visit_state() -> dict[str, Any]:
+    """Load only the new zone-visit state schema; no legacy migration is supported."""
+    if not ZONE_VISIT_STATE_PATH.exists():
+        return {"version": ZONE_VISIT_STATE_VERSION, "symbols": {}}
+    try:
+        raw = json.loads(ZONE_VISIT_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.warning("[ZONE_STATE] load failed; starting empty state: %s", exc)
+        return {"version": ZONE_VISIT_STATE_VERSION, "symbols": {}}
+    if not isinstance(raw, dict) or int(raw.get("version", -1)) != ZONE_VISIT_STATE_VERSION or not isinstance(raw.get("symbols"), dict):
+        log.warning("[ZONE_STATE] invalid/newer schema; starting empty state")
+        return {"version": ZONE_VISIT_STATE_VERSION, "symbols": {}}
+    return raw
+
+
+def _save_zone_visit_state(state: dict[str, Any]) -> None:
+    """Atomically persist zone-visit state after a complete scan batch."""
+    DATA.mkdir(parents=True, exist_ok=True)
+    payload = {"version": ZONE_VISIT_STATE_VERSION, "symbols": state.get("symbols", {})}
+    lock_path = ZONE_VISIT_STATE_LOCK_PATH
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        tmp = ZONE_VISIT_STATE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        os.replace(tmp, ZONE_VISIT_STATE_PATH)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _make_5m_event_id(symbol: str, direction: str, trigger_ts_ms: int, zone: dict[str, Any]) -> str:
+    raw = (
+        f"ZONE5M:{symbol.upper()}:{direction.upper()}:{int(trigger_ts_ms)}:"
+        f"{int(zone.get('start', -1))}:{float(zone.get('top', 0.0)):.12f}:{float(zone.get('btm', 0.0)):.12f}"
+    )
+    return "ZONE_" + hashlib.sha256(raw.encode("utf-8")).hexdigest().upper()[:24]
+
+
+def _normalize_closed_5m(bars: list[dict[str, Any]]) -> pd.DataFrame:
+    """Normalize provider 5m bars and retain only fully closed candles."""
+    if not bars:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+    x = pd.DataFrame(bars).copy()
+    required = ["timestamp", "open", "high", "low", "close", "volume"]
+    missing = [c for c in required if c not in x.columns]
+    if missing:
+        raise ValueError(f"5m bars missing columns: {missing}")
+    raw_ts = x["timestamp"]
+    if pd.api.types.is_datetime64_any_dtype(raw_ts):
+        x["timestamp"] = pd.to_datetime(raw_ts, utc=True, errors="coerce")
+    else:
+        numeric = pd.to_numeric(raw_ts, errors="coerce")
+        magnitude = float(numeric.dropna().abs().median()) if not numeric.dropna().empty else 0.0
+        unit = "ms" if magnitude >= 1e11 else "s" if magnitude >= 1e8 else None
+        x["timestamp"] = pd.to_datetime(numeric, unit=unit, utc=True, errors="coerce") if unit else pd.to_datetime(raw_ts, utc=True, errors="coerce")
+    for c in ["open", "high", "low", "close", "volume"]:
+        x[c] = pd.to_numeric(x[c], errors="coerce")
+    x = x.dropna(subset=required).sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
+    if x.empty:
+        return x
+    now = pd.Timestamp.now(tz="UTC")
+    close_time = x["timestamp"] + pd.Timedelta(minutes=5)
+    x = x.loc[close_time <= now].copy().reset_index(drop=True)
+    return x
+
+
+def _build_5m_zone_signal(
+    symbol: str,
+    direction: str,
+    zone: dict[str, Any],
+    bar: pd.Series,
+    prev_bar: pd.Series | None,
+    df_1h: pd.DataFrame,
+    demand: list[dict[str, Any]],
+    supply: list[dict[str, Any]],
+    zone_state: dict[str, Any],
+) -> dict[str, Any]:
+    """Build an execution-ready signal from a 5m midpoint touch of an existing 1H zone."""
+    top = float(zone["top"])
+    bottom = float(zone["btm"])
+    midpoint = (top + bottom) / 2.0
+    entry = midpoint
+    fixed_stop_pct = FIXED_STOP_PCT
+    risk = entry * fixed_stop_pct / 100.0
+    stop = entry - risk if direction == "LONG" else entry + risk
+    current_idx = len(df_1h) - 1
+    obstacle = _nearest_opposing_level(direction, entry, demand, supply, df_1h, current_idx)
+    if obstacle is not None:
+        obstacle_price = float(obstacle["price"])
+        structural_distance = obstacle_price - entry if direction == "LONG" else entry - obstacle_price
+        if structural_distance <= 0 or structural_distance / risk < MIN_STRUCTURE_ROOM_R:
+            raise ValueError(f"insufficient_structure_room={structural_distance / risk if risk else 0.0:.3f}R < {MIN_STRUCTURE_ROOM_R:.3f}R")
+    elif REQUIRE_STRUCTURE_OBSTACLE:
+        raise ValueError("missing_structural_obstacle")
+
+    tp1 = entry * (1.0 + TP1_PCT / 100.0) if direction == "LONG" else entry * (1.0 - TP1_PCT / 100.0)
+    tp2 = entry * (1.0 + TP2_PCT / 100.0) if direction == "LONG" else entry * (1.0 - TP2_PCT / 100.0)
+    ts = pd.Timestamp(bar["timestamp"])
+    trigger_ts_ms = int(ts.timestamp() * 1000)
+    zone_copy = {**zone, "kind": "DEMAND" if direction == "LONG" else "SUPPLY"}
+    prev_bar_dict = {
+        "timestamp": pd.Timestamp(prev_bar["timestamp"]).isoformat() if prev_bar is not None else None,
+        "open": float(prev_bar["open"]) if prev_bar is not None else None,
+        "high": float(prev_bar["high"]) if prev_bar is not None else None,
+        "low": float(prev_bar["low"]) if prev_bar is not None else None,
+        "close": float(prev_bar["close"]) if prev_bar is not None else None,
+        "volume": float(prev_bar["volume"]) if prev_bar is not None else None,
+    }
+    event_id = _make_5m_event_id(symbol, direction, trigger_ts_ms, zone)
+    atr_1h = float(df_1h.loc[current_idx, "atr50"]) if "atr50" in df_1h.columns else 0.0
+    volume_window = df_1h["volume"].rolling(20, min_periods=20).mean() if "volume" in df_1h.columns else pd.Series(dtype=float)
+    avg_vol = float(volume_window.iloc[-1]) if not volume_window.empty and pd.notna(volume_window.iloc[-1]) else 0.0
+    trigger_volume = float(bar["volume"])
+    vol_ratio = trigger_volume / avg_vol if avg_vol > 0 else None
+    zone_age_bars = max(0, int(current_idx - int(zone.get("start", current_idx))))
+    if zone_age_bars > MAX_ZONE_AGE_BARS:
+        raise ValueError(f"zone_age_bars={zone_age_bars}>{MAX_ZONE_AGE_BARS}")
+    directional_ok = (float(bar["close"]) >= float(bar["open"])) if direction == "LONG" else (float(bar["close"]) <= float(bar["open"]))
+    if REQUIRE_DIRECTIONAL_CANDLE and not directional_ok:
+        raise ValueError("directional_candle_required")
+    entry_bar = {k: (pd.Timestamp(bar[k]).isoformat() if k == "timestamp" else float(bar[k])) for k in ["timestamp", "open", "high", "low", "close", "volume"]}
+    setup_zone = {**zone_copy, "age_bars": zone_age_bars}
+    signal_forensics = _signal_forensics(direction, float(bar["open"]), float(bar["high"]), float(bar["low"]), float(bar["close"]), max(atr_1h, 1e-12), setup_zone)
+    return {
+        "event_id": event_id,
+        "idx": trigger_ts_ms,
+        "time": ts.isoformat(),
+        "trigger_bar_time": ts.isoformat(),
+        "trigger_timeframe": "5m",
+        "type": direction,
+        "symbol": symbol.upper(),
+        "entry": entry,
+        "sl": stop,
+        "tp1": tp1,
+        "tp2": tp2,
+        "risk_pct": fixed_stop_pct,
+        "risk_abs": risk,
+        "atr": atr_1h,
+        "tp1_rr": TP1_PCT / fixed_stop_pct,
+        "tp2_rr": TP2_PCT / fixed_stop_pct,
+        "strategy": "Demand/Supply Zone First",
+        "strategy_version": STRATEGY_VERSION,
+        "entry_bar": entry_bar,
+        "previous_bar": prev_bar_dict,
+        "trigger": {
+            "type": "ZONE_MIDPOINT_TOUCH_5M",
+            "alma_required": False,
+            "alternate_timeframe": "8h",
+            "zone_touch": True,
+            "zone_entry_rule": "fresh_midpoint_touch_5m",
+            "zone_midpoint": midpoint,
+            "zone_midpoint_pct": 50.0,
+            "previous_bar_midpoint_touch": bool(zone_state.get("previous_midpoint_touch", False)),
+            "zone_visit_id": zone_state.get("visit_id"),
+            "zone_visit_state": "TRIGGERED",
+        },
+        "zone": setup_zone,
+        "target": {
+            "source": "fixed_entry_percentage",
+            "obstacle_source": obstacle.get("source") if obstacle else None,
+            "obstacle_price": float(obstacle["price"]) if obstacle else None,
+            "tp1_pct": TP1_PCT,
+            "tp2_pct": TP2_PCT,
+            "tp1_close_fraction": 0.50,
+            "tp2_close_fraction": 0.50,
+            "be_rule": "after_tp1_filled",
+        },
+        "risk_model": {
+            "sl_source": "fixed_percent_from_entry",
+            "fixed_stop_pct": FIXED_STOP_PCT,
+            "max_signal_risk_pct": MAX_PRODUCTION_RISK_PCT,
+            "initial_risk_pct": fixed_stop_pct,
+        },
+        "confirmation": {
+            "alma_cross": False,
+            "directional_candle_required": REQUIRE_DIRECTIONAL_CANDLE,
+            "directional_candle_ok": (float(bar["close"]) >= float(bar["open"])) if direction == "LONG" else (float(bar["close"]) <= float(bar["open"])),
+            "zone_age_limit_bars": MAX_ZONE_AGE_BARS,
+            "zone_age_bars": zone_age_bars,
+            "minimum_structure_room_r": MIN_STRUCTURE_ROOM_R,
+            "zone_touch": True,
+            "midpoint_touch": True,
+            "trigger_timeframe": "5m",
+            "volume_ratio": vol_ratio,
+            "bullish_candle": float(bar["close"]) >= float(bar["open"]),
+            "bearish_candle": float(bar["close"]) <= float(bar["open"]),
+        },
+        "source_bar_close": float(bar["close"]),
+        "zone_midpoint": midpoint,
+        "zone_width_abs": max(0.0, top - bottom),
+        "zone_width_pct_of_entry": (max(0.0, top - bottom) / entry) * 100.0 if entry > 0 else None,
+        "signal_forensics": signal_forensics,
+        "zone_visit": {
+            "visit_id": zone_state.get("visit_id"),
+            "first_touch_ts": zone_state.get("first_touch_ts"),
+            "touch_count_before_trigger": zone_state.get("touch_count", 0),
+            "state": "LOCKED",
+        },
+    }
+
+
+def _process_5m_zone_visits(
+    symbol: str,
+    bars: list[dict[str, Any]],
+    demand: list[dict[str, Any]],
+    supply: list[dict[str, Any]],
+    df_1h: pd.DataFrame,
+    state_for_symbol: dict[str, Any] | None,
+    successful_ids: set[str],
+    terminal_event_ids: set[str],
+) -> tuple[list[dict[str, Any]], dict[str, Any], str | None]:
+    """Process closed 5m bars with one locked visit per 1H zone and durable cursor state."""
+    x = _normalize_closed_5m(bars)
+    now = pd.Timestamp.now(tz="UTC")
+    symbol_state = dict(state_for_symbol or {})
+    symbol_state.setdefault("version", ZONE_VISIT_STATE_VERSION)
+    symbol_state.setdefault("zones", {})
+    active_zone_map: dict[str, tuple[str, dict[str, Any]]] = {}
+    for z in demand:
+        active_zone_map[_zone_visit_key(z, "DEMAND")] = ("LONG", z)
+    for z in supply:
+        active_zone_map[_zone_visit_key(z, "SUPPLY")] = ("SHORT", z)
+
+    # Drop stale state entries for zones that no longer exist; a broken 1H zone
+    # cannot be resurrected by an old 5m visit.
+    symbol_state["zones"] = {k: v for k, v in symbol_state["zones"].items() if k in active_zone_map and isinstance(v, dict)}
+    last_processed_raw = symbol_state.get("last_processed_5m_ts")
+    if last_processed_raw:
+        last_processed = pd.Timestamp(last_processed_raw)
+        start_mask = x["timestamp"] > last_processed
+    else:
+        start_mask = x["timestamp"] >= (now - pd.Timedelta(minutes=INITIAL_5M_TRIGGER_LOOKBACK_MINUTES))
+
+    signals: list[dict[str, Any]] = []
+    trigger_text: str | None = None
+    processed_rows = x.loc[start_mask].copy()
+    for _, bar in processed_rows.iterrows():
+        bar_ts = pd.Timestamp(bar["timestamp"])
+        prev_bar = x.loc[x["timestamp"] < bar_ts].tail(1)
+        prev = prev_bar.iloc[0] if not prev_bar.empty else None
+        # First update re-arm status for every currently active zone. Re-arm only
+        # after a closed 5m candle finishes fully beyond the far boundary of the zone.
+        for zone_key, (direction, zone) in active_zone_map.items():
+            zs = symbol_state["zones"].setdefault(zone_key, {"state": "ARMED", "visit_id": f"{symbol}:{zone_key}", "touch_count": 0})
+            close = float(bar["close"])
+            if zs.get("state") == "LOCKED":
+                rearmed = (close > float(zone["top"])) if direction == "LONG" else (close < float(zone["btm"]))
+                # A bar that both exits beyond the far edge and crosses the midpoint
+                # is an exit/breakout bar, not a fresh return. Re-arm only after it.
+                if rearmed and zs.get("first_touch_ts") and bar_ts > pd.Timestamp(zs["first_touch_ts"]):
+                    zs.update({"state": "ARMED", "rearm_ts": bar_ts.isoformat(), "pending_signal": None, "trigger_event_id": None, "touch_count": 0, "first_touch_ts": None, "last_touch_ts": None})
+                    continue
+            if zs.get("state") != "ARMED":
+                continue
+            activation_idx = int(zone.get("start", -1)) + SWING_LEN
+            if activation_idx >= 0 and activation_idx < len(df_1h):
+                activation_ts = pd.Timestamp(df_1h.loc[activation_idx, "timestamp"])
+                if bar_ts < activation_ts:
+                    continue
+            midpoint = (float(zone["top"]) + float(zone["btm"])) / 2.0
+            touch = float(bar["low"]) <= midpoint <= float(bar["high"])
+            if not touch:
+                continue
+            # Ambiguous overlap is a no-trade state; still record the visit so it
+            # cannot create repeated directional attempts while price oscillates.
+            if direction == "LONG":
+                opposite_touch = any(float(bar["low"]) <= (float(z["top"]) + float(z["btm"])) / 2.0 <= float(bar["high"]) for z in supply)
+            else:
+                opposite_touch = any(float(bar["low"]) <= (float(z["top"]) + float(z["btm"])) / 2.0 <= float(bar["high"]) for z in demand)
+            if opposite_touch:
+                zs.update({"state": "LOCKED", "first_touch_ts": bar_ts.isoformat(), "last_touch_ts": bar_ts.isoformat(), "touch_count": int(zs.get("touch_count", 0)) + 1, "lock_reason": "ambiguous_overlap", "visit_id": f"{symbol}:{zone_key}:{int(bar_ts.timestamp()*1000)}"})
+                continue
+            state = dict(zs)
+            state["previous_midpoint_touch"] = bool(prev is not None and float(prev["low"]) <= midpoint <= float(prev["high"]))
+            if state["previous_midpoint_touch"]:
+                # This is still the same continuous visit, not a new touch event.
+                zs.update({"state": "LOCKED", "last_touch_ts": bar_ts.isoformat(), "touch_count": int(zs.get("touch_count", 0)) + 1})
+                continue
+            if not zs.get("first_touch_ts"):
+                visit_id = f"{symbol}:{zone_key}:{int(bar_ts.timestamp()*1000)}"
+                zs.update({"state": "LOCKED", "first_touch_ts": bar_ts.isoformat(), "last_touch_ts": bar_ts.isoformat(), "touch_count": int(zs.get("touch_count", 0)), "visit_id": visit_id, "lock_reason": "midpoint_touch"})
+            try:
+                signal = _build_5m_zone_signal(symbol, direction, zone, bar, prev, df_1h, demand, supply, zs)
+            except ValueError as exc:
+                zs.update({"state": "LOCKED", "lock_reason": str(exc), "trigger_event_id": None})
+                continue
+            event_id = str(signal["event_id"])
+            age_min = max(0.0, (now - bar_ts).total_seconds() / 60.0)
+            if age_min > MAX_5M_TRIGGER_AGE_MINUTES:
+                # A stale touch is useful audit data but must not consume the zone visit.
+                # Otherwise a delayed provider/API response could lock a zone until a
+                # future full exit/re-entry, silently suppressing the next valid setup.
+                zs.update({
+                    "state": "ARMED",
+                    "last_touch_ts": bar_ts.isoformat(),
+                    "touch_count": int(zs.get("touch_count", 0)) + 1,
+                    "lock_reason": "stale_midpoint_touch_ignored",
+                    "trigger_event_id": None,
+                    "pending_signal": None,
+                })
+                continue
+            zs["trigger_event_id"] = event_id
+            zs["pending_signal"] = signal
+            zs["state"] = "LOCKED"
+            # Re-use the same event for a retryable execution failure.
+            if event_id not in successful_ids and event_id not in terminal_event_ids:
+                signals.append(signal)
+                trigger_text = f"{direction} @ {midpoint:.12g} 5m_midpoint"
+
+    if not processed_rows.empty:
+        symbol_state["last_processed_5m_ts"] = pd.Timestamp(processed_rows["timestamp"].max()).isoformat()
+    symbol_state["last_scan_ts"] = now.isoformat()
+
+    # Retry an already-created event only while it remains fresh. This keeps
+    # transient exchange failures attached to the same visit/event id.
+    for zs in symbol_state["zones"].values():
+        pending = zs.get("pending_signal")
+        if not isinstance(pending, dict):
+            continue
+        eid = str(pending.get("event_id", ""))
+        if not eid or eid in successful_ids or eid in terminal_event_ids:
+            continue
+        try:
+            age_min = max(0.0, (now - pd.Timestamp(pending["trigger_bar_time"])).total_seconds() / 60.0)
+        except Exception:
+            age_min = float("inf")
+        if age_min <= MAX_5M_TRIGGER_AGE_MINUTES and not any(str(s.get("event_id")) == eid for s in signals):
+            signals.append(pending)
+            trigger_text = trigger_text or f"{pending.get('type')} @ {pending.get('entry')} 5m_midpoint_retry"
+    return signals, symbol_state, trigger_text
 
 def _log_coin_skip(symbol: str, reason: str) -> None:
     log.warning("[COIN_SKIP] %s | %s", symbol, reason)
@@ -492,8 +842,8 @@ def reconcile_all_open_positions() -> None:
         if not tp_levels:
             risk_pct = max(stop_loss_pct, 0.05)
             tp_levels = [
-                {"leg": "tp1", "pnl_pct": risk_pct * TP1_R, "close_fraction": 0.50},
-                {"leg": "tp2", "pnl_pct": risk_pct * TP2_R, "close_fraction": 0.50},
+                {"leg": "tp1", "pnl_pct": TP1_PCT, "close_fraction": 0.50},
+                {"leg": "tp2", "pnl_pct": TP2_PCT, "close_fraction": 0.50},
             ]
 
         # Never recreate a TP leg already confirmed as executed. After TP1 the
@@ -542,15 +892,26 @@ def _build_setup(signal: dict[str, Any]) -> dict[str, Any]:
     risk_pct = float(signal["risk_pct"])
     return {
         "strategy": str(signal.get("strategy", "Demand/Supply Zone First")),
+        "strategy_version": str(signal.get("strategy_version", STRATEGY_VERSION)),
+        "entry_rule": str((signal.get("trigger") or {}).get("zone_entry_rule", "fresh_midpoint_touch")),
+        "stop_rule": str((signal.get("risk_model") or {}).get("sl_source", "fixed_percent_from_entry")),
+        "target_rule": str((signal.get("target") or {}).get("source", "fixed_entry_percentage")),
+        "be_rule": str((signal.get("target") or {}).get("be_rule", "after_tp1_filled")),
+        "signal_snapshot": dict(signal),
+        "target": dict(signal.get("target", {})) if isinstance(signal.get("target"), dict) else {},
+        "risk_model": dict(signal.get("risk_model", {})) if isinstance(signal.get("risk_model"), dict) else {},
+        "trigger": dict(signal.get("trigger", {})) if isinstance(signal.get("trigger"), dict) else {},
+        "entry_bar": dict(signal.get("entry_bar", {})) if isinstance(signal.get("entry_bar"), dict) else {},
+        "previous_bar": dict(signal.get("previous_bar", {})) if isinstance(signal.get("previous_bar"), dict) else {},
         "signal_price": float(signal["entry"]),
         "entry_reference": float(signal["entry"]),
         "invalidation_price": float(signal["sl"]),
         "risk_pct": risk_pct,
-        "target_rr": float(signal.get("tp2_rr", TP2_R)),
-        "planned_weighted_rr": float(signal.get("tp1_rr", TP1_R)) * 0.50 + float(signal.get("tp2_rr", TP2_R)) * 0.50,
+        "target_rr": float(signal.get("tp2_rr", TP2_PCT / FIXED_STOP_PCT)),
+        "planned_weighted_rr": float(signal.get("tp1_rr", TP1_PCT / FIXED_STOP_PCT)) * 0.50 + float(signal.get("tp2_rr", TP2_PCT / FIXED_STOP_PCT)) * 0.50,
         "tp_levels": [
-            {"leg": "tp1", "pnl_pct": float(signal.get("tp1_rr", TP1_R)) * risk_pct, "close_fraction": 0.50, "price": float(signal["tp1"])},
-            {"leg": "tp2", "pnl_pct": float(signal.get("tp2_rr", TP2_R)) * risk_pct, "close_fraction": 0.50, "price": float(signal["tp2"])},
+            {"leg": "tp1", "pnl_pct": TP1_PCT, "close_fraction": 0.50, "price": float(signal["tp1"])},
+            {"leg": "tp2", "pnl_pct": TP2_PCT, "close_fraction": 0.50, "price": float(signal["tp2"])},
         ],
         "target_price": float(signal["tp2"]),
         "zone": signal.get("zone", {}),
@@ -612,10 +973,12 @@ def _validate_trade_geometry(signal: dict[str, Any]) -> tuple[bool, str]:
 
 
 def _protection_geometry_from_fill(direction: str, avg_price: float, risk_pct: float) -> tuple[float, float, float]:
+    # Kept as a small geometry helper for tests/diagnostics. Production uses the
+    # same fixed stop percentage through _rebase_protection_after_fill().
     risk = avg_price * risk_pct / 100.0
     if direction == "LONG":
-        return avg_price - risk, avg_price + TP1_R * risk, avg_price + TP2_R * risk
-    return avg_price + risk, avg_price - TP1_R * risk, avg_price - TP2_R * risk
+        return avg_price - risk, avg_price * (1.0 + TP1_PCT / 100.0), avg_price * (1.0 + TP2_PCT / 100.0)
+    return avg_price + risk, avg_price * (1.0 - TP1_PCT / 100.0), avg_price * (1.0 - TP2_PCT / 100.0)
 
 
 def _cleanup_engine_protection(symbol: str, direction: str) -> dict[str, Any]:
@@ -663,15 +1026,15 @@ def _rebase_protection_after_fill(signal: dict[str, Any], avg_price: float) -> d
     if zone_top is None or zone_bottom is None:
         raise ValueError("zone boundaries unavailable for post-fill protection")
 
-    sl_buffer = max(atr * float(os.environ.get("ZONE_SL_ATR_BUFFER", "0.10")), entry * 0.0002)
+    fixed_stop_pct = float(os.environ.get("FIXED_STOP_PCT", "10.00"))
+    if not (0.0 < fixed_stop_pct <= 10.0):
+        raise ValueError(f"FIXED_STOP_PCT must be in (0, 10], got {fixed_stop_pct}")
+    risk = entry * fixed_stop_pct / 100.0
     if direction == "LONG":
-        zone_stop = zone_bottom - sl_buffer
-        sl = zone_stop if zone_stop < entry else entry - sl_buffer
+        sl = entry - risk
     else:
-        zone_stop = zone_top + sl_buffer
-        sl = zone_stop if zone_stop > entry else entry + sl_buffer
+        sl = entry + risk
 
-    risk = abs(entry - sl)
     if risk <= 0:
         raise ValueError("post-fill risk is non-positive")
 
@@ -681,48 +1044,17 @@ def _rebase_protection_after_fill(signal: dict[str, Any], avg_price: float) -> d
     except (TypeError, ValueError):
         obstacle = None
 
-    obstacle_buffer = max(atr * float(os.environ.get("TP_OBSTACLE_BUFFER_ATR", "0.10")), entry * 0.0002)
-    tp1_r = float(os.environ.get("TP1_R", "0.5"))
-    tp2_r = float(os.environ.get("TP2_R", "1.0"))
-    tp_min_r = float(os.environ.get("TP_MIN_R", "0.50"))
-    tp_max_r = float(os.environ.get("TP_MAX_R", "1.50"))
-    tp1_fraction = float(os.environ.get("TP1_OBSTACLE_FRACTION", "0.50"))
-    tp2_fraction = float(os.environ.get("TP2_OBSTACLE_FRACTION", "0.90"))
-
-    target_source = "atr_rr_fallback_after_fill"
-    if obstacle is None and os.environ.get("REQUIRE_STRUCTURE_OBSTACLE", "true").lower() == "true":
-        raise ValueError("structural obstacle unavailable after fill")
-    if obstacle is not None:
-        if direction == "LONG" and obstacle > entry + obstacle_buffer:
-            usable = obstacle - obstacle_buffer - entry
-        elif direction == "SHORT" and obstacle < entry - obstacle_buffer:
-            usable = entry - obstacle_buffer - obstacle
-        else:
-            usable = -1.0
-        if usable > 0:
-            tp2_distance = min(usable * tp2_fraction, tp_max_r * risk)
-            tp1_distance = tp2_distance * tp1_fraction
-            if tp2_distance / risk >= tp_min_r and tp1_distance > 0 and tp2_distance > tp1_distance:
-                target_source = "nearest_opposing_structure_after_fill"
-            else:
-                tp2_distance = 0.0
-        else:
-            tp2_distance = 0.0
-    else:
-        tp2_distance = 0.0
-
-    if tp2_distance <= 0:
-        tp1_distance = tp1_r * risk
-        tp2_distance = tp2_r * risk
-        if tp2_distance <= tp1_distance:
-            tp2_distance = max(tp1_distance * 2.0, risk)
-
+    # Targets are fixed percentages from the actual fill. The obstacle is kept
+    # only as metadata/diagnostic context; it no longer compresses TP distance.
+    tp1_distance = entry * TP1_PCT / 100.0
+    tp2_distance = entry * TP2_PCT / 100.0
     if direction == "LONG":
         tp1 = entry + tp1_distance
         tp2 = entry + tp2_distance
     else:
         tp1 = entry - tp1_distance
         tp2 = entry - tp2_distance
+    target_source = "fixed_entry_percentage_after_fill"
 
     return {
         "entry": entry,
@@ -1093,6 +1425,29 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         {"leg": "tp2", "pnl_pct": tp2_pnl_pct, "close_fraction": 0.50, "price": tp2_price},
     ]
     setup["target_price"] = tp2_price
+    setup["entry_order"] = order if isinstance(order, dict) else {}
+    setup["fill_position"] = position if isinstance(position, dict) else {}
+    setup["execution_snapshot"] = {
+        "strategy_version": STRATEGY_VERSION,
+        "signal_entry": entry_price,
+        "requested_entry": entry_price,
+        "pre_entry_bid": pre_entry_bid,
+        "pre_entry_ask": pre_entry_ask,
+        "execution_reference_price": executable_reference_price,
+        "signal_drift_pct": signal_drift_pct,
+        "fill_price": avg_price,
+        "entry_slippage_pct": execution_slippage_pct,
+        "adverse_entry_slippage_pct": execution_slippage_pct,
+        "sl_price": sl_price,
+        "tp1_price": tp1_price,
+        "tp2_price": tp2_price,
+        "stop_pct": actual_risk_pct,
+        "tp1_pct": tp1_pnl_pct,
+        "tp2_pct": tp2_pnl_pct,
+        "tp1_fraction": 0.50,
+        "tp2_fraction": 0.50,
+        "be_rule": "after_tp1_filled",
+    }
 
     log.info(
         "[EXEC_POST_FILL_REBASED] %s %s | fill=%s sl=%s tp1=%s tp2=%s tp1_rr=%.3f tp2_rr=%.3f target_source=%s",
@@ -1104,6 +1459,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         symbol, direction, avg_price, qty,
         actual_risk_pct, setup["tp_levels"], trade_id=event_id,
     )
+    setup["execution_snapshot"]["protection_status"] = protection.get("status")
     if protection.get("status") != "PROTECTED":
         log.critical("[SAFETY_CLOSE] %s %s | mandatory protection incomplete | %s", symbol, direction, protection)
         # Mandatory rule: never leave a newly-opened position live without BOTH
@@ -1136,8 +1492,8 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         qty=qty,
         tp_orders=protection.get("tp_orders", []),
         sl_result=protection.get("sl_result", {}),
-        event_type=f"{setup['zone'].get('kind', 'ZONE')}_ZONE_TOUCH",
-        timeframe="1h",
+        event_type=f"{setup['zone'].get('kind', 'ZONE')}_MIDPOINT_TOUCH_5M",
+        timeframe="5m",
         score=float(signal.get("score", 0.0)),
         setup={**setup, "protection_status": protection.get("status"), "protection_result": protection},
         requested_entry_price=entry_price,
@@ -1148,6 +1504,27 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         "order": order,
         "position": position,
         "protection": protection,
+        "execution_snapshot": {
+            "strategy_version": STRATEGY_VERSION,
+            "signal_entry": entry_price,
+            "requested_entry": entry_price,
+            "pre_entry_bid": pre_entry_bid,
+            "pre_entry_ask": pre_entry_ask,
+            "execution_reference_price": executable_reference_price,
+            "signal_drift_pct": signal_drift_pct,
+            "fill_price": avg_price,
+            "entry_slippage_pct": execution_slippage_pct,
+            "adverse_entry_slippage_pct": execution_slippage_pct,
+            "sl_price": sl_price,
+            "tp1_price": tp1_price,
+            "tp2_price": tp2_price,
+            "stop_pct": actual_risk_pct,
+            "tp1_pct": tp1_pnl_pct,
+            "tp2_pct": tp2_pnl_pct,
+            "tp1_fraction": 0.50,
+            "tp2_fraction": 0.50,
+            "be_rule": "after_tp1_filled",
+        },
         "executed_signal": actual_signal,
     }
 
@@ -1229,7 +1606,7 @@ def main() -> None:
     analysis_meta = {str(item["bingx_symbol"]): item for item in analysis_universe}
     crypto_n = sum(1 for x in analysis_universe if str(x.get("asset_class")).upper() == "CRYPTO")
     equity_n = sum(1 for x in analysis_universe if str(x.get("asset_class")).upper() == "EQUITY")
-    log.info("[SCAN] Eligible symbols: %d | crypto=%d equity=%d | strategy_mode=ZONE_ONLY | diagnostics_mode=%s", len(symbols), crypto_n, equity_n, DIAGNOSTICS_MODE)
+    log.info("[SCAN] Eligible symbols: %d | crypto=%d equity=%d | strategy_mode=ZONE_1H_5M_MIDPOINT | diagnostics_mode=%s", len(symbols), crypto_n, equity_n, DIAGNOSTICS_MODE)
     if not symbols:
         log.error("[SCAN] No eligible symbols for signal scan")
 
@@ -1245,6 +1622,7 @@ def main() -> None:
             private_ready = False
     else:
         open_keys = set()
+    zone_visit_state = _load_zone_visit_state()
     scan_rows: list[dict[str, Any]] = []
     fresh_signals: list[dict[str, Any]] = []
 
@@ -1316,20 +1694,55 @@ def main() -> None:
                     "error": f"stale_1h_data:{data_age_hours:.2f}h>{MAX_DATA_STALENESS_HOURS:.2f}h",
                 }
 
-            # ZONE_ONLY trading decisions come only from a fresh Demand/Supply
-            # touch on the latest closed 1H candle. ALMA/Pine diagnostics may still
-            # be attached to the dataframe, but they never gate execution.
-            recent = [
-                s for s in signals
-                if int(s.get("idx", -1)) == int(latest_closed_idx)
-                and pd.Timestamp(s.get("time")) == latest_closed_time
-            ]
+            # 1H remains the zone-construction timeframe. The actual execution trigger
+            # is detected from CLOSED 5m candles so a short intrahour midpoint touch is
+            # observable to a 5-minute cron. Zone-visit state prevents repeated entries
+            # while price chops around the same zone.
+            zone_signals: list[dict[str, Any]] = []
+            symbol_state = zone_visit_state.get("symbols", {}).get(symbol, {}) if isinstance(zone_visit_state.get("symbols"), dict) else {}
+            if demand or supply:
+                trigger_limit = max(24, KLINE_LIMIT_5M)
+                if provider == "bingx":
+                    trigger_bars_raw = fetch_bingx_klines(symbol, "5m", limit=trigger_limit, retryable=False)
+                else:
+                    trigger_bars_raw = fetch_binance_klines(binance_symbol, "5m", limit=trigger_limit, retryable=False)
+                zone_signals, symbol_state, trigger_text = _process_5m_zone_visits(
+                    symbol=symbol,
+                    bars=trigger_bars_raw,
+                    demand=demand,
+                    supply=supply,
+                    df_1h=df,
+                    state_for_symbol=symbol_state,
+                    successful_ids=successful_ids,
+                    terminal_event_ids=terminal_event_ids,
+                )
+                zone_visit_state.setdefault("symbols", {})[symbol] = symbol_state
+            else:
+                zone_visit_state.setdefault("symbols", {})[symbol] = {
+                    "version": ZONE_VISIT_STATE_VERSION,
+                    "zones": {},
+                    "last_scan_ts": pd.Timestamp.now(tz="UTC").isoformat(),
+                }
+                trigger_text = None
+
+            recent = zone_signals
             for sig in recent:
                 sig["score"] = score_zone_signal(sig)
+                sig["market_snapshot"] = {
+                    "analysis_provider": provider,
+                    "analysis_source": source_name,
+                    "asset_class": meta.get("asset_class", "UNKNOWN"),
+                    "binance_symbol": binance_symbol,
+                    "analysis_last_price": latest_price,
+                    "analysis_latest_closed_time": latest_closed_time.isoformat(),
+                    "trigger_timeframe": "5m",
+                    "trigger_bar_time": sig.get("trigger_bar_time"),
+                    "zone_visit_id": (sig.get("zone_visit") or {}).get("visit_id"),
+                }
 
-            # Only validate BingX live price when a fresh signal exists. This keeps
-            # the full-market scan on Binance while spending a small number of extra
-            # BingX public requests only on actionable candidates.
+            # Only validate BingX live price when a fresh 5m trigger exists. This keeps
+            # the full-market scan on Binance while spending extra venue requests only
+            # on actionable candidates.
             if recent and bingx_price is None:
                 try:
                     bx_live = fetch_bingx_klines(symbol, "1m", limit=1, retryable=False)
@@ -1337,9 +1750,6 @@ def main() -> None:
                         bingx_price = float(bx_live[-1]["close"])
                 except Exception as bx_exc:
                     log.warning("[MARKET_CHECK] %s | BingX price validation failed: %s", symbol, bx_exc)
-            # For executable spread validation, compare two current venue prices.
-            # The closed 1H candle remains the strategy reference; it must not be
-            # used as the Binance side of a live cross-venue spread check.
             binance_live_price = None
             if recent and provider == "binance":
                 try:
@@ -1356,23 +1766,29 @@ def main() -> None:
                 binance_live_price if binance_live_price is not None else latest_price,
                 bingx_price,
             ) if provider == "binance" else None
+            for sig in recent:
+                market_snapshot = sig.setdefault("market_snapshot", {})
+                trigger_ts = pd.Timestamp(sig.get("trigger_bar_time")) if sig.get("trigger_bar_time") else pd.Timestamp.now(tz="UTC")
+                market_snapshot.update({
+                    "bingx_live_price": bingx_price,
+                    "binance_live_price": binance_live_price,
+                    "market_spread_pct": spread_pct,
+                    "scan_time": pd.Timestamp.now(tz="UTC").isoformat(),
+                    "trigger_age_minutes_at_scan": max(0.0, (pd.Timestamp.now(tz="UTC") - trigger_ts).total_seconds() / 60.0),
+                })
+
             if spread_pct is not None and spread_pct > MAX_MARKET_SPREAD_PCT:
-                log.warning("[MARKET_SPREAD] %s | Binance=%.12g | BingX=%.12g | spread=%.4f%% > %.4f%%", symbol, latest_price, bingx_price, spread_pct, MAX_MARKET_SPREAD_PCT)
+                log.warning("[MARKET_SPREAD] %s | Binance=%s | BingX=%s | spread=%.4f%% > %.4f%%", symbol, binance_live_price, bingx_price, spread_pct, MAX_MARKET_SPREAD_PCT)
                 recent = []
-            # Signal freshness is controlled by MAX_SIGNAL_AGE_BARS, but the
-            # executable candidate must always be the newest signal bar. Score is
-            # only a tie-breaker for multiple signals on the same bar.
-            latest_signal = _select_latest_signal(recent)
-            if not latest_signal and spread_pct is not None and spread_pct > MAX_MARKET_SPREAD_PCT:
                 fresh_text = f"BLOCKED_SPREAD>{MAX_MARKET_SPREAD_PCT:.2f}%"
             else:
-                fresh_text = None
-            price_position = _price_position(latest_price, demand, supply)
-            if fresh_text is None:
-                fresh_text = (
-                    f"{latest_signal['type']} @ {latest_signal['entry']} score={latest_signal.get('score', 0):.1f}"
+                latest_signal = _select_latest_signal(recent)
+                fresh_text = trigger_text or (
+                    f"{latest_signal['type']} @ {latest_signal['entry']} score={latest_signal.get('score', 0):.1f} 5m_midpoint"
                     if latest_signal else "—"
                 )
+            price_position = _price_position(latest_price, demand, supply)
+
             return {
                 "symbol": symbol,
                 "current_price": latest_price,
@@ -1465,15 +1881,17 @@ def main() -> None:
         total, scan_errors, scan_skips, len(fresh_signals), time.time() - started,
     )
 
-    # Execution safety: choose exactly ONE zone signal per symbol, namely the
-    # newest fresh-touch bar. Never allow an older setup to compete with a newer
-    # setup because of score sorting.
+    # Persist visit locks before any exchange execution. A process crash after scanning
+    # must not make the same midpoint visit eligible again on the next cron run.
+    _save_zone_visit_state(zone_visit_state)
+
+    # Execution safety: choose exactly ONE newest 5m visit event per symbol.
     latest_by_symbol: dict[str, dict[str, Any]] = {}
     for signal in fresh_signals:
         symbol_key = str(signal["symbol"]).upper()
         previous = latest_by_symbol.get(symbol_key)
-        candidate_key = (int(signal["idx"]), float(signal.get("score", 0.0)))
-        previous_key = (int(previous["idx"]), float(previous.get("score", 0.0))) if previous else None
+        candidate_key = (int(signal.get("idx", 0)), float(signal.get("score", 0.0)))
+        previous_key = (int(previous.get("idx", 0)), float(previous.get("score", 0.0))) if previous else None
         if previous is None or candidate_key > previous_key:
             latest_by_symbol[symbol_key] = signal
 
@@ -1488,28 +1906,9 @@ def main() -> None:
         for r in scan_rows
         if r.get("latest_closed_time") is not None
     }
+    now_exec = pd.Timestamp.now(tz="UTC")
     for signal in latest_by_symbol.values():
         symbol_key = str(signal["symbol"]).upper()
-        latest_closed_idx = latest_index_by_symbol.get(symbol_key)
-        if latest_closed_idx is None:
-            log.warning("[EXEC_REJECT_NO_LATEST] %s %s | latest_closed_idx unavailable", signal["symbol"], signal["type"])
-            continue
-        latest_closed_time = latest_time_by_symbol.get(symbol_key)
-        signal_age = int(latest_closed_idx) - int(signal["idx"])
-        signal["execution_age_bars"] = int(signal_age)
-        signal["latest_closed_idx"] = int(latest_closed_idx)
-        signal["latest_closed_time"] = latest_closed_time
-        if signal_age > EXECUTION_MAX_SIGNAL_AGE_BARS:
-            log.info("[EXEC_REJECT_AGE] %s %s | signal_idx=%s signal_time=%s latest_closed_idx=%s latest_closed_time=%s age_bars=%s allowed=%s", signal["symbol"], signal["type"], signal.get("idx"), signal.get("time"), latest_closed_idx, latest_closed_time, signal_age, EXECUTION_MAX_SIGNAL_AGE_BARS)
-            continue
-        matches_latest, reject_reason = _signal_matches_latest_bar(signal, latest_closed_idx, latest_closed_time)
-        if not matches_latest:
-            log.warning(
-                "[EXEC_REJECT_LATEST_BAR] %s %s | reason=%s signal_idx=%s signal_time=%s latest_closed_idx=%s latest_closed_time=%s age_bars=%s",
-                signal["symbol"], signal["type"], reject_reason, signal.get("idx"), signal.get("time"),
-                latest_closed_idx, latest_closed_time, signal_age,
-            )
-            continue
         bx = get_contract(signal["symbol"])
         bx_symbol = str((bx or {}).get("symbol", signal["symbol"])).upper()
         key = (bx_symbol, signal["type"])
@@ -1520,6 +1919,36 @@ def main() -> None:
             continue
         if key in open_keys or opposite in open_keys:
             continue
+
+        trigger_tf = str(signal.get("trigger_timeframe", "1h")).lower()
+        if trigger_tf == "5m":
+            try:
+                trigger_ts = pd.Timestamp(signal.get("trigger_bar_time") or signal.get("time"))
+                if trigger_ts.tzinfo is None:
+                    trigger_ts = trigger_ts.tz_localize("UTC")
+                age_min = max(0.0, (now_exec - trigger_ts).total_seconds() / 60.0)
+            except Exception:
+                log.warning("[EXEC_REJECT_TRIGGER_TIME] %s %s | invalid 5m trigger time=%s", signal.get("symbol"), signal.get("type"), signal.get("trigger_bar_time"))
+                continue
+            signal["execution_age_minutes"] = age_min
+            if age_min > MAX_5M_TRIGGER_AGE_MINUTES:
+                log.info("[EXEC_REJECT_5M_AGE] %s %s | age_min=%.2f allowed=%.2f", signal["symbol"], signal["type"], age_min, MAX_5M_TRIGGER_AGE_MINUTES)
+                continue
+        else:
+            latest_closed_idx = latest_index_by_symbol.get(symbol_key)
+            latest_closed_time = latest_time_by_symbol.get(symbol_key)
+            if latest_closed_idx is None:
+                continue
+            signal_age = int(latest_closed_idx) - int(signal["idx"])
+            signal["execution_age_bars"] = int(signal_age)
+            signal["latest_closed_idx"] = int(latest_closed_idx)
+            signal["latest_closed_time"] = latest_closed_time
+            if signal_age > EXECUTION_MAX_SIGNAL_AGE_BARS:
+                continue
+            matches_latest, reject_reason = _signal_matches_latest_bar(signal, latest_closed_idx, latest_closed_time)
+            if not matches_latest:
+                log.warning("[EXEC_REJECT_LATEST_BAR] %s %s | reason=%s", signal["symbol"], signal["type"], reject_reason)
+                continue
         executable.append(signal)
 
     # Safety ordering: newest signal bar first; score only breaks ties.
@@ -1596,6 +2025,15 @@ def main() -> None:
             "symbol": signal["symbol"],
             "direction": signal["type"],
             "score": signal["score"],
+            "strategy_version": signal.get("strategy_version", STRATEGY_VERSION),
+            "entry_rule": (signal.get("trigger") or {}).get("zone_entry_rule"),
+            "zone_midpoint": signal.get("zone_midpoint") or (signal.get("trigger") or {}).get("zone_midpoint"),
+            "stop_pct": (signal.get("risk_model") or {}).get("fixed_stop_pct"),
+            "tp1_pct": (signal.get("target") or {}).get("tp1_pct"),
+            "tp2_pct": (signal.get("target") or {}).get("tp2_pct"),
+            "be_rule": (signal.get("target") or {}).get("be_rule", "after_tp1_filled"),
+            "entry_bar": signal.get("entry_bar", {}),
+            "previous_bar": signal.get("previous_bar", {}),
             "signal": signal,
             "outcome_category": _execution_outcome_category(execution_status),
             "result": execution,

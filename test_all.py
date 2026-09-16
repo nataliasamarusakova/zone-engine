@@ -5,9 +5,6 @@ import pandas as pd
 from pathlib import Path
 
 from event_engine.signals import (
-    RR_RATIO,
-    TP1_R,
-    TP2_R,
     calc_hma,
     calc_alma,
     compute_ajay_trigger,
@@ -111,6 +108,74 @@ def test_zone_signal_schema():
         assert s["trigger"]["alma_required"] is False
 
 
+def test_fixed_stop_is_exactly_10_percent_from_entry():
+    import run_once
+    long_sl, long_tp1, long_tp2 = run_once._protection_geometry_from_fill("LONG", 100.0, 10.0)
+    short_sl, short_tp1, short_tp2 = run_once._protection_geometry_from_fill("SHORT", 100.0, 10.0)
+    assert long_sl == 90.0 and short_sl == 110.0
+    assert long_tp1 > 100.0 and long_tp2 > long_tp1
+    assert short_tp1 < 100.0 and short_tp2 < short_tp1
+
+
+
+
+def test_strategy_snapshot_contains_entry_context_and_exit_rules():
+    from event_engine import signals as sig
+    assert sig.STRATEGY_VERSION == "zone-midpoint-v3-5m-visit-stop10-tp5-tp7-be-on-tp1"
+    import run_once
+    setup = run_once._build_setup({
+        "event_id": "ZONE_TEST", "symbol": "TEST-USDT", "type": "LONG",
+        "entry": 100.0, "sl": 90.0, "tp1": 105.0, "tp2": 107.0, "risk_pct": 10.0,
+        "tp1_rr": 0.5, "tp2_rr": 0.7, "score": 75.0,
+        "strategy": "Demand/Supply Zone First", "strategy_version": sig.STRATEGY_VERSION,
+        "trigger": {"zone_entry_rule": "fresh_midpoint_touch", "zone_midpoint": 110.0},
+        "target": {"source": "fixed_entry_percentage", "tp1_pct": 5.0, "tp2_pct": 7.0, "be_rule": "after_tp1_filled"},
+        "risk_model": {"sl_source": "fixed_percent_from_entry", "fixed_stop_pct": 10.0},
+        "entry_bar": {"open": 99.0, "high": 111.0, "low": 98.0, "close": 100.0, "volume": 1000.0},
+        "previous_bar": {"close": 120.0},
+    })
+    assert setup["strategy_version"] == sig.STRATEGY_VERSION
+    assert setup["entry_bar"]["close"] == 100.0
+    assert setup["previous_bar"]["close"] == 120.0
+    assert setup["signal_snapshot"]["trigger"]["zone_entry_rule"] == "fresh_midpoint_touch"
+    assert setup["target"]["tp1_pct"] == 5.0
+    assert setup["target"]["tp2_pct"] == 7.0
+    assert setup["target"]["be_rule"] == "after_tp1_filled"
+
+
+def test_register_active_trade_persists_research_snapshots(tmp_path, monkeypatch):
+    from event_engine import tracker
+    setup = {
+        "risk_pct": 10.0, "target_rr": 0.7, "planned_weighted_rr": 0.6,
+        "entry_reference": 100.0, "invalidation_price": 90.0, "target_price": 107.0,
+        "strategy_version": "zone-midpoint-v3-5m-visit-stop10-tp5-tp7-be-on-tp1",
+        "signal_snapshot": {"strategy_version": "zone-midpoint-v3-5m-visit-stop10-tp5-tp7-be-on-tp1"},
+        "entry_bar": {"close": 100.0}, "previous_bar": {"close": 120.0},
+        "entry_order": {"orderId": "ENTRY1"}, "fill_position": {"avgPrice": 100.0},
+        "execution_snapshot": {"fill_price": 100.0, "sl_price": 90.0, "tp1_price": 105.0, "tp2_price": 107.0},
+        "tp_levels": [
+            {"leg": "tp1", "price": 105.0, "pnl_pct": 5.0, "close_fraction": 0.5},
+            {"leg": "tp2", "price": 107.0, "pnl_pct": 7.0, "close_fraction": 0.5},
+        ],
+    }
+    tracker.register_active_trade(
+        event_id="ZONE_TEST", symbol="TEST-USDT", name="TEST-USDT", direction="LONG",
+        entry_price=100.0, qty=1.0, tp_orders=[], sl_result={"order_id": "SL1"},
+        event_type="DEMAND_ZONE_TOUCH", timeframe="1h", score=75.0, setup=setup, requested_entry_price=100.0,
+    )
+    state = tracker._load_active_trades()["ZONE_TEST"]
+    assert state["strategy_version"] == setup["strategy_version"]
+    assert state["entry_bar"] == setup["entry_bar"]
+    assert state["previous_bar"] == setup["previous_bar"]
+    assert state["signal_snapshot"] == setup["signal_snapshot"]
+    assert state["entry_order"] == setup["entry_order"]
+    assert state["fill_position"] == setup["fill_position"]
+    assert state["execution_snapshot"] == setup["execution_snapshot"]
+    assert state["tp_fill_events"] == []
+    assert state["be_trigger_rule"] == "after_tp1_filled"
+    assert "be_trigger_r" not in state
+
+
 def test_long_tp_ordering_and_rr():
     signal = {
         "symbol": "TEST-USDT", "type": "LONG", "entry": 100.0, "sl": 95.0,
@@ -119,9 +184,6 @@ def test_long_tp_ordering_and_rr():
         "confirmation": {"alma_cross": True, "zone_touch": True, "volume_ratio": 1.5, "candle_body_atr": 1.0},
     }
     assert signal["tp1"] < signal["tp2"]
-    assert RR_RATIO == 3.0
-    assert TP1_R == 1.0
-    assert TP2_R == 2.0
     assert score_zone_signal(signal) >= 70
 
 
@@ -327,7 +389,7 @@ def test_execute_emergency_closes_when_protection_fails(monkeypatch):
         "risk_pct": 1.0,
         "score": 90,
         "zone": {"kind": "DEMAND", "btm": 99.0, "top": 100.0},
-        "target": {"obstacle_price": 110.0},
+        "target": {"obstacle_price": 130.0},
     }
     monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {
         "status": "ok", "sl_orders": [], "tp_orders": []
@@ -366,9 +428,7 @@ def test_open_client_order_id_is_unique():
 
 
 def test_tp_constants_are_one_and_two_r():
-    from event_engine.signals import TP1_R, TP2_R, TP1_FRACTION, TP2_FRACTION
-    assert TP1_R == 1.0
-    assert TP2_R == 2.0
+    from event_engine.signals import TP1_FRACTION, TP2_FRACTION
     assert TP1_FRACTION == 0.50
     assert TP2_FRACTION == 0.50
 
@@ -389,7 +449,6 @@ def test_generate_signals_are_zone_touch_only_and_not_alma_gated():
 
     # Direct unit contract for the new strategy: zone touch is the trigger,
     # ALMA/Pine values are diagnostic only.
-    assert sig.REQUIRE_ZONE_TOUCH is False
     out = pd.DataFrame({"pine_buy": [True], "pine_sell": [False]})
     assert bool(out.loc[0, "pine_buy"]) is True
 
@@ -418,18 +477,33 @@ def test_zone_only_latest_bar_check_never_reads_pine_direction():
     ok, reason = run_once._signal_matches_latest_bar(signal, 119, "2026-09-02T11:00:00+00:00")
     assert ok and reason == "ok"
 
+def test_scan_universe_is_limited_to_150_fundamental_assets(monkeypatch):
+    import run_once
+    from event_engine.fundamental_assets import FUNDAMENTAL_ASSET_SYMBOLS
+    monkeypatch.setattr(run_once, "contracts", lambda: {
+        "BTC-USDT": {"symbol": "BTC-USDT"},
+        "DOGE-USDT": {"symbol": "DOGE-USDT"},
+        "ETH-USDT": {"symbol": "ETH-USDT"},
+    })
+    monkeypatch.setattr(run_once, "WATCHLIST_ONLY", False)
+    out = run_once.get_scan_symbols()
+    assert set(out).issubset(FUNDAMENTAL_ASSET_SYMBOLS)
+    assert {"BTC-USDT", "ETH-USDT"}.issubset(out)
+    assert "DOGE-USDT" not in out
+
+
 def test_telegram_uses_zone_only_label_and_dynamic_rr_values():
     from event_engine.telegram import format_signal
     msg = format_signal({
         "type": "LONG", "symbol": "TEST-USDT", "entry": 100.0, "sl": 95.0,
-        "tp1": 102.5, "tp2": 105.0, "tp1_rr": 0.5, "tp2_rr": 1.0, "risk_pct": 5.0,
+        "tp1": 105.0, "tp2": 107.0, "tp1_rr": 0.5, "tp2_rr": 0.7, "risk_pct": 10.0,
         "zone": {"kind": "DEMAND", "btm": 94.0, "top": 99.0, "poi": 96.5, "age_bars": 1, "impulse_atr": 2.0},
         "confirmation": {},
     })
     assert "Demand/Supply Zone First" in msg
     assert "Ajay R5.41 · ALMA" not in msg
     assert "(0.5R / 50%)" in msg
-    assert "(1.0R / 50%)" in msg
+    assert "(0.7R / 50%)" in msg
 
 
 def test_post_fill_rebases_zone_protection_and_never_reuses_stale_absolute_targets():
@@ -479,7 +553,7 @@ def test_execute_rebases_protection_to_actual_fill_before_installing(monkeypatch
         "entry": 100.0, "sl": 105.0, "tp1": 99.0, "tp2": 98.0, "risk_pct": 1.0,
         "score": 75, "atr": 2.0,
         "zone": {"kind": "SUPPLY", "btm": 99.0, "top": 104.0},
-        "target": {"obstacle_price": 90.0, "source": "nearest_opposing_structure"},
+        "target": {"obstacle_price": 70.0, "source": "nearest_opposing_structure"},
     }
     captured = {}
     monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
@@ -591,7 +665,7 @@ def test_run_once_has_no_pine_execution_rejection_gate():
 def test_tracker_uses_zone_touch_event_type():
     import run_once
     source = Path(run_once.__file__).read_text(encoding="utf-8")
-    assert '_ZONE_TOUCH"' in source
+    assert '_MIDPOINT_TOUCH_5M"' in source
 
 
 def test_historical_lookahead_8h_series_is_constant_inside_bucket():
@@ -671,7 +745,6 @@ def test_no_zone_signal_is_blocked(monkeypatch):
     import pandas as pd
     from event_engine import signals as sig
 
-    monkeypatch.setattr(sig, "REQUIRE_ZONE_TOUCH", True)
     n = 120
     ts = pd.date_range("2026-01-01", periods=n, freq="h", tz="UTC")
     close = np.linspace(100.0, 120.0, n)
@@ -684,12 +757,11 @@ def test_no_zone_signal_is_blocked(monkeypatch):
     assert emitted == []
 
 
-def test_zone_signal_uses_zone_boundary_stop_and_small_tps(monkeypatch):
+def test_zone_signal_uses_fixed_10pct_stop_and_small_tps(monkeypatch):
     import numpy as np
     import pandas as pd
     from event_engine import signals as sig
 
-    monkeypatch.setattr(sig, "REQUIRE_ZONE_TOUCH", True)
     n = 120
     ts = pd.date_range("2026-01-01", periods=n, freq="h", tz="UTC")
     close = np.linspace(100.0, 120.0, n)
@@ -713,36 +785,61 @@ def test_zone_signal_uses_zone_boundary_stop_and_small_tps(monkeypatch):
     # so patch zone construction/selection at the deterministic insertion point.
     forced_zone = {"top": 110.5, "btm": 109.0, "poi": 109.75, "start": n - 5}
     monkeypatch.setattr(sig, "_find_directional_zone", lambda direction, cur_l, cur_h, cur_c, demand, supply: forced_zone if direction == "LONG" else None)
-    monkeypatch.setattr(sig, "_nearest_opposing_level", lambda direction, entry, active_demand, active_supply, frame, idx: {"price": 115.0, "source": "supply_zone"} if direction == "LONG" else {"price": 95.0, "source": "demand_zone"})
+    monkeypatch.setattr(sig, "_nearest_opposing_level", lambda direction, entry, active_demand, active_supply, frame, idx: {"price": 130.0, "source": "supply_zone"} if direction == "LONG" else {"price": 70.0, "source": "demand_zone"})
 
     _, _, _, emitted = sig.generate_zone_signals(df, symbol="TEST-USDT", mode="live")
     assert emitted
     latest = emitted[-1]
     assert latest["confirmation"]["zone_touch"] is True
-    assert latest["risk_model"]["sl_source"] == "zone_boundary_plus_atr_buffer"
+    assert latest["risk_model"]["sl_source"] == "fixed_percent_from_entry"
+    assert latest["risk_model"]["fixed_stop_pct"] == 10.0
+    assert latest["risk_pct"] == 10.0
+    assert abs((latest["entry"] - latest["sl"]) / latest["entry"] * 100.0 - 10.0) < 1e-9
     assert latest["trigger"]["alma_required"] is False
-    assert latest["target"]["source"] in {"nearest_opposing_structure", "atr_rr_fallback"}
-    assert latest["tp1"] < latest["tp2"]
-    assert latest["tp1_rr"] > 0
-    assert latest["tp2_rr"] >= latest["tp1_rr"]
+    assert latest["target"]["source"] == "fixed_entry_percentage"
+    assert abs(latest["tp1"] / latest["entry"] - 1.05) < 1e-9
+    assert abs(latest["tp2"] / latest["entry"] - 1.07) < 1e-9
+    assert abs(latest["tp1_rr"] - 0.5) < 1e-9
+    assert abs(latest["tp2_rr"] - 0.7) < 1e-9
     assert latest["sl"] < 110.0
 
 
-def test_targets_use_nearest_opposing_zone_and_stay_before_it():
+def test_targets_are_fixed_5pct_and_7pct_from_entry():
     from event_engine import signals as sig
 
     obstacle = {"price": 108.0, "source": "supply_zone"}
-    out = sig._targets_from_nearest_obstacle("LONG", 100.0, 95.0, 1.0, obstacle)
+    out = sig._targets_from_nearest_obstacle("LONG", 100.0, 90.0, 1.0, obstacle)
     assert out is not None
-    assert out["target_source"] == "nearest_opposing_structure"
+    assert out["target_source"] == "fixed_entry_percentage"
     assert out["obstacle_price"] == 108.0
-    assert 100.0 < out["tp1"] < out["tp2"] < 108.0
-    assert out["tp2_rr"] <= sig.TP_MAX_R + 1e-9
+    assert out["tp1"] == 105.0
+    assert out["tp2"] == 107.0
+    assert out["tp1_rr"] == 0.5
+    assert out["tp2_rr"] == 0.7
 
     obstacle = {"price": 92.0, "source": "demand_zone"}
-    out = sig._targets_from_nearest_obstacle("SHORT", 100.0, 105.0, 1.0, obstacle)
+    out = sig._targets_from_nearest_obstacle("SHORT", 100.0, 110.0, 1.0, obstacle)
     assert out is not None
-    assert 92.0 < out["tp2"] < out["tp1"] < 100.0
+    assert out["tp1"] == 95.0
+    assert out["tp2"] == 93.0
+
+
+def test_post_fill_targets_are_exact_5pct_and_7pct_from_actual_fill():
+    import run_once
+    signal = {
+        "type": "LONG",
+        "entry": 100.0, "sl": 90.0, "tp1": 105.0, "tp2": 107.0, "risk_pct": 10.0,
+        "atr": 2.0,
+        "zone": {"btm": 98.0, "top": 102.0},
+        "target": {"obstacle_price": 103.0, "source": "nearest_opposing_structure"},
+    }
+    out = run_once._rebase_protection_after_fill(signal, 200.0)
+    assert out["entry"] == 200.0
+    assert out["sl"] == 180.0
+    assert out["tp1"] == 210.0
+    assert out["tp2"] == 214.0
+    assert abs(out["tp1_rr"] - 0.5) < 1e-9
+    assert abs(out["tp2_rr"] - 0.7) < 1e-9
 
 
 def test_latest_signal_selection_prefers_newest_bar_over_score():
@@ -983,15 +1080,13 @@ def test_price_position_does_not_call_nearby_price_inside_zone():
     assert _price_position(110.0, demand, supply) == "🟢 В зоне DEMAND"
 
 
-def test_directional_zone_requires_actual_candle_touch_without_padding():
+def test_directional_zone_requires_exact_midpoint_touch():
     from event_engine.signals import _find_directional_zone
     demand = [{"btm": 100.0, "top": 110.0}]
     supply = [{"btm": 120.0, "top": 130.0}]
-    assert _find_directional_zone("LONG", 110.1, 112.0, 111.0, demand, supply) is None
-    assert _find_directional_zone("LONG", 110.0, 112.0, 111.0, demand, supply) == demand[0]
-    assert _find_directional_zone("SHORT", 118.0, 119.0, 119.0, demand, supply) is None
-    assert _find_directional_zone("SHORT", 118.0, 120.0, 119.5, demand, supply) == supply[0]
-
+    assert _find_directional_zone("LONG", 110.0, 112.0, 111.0, demand, supply) is None
+    assert _find_directional_zone("LONG", 104.9, 105.0, 106.0, demand, supply) == demand[0]
+    assert _find_directional_zone("SHORT", 123.0, 125.0, 126.0, demand, supply) == supply[0]
 
 def test_run_once_import_regression():
     # run_once.py uses SWING_LEN for its per-symbol minimum-history guard.
@@ -1031,15 +1126,15 @@ def test_atr_does_not_backfill_future_values():
 
 def test_run_once_validation_enforces_risk_and_structure(monkeypatch):
     import run_once
-    monkeypatch.setenv("MAX_SIGNAL_RISK_PCT", "5.00")
+    monkeypatch.setenv("MAX_SIGNAL_RISK_PCT", "10.00")
     monkeypatch.setenv("MIN_STRUCTURE_ROOM_R", "1.20")
     good = _base_signal("LONG")
-    good["risk_pct"] = 4.0
+    good["risk_pct"] = 8.0
     good["target"]["obstacle_price"] = 104.0
     ok, reason = run_once._validate_trade_geometry(good)
     assert ok, reason
     bad = _base_signal("LONG")
-    bad["risk_pct"] = 6.0
+    bad["risk_pct"] = 11.0
     ok, reason = run_once._validate_trade_geometry(bad)
     assert not ok and "risk_pct_above_limit" in reason
 
@@ -1062,7 +1157,7 @@ def test_server_time_offset_function_exists():
 def test_zone_entry_filters_are_configured_safely():
     from event_engine import signals as sig
     assert sig.MAX_ZONE_AGE_BARS == 30
-    assert sig.MAX_SIGNAL_RISK_PCT == 5.00
+    assert sig.MAX_SIGNAL_RISK_PCT == 10.00
     assert sig.MIN_STRUCTURE_ROOM_R == 1.20
     assert sig.REQUIRE_DIRECTIONAL_CANDLE is False
     assert sig.REQUIRE_STRUCTURE_OBSTACLE is False
@@ -1108,7 +1203,7 @@ def test_sl_order_validation_is_one_sided_and_be_allows_entry():
 def test_workflow_risk_cap_is_not_accidentally_25_percent():
     from pathlib import Path
     workflow = Path('.github/workflows/event-engine.yml').read_text(encoding='utf-8')
-    assert 'MAX_SIGNAL_RISK_PCT: "5.00"' in workflow
+    assert 'MAX_SIGNAL_RISK_PCT: "10.00"' in workflow
     assert 'MAX_SIGNAL_RISK_PCT: "25"' not in workflow
 
 def test_signal_risk_cap_hard_clamped(monkeypatch):
@@ -1116,7 +1211,7 @@ def test_signal_risk_cap_hard_clamped(monkeypatch):
     import event_engine.signals as sig
     monkeypatch.setenv('MAX_SIGNAL_RISK_PCT', '25')
     sig2 = importlib.reload(sig)
-    assert sig2.MAX_SIGNAL_RISK_PCT == 5.00
+    assert sig2.MAX_SIGNAL_RISK_PCT == 10.00
     monkeypatch.setenv('MAX_SIGNAL_RISK_PCT', '1.25')
     sig2 = importlib.reload(sig2)
     assert sig2.MAX_SIGNAL_RISK_PCT == 1.25
@@ -1126,7 +1221,7 @@ def test_signal_risk_cap_hard_clamped(monkeypatch):
 def test_run_once_hard_caps_production_risk(monkeypatch):
     import run_once
     monkeypatch.setenv("MAX_SIGNAL_RISK_PCT", "25")
-    assert run_once.MAX_PRODUCTION_RISK_PCT == 5.00
+    assert run_once.MAX_PRODUCTION_RISK_PCT == 10.00
 
 def test_request_does_not_fallback_post_after_network_error(monkeypatch):
     from event_engine import bingx
@@ -2230,3 +2325,198 @@ def test_update_mfe_mae_records_threshold_milestones():
     assert trade["mfe_milestones_r"]["0.50"] == 1_122
     assert trade["mfe_milestones_r"]["1.00"] == 1_122
     assert trade["mfe_milestones_r"]["2.00"] == 1_183
+
+
+def test_5m_zone_visit_locks_after_midpoint_touch_and_does_not_retrigger_in_chop():
+    import time
+    import pandas as pd
+    from run_once import _process_5m_zone_visits
+
+    now = pd.Timestamp.now(tz="UTC").floor("5min")
+    t0 = now - pd.Timedelta(minutes=15)
+    zone = {"start": 0, "top": 110.0, "btm": 100.0, "poi": 105.0}
+    bars = [
+        {"timestamp": int(t0.timestamp()*1000), "open": 108, "high": 109, "low": 107, "close": 108, "volume": 10},
+        {"timestamp": int((t0+pd.Timedelta(minutes=5)).timestamp()*1000), "open": 107, "high": 108, "low": 104, "close": 106, "volume": 10},
+        {"timestamp": int((t0+pd.Timedelta(minutes=10)).timestamp()*1000), "open": 106, "high": 107, "low": 104, "close": 106, "volume": 10},
+    ]
+    df1h = pd.DataFrame([
+        {"timestamp": now - pd.Timedelta(hours=12-i), "open": 100, "high": 111, "low": 99, "close": 105, "volume": 100, "atr50": 2.0}
+        for i in range(12)
+    ])
+    signals, state, text = _process_5m_zone_visits("TEST-USDT", bars, [zone], [], df1h, None, set(), set())
+    assert len(signals) == 1
+    assert signals[0]["trigger_timeframe"] == "5m"
+    assert signals[0]["entry"] == 105.0
+    assert state["zones"]["DEMAND:0:110.000000000000:100.000000000000"]["state"] == "LOCKED"
+
+
+def test_5m_zone_visit_rearms_only_after_closed_bar_exits_far_edge_then_allows_new_touch(monkeypatch):
+    import pandas as pd
+    import run_once
+    from run_once import _process_5m_zone_visits
+    monkeypatch.setattr(run_once, "MAX_5M_TRIGGER_AGE_MINUTES", 60.0)
+    monkeypatch.setattr(run_once, "INITIAL_5M_TRIGGER_LOOKBACK_MINUTES", 60.0)
+
+    now = pd.Timestamp.now(tz="UTC").floor("5min")
+    t0 = now - pd.Timedelta(minutes=20)
+    zone = {"start": 0, "top": 110.0, "btm": 100.0, "poi": 105.0}
+    bars = []
+    vals = [
+        (108, 109, 104, 106),  # first midpoint touch
+        (106, 108, 103, 106),  # same visit/chop
+        (109, 112, 108, 111),  # close beyond top -> rearm
+        (112, 113, 104, 105),  # new visit midpoint touch
+        (105, 108, 102, 106),  # same visit
+    ]
+    for i, (o,h,l,c) in enumerate(vals):
+        ts=t0+pd.Timedelta(minutes=5*i)
+        bars.append({"timestamp": int(ts.timestamp()*1000), "open":o,"high":h,"low":l,"close":c,"volume":10})
+    df1h = pd.DataFrame([
+        {"timestamp": now - pd.Timedelta(hours=12-i), "open": 100, "high": 111, "low": 99, "close": 105, "volume": 100, "atr50": 2.0}
+        for i in range(12)
+    ])
+    signals, state, _ = _process_5m_zone_visits("TEST-USDT", bars, [zone], [], df1h, None, set(), set())
+    assert len(signals) == 2
+    assert signals[0]["trigger_bar_time"] != signals[1]["trigger_bar_time"]
+    assert state["zones"]["DEMAND:0:110.000000000000:100.000000000000"]["state"] == "LOCKED"
+
+
+def test_5m_pending_event_is_reused_for_retry_without_new_event_id():
+    import pandas as pd
+    from run_once import _process_5m_zone_visits
+
+    now = pd.Timestamp.now(tz="UTC").floor("5min")
+    t0 = now - pd.Timedelta(minutes=10)
+    zone = {"start": 0, "top": 110.0, "btm": 100.0, "poi": 105.0}
+    bars = [
+        {"timestamp": int(t0.timestamp()*1000), "open": 108, "high": 109, "low": 104, "close": 106, "volume": 10},
+    ]
+    df1h = pd.DataFrame([
+        {"timestamp": now - pd.Timedelta(hours=12-i), "open": 100, "high": 111, "low": 99, "close": 105, "volume": 100, "atr50": 2.0}
+        for i in range(12)
+    ])
+    signals, state, _ = _process_5m_zone_visits("TEST-USDT", bars, [zone], [], df1h, None, set(), set())
+    assert len(signals) == 1
+    eid = signals[0]["event_id"]
+    signals2, state2, _ = _process_5m_zone_visits("TEST-USDT", [], [zone], [], df1h, state, set(), set())
+    assert len(signals2) == 1
+    assert signals2[0]["event_id"] == eid
+
+
+def test_5m_touch_before_zone_activation_is_ignored(monkeypatch):
+    import pandas as pd
+    import run_once
+    from run_once import _process_5m_zone_visits, SWING_LEN
+    monkeypatch.setattr(run_once, "INITIAL_5M_TRIGGER_LOOKBACK_MINUTES", 240.0)
+    monkeypatch.setattr(run_once, "MAX_5M_TRIGGER_AGE_MINUTES", 240.0)
+
+    now = pd.Timestamp.now(tz="UTC").floor("5min")
+    # Zone with start=0 becomes active at 1H index 10; this touch is deliberately 1h before activation.
+    t0 = now - pd.Timedelta(hours=3)
+    zone = {"start": 0, "top": 110.0, "btm": 100.0, "poi": 105.0}
+    bars = [{"timestamp": int(t0.timestamp()*1000), "open":108, "high":106, "low":104, "close":105, "volume":10}]
+    df1h = pd.DataFrame([
+        {"timestamp": now - pd.Timedelta(hours=12-i), "open":100, "high":111, "low":99, "close":105, "volume":100, "atr50":2.0}
+        for i in range(12)
+    ])
+    assert SWING_LEN == 10
+    activation_ts = pd.Timestamp(df1h.loc[10, "timestamp"])
+    assert t0 < activation_ts
+    signals, _, _ = _process_5m_zone_visits("TEST-USDT", bars, [zone], [], df1h, None, set(), set())
+    assert signals == []
+
+
+def test_5m_prior_closed_bar_touch_remains_actionable_when_current_bar_no_longer_touches(monkeypatch):
+    import pandas as pd
+    import run_once
+    from run_once import _process_5m_zone_visits
+
+    monkeypatch_now = pd.Timestamp.now(tz="UTC").floor("5min")
+    t0 = monkeypatch_now - pd.Timedelta(minutes=10)
+    monkeypatch.setattr(run_once, "INITIAL_5M_TRIGGER_LOOKBACK_MINUTES", 30.0)
+    monkeypatch.setattr(run_once, "MAX_5M_TRIGGER_AGE_MINUTES", 15.0)
+    zone = {"start": 0, "top": 110.0, "btm": 100.0, "poi": 105.0}
+    bars = [
+        {"timestamp": int(t0.timestamp()*1000), "open": 108, "high": 109, "low": 104, "close": 106, "volume": 10},
+        {"timestamp": int((t0+pd.Timedelta(minutes=5)).timestamp()*1000), "open": 106, "high": 109, "low": 106, "close": 108, "volume": 10},
+    ]
+    df1h = pd.DataFrame([
+        {"timestamp": monkeypatch_now - pd.Timedelta(hours=12-i), "open": 100, "high": 111, "low": 99, "close": 105, "volume": 100, "atr50": 2.0}
+        for i in range(12)
+    ])
+    signals, state, _ = _process_5m_zone_visits("TEST-USDT", bars, [zone], [], df1h, None, set(), set())
+    assert len(signals) == 1
+    assert signals[0]["trigger_bar_time"] == pd.Timestamp(bars[0]["timestamp"], unit="ms", tz="UTC").isoformat()
+    assert state["zones"]["DEMAND:0:110.000000000000:100.000000000000"]["state"] == "LOCKED"
+
+
+def test_5m_rearm_bar_that_also_crosses_midpoint_does_not_create_same_bar_reentry(monkeypatch):
+    import pandas as pd
+    import run_once
+    from run_once import _process_5m_zone_visits
+    monkeypatch.setattr(run_once, "INITIAL_5M_TRIGGER_LOOKBACK_MINUTES", 60.0)
+    monkeypatch.setattr(run_once, "MAX_5M_TRIGGER_AGE_MINUTES", 60.0)
+    now = pd.Timestamp.now(tz="UTC").floor("5min")
+    t0 = now - pd.Timedelta(minutes=15)
+    zone = {"start": 0, "top": 110.0, "btm": 100.0, "poi": 105.0}
+    bars = [
+        {"timestamp": int(t0.timestamp()*1000), "open": 107, "high": 108, "low": 104, "close": 106, "volume": 10},
+        {"timestamp": int((t0+pd.Timedelta(minutes=5)).timestamp()*1000), "open": 106, "high": 112, "low": 104, "close": 111, "volume": 10},
+        {"timestamp": int((t0+pd.Timedelta(minutes=10)).timestamp()*1000), "open": 112, "high": 113, "low": 104, "close": 105, "volume": 10},
+    ]
+    df1h = pd.DataFrame([{"timestamp": now-pd.Timedelta(hours=12-i), "open":100, "high":111, "low":99, "close":105, "volume":100, "atr50":2.0} for i in range(12)])
+    sigs, state, _ = _process_5m_zone_visits("TEST-USDT", bars, [zone], [], df1h, None, set(), set())
+    assert len(sigs) == 1
+    assert sigs[0]["trigger_bar_time"] == pd.Timestamp(bars[0]["timestamp"], unit="ms", tz="UTC").isoformat()
+
+
+def test_5m_stale_touch_does_not_lock_zone(monkeypatch):
+    import pandas as pd
+    import run_once
+    from run_once import _process_5m_zone_visits
+    monkeypatch.setattr(run_once, "INITIAL_5M_TRIGGER_LOOKBACK_MINUTES", 60.0)
+    monkeypatch.setattr(run_once, "MAX_5M_TRIGGER_AGE_MINUTES", 5.0)
+    now = pd.Timestamp.now(tz="UTC").floor("5min")
+    t0 = now - pd.Timedelta(minutes=20)
+    zone = {"start": 0, "top": 110.0, "btm": 100.0, "poi": 105.0}
+    bars = [{"timestamp": int(t0.timestamp()*1000), "open":108, "high":109, "low":104, "close":106, "volume":10}]
+    df1h = pd.DataFrame([{"timestamp": now-pd.Timedelta(hours=12-i), "open":100, "high":111, "low":99, "close":105, "volume":100, "atr50":2.0} for i in range(12)])
+    sigs, state, _ = _process_5m_zone_visits("TEST-USDT", bars, [zone], [], df1h, None, set(), set())
+    zs = state["zones"]["DEMAND:0:110.000000000000:100.000000000000"]
+    assert sigs == []
+    assert zs["state"] == "ARMED"
+    assert zs["lock_reason"] == "stale_midpoint_touch_ignored"
+
+
+def test_register_active_trade_preserves_5m_trigger_metadata(monkeypatch, tmp_path):
+    import event_engine.tracker as tracker
+    monkeypatch.setattr(tracker, "DATA", tmp_path)
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", tmp_path / "active_trades.json")
+    monkeypatch.setattr(tracker, "TRADES_PATH", tmp_path / "trades.jsonl")
+    monkeypatch.setattr(tracker, "ACTIONS_PATH", tmp_path / "actions.jsonl")
+    tracker.register_active_trade(
+        event_id="EVT_META_5M",
+        symbol="BTC-USDT",
+        name="BTC-USDT",
+        direction="LONG",
+        entry_price=100.0,
+        qty=1.0,
+        tp_orders=[],
+        sl_result={},
+        event_type="DEMAND_MIDPOINT_TOUCH_5M",
+        timeframe="5m",
+        score=75.0,
+        setup={
+            "strategy_version": "zone-midpoint-v3-5m-visit-stop10-tp5-tp7-be-on-tp1",
+            "signal_snapshot": {"trigger_timeframe": "5m"},
+            "tp_levels": [],
+            "planned_risk_pct": 10.0,
+            "target_rr": 0.7,
+            "planned_weighted_rr": 0.6,
+        },
+    )
+    state = tracker._load_active_trades()
+    trade = state["EVT_META_5M"]
+    assert trade["timeframe"] == "5m"
+    assert trade["event_type"] == "DEMAND_MIDPOINT_TOUCH_5M"
