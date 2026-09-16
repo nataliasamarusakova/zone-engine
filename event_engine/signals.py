@@ -24,33 +24,23 @@ INT_RES = 8
 SWING_LEN = 10
 ZONE_HISTORY = 20
 BOX_WIDTH = 2.5
-RR_RATIO = 3.0
-TP1_R = float(os.environ.get("TP1_R", "1.0"))  # fallback only
-TP2_R = float(os.environ.get("TP2_R", "2.0"))  # fallback only
+STRATEGY_VERSION = "zone-midpoint-v3-5m-visit-stop10-tp5-tp7-be-on-tp1"
+TP1_PCT = 5.0
+TP2_PCT = 7.0
 TP1_FRACTION = 0.50
 TP2_FRACTION = 0.50
-ZONE_SL_ATR_BUFFER = float(os.environ.get("ZONE_SL_ATR_BUFFER", "0.10"))
-REQUIRE_ZONE_TOUCH = os.environ.get("REQUIRE_ZONE_TOUCH", "false").lower() == "true"
-TP1_OBSTACLE_FRACTION = float(os.environ.get("TP1_OBSTACLE_FRACTION", "0.50"))
-TP2_OBSTACLE_FRACTION = float(os.environ.get("TP2_OBSTACLE_FRACTION", "0.90"))
-TP_OBSTACLE_BUFFER_ATR = float(os.environ.get("TP_OBSTACLE_BUFFER_ATR", "0.10"))
-TP_MAX_R = float(os.environ.get("TP_MAX_R", "2.50"))
-TP_MIN_R = float(os.environ.get("TP_MIN_R", "0.80"))
-TP_MIN_R = max(0.50, min(TP_MIN_R, 3.0))
 
 MIN_BARS = 70
 # Production entry filters selected from the last completed audit. Keep them
 # explicit and small so their effect remains observable in the new trade set.
 MAX_ZONE_AGE_BARS = int(os.environ.get("MAX_ZONE_AGE_BARS", "30"))
-MAX_SIGNAL_RISK_PCT = min(float(os.environ.get("MAX_SIGNAL_RISK_PCT", "5.00")), 5.00)
+FIXED_STOP_PCT = float(os.environ.get("FIXED_STOP_PCT", "10.00"))
+if not (0.0 < FIXED_STOP_PCT <= 10.0):
+    raise ValueError("FIXED_STOP_PCT must be in (0, 10]")
+MAX_SIGNAL_RISK_PCT = min(float(os.environ.get("MAX_SIGNAL_RISK_PCT", str(FIXED_STOP_PCT))), FIXED_STOP_PCT)
 MIN_STRUCTURE_ROOM_R = float(os.environ.get("MIN_STRUCTURE_ROOM_R", "1.20"))
 REQUIRE_DIRECTIONAL_CANDLE = os.environ.get("REQUIRE_DIRECTIONAL_CANDLE", "false").lower() == "true"
 REQUIRE_STRUCTURE_OBSTACLE = os.environ.get("REQUIRE_STRUCTURE_OBSTACLE", "false").lower() == "true"
-
-# When an Ajay ALMA signal has no directional Demand/Supply zone touching the
-# signal bar, production still needs a deterministic protective stop. This
-# fallback is deliberately expressed in ATR rather than inventing a zone.
-FALLBACK_SL_ATR_MULTIPLIER = float(os.environ.get("FALLBACK_SL_ATR_MULTIPLIER", "1.5"))
 
 # Pine visual S/R settings (diagnostic layer; not an entry filter)
 SR_ENABLE = True
@@ -520,14 +510,19 @@ def _signal_forensics(
 
 
 def _find_directional_zone(direction: str, cur_l: float, cur_h: float, cur_c: float, demand: list[dict[str, Any]], supply: list[dict[str, Any]]) -> dict[str, Any] | None:
-    if direction == "LONG":
-        # Exact zone-touch geometry: the candle must actually reach the
-        # Demand zone. No 0.3% proximity expansion.
-        candidates = [z for z in demand if cur_l <= float(z["top"]) and cur_c >= float(z["btm"])]
-    else:
-        # Exact zone-touch geometry: the candle must actually reach the
-        # Supply zone. No 0.3% proximity expansion.
-        candidates = [z for z in supply if cur_h >= float(z["btm"]) and cur_c <= float(z["top"])]
+    """Return the first Demand/Supply zone whose 50% midpoint is touched.
+
+    A touch is intrabar: the candle high/low range must contain the midpoint.
+    The close does not need to remain inside the zone.
+    """
+    zones = demand if direction == "LONG" else supply
+    candidates = []
+    for z in zones:
+        top = float(z["top"])
+        bottom = float(z["btm"])
+        midpoint = (top + bottom) / 2.0
+        if cur_l <= midpoint <= cur_h:
+            candidates.append(z)
     return candidates[0] if candidates else None
 
 
@@ -742,57 +737,33 @@ def _targets_from_nearest_obstacle(
     atr: float,
     obstacle: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    """Place small targets before the nearest support/resistance obstacle."""
+    """Build fixed percentage targets from entry; obstacle is diagnostic only.
+
+    Production strategy contract:
+      LONG  -> TP1 +5%, TP2 +7%, SL is handled separately.
+      SHORT -> TP1 -5%, TP2 -7%.
+    """
     risk = abs(entry - stop)
     if risk <= 0 or entry <= 0:
         return None
-    if obstacle is None:
-        # Deterministic fallback only when no structural obstacle exists.
-        tp2 = entry + TP2_R * risk if direction == "LONG" else entry - TP2_R * risk
-        tp1 = entry + TP1_R * risk if direction == "LONG" else entry - TP1_R * risk
-        return {
-            "tp1": tp1,
-            "tp2": tp2,
-            "tp1_rr": abs(tp1 - entry) / risk,
-            "tp2_rr": abs(tp2 - entry) / risk,
-            "target_source": "atr_rr_fallback",
-            "obstacle_price": None,
-            "obstacle_source": None,
-        }
-
-    level = float(obstacle["price"])
-    buffer = max(float(atr) * TP_OBSTACLE_BUFFER_ATR, entry * 0.0002)
+    tp1_distance = entry * TP1_PCT / 100.0
+    tp2_distance = entry * TP2_PCT / 100.0
     if direction == "LONG":
-        usable_distance = level - buffer - entry
-        if usable_distance <= 0:
-            return None
-        tp2_distance = usable_distance * TP2_OBSTACLE_FRACTION
-        tp2_distance = min(tp2_distance, TP_MAX_R * risk)
-        tp1_distance = tp2_distance * TP1_OBSTACLE_FRACTION
         tp1 = entry + tp1_distance
         tp2 = entry + tp2_distance
     else:
-        usable_distance = entry - (level + buffer)
-        if usable_distance <= 0:
-            return None
-        tp2_distance = usable_distance * TP2_OBSTACLE_FRACTION
-        tp2_distance = min(tp2_distance, TP_MAX_R * risk)
-        tp1_distance = tp2_distance * TP1_OBSTACLE_FRACTION
         tp1 = entry - tp1_distance
         tp2 = entry - tp2_distance
-
-    tp1_rr = abs(tp1 - entry) / risk
-    tp2_rr = abs(tp2 - entry) / risk
-    if tp2_rr < TP_MIN_R or tp1_rr <= 0 or tp2_rr <= tp1_rr:
-        return None
+    tp1_rr = tp1_distance / risk
+    tp2_rr = tp2_distance / risk
     return {
         "tp1": tp1,
         "tp2": tp2,
         "tp1_rr": tp1_rr,
         "tp2_rr": tp2_rr,
-        "target_source": "nearest_opposing_structure",
-        "obstacle_price": level,
-        "obstacle_source": obstacle.get("source"),
+        "target_source": "fixed_entry_percentage",
+        "obstacle_price": float(obstacle["price"]) if obstacle and obstacle.get("price") is not None else None,
+        "obstacle_source": obstacle.get("source") if obstacle else None,
     }
 
 
@@ -857,14 +828,16 @@ def generate_zone_signals(
         if direction is None or trade_zone is None:
             continue
 
-        # Fresh touch only: previous close must have been outside the zone.
-        prev_close = float(df.loc[i - 1, "close"])
-        if direction == "LONG":
-            if not (prev_close > float(trade_zone["top"]) and cur_l <= float(trade_zone["top"]) and cur_c >= float(trade_zone["btm"])):
-                continue
-        else:
-            if not (prev_close < float(trade_zone["btm"]) and cur_h >= float(trade_zone["btm"]) and cur_c <= float(trade_zone["top"])):
-                continue
+        # Fresh midpoint touch: the current candle must touch the exact 50%
+        # level of the selected zone, while the previous candle must not have
+        # touched that midpoint. This creates one deterministic event per touch.
+        midpoint = (float(trade_zone["top"]) + float(trade_zone["btm"])) / 2.0
+        prev_l = float(df.loc[i - 1, "low"])
+        prev_h = float(df.loc[i - 1, "high"])
+        prev_midpoint_touch = prev_l <= midpoint <= prev_h
+        current_midpoint_touch = cur_l <= midpoint <= cur_h
+        if not current_midpoint_touch or prev_midpoint_touch:
+            continue
 
         # Audit-derived entry filters. These are applied only after a literal
         # fresh zone touch, never to ordinary in-zone observations.
@@ -884,15 +857,11 @@ def generate_zone_signals(
 
         zone_top = float(trade_zone["top"])
         zone_bottom = float(trade_zone["btm"])
-        sl_buffer = ZONE_SL_ATR_BUFFER * atr
+        risk = cur_c * FIXED_STOP_PCT / 100.0
         if direction == "LONG":
-            stop = zone_bottom - sl_buffer
-            risk = cur_c - stop
+            stop = cur_c - risk
         else:
-            stop = zone_top + sl_buffer
-            risk = stop - cur_c
-        if risk <= 0:
-            continue
+            stop = cur_c + risk
 
         obstacle = _nearest_opposing_level(direction, cur_c, active_demand, active_supply, df, i)
         if REQUIRE_STRUCTURE_OBSTACLE and obstacle is None:
@@ -922,6 +891,24 @@ def generate_zone_signals(
             **_zone_context(trade_zone, i, df),
             "kind": "DEMAND" if direction == "LONG" else "SUPPLY",
         }
+        entry_bar = {
+            "timestamp": df.loc[i, "timestamp"].isoformat(),
+            "open": round(cur_o, 12),
+            "high": round(cur_h, 12),
+            "low": round(cur_l, 12),
+            "close": round(cur_c, 12),
+            "volume": round(_safe_num(df.loc[i, "volume"]), 12),
+        }
+        previous_bar = {
+            "timestamp": df.loc[i - 1, "timestamp"].isoformat(),
+            "open": round(_safe_num(df.loc[i - 1, "open"]), 12),
+            "high": round(prev_h, 12),
+            "low": round(prev_l, 12),
+            "close": round(_safe_num(df.loc[i - 1, "close"]), 12),
+            "volume": round(_safe_num(df.loc[i - 1, "volume"]), 12),
+        }
+        zone_midpoint = (zone_top + zone_bottom) / 2.0
+        zone_width_abs = max(0.0, zone_top - zone_bottom)
         signals.append(
             {
                 "event_id": event_id,
@@ -938,30 +925,37 @@ def generate_zone_signals(
                 "atr": round(float(atr), 8),
                 "tp1_rr": round(tp1_rr, 4),
                 "tp2_rr": round(tp2_rr, 4),
-                "rr_ratio": round(tp2_rr, 4),
                 "strategy": "Demand/Supply Zone First",
+                "strategy_version": STRATEGY_VERSION,
+                "entry_bar": entry_bar,
+                "previous_bar": previous_bar,
                 "trigger": {
                     "type": "ZONE_TOUCH",
                     "alma_required": False,
                     "alternate_timeframe": "8h",
                     "mode": mode,
                     "zone_touch": True,
-                    "zone_entry_rule": "fresh_touch_from_outside",
+                    "zone_entry_rule": "fresh_midpoint_touch",
+                    "zone_midpoint": round(zone_midpoint, 12),
+                    "zone_midpoint_pct": 50.0,
+                    "previous_bar_midpoint_touch": bool(prev_midpoint_touch),
                 },
                 "zone": zone_ctx,
                 "target": {
                     "source": targets["target_source"],
                     "obstacle_source": targets["obstacle_source"],
                     "obstacle_price": targets["obstacle_price"],
-                    "tp1_fraction_to_tp2": TP1_OBSTACLE_FRACTION,
-                    "tp2_fraction_to_obstacle": TP2_OBSTACLE_FRACTION,
-                    "obstacle_buffer_atr": TP_OBSTACLE_BUFFER_ATR,
-                    "tp_max_r": TP_MAX_R,
+                    "tp1_pct": TP1_PCT,
+                    "tp2_pct": TP2_PCT,
+                    "tp1_close_fraction": TP1_FRACTION,
+                    "tp2_close_fraction": TP2_FRACTION,
+                    "be_rule": "after_tp1_filled",
                 },
                 "risk_model": {
-                    "sl_source": "zone_boundary_plus_atr_buffer",
-                    "zone_sl_buffer_atr": ZONE_SL_ATR_BUFFER,
+                    "sl_source": "fixed_percent_from_entry",
+                    "fixed_stop_pct": FIXED_STOP_PCT,
                     "max_signal_risk_pct": MAX_SIGNAL_RISK_PCT,
+                    "initial_risk_pct": round(risk_pct, 6),
                 },
                 "confirmation": {
                     "alma_cross": False,
@@ -971,6 +965,7 @@ def generate_zone_signals(
                     "zone_age_bars": zone_age_bars,
                     "minimum_structure_room_r": MIN_STRUCTURE_ROOM_R,
                     "zone_touch": True,
+                    "midpoint_touch": True,
                     "volume_ratio": round(vol_ratio, 3) if vol_ratio is not None else None,
                     "candle_body_atr": round(_safe_num(df.loc[i, "body_atr"]), 3),
                     "range_atr": round(_safe_num(df.loc[i, "range_atr"]), 3),
@@ -978,6 +973,9 @@ def generate_zone_signals(
                     "bearish_candle": cur_c <= cur_o,
                 },
                 "source_bar_close": cur_c,
+                "zone_midpoint": round(zone_midpoint, 12),
+                "zone_width_abs": round(zone_width_abs, 12),
+                "zone_width_pct_of_entry": round((zone_width_abs / cur_c) * 100.0, 6) if cur_c > 0 else None,
                 "signal_forensics": _signal_forensics(
                     direction, cur_o, cur_h, cur_l, cur_c, atr, zone_ctx
                 ),

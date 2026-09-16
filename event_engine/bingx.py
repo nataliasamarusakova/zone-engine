@@ -1810,17 +1810,6 @@ def ensure_directional_protection(
             "qty": _order_qty(order), "pnl_pct": pnl_pct,
         })
 
-    # Remove only legacy TP3 orders created by this engine. Manual/unrelated
-    # take-profit orders are left untouched.
-    for old_order in existing_tp:
-        cid = str(old_order.get("clientOrderId", "")).upper()
-        old_id = str(old_order.get("orderId", ""))
-        if old_id and ("_TP3" in cid or cid.endswith("TP3")):
-            try:
-                cancel_order(symbol, old_id)
-            except Exception as exc:
-                log.warning("[BINGX] Could not remove legacy TP3 %s: %s", old_id, exc)
-
     successful_tps = [t for t in tp_results if t.get("status") in {"created", "already_exists", "reconciled_after_post_error"}]
     if not verified_sl_valid:
         final_status = "PROTECTION_FAILED"

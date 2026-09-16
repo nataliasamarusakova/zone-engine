@@ -69,6 +69,15 @@ def _load_active_trades() -> dict[str, dict]:
                 t.setdefault("max_drawdown_pct", 0.0)
                 t.setdefault("be_required", False)
                 t.setdefault("be_last_error", None)
+                t.setdefault("be_trigger_rule", "after_tp1_filled")
+                t.setdefault("strategy_version", None)
+                t.setdefault("signal_snapshot", {})
+                t.setdefault("entry_bar", {})
+                t.setdefault("previous_bar", {})
+                t.setdefault("entry_order", {})
+                t.setdefault("fill_position", {})
+                t.setdefault("execution_snapshot", {})
+                t.setdefault("tp_fill_events", [])
                 t.setdefault("tp_mode", "single_tp" if len(t.get("tp_orders", [])) == 1 else "multi_tp")
                 t.setdefault("effective_tp_levels", t.get("tp_levels", []))
                 t.setdefault("effective_weighted_rr", t.get("planned_weighted_rr", 0.75))
@@ -257,6 +266,14 @@ def _extract_setup_metrics(setup: dict | None) -> dict[str, Any]:
             "effective_tp_levels": [],
             "effective_weighted_rr": 0.75,
             "tp_mode": "multi_tp",
+            "strategy_version": None,
+            "signal_snapshot": {},
+            "entry_bar": {},
+            "previous_bar": {},
+            "entry_order": {},
+            "fill_position": {},
+            "execution_snapshot": {},
+            "tp_fill_events": [],
         }
 
     return {
@@ -266,6 +283,13 @@ def _extract_setup_metrics(setup: dict | None) -> dict[str, Any]:
         "effective_tp_levels": setup.get("effective_tp_levels") if isinstance(setup.get("effective_tp_levels"), list) else [],
         "effective_weighted_rr": _safe_float(setup.get("effective_weighted_rr", setup.get("planned_weighted_rr", 0.75)), 0.75),
         "tp_mode": str(setup.get("tp_mode", "multi_tp")),
+        "strategy_version": str(setup.get("strategy_version", "")) or None,
+        "signal_snapshot": setup.get("signal_snapshot") if isinstance(setup.get("signal_snapshot"), dict) else {},
+        "entry_bar": setup.get("entry_bar") if isinstance(setup.get("entry_bar"), dict) else {},
+        "previous_bar": setup.get("previous_bar") if isinstance(setup.get("previous_bar"), dict) else {},
+        "entry_order": setup.get("entry_order") if isinstance(setup.get("entry_order"), dict) else {},
+        "fill_position": setup.get("fill_position") if isinstance(setup.get("fill_position"), dict) else {},
+        "execution_snapshot": setup.get("execution_snapshot") if isinstance(setup.get("execution_snapshot"), dict) else {},
         "entry_reference": _safe_float(setup.get("entry_reference"), 0.0) if setup.get("entry_reference") is not None else None,
         "invalidation_price": _safe_float(setup.get("invalidation_price"), 0.0) if setup.get("invalidation_price") is not None else None,
         "target_price": _safe_float(setup.get("target_price"), 0.0) if setup.get("target_price") is not None else None,
@@ -329,6 +353,9 @@ def register_active_trade(
     if execution_slippage_pct is not None:
         adverse_entry_slippage_pct = execution_slippage_pct
 
+    signal_snapshot = setup_metrics.get("signal_snapshot") if isinstance(setup_metrics.get("signal_snapshot"), dict) else {}
+    entry_bar = setup_metrics.get("entry_bar") if isinstance(setup_metrics.get("entry_bar"), dict) else {}
+    previous_bar = setup_metrics.get("previous_bar") if isinstance(setup_metrics.get("previous_bar"), dict) else {}
     trades[event_id] = {
         "event_id": event_id,
         "symbol": symbol,
@@ -352,6 +379,7 @@ def register_active_trade(
         "be_activated": False,
         "be_activation_ts": None,
         "be_trigger_ts": None,
+        "be_trigger_rule": "after_tp1_filled",
         "be_trigger_peak_r": None,
         "be_order_id": None,
         "be_trigger_price": None,
@@ -365,6 +393,14 @@ def register_active_trade(
         "max_drawdown_pct": 0.0,
         "current_pnl_pct": 0.0,
         "score": _safe_float(score, 50.0),
+        "strategy_version": setup_metrics.get("strategy_version"),
+        "entry_bar": entry_bar,
+        "previous_bar": previous_bar,
+        "signal_snapshot": signal_snapshot,
+        "entry_order": setup_metrics.get("entry_order", {}),
+        "fill_position": setup_metrics.get("fill_position", {}),
+        "execution_snapshot": setup_metrics.get("execution_snapshot", {}),
+        "tp_fill_events": [],
         "event_type": event_type,
         "timeframe": str(timeframe or (setup or {}).get("event_timeframe") or (setup or {}).get("timeframe") or "1h").lower(),
         "research": research,
@@ -1195,34 +1231,10 @@ def update_active_trades() -> None:
             trade["current_position_qty"] = pos_amt
             trade["last_observation_ts"] = now_ms
 
-            # Audit fix: BE is triggered by PRICE reaching +0.50R, not by TP1
-            # order status. MFE is updated from the fetched 1m candles above, so
-            # an intrabar touch that later retraces is still detected.
+            # Break-even is intentionally activated ONLY after TP1 is fully filled.
+            # There is no earlier +0.50R price-triggered BE in this strategy.
             planned_risk_pct = _derive_planned_risk_pct(trade)
-            be_trigger_r = float(os.environ.get("BE_TRIGGER_R", "0.50"))
             peak_r = (float(trade.get("peak_pnl_pct", 0.0)) / planned_risk_pct) if planned_risk_pct and planned_risk_pct > 0 else 0.0
-            if pos_status == "found" and rem_qty > 0 and not trade.get("be_activated") and peak_r >= be_trigger_r:
-                old_sl = trade.get("sl_order", {}) if isinstance(trade.get("sl_order"), dict) else {}
-                old_sl_id = old_sl.get("order_id")
-                old_sl_price = _safe_float(old_sl.get("stop_price"), 0.0) or None
-                be_result = _move_sl_to_break_even(symbol, direction, entry_price, rem_qty, old_sl_id, str(event_id).replace("EVT_", ""), old_sl_price=old_sl_price)
-                trade["be_trigger_ts"] = trade.get("be_trigger_ts") or now_ms
-                trade["be_trigger_peak_r"] = peak_r
-                if be_result.get("status") == "created":
-                    trade["sl_order"] = be_result
-                    trade["be_activated"] = True
-                    trade["be_required"] = False
-                    trade["be_trigger_r"] = be_trigger_r
-                    trade["be_activation_ts"] = trade.get("be_activation_ts") or now_ms
-                    trade["be_order_id"] = be_result.get("order_id")
-                    trade["be_trigger_price"] = _safe_float(be_result.get("stop_price"), entry_price)
-                    log.info("[TRACKER_BE_ACTIVATED] %s (%s) Price reached +%.2fR. Stop-loss moved to Break-Even: %.8g", trade.get("name", symbol), symbol, peak_r, entry_price)
-                else:
-                    trade["be_required"] = True
-                    trade["be_last_error"] = be_result.get("error")
-                    trade["be_trigger_r"] = be_trigger_r
-                    trade["be_trigger_peak_r"] = peak_r
-                    log.error("[TRACKER_BE_FAILED] %s (%s) Price reached +%.2fR but BE failed: %s", trade.get("name", symbol), symbol, peak_r, be_result.get("error"))
 
             # Retry a failed TP1 -> BE transition while the position remains open.
             if "tp1" in set(trade.get("hit_legs", [])) and not trade.get("be_activated") and rem_qty > 0:
@@ -1299,6 +1311,17 @@ def update_active_trades() -> None:
                 trade["realized_pnl_qty"] = realized_qty
                 trade["realized_pnl_weighted_sum"] = realized_weighted
                 trade["last_tp_exec_price"] = exec_price
+                trade.setdefault("tp_fill_events", []).append({
+                    "ts": now_ms,
+                    "leg": leg,
+                    "order_id": order_id,
+                    "order_status": order_status,
+                    "executed_qty_total": executed_qty,
+                    "delta_qty": delta_qty,
+                    "avg_price": exec_price,
+                    "pnl_pct": pnl_tp,
+                    "remaining_qty": rem_qty,
+                })
 
                 if order_status == "FILLED" and leg not in hit_legs:
                     hit_legs.add(leg)
@@ -1345,7 +1368,7 @@ def update_active_trades() -> None:
                             trade["be_activated"] = True
                             trade["be_trigger_ts"] = trade.get("be_trigger_ts") or now_ms
                             trade["be_trigger_peak_r"] = peak_r
-                            trade["be_trigger_r"] = float(os.environ.get("BE_TRIGGER_R", "0.50"))
+                            trade["be_trigger_rule"] = "tp1_filled"
                             trade["be_activation_ts"] = now_ms
                             trade["be_order_id"] = new_sl.get("order_id")
                             trade["be_trigger_price"] = _safe_float(new_sl.get("stop_price"), entry_price)
@@ -1509,6 +1532,15 @@ def update_active_trades() -> None:
                 "realized_pnl_source": realized_pnl_source,
                 "effective_weighted_rr": planned_rr,
                 "tp_mode": trade.get("tp_mode", "multi_tp"),
+                "strategy_version": trade.get("strategy_version"),
+                "be_trigger_rule": trade.get("be_trigger_rule", "after_tp1_filled"),
+                "entry_bar": trade.get("entry_bar", {}),
+                "previous_bar": trade.get("previous_bar", {}),
+                "signal_snapshot": trade.get("signal_snapshot", {}),
+                "entry_order": trade.get("entry_order", {}),
+                "fill_position": trade.get("fill_position", {}),
+                "execution_snapshot": trade.get("execution_snapshot", {}),
+                "tp_fill_events": trade.get("tp_fill_events", []),
                 "effective_tp_levels": trade.get("effective_tp_levels", []),
                 "peak_pnl_pct": _safe_float(trade.get("peak_pnl_pct")),
                 "mae_pct": _safe_float(trade.get("mae_pct")),
