@@ -464,6 +464,61 @@ def _zone_context(zone: dict[str, Any], current_idx: int, df: pd.DataFrame) -> d
     }
 
 
+def _signal_forensics(
+    direction: str,
+    cur_o: float,
+    cur_h: float,
+    cur_l: float,
+    cur_c: float,
+    atr: float,
+    zone: dict[str, Any],
+) -> dict[str, Any]:
+    """Deterministic, pre-entry observations for later forensic analysis.
+
+    This helper only records measurements from the signal candle and the zone.
+    It never rejects a setup and never changes the strategy trigger.
+    """
+    safe_atr = max(float(atr), 1e-12)
+    rng = max(float(cur_h) - float(cur_l), 0.0)
+    body = abs(float(cur_c) - float(cur_o))
+    upper_wick = max(0.0, float(cur_h) - max(float(cur_o), float(cur_c)))
+    lower_wick = max(0.0, min(float(cur_o), float(cur_c)) - float(cur_l))
+    close_location = ((float(cur_c) - float(cur_l)) / rng) if rng > 0 else 0.5
+    directional_close_location = close_location if direction == "LONG" else 1.0 - close_location
+    directional_wick = lower_wick if direction == "LONG" else upper_wick
+
+    zone_top = _safe_num(zone.get("top"), 0.0)
+    zone_bottom = _safe_num(zone.get("btm"), 0.0)
+    zone_width = max(0.0, zone_top - zone_bottom)
+    if direction == "LONG":
+        penetration_raw = (zone_top - float(cur_l)) / zone_width if zone_width > 0 else 0.0
+        close_vs_edge_atr = (float(cur_c) - zone_top) / safe_atr
+        directional_rejection_side = "lower_wick"
+    else:
+        penetration_raw = (float(cur_h) - zone_bottom) / zone_width if zone_width > 0 else 0.0
+        close_vs_edge_atr = (zone_bottom - float(cur_c)) / safe_atr
+        directional_rejection_side = "upper_wick"
+
+    return {
+        "range_atr": round(rng / safe_atr, 6),
+        "body_atr": round(body / safe_atr, 6),
+        "body_to_range": round(body / rng, 6) if rng > 0 else 0.0,
+        "upper_wick_ratio": round(upper_wick / rng, 6) if rng > 0 else 0.0,
+        "lower_wick_ratio": round(lower_wick / rng, 6) if rng > 0 else 0.0,
+        "directional_wick_ratio": round(directional_wick / rng, 6) if rng > 0 else 0.0,
+        "directional_wick_to_body": round(directional_wick / body, 6) if body > 0 else None,
+        "close_location": round(close_location, 6),
+        "directional_close_location": round(directional_close_location, 6),
+        "zone_width_abs": round(zone_width, 12),
+        "zone_width_atr": round(zone_width / safe_atr, 6) if zone_width > 0 else 0.0,
+        "zone_penetration_ratio_raw": round(penetration_raw, 6),
+        "zone_penetration_pct_capped": round(max(0.0, min(1.0, penetration_raw)) * 100.0, 4),
+        "zone_close_vs_entry_edge_atr": round(close_vs_edge_atr, 6),
+        "zone_close_to_poi_atr": round(abs(float(cur_c) - _safe_num(zone.get("poi"), float(cur_c))) / safe_atr, 6),
+        "directional_rejection_side": directional_rejection_side,
+    }
+
+
 def _find_directional_zone(direction: str, cur_l: float, cur_h: float, cur_c: float, demand: list[dict[str, Any]], supply: list[dict[str, Any]]) -> dict[str, Any] | None:
     if direction == "LONG":
         # Exact zone-touch geometry: the candle must actually reach the
@@ -923,6 +978,9 @@ def generate_zone_signals(
                     "bearish_candle": cur_c <= cur_o,
                 },
                 "source_bar_close": cur_c,
+                "signal_forensics": _signal_forensics(
+                    direction, cur_o, cur_h, cur_l, cur_c, atr, zone_ctx
+                ),
             }
         )
 

@@ -302,6 +302,8 @@ def register_active_trade(
 
     setup_metrics = _extract_setup_metrics(setup)
     research: dict[str, Any] = {"source": "BingX 1H demand_supply zone engine"}
+    if isinstance(setup, dict) and isinstance(setup.get("signal_forensics"), dict):
+        research["signal_forensics"] = dict(setup.get("signal_forensics") or {})
 
     requested_price = _safe_float(requested_entry_price, 0.0) if requested_entry_price is not None else setup_metrics["entry_reference"]
     signal_reference_price = _safe_float((setup or {}).get("signal_price"), 0.0) if isinstance(setup, dict) else 0.0
@@ -349,6 +351,13 @@ def register_active_trade(
         "hit_legs": [],
         "be_activated": False,
         "be_activation_ts": None,
+        "be_trigger_ts": None,
+        "be_trigger_peak_r": None,
+        "be_order_id": None,
+        "be_trigger_price": None,
+        "be_fill_price": None,
+        "be_execution_slippage_pct": None,
+        "mfe_milestones_r": {},
         "be_required": False,
         "be_last_error": None,
         "peak_pnl_pct": 0.0,
@@ -1006,6 +1015,16 @@ def _update_mfe_mae(trade: dict, candles: list[dict]) -> None:
         peak = max(peak, favorable)
         mae = min(mae, adverse)
         drawdown = min(drawdown, adverse - max(prior_peak, favorable))
+
+        risk_pct = _derive_planned_risk_pct(trade)
+        if risk_pct and risk_pct > 0:
+            milestones = trade.setdefault("mfe_milestones_r", {})
+            favorable_r = favorable / risk_pct
+            observed_ts = close_ts or open_ts
+            for threshold in (0.25, 0.50, 1.00, 2.00):
+                key = f"{threshold:.2f}"
+                if favorable_r >= threshold and key not in milestones:
+                    milestones[key] = observed_ts
     trade["peak_pnl_pct"] = peak
     trade["mae_pct"] = mae
     trade["max_drawdown_pct"] = drawdown
@@ -1187,13 +1206,16 @@ def update_active_trades() -> None:
                 old_sl_id = old_sl.get("order_id")
                 old_sl_price = _safe_float(old_sl.get("stop_price"), 0.0) or None
                 be_result = _move_sl_to_break_even(symbol, direction, entry_price, rem_qty, old_sl_id, str(event_id).replace("EVT_", ""), old_sl_price=old_sl_price)
+                trade["be_trigger_ts"] = trade.get("be_trigger_ts") or now_ms
+                trade["be_trigger_peak_r"] = peak_r
                 if be_result.get("status") == "created":
                     trade["sl_order"] = be_result
                     trade["be_activated"] = True
                     trade["be_required"] = False
                     trade["be_trigger_r"] = be_trigger_r
-                    trade["be_trigger_peak_r"] = peak_r
                     trade["be_activation_ts"] = trade.get("be_activation_ts") or now_ms
+                    trade["be_order_id"] = be_result.get("order_id")
+                    trade["be_trigger_price"] = _safe_float(be_result.get("stop_price"), entry_price)
                     log.info("[TRACKER_BE_ACTIVATED] %s (%s) Price reached +%.2fR. Stop-loss moved to Break-Even: %.8g", trade.get("name", symbol), symbol, peak_r, entry_price)
                 else:
                     trade["be_required"] = True
@@ -1321,7 +1343,12 @@ def update_active_trades() -> None:
                         if new_sl.get("status") in {"created", "created_cleanup_pending"}:
                             trade["sl_order"] = new_sl
                             trade["be_activated"] = True
+                            trade["be_trigger_ts"] = trade.get("be_trigger_ts") or now_ms
+                            trade["be_trigger_peak_r"] = peak_r
+                            trade["be_trigger_r"] = float(os.environ.get("BE_TRIGGER_R", "0.50"))
                             trade["be_activation_ts"] = now_ms
+                            trade["be_order_id"] = new_sl.get("order_id")
+                            trade["be_trigger_price"] = _safe_float(new_sl.get("stop_price"), entry_price)
                             log.info(
                                 "[TRACKER_BE_ACTIVATED] %s (%s) TP1 taken. Stop-loss moved to Break-Even: %.8g (Risk: 0.00%%)",
                                 trade.get("name", symbol), symbol, entry_price
@@ -1422,6 +1449,38 @@ def update_active_trades() -> None:
             realized_rr = _calc_realized_rr(final_pnl, planned_risk_pct) if realized_pnl_source == "executed_tp_or_sl" else None
             planned_rr = _safe_float(trade.get("effective_weighted_rr", trade.get("planned_weighted_rr", 1.05)), 1.05)
 
+            # For BE/SL exits, retain exchange-confirmed trigger/fill telemetry
+            # so the next audit can measure actual stop degradation rather than
+            # infer it from PnL.
+            exit_order_info = _get_filled_order(symbol, sl_order_id) if sl_order_id else None
+            if exit_order_info:
+                actual_exit_fill = _safe_float(exit_order_info.get("avg_price"), 0.0)
+                trigger_px = _safe_float(exit_order_info.get("stop_price") or sl_order.get("stop_price"), 0.0)
+                if actual_exit_fill > 0:
+                    trade["exit_order_id"] = exit_order_info.get("order_id") or sl_order_id
+                    trade["exit_order_avg_price"] = actual_exit_fill
+                    trade["exit_order_trigger_price"] = trigger_px if trigger_px > 0 else None
+                    if trigger_px > 0:
+                        raw_stop_slippage = (actual_exit_fill - trigger_px) / trigger_px * 100.0
+                        trade["exit_order_adverse_slippage_pct"] = (
+                            max(0.0, raw_stop_slippage) if direction == "LONG" else max(0.0, -raw_stop_slippage)
+                        )
+                    if trade.get("be_activated"):
+                        trade["be_order_id"] = trade.get("be_order_id") or sl_order_id
+                        trade["be_trigger_price"] = trade.get("be_trigger_price") or (trigger_px if trigger_px > 0 else entry_price)
+                        trade["be_fill_price"] = actual_exit_fill
+                        be_trigger_px = _safe_float(trade.get("be_trigger_price"), entry_price)
+                        if be_trigger_px > 0:
+                            raw_be_slippage = (actual_exit_fill - be_trigger_px) / be_trigger_px * 100.0
+                            trade["be_execution_slippage_pct"] = (
+                                max(0.0, raw_be_slippage) if direction == "LONG" else max(0.0, -raw_be_slippage)
+                            )
+
+            if trade.get("be_trigger_ts") and entry_ts:
+                trade["time_to_be_trigger_min"] = max(0.0, (int(trade["be_trigger_ts"]) - entry_ts) / 60000.0)
+            if trade.get("be_activation_ts") and entry_ts:
+                trade["time_to_be_activation_min"] = max(0.0, (int(trade["be_activation_ts"]) - entry_ts) / 60000.0)
+
             trade["remaining_qty"] = 0.0
             trade["realized_pnl_pct"] = final_pnl
             trade["realized_pnl_qty"] = realized_qty
@@ -1458,6 +1517,19 @@ def update_active_trades() -> None:
                 "hit_legs": sorted(hit_legs),
                 "tp_filled_qty": filled_by_leg,
                 "be_activated": bool(trade.get("be_activated")),
+                "be_trigger_ts": trade.get("be_trigger_ts"),
+                "be_trigger_peak_r": trade.get("be_trigger_peak_r"),
+                "be_order_id": trade.get("be_order_id"),
+                "be_trigger_price": trade.get("be_trigger_price"),
+                "be_fill_price": trade.get("be_fill_price"),
+                "be_execution_slippage_pct": trade.get("be_execution_slippage_pct"),
+                "time_to_be_trigger_min": trade.get("time_to_be_trigger_min"),
+                "time_to_be_activation_min": trade.get("time_to_be_activation_min"),
+                "mfe_milestones_r": trade.get("mfe_milestones_r", {}),
+                "exit_order_id": trade.get("exit_order_id"),
+                "exit_order_avg_price": trade.get("exit_order_avg_price"),
+                "exit_order_trigger_price": trade.get("exit_order_trigger_price"),
+                "exit_order_adverse_slippage_pct": trade.get("exit_order_adverse_slippage_pct"),
                 "research": trade.get("research", {}),
                 "setup": trade.get("setup", {}),
                 })
