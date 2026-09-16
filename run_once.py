@@ -555,6 +555,7 @@ def _build_setup(signal: dict[str, Any]) -> dict[str, Any]:
         "target_price": float(signal["tp2"]),
         "zone": signal.get("zone", {}),
         "confirmation": signal.get("confirmation", {}),
+        "signal_forensics": signal.get("signal_forensics", {}),
         "score": float(signal.get("score", 0.0)),
         "event_time": signal.get("time"),
     }

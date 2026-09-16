@@ -2186,3 +2186,47 @@ def test_event_execution_claim_blocks_second_in_flight_attempt():
     assert reason2 == "in_flight"
     assert attempt2 == ""
     run_once._finalize_event_claim("ZONE_TEST_INFLIGHT", attempt, terminal=False, status="execution_quote_unavailable")
+
+
+def test_signal_forensics_records_rejection_and_zone_geometry():
+    from event_engine.signals import _signal_forensics
+    out = _signal_forensics(
+        "SHORT",
+        cur_o=10.0,
+        cur_h=11.0,
+        cur_l=9.0,
+        cur_c=9.4,
+        atr=1.0,
+        zone={"top": 10.8, "btm": 10.0, "poi": 10.4},
+    )
+    assert out["range_atr"] == 2.0
+    assert out["body_atr"] == 0.6
+    assert out["upper_wick_ratio"] == 0.5
+    assert out["lower_wick_ratio"] == 0.2
+    assert out["directional_rejection_side"] == "upper_wick"
+    assert out["zone_width_atr"] == 0.8
+    assert out["zone_penetration_pct_capped"] == 100.0
+    assert 0.0 <= out["directional_close_location"] <= 1.0
+
+
+def test_update_mfe_mae_records_threshold_milestones():
+    from event_engine import tracker
+    trade = {
+        "entry_price": 100.0,
+        "direction": "LONG",
+        "entry_ts": 1_000,
+        "planned_risk_pct": 1.0,
+        "peak_pnl_pct": 0.0,
+        "mae_pct": 0.0,
+        "max_drawdown_pct": 0.0,
+    }
+    candles = [
+        {"open_time": 1_001, "close_time": 1_061, "high": 100.4, "low": 99.9},
+        {"open_time": 1_062, "close_time": 1_122, "high": 101.1, "low": 100.8},
+        {"open_time": 1_123, "close_time": 1_183, "high": 102.2, "low": 101.5},
+    ]
+    tracker._update_mfe_mae(trade, candles)
+    assert set(trade["mfe_milestones_r"]) >= {"0.25", "0.50", "1.00", "2.00"}
+    assert trade["mfe_milestones_r"]["0.50"] == 1_122
+    assert trade["mfe_milestones_r"]["1.00"] == 1_122
+    assert trade["mfe_milestones_r"]["2.00"] == 1_183
