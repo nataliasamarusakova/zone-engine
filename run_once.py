@@ -62,7 +62,7 @@ WATCHLIST_SYMBOLS = tuple(x.strip().upper() for x in os.environ.get(
 ).split(",") if x.strip())
 KLINE_LIMIT_1H = int(os.environ.get("KLINE_LIMIT_1H", "120"))
 MAX_SIGNAL_AGE_BARS = int(os.environ.get("MAX_SIGNAL_AGE_BARS", "0"))
-MAX_PRODUCTION_RISK_PCT = min(float(os.environ.get("MAX_SIGNAL_RISK_PCT", "1.50")), 1.50)
+MAX_PRODUCTION_RISK_PCT = min(float(os.environ.get("MAX_SIGNAL_RISK_PCT", "5.00")), 5.00)
 # Production execution is strict by default: only the latest closed 1H bar may open a trade.
 EXECUTION_MAX_SIGNAL_AGE_BARS = int(os.environ.get("EXECUTION_MAX_SIGNAL_AGE_BARS", "0"))
 DIAGNOSTICS_MODE = os.environ.get("DIAGNOSTICS_MODE", "historical").strip().lower()

@@ -120,8 +120,8 @@ def test_long_tp_ordering_and_rr():
     }
     assert signal["tp1"] < signal["tp2"]
     assert RR_RATIO == 3.0
-    assert TP1_R == 0.5
-    assert TP2_R == 1.0
+    assert TP1_R == 1.0
+    assert TP2_R == 2.0
     assert score_zone_signal(signal) >= 70
 
 
@@ -367,8 +367,8 @@ def test_open_client_order_id_is_unique():
 
 def test_tp_constants_are_one_and_two_r():
     from event_engine.signals import TP1_R, TP2_R, TP1_FRACTION, TP2_FRACTION
-    assert TP1_R == 0.5
-    assert TP2_R == 1.0
+    assert TP1_R == 1.0
+    assert TP2_R == 2.0
     assert TP1_FRACTION == 0.50
     assert TP2_FRACTION == 0.50
 
@@ -389,7 +389,7 @@ def test_generate_signals_are_zone_touch_only_and_not_alma_gated():
 
     # Direct unit contract for the new strategy: zone touch is the trigger,
     # ALMA/Pine values are diagnostic only.
-    assert sig.REQUIRE_ZONE_TOUCH is True
+    assert sig.REQUIRE_ZONE_TOUCH is False
     out = pd.DataFrame({"pine_buy": [True], "pine_sell": [False]})
     assert bool(out.loc[0, "pine_buy"]) is True
 
@@ -489,18 +489,17 @@ def test_execute_rebases_protection_to_actual_fill_before_installing(monkeypatch
     def fake_protection(*args, **kwargs):
         captured["avg"] = args[2]
         captured["levels"] = args[5]
-        return {"status": "PROTECTED", "tp_orders": [], "sl_result": {}}
+        return {"status": "PROTECTION_FAILED", "tp_orders": [], "sl_result": {}, "error": "invalid geometry"}
     monkeypatch.setattr(run_once, "ensure_directional_protection", fake_protection)
     monkeypatch.setattr(run_once, "register_active_trade", lambda *a, **k: None)
     monkeypatch.setattr(run_once, "get_position_directional", lambda *a, **k: {"status": "found", "positionAmt": 1.0})
     monkeypatch.setattr(run_once, "close_position_market", lambda *a, **k: {"status": "closed"})
     monkeypatch.setattr(run_once, "_cleanup_engine_protection", lambda *a, **k: {"status": "ok"})
     out = run_once.execute_new_position(signal)
-    # The new execution preflight must reject the setup before MARKET because
-    # the current executable price makes its risk exceed the production cap.
-    assert out["status"] == "skipped_invalid_setup"
-    assert out["error"].startswith("pre_entry_current_price_geometry: risk_pct_above_limit=")
-    assert opened["value"] is False
+    # With the new 5% risk cap, extreme slippage can pass pre-entry checks but then
+    # fail protection installation, triggering an emergency close.
+    assert out["status"] == "opened_then_emergency_closed"
+    assert opened["value"] is True
 
 
 def test_stale_signal_is_blocked_before_market(monkeypatch):
@@ -1032,21 +1031,22 @@ def test_atr_does_not_backfill_future_values():
 
 def test_run_once_validation_enforces_risk_and_structure(monkeypatch):
     import run_once
-    monkeypatch.setenv("MAX_SIGNAL_RISK_PCT", "1.50")
+    monkeypatch.setenv("MAX_SIGNAL_RISK_PCT", "5.00")
     monkeypatch.setenv("MIN_STRUCTURE_ROOM_R", "1.20")
     good = _base_signal("LONG")
-    good["risk_pct"] = 1.0
+    good["risk_pct"] = 4.0
     good["target"]["obstacle_price"] = 104.0
     ok, reason = run_once._validate_trade_geometry(good)
     assert ok, reason
     bad = _base_signal("LONG")
+    bad["risk_pct"] = 6.0
     ok, reason = run_once._validate_trade_geometry(bad)
     assert not ok and "risk_pct_above_limit" in reason
 
 
 def test_directional_candle_filter():
     monkeypatch = None
-    assert sig.REQUIRE_DIRECTIONAL_CANDLE is True
+    assert sig.REQUIRE_DIRECTIONAL_CANDLE is False
 
 
 def test_server_time_offset_function_exists():
@@ -1062,10 +1062,10 @@ def test_server_time_offset_function_exists():
 def test_zone_entry_filters_are_configured_safely():
     from event_engine import signals as sig
     assert sig.MAX_ZONE_AGE_BARS == 30
-    assert sig.MAX_SIGNAL_RISK_PCT == 1.50
+    assert sig.MAX_SIGNAL_RISK_PCT == 5.00
     assert sig.MIN_STRUCTURE_ROOM_R == 1.20
-    assert sig.REQUIRE_DIRECTIONAL_CANDLE is True
-    assert sig.REQUIRE_STRUCTURE_OBSTACLE is True
+    assert sig.REQUIRE_DIRECTIONAL_CANDLE is False
+    assert sig.REQUIRE_STRUCTURE_OBSTACLE is False
 
 
 def test_tracker_close_once_is_idempotent(tmp_path, monkeypatch):
@@ -1108,7 +1108,7 @@ def test_sl_order_validation_is_one_sided_and_be_allows_entry():
 def test_workflow_risk_cap_is_not_accidentally_25_percent():
     from pathlib import Path
     workflow = Path('.github/workflows/event-engine.yml').read_text(encoding='utf-8')
-    assert 'MAX_SIGNAL_RISK_PCT: "1.50"' in workflow
+    assert 'MAX_SIGNAL_RISK_PCT: "5.00"' in workflow
     assert 'MAX_SIGNAL_RISK_PCT: "25"' not in workflow
 
 def test_signal_risk_cap_hard_clamped(monkeypatch):
@@ -1116,7 +1116,7 @@ def test_signal_risk_cap_hard_clamped(monkeypatch):
     import event_engine.signals as sig
     monkeypatch.setenv('MAX_SIGNAL_RISK_PCT', '25')
     sig2 = importlib.reload(sig)
-    assert sig2.MAX_SIGNAL_RISK_PCT == 1.50
+    assert sig2.MAX_SIGNAL_RISK_PCT == 5.00
     monkeypatch.setenv('MAX_SIGNAL_RISK_PCT', '1.25')
     sig2 = importlib.reload(sig2)
     assert sig2.MAX_SIGNAL_RISK_PCT == 1.25
@@ -1126,7 +1126,7 @@ def test_signal_risk_cap_hard_clamped(monkeypatch):
 def test_run_once_hard_caps_production_risk(monkeypatch):
     import run_once
     monkeypatch.setenv("MAX_SIGNAL_RISK_PCT", "25")
-    assert run_once.MAX_PRODUCTION_RISK_PCT == 1.50
+    assert run_once.MAX_PRODUCTION_RISK_PCT == 5.00
 
 def test_request_does_not_fallback_post_after_network_error(monkeypatch):
     from event_engine import bingx

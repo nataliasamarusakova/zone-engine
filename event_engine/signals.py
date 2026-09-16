@@ -25,27 +25,27 @@ SWING_LEN = 10
 ZONE_HISTORY = 20
 BOX_WIDTH = 2.5
 RR_RATIO = 3.0
-TP1_R = float(os.environ.get("TP1_R", "0.5"))  # fallback only
-TP2_R = float(os.environ.get("TP2_R", "1.0"))  # fallback only
+TP1_R = float(os.environ.get("TP1_R", "1.0"))  # fallback only
+TP2_R = float(os.environ.get("TP2_R", "2.0"))  # fallback only
 TP1_FRACTION = 0.50
 TP2_FRACTION = 0.50
 ZONE_SL_ATR_BUFFER = float(os.environ.get("ZONE_SL_ATR_BUFFER", "0.10"))
-REQUIRE_ZONE_TOUCH = os.environ.get("REQUIRE_ZONE_TOUCH", "true").lower() == "true"
+REQUIRE_ZONE_TOUCH = os.environ.get("REQUIRE_ZONE_TOUCH", "false").lower() == "true"
 TP1_OBSTACLE_FRACTION = float(os.environ.get("TP1_OBSTACLE_FRACTION", "0.50"))
 TP2_OBSTACLE_FRACTION = float(os.environ.get("TP2_OBSTACLE_FRACTION", "0.90"))
 TP_OBSTACLE_BUFFER_ATR = float(os.environ.get("TP_OBSTACLE_BUFFER_ATR", "0.10"))
-TP_MAX_R = float(os.environ.get("TP_MAX_R", "1.50"))
-TP_MIN_R = float(os.environ.get("TP_MIN_R", "0.50"))
+TP_MAX_R = float(os.environ.get("TP_MAX_R", "2.50"))
+TP_MIN_R = float(os.environ.get("TP_MIN_R", "0.80"))
 TP_MIN_R = max(0.50, min(TP_MIN_R, 3.0))
 
 MIN_BARS = 70
 # Production entry filters selected from the last completed audit. Keep them
 # explicit and small so their effect remains observable in the new trade set.
 MAX_ZONE_AGE_BARS = int(os.environ.get("MAX_ZONE_AGE_BARS", "30"))
-MAX_SIGNAL_RISK_PCT = min(float(os.environ.get("MAX_SIGNAL_RISK_PCT", "1.50")), 1.50)
+MAX_SIGNAL_RISK_PCT = min(float(os.environ.get("MAX_SIGNAL_RISK_PCT", "5.00")), 5.00)
 MIN_STRUCTURE_ROOM_R = float(os.environ.get("MIN_STRUCTURE_ROOM_R", "1.20"))
-REQUIRE_DIRECTIONAL_CANDLE = os.environ.get("REQUIRE_DIRECTIONAL_CANDLE", "true").lower() == "true"
-REQUIRE_STRUCTURE_OBSTACLE = os.environ.get("REQUIRE_STRUCTURE_OBSTACLE", "true").lower() == "true"
+REQUIRE_DIRECTIONAL_CANDLE = os.environ.get("REQUIRE_DIRECTIONAL_CANDLE", "false").lower() == "true"
+REQUIRE_STRUCTURE_OBSTACLE = os.environ.get("REQUIRE_STRUCTURE_OBSTACLE", "false").lower() == "true"
 
 # When an Ajay ALMA signal has no directional Demand/Supply zone touching the
 # signal bar, production still needs a deterministic protective stop. This
