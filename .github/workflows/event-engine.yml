@@ -85,7 +85,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Syntax check
-        run: python -m compileall -q event_engine run_once.py test_all.py
+        run: python -m compileall -q event_engine run_once.py pine_r541_sr.py pine_sr_diagnostic.py test_all.py test_pine_sr_diagnostic.py
 
       - name: Run tests
         run: python -m pytest -q
@@ -94,9 +94,10 @@ jobs:
         env:
           FUNDAMENTAL_WHITELIST_ENABLED: "false"
           ZONE_TRIGGER_MODE: "zone"
+          MIN_STRUCTURE_ROOM_R: "0"
         run: python run_once.py
 
-      - name: Upload full diagnostic log
+      - name: Upload diagnostic log
         if: always()
         uses: actions/upload-artifact@v4
         with:
