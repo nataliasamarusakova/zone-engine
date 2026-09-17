@@ -127,15 +127,15 @@ def test_fixed_stop_is_exactly_10_percent_from_entry():
 
 def test_strategy_snapshot_contains_entry_context_and_exit_rules():
     from event_engine import signals as sig
-    assert sig.STRATEGY_VERSION == "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp5-tp7-be-on-tp1"
+    assert sig.STRATEGY_VERSION == "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp3-tp6-be-on-tp1"
     import run_once
     setup = run_once._build_setup({
         "event_id": "ZONE_TEST", "symbol": "TEST-USDT", "type": "LONG",
-        "entry": 100.0, "sl": 90.0, "tp1": 105.0, "tp2": 107.0, "risk_pct": 10.0,
-        "tp1_rr": 0.5, "tp2_rr": 0.7, "score": 75.0,
+        "entry": 100.0, "sl": 90.0, "tp1": 103.0, "tp2": 106.0, "risk_pct": 10.0,
+        "tp1_rr": 0.3, "tp2_rr": 0.6, "score": 75.0,
         "strategy": "Demand/Supply Zone First", "strategy_version": sig.STRATEGY_VERSION,
         "trigger": {"zone_entry_rule": "fresh_midpoint_touch", "zone_midpoint": 110.0},
-        "target": {"source": "fixed_entry_percentage", "tp1_pct": 5.0, "tp2_pct": 7.0, "be_rule": "after_tp1_filled"},
+        "target": {"source": "fixed_entry_percentage", "tp1_pct": 3.0, "tp2_pct": 6.0, "be_rule": "after_tp1_filled"},
         "risk_model": {"sl_source": "fixed_percent_from_entry", "fixed_stop_pct": 10.0},
         "entry_bar": {"open": 99.0, "high": 111.0, "low": 98.0, "close": 100.0, "volume": 1000.0},
         "previous_bar": {"close": 120.0},
@@ -144,8 +144,8 @@ def test_strategy_snapshot_contains_entry_context_and_exit_rules():
     assert setup["entry_bar"]["close"] == 100.0
     assert setup["previous_bar"]["close"] == 120.0
     assert setup["signal_snapshot"]["trigger"]["zone_entry_rule"] == "fresh_midpoint_touch"
-    assert setup["target"]["tp1_pct"] == 5.0
-    assert setup["target"]["tp2_pct"] == 7.0
+    assert setup["target"]["tp1_pct"] == 3.0
+    assert setup["target"]["tp2_pct"] == 6.0
     assert setup["target"]["be_rule"] == "after_tp1_filled"
 
 
@@ -515,14 +515,65 @@ def test_telegram_uses_zone_only_label_and_dynamic_rr_values():
     from event_engine.telegram import format_signal
     msg = format_signal({
         "type": "LONG", "symbol": "TEST-USDT", "entry": 100.0, "sl": 95.0,
-        "tp1": 105.0, "tp2": 107.0, "tp1_rr": 0.5, "tp2_rr": 0.7, "risk_pct": 10.0,
+        "tp1": 103.0, "tp2": 106.0, "tp1_rr": 0.3, "tp2_rr": 0.6, "risk_pct": 10.0,
         "zone": {"kind": "DEMAND", "btm": 94.0, "top": 99.0, "poi": 96.5, "age_bars": 1, "impulse_atr": 2.0},
+        "target": {"tp1_pct": 3.0, "tp2_pct": 6.0},
         "confirmation": {},
     })
     assert "Demand/Supply Zone First" in msg
     assert "Ajay R5.41 · ALMA" not in msg
-    assert "(0.5R / 50%)" in msg
-    assert "(0.7R / 50%)" in msg
+    assert "(3% / 0.3R / 50%)" in msg
+    assert "(6% / 0.6R / 50%)" in msg
+
+
+def test_telegram_formats_live_entry_with_compact_prices_and_zone_counts():
+    from event_engine.telegram import format_signal
+    msg = format_signal({
+        "type": "SHORT", "symbol": "ONDO-USDT", "entry": 0.3537, "sl": 0.38907,
+        "tp1": 0.343089, "tp2": 0.332478, "tp1_rr": 0.3, "tp2_rr": 0.6, "risk_pct": 10.0,
+        "zone": {"kind": "SUPPLY", "btm": 0.3547808259709935, "top": 0.3559, "poi": 0.35534041298549673, "age_bars": 10},
+        "zone_counts": {"demand": 5, "supply": 1},
+        "target": {"tp1_pct": 3.0, "tp2_pct": 6.0},
+        "confirmation": {"volume_ratio": 0.14405361643357992},
+    })
+    assert "ONDOUSDT" in msg
+    assert "ONDO-USDT" not in msg
+    assert "Demand zones: <code>5</code>" in msg
+    assert "Supply zones: <code>1</code>" in msg
+    assert "0.35534" in msg
+    assert "0.35534041298549673" not in msg
+    assert "(3% / 0.3R / 50%)" in msg
+    assert "(6% / 0.6R / 50%)" in msg
+    assert "Risk: <code>10%</code>" in msg
+
+
+def test_entry_telegram_is_suppressed_for_failed_execution(monkeypatch):
+    import run_once
+    sent = []
+    monkeypatch.setattr(run_once, "send_tg", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(run_once, "_append_jsonl", lambda *args, **kwargs: None)
+    signal = {
+        "event_id": "EVT_TG_GUARD", "type": "SHORT", "symbol": "ONDO-USDT",
+        "entry": 1.0, "sl": 1.1, "tp1": 0.97, "tp2": 0.94, "risk_pct": 10.0,
+        "tp1_rr": 0.3, "tp2_rr": 0.6, "zone": {}, "confirmation": {},
+    }
+    for status in ("opened_then_emergency_closed", "skipped_invalid_setup", "blocked_protection_preflight", "entry_not_filled"):
+        run_once._send_signal(signal, {"status": status})
+    assert sent == []
+    run_once._send_signal(signal, {"status": "opened_protected"})
+    assert len(sent) == 1
+
+
+def test_post_fill_risk_pct_remains_exactly_at_configured_limit():
+    import run_once
+    signal = {
+        "type": "SHORT", "entry": 1.0, "sl": 1.1, "tp1": 0.97, "tp2": 0.94,
+        "risk_pct": 10.0, "target": {"obstacle_price": 0.5}, "zone": {"btm": 0.7, "top": 0.9},
+    }
+    rebased = run_once._rebase_protection_after_fill(signal, 0.7974)
+    assert rebased["risk_pct"] == 10.0
+    ok, reason = run_once._validate_trade_geometry({**signal, **rebased})
+    assert ok, reason
 
 
 def test_post_fill_rebases_zone_protection_and_never_reuses_stale_absolute_targets():
@@ -816,14 +867,14 @@ def test_zone_signal_uses_fixed_10pct_stop_and_small_tps(monkeypatch):
     assert abs((latest["entry"] - latest["sl"]) / latest["entry"] * 100.0 - 10.0) < 1e-9
     assert latest["trigger"]["alma_required"] is False
     assert latest["target"]["source"] == "fixed_entry_percentage"
-    assert abs(latest["tp1"] / latest["entry"] - 1.05) < 1e-9
-    assert abs(latest["tp2"] / latest["entry"] - 1.07) < 1e-9
-    assert abs(latest["tp1_rr"] - 0.5) < 1e-9
-    assert abs(latest["tp2_rr"] - 0.7) < 1e-9
+    assert abs(latest["tp1"] / latest["entry"] - 1.03) < 1e-9
+    assert abs(latest["tp2"] / latest["entry"] - 1.06) < 1e-9
+    assert abs(latest["tp1_rr"] - 0.3) < 1e-9
+    assert abs(latest["tp2_rr"] - 0.6) < 1e-9
     assert latest["sl"] < 110.0
 
 
-def test_targets_are_fixed_5pct_and_7pct_from_entry():
+def test_targets_are_fixed_3pct_and_6pct_from_entry():
     from event_engine import signals as sig
 
     obstacle = {"price": 108.0, "source": "supply_zone"}
@@ -831,23 +882,23 @@ def test_targets_are_fixed_5pct_and_7pct_from_entry():
     assert out is not None
     assert out["target_source"] == "fixed_entry_percentage"
     assert out["obstacle_price"] == 108.0
-    assert out["tp1"] == 105.0
-    assert out["tp2"] == 107.0
-    assert out["tp1_rr"] == 0.5
-    assert out["tp2_rr"] == 0.7
+    assert out["tp1"] == 103.0
+    assert out["tp2"] == 106.0
+    assert out["tp1_rr"] == 0.3
+    assert out["tp2_rr"] == 0.6
 
     obstacle = {"price": 92.0, "source": "demand_zone"}
     out = sig._targets_from_nearest_obstacle("SHORT", 100.0, 110.0, 1.0, obstacle)
     assert out is not None
-    assert out["tp1"] == 95.0
-    assert out["tp2"] == 93.0
+    assert out["tp1"] == 97.0
+    assert out["tp2"] == 94.0
 
 
-def test_post_fill_targets_are_exact_5pct_and_7pct_from_actual_fill():
+def test_post_fill_targets_are_exact_3pct_and_6pct_from_actual_fill():
     import run_once
     signal = {
         "type": "LONG",
-        "entry": 100.0, "sl": 90.0, "tp1": 105.0, "tp2": 107.0, "risk_pct": 10.0,
+        "entry": 100.0, "sl": 90.0, "tp1": 103.0, "tp2": 106.0, "risk_pct": 10.0,
         "atr": 2.0,
         "zone": {"btm": 98.0, "top": 102.0},
         "target": {"obstacle_price": 103.0, "source": "nearest_opposing_structure"},
@@ -855,10 +906,10 @@ def test_post_fill_targets_are_exact_5pct_and_7pct_from_actual_fill():
     out = run_once._rebase_protection_after_fill(signal, 200.0)
     assert out["entry"] == 200.0
     assert out["sl"] == 180.0
-    assert out["tp1"] == 210.0
-    assert out["tp2"] == 214.0
-    assert abs(out["tp1_rr"] - 0.5) < 1e-9
-    assert abs(out["tp2_rr"] - 0.7) < 1e-9
+    assert out["tp1"] == 206.0
+    assert out["tp2"] == 212.0
+    assert abs(out["tp1_rr"] - 0.3) < 1e-9
+    assert abs(out["tp2_rr"] - 0.6) < 1e-9
 
 
 def test_latest_signal_selection_prefers_newest_bar_over_score():
@@ -1340,10 +1391,11 @@ def test_old_active_zone_is_not_rejected_by_zone_age():
         run_once.REQUIRE_STRUCTURE_OBSTACLE = old_req
 
     assert signal["zone"]["age_bars"] >= 100
+    assert signal["zone_counts"] == {"demand": 1, "supply": 0}
     assert signal["entry"] == 100.0
     assert signal["sl"] == 90.0
-    assert signal["tp1"] == 105.0
-    assert signal["tp2"] == 107.0
+    assert signal["tp1"] == 103.0
+    assert signal["tp2"] == 106.0
 
 
 def test_tracker_close_once_is_idempotent(tmp_path, monkeypatch):

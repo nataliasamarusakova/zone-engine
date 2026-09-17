@@ -604,6 +604,7 @@ def _build_5m_zone_signal(
             "zone_visit_state": "TRIGGERED",
         },
         "zone": setup_zone,
+        "zone_counts": {"demand": len(demand), "supply": len(supply)},
         "target": {
             "source": "fixed_entry_percentage",
             "obstacle_source": obstacle.get("source") if obstacle else None,
@@ -1291,6 +1292,7 @@ def _build_setup(signal: dict[str, Any]) -> dict[str, Any]:
         ],
         "target_price": float(signal["tp2"]),
         "zone": signal.get("zone", {}),
+        "zone_counts": dict(signal.get("zone_counts", {})) if isinstance(signal.get("zone_counts"), dict) else {},
         "confirmation": signal.get("confirmation", {}),
         "signal_forensics": signal.get("signal_forensics", {}),
         "score": float(signal.get("score", 0.0)),
@@ -1317,7 +1319,8 @@ def _validate_trade_geometry(signal: dict[str, Any]) -> tuple[bool, str]:
         return False, "non_positive_price"
     if risk_pct <= 0:
         return False, f"non_positive_risk_pct={risk_pct}"
-    if risk_pct > MAX_PRODUCTION_RISK_PCT:
+    risk_limit_epsilon = 1e-9
+    if risk_pct > MAX_PRODUCTION_RISK_PCT + risk_limit_epsilon:
         return False, f"risk_pct_above_limit={risk_pct}"
     target = signal.get("target") if isinstance(signal.get("target"), dict) else {}
     obstacle_price = target.get("obstacle_price")
@@ -1438,7 +1441,7 @@ def _rebase_protection_after_fill(signal: dict[str, Any], avg_price: float) -> d
         "tp1": tp1,
         "tp2": tp2,
         "risk_abs": risk,
-        "risk_pct": (risk / entry) * 100.0,
+        "risk_pct": fixed_stop_pct,
         "tp1_rr": abs(tp1 - entry) / risk,
         "tp2_rr": abs(tp2 - entry) / risk,
         "target_source": target_source,
@@ -1905,6 +1908,10 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     }
 
 def _send_signal(signal: dict[str, Any], execution: dict[str, Any] | None = None) -> None:
+    # Entry notifications are sent only after a position is actually opened
+    # and mandatory SL/TP protection has been verified.
+    if not isinstance(execution, dict) or str(execution.get("status", "")) != "opened_protected":
+        return
     try:
         display_signal = signal
         if isinstance(execution, dict) and isinstance(execution.get("executed_signal"), dict):
