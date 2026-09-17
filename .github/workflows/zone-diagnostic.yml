@@ -1,0 +1,64 @@
+name: Zone Diagnostic (one symbol)
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: "BingX-style symbol, e.g. BTC-USDT"
+        required: true
+        default: "BTC-USDT"
+        type: string
+  repository_dispatch:
+    types: [run_zone_diagnostic]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zone-diagnostic
+  cancel-in-progress: true
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DIAG_SYMBOL: ${{ github.event.inputs.symbol || github.event.client_payload.symbol || 'BTC-USDT' }}
+      KLINE_LIMIT_1H: "1000"
+      KLINE_LIMIT_5M: "288"
+      BINANCE_MARKET_BASE_URL: https://data-api.binance.vision
+      BINANCE_HTTP_TIMEOUT_SEC: "10"
+      BINANCE_EXCHANGE_INFO_TTL_SEC: "1800"
+      BINGX_ENV: "vst"
+      BINGX_BASE_URL: https://open-api-vst.bingx.com
+      BINGX_HTTP_TIMEOUT_SEC: "10"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Syntax check diagnostic
+        run: python -m py_compile zone_diagnostic.py
+
+      - name: Run zone diagnostic
+        run: python zone_diagnostic.py --symbol "$DIAG_SYMBOL" | tee zone-diagnostic.log
+
+      - name: Upload diagnostic log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zone-diagnostic-${{ github.run_id }}
+          path: zone-diagnostic.log
+          if-no-files-found: warn
