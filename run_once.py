@@ -68,7 +68,6 @@ FIXED_STOP_PCT = float(os.environ.get("FIXED_STOP_PCT", "10.00"))
 MAX_PRODUCTION_RISK_PCT = min(float(os.environ.get("MAX_SIGNAL_RISK_PCT", str(FIXED_STOP_PCT))), FIXED_STOP_PCT)
 MIN_STRUCTURE_ROOM_R = float(os.environ.get("MIN_STRUCTURE_ROOM_R", "1.20"))
 REQUIRE_STRUCTURE_OBSTACLE = os.environ.get("REQUIRE_STRUCTURE_OBSTACLE", "false").lower() == "true"
-MAX_ZONE_AGE_BARS = int(os.environ.get("MAX_ZONE_AGE_BARS", "30"))
 REQUIRE_DIRECTIONAL_CANDLE = os.environ.get("REQUIRE_DIRECTIONAL_CANDLE", "false").lower() == "true"
 # Production execution is strict by default: only the latest closed 1H bar may open a trade.
 EXECUTION_MAX_SIGNAL_AGE_BARS = int(os.environ.get("EXECUTION_MAX_SIGNAL_AGE_BARS", "0"))
@@ -481,9 +480,9 @@ def _build_5m_zone_signal(
     avg_vol = float(volume_window.iloc[-1]) if not volume_window.empty and pd.notna(volume_window.iloc[-1]) else 0.0
     trigger_volume = float(bar["volume"])
     vol_ratio = trigger_volume / avg_vol if avg_vol > 0 else None
+    # Zone age is diagnostic metadata only. An active zone may be traded
+    # regardless of age; invalidation is determined by the zone engine itself.
     zone_age_bars = max(0, int(current_idx - int(zone.get("start", current_idx))))
-    if zone_age_bars > MAX_ZONE_AGE_BARS:
-        raise ValueError(f"zone_age_bars={zone_age_bars}>{MAX_ZONE_AGE_BARS}")
     directional_ok = (float(bar["close"]) >= float(bar["open"])) if direction == "LONG" else (float(bar["close"]) <= float(bar["open"]))
     if REQUIRE_DIRECTIONAL_CANDLE and not directional_ok:
         raise ValueError("directional_candle_required")
@@ -544,7 +543,6 @@ def _build_5m_zone_signal(
             "alma_cross": False,
             "directional_candle_required": REQUIRE_DIRECTIONAL_CANDLE,
             "directional_candle_ok": (float(bar["close"]) >= float(bar["open"])) if direction == "LONG" else (float(bar["close"]) <= float(bar["open"])),
-            "zone_age_limit_bars": MAX_ZONE_AGE_BARS,
             "zone_age_bars": zone_age_bars,
             "minimum_structure_room_r": MIN_STRUCTURE_ROOM_R,
             "zone_touch": True,

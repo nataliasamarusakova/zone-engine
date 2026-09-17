@@ -121,7 +121,7 @@ def test_fixed_stop_is_exactly_10_percent_from_entry():
 
 def test_strategy_snapshot_contains_entry_context_and_exit_rules():
     from event_engine import signals as sig
-    assert sig.STRATEGY_VERSION == "zone-midpoint-v3-5m-visit-stop10-tp5-tp7-be-on-tp1"
+    assert sig.STRATEGY_VERSION == "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp5-tp7-be-on-tp1"
     import run_once
     setup = run_once._build_setup({
         "event_id": "ZONE_TEST", "symbol": "TEST-USDT", "type": "LONG",
@@ -1156,11 +1156,74 @@ def test_server_time_offset_function_exists():
 
 def test_zone_entry_filters_are_configured_safely():
     from event_engine import signals as sig
-    assert sig.MAX_ZONE_AGE_BARS == 30
+    assert not hasattr(sig, "MAX_ZONE_AGE_BARS")
     assert sig.MAX_SIGNAL_RISK_PCT == 10.00
     assert sig.MIN_STRUCTURE_ROOM_R == 1.20
     assert sig.REQUIRE_DIRECTIONAL_CANDLE is False
     assert sig.REQUIRE_STRUCTURE_OBSTACLE is False
+
+
+def test_old_active_zone_is_not_rejected_by_zone_age():
+    import run_once
+    import pandas as pd
+
+    bars = []
+    start = pd.Timestamp("2026-01-01T00:00:00Z")
+    for i in range(101):
+        ts = start + pd.Timedelta(hours=i)
+        bars.append({
+            "timestamp": ts,
+            "open": 100.0,
+            "high": 106.0,
+            "low": 94.0,
+            "close": 100.0,
+            "volume": 1000.0,
+            "atr50": 2.0,
+        })
+    df_1h = pd.DataFrame(bars)
+
+    zone = {
+        "kind": "DEMAND",
+        "btm": 99.0,
+        "top": 101.0,
+        "poi": 100.0,
+        "start": 0,
+    }
+    bar = pd.Series({
+        "timestamp": start + pd.Timedelta(hours=101, minutes=0),
+        "open": 99.5,
+        "high": 101.0,
+        "low": 99.0,
+        "close": 100.0,
+        "volume": 1200.0,
+    })
+    prev_bar = pd.Series({
+        "timestamp": start + pd.Timedelta(hours=100, minutes=55),
+        "open": 104.0,
+        "high": 104.5,
+        "low": 103.5,
+        "close": 104.0,
+        "volume": 900.0,
+    })
+
+    old_helper = run_once._nearest_opposing_level
+    old_req = run_once.REQUIRE_STRUCTURE_OBSTACLE
+    try:
+        run_once._nearest_opposing_level = lambda *args, **kwargs: None
+        run_once.REQUIRE_STRUCTURE_OBSTACLE = False
+        signal = run_once._build_5m_zone_signal(
+            "TEST-USDT", "LONG", zone, bar, prev_bar, df_1h, [zone], [],
+            {"visit_id": "VISIT", "previous_midpoint_touch": False},
+        )
+    finally:
+        run_once._nearest_opposing_level = old_helper
+        run_once.REQUIRE_STRUCTURE_OBSTACLE = old_req
+
+    assert signal["zone"]["age_bars"] >= 100
+    assert signal["entry"] == 100.0
+    assert signal["sl"] == 90.0
+    assert signal["tp1"] == 105.0
+    assert signal["tp2"] == 107.0
 
 
 def test_tracker_close_once_is_idempotent(tmp_path, monkeypatch):
