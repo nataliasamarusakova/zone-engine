@@ -218,6 +218,10 @@ def _normalized_symbol(symbol: str) -> str:
     return str(symbol or "").upper().replace("-USDT", "")
 
 
+def _display_symbol(symbol: str) -> str:
+    return str(symbol or "").upper().replace("-", "")
+
+
 def update_active_trade_protection(
     symbol: str,
     direction: str,
@@ -438,7 +442,7 @@ def format_tp_hit_message(
     exec_price: float, closed_qty: float, remaining_qty: float, remaining_pct: float,
 ) -> str:
     return (
-        f"💰 <b>{name} ({symbol})</b>\n\n"
+        f"💰 <b>{_display_symbol(symbol)}</b>\n\n"
         f"Leg: <b>{leg}</b>\n"
         f"PnL TP: <b>+{pnl_pct:.2f}%</b>\n"
         f"Цена исполнения: <code>{exec_price:.8g}</code>\n"
@@ -460,7 +464,7 @@ def format_trade_closed_message(
     planned_rr_text = f"{planned_rr:.3f}" if planned_rr is not None else "—"
 
     lines = [
-        f"{emoji} <b>{name} ({symbol}) — сделка закрыта</b>",
+        f"{emoji} <b>{_display_symbol(symbol)} — сделка закрыта</b>",
         "",
         f"Вход <code>{entry_price:.8g}</code> → Выход <code>{exit_price:.8g}</code>   <b>{pnl_sign}{pnl_pct:.2f}%</b>",
         f"Realized R:R: <b>{realized_rr_text}</b> · Planned Weighted R:R: <b>{planned_rr_text}</b>",
@@ -528,7 +532,7 @@ def _notify_be_failure(symbol: str, direction: str, detail: str, *, event_id: st
     else:
         suffix = "Состояние rollback требует reconciliation; закрытие не считается подтверждённым."
     text = (
-        f"🛑 <b>BE move failed ({symbol} {direction})</b>\n"
+        f"🛑 <b>BE move failed ({_display_symbol(symbol)} {direction})</b>\n"
         f"Status: <code>{detail}</code>\n"
         f"{suffix}"
     )

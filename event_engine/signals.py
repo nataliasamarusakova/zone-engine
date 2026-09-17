@@ -24,9 +24,9 @@ INT_RES = 8
 SWING_LEN = 10
 ZONE_HISTORY = 20
 BOX_WIDTH = 2.5
-STRATEGY_VERSION = "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp5-tp7-be-on-tp1"
-TP1_PCT = 5.0
-TP2_PCT = 7.0
+STRATEGY_VERSION = "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp3-tp6-be-on-tp1"
+TP1_PCT = 3.0
+TP2_PCT = 6.0
 TP1_FRACTION = 0.50
 TP2_FRACTION = 0.50
 
@@ -739,8 +739,8 @@ def _targets_from_nearest_obstacle(
     """Build fixed percentage targets from entry; obstacle is diagnostic only.
 
     Production strategy contract:
-      LONG  -> TP1 +5%, TP2 +7%, SL is handled separately.
-      SHORT -> TP1 -5%, TP2 -7%.
+      LONG  -> TP1 +3%, TP2 +6%, SL is handled separately.
+      SHORT -> TP1 -3%, TP2 -6%.
     """
     risk = abs(entry - stop)
     if risk <= 0 or entry <= 0:
@@ -939,6 +939,7 @@ def generate_zone_signals(
                     "previous_bar_midpoint_touch": bool(prev_midpoint_touch),
                 },
                 "zone": zone_ctx,
+                "zone_counts": {"demand": len(active_demand), "supply": len(active_supply)},
                 "target": {
                     "source": targets["target_source"],
                     "obstacle_source": targets["obstacle_source"],
