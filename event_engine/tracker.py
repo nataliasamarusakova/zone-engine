@@ -177,7 +177,7 @@ def _send_tracker_notification(kind: str, event_id: str, text: str, *, symbol: s
     if not ok:
         log.error("[TG_%s_FAILED] event=%s symbol=%s leg=%s send() returned False", kind, event_id, symbol, leg or "")
     else:
-        log.info("[TG_%s_SENT] event=%s symbol=%s leg=%s", kind, event_id, symbol, leg or "")
+        log.debug("[TG_%s_SENT] event=%s symbol=%s leg=%s", kind, event_id, symbol, leg or "")
     return ok
 
 def _append_trade_close_once(record: dict) -> bool:

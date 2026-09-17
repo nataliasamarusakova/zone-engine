@@ -298,7 +298,7 @@ def refresh_contracts() -> dict[str, Any]:
             by_name[name] = c
 
     CACHE.update(ts=time.time(), data=data, by_display_name=by_name)
-    log.info("[BINGX] Active contracts=%d", len(data))
+    log.debug("[BINGX] Active contracts=%d", len(data))
     return data
 
 
@@ -501,7 +501,7 @@ def get_position_mode(*, force_refresh: bool = False, timeout_sec: float | None 
         raise RuntimeError(f"position mode response missing dualSidePosition: {data}")
     _POSITION_MODE_CACHE.update({"ts": now, "dual": dual})
     mode = "HEDGE" if dual else "ONE_WAY"
-    log.info("[BINGX] Position mode=%s", mode)
+    log.debug("[BINGX] Position mode=%s", mode)
     return mode
 
 
