@@ -1136,6 +1136,7 @@ def test_5m_zone_diagnostics_formatter_never_raises_with_percent_literals(monkey
             }
         },
         "touch_events": [],
+        "decision": {"status": "SIGNAL_CREATED", "zone_key": "DEMAND:0:110.000000000000:100.000000000000", "direction": "LONG", "reason": "signal_created", "timestamp": "2026-09-17T10:05:00+00:00"},
     }
     state = {"zones": {
         "DEMAND:0:110.000000000000:100.000000000000": {
@@ -1149,8 +1150,30 @@ def test_5m_zone_diagnostics_formatter_never_raises_with_percent_literals(monkey
             "ZRX-USDT", 103.0, pd.Timestamp("2026-09-17T10:00:00+00:00"),
             [{"start": 0, "top": 110.0, "btm": 100.0}], [], diagnostics, state, 1,
         )
-    assert any("[ZONE_DIAG] ZRXUSDT" in r.message for r in caplog.records)
-    assert any("window_last_mode_touch=" in r.message for r in caplog.records)
+    assert any("[ZONE_STATUS] ZRXUSDT" in r.message for r in caplog.records)
+    assert any("5m=SIGNAL_CREATED" in r.message for r in caplog.records)
+    assert all("ZONE_CLOSEST" not in r.message for r in caplog.records)
+
+
+def test_active_zone_logs_compact_no_touch_reason(monkeypatch, caplog):
+    import logging
+    import pandas as pd
+    import run_once
+    monkeypatch.setattr(run_once, "ZONE_TRIGGER_MODE", "zone")
+    diagnostics = {
+        "processed_bars": 3,
+        "latest_closed_5m_ts": "2026-09-17T14:35:00+00:00",
+        "zones": {"DEMAND:0:110:100": {"kind": "DEMAND", "bottom": 100.0, "top": 110.0}},
+        "decision": {"status": "NO_5M_TOUCH", "zone_key": None, "direction": None, "reason": "no_configured_touch_in_processed_5m_bars", "timestamp": "2026-09-17T14:35:00+00:00"},
+    }
+    with caplog.at_level(logging.INFO):
+        run_once._log_5m_zone_diagnostics(
+            "ZIL-USDT", 103.0, pd.Timestamp("2026-09-17T14:00:00+00:00"),
+            [{"start": 0, "top": 110.0, "btm": 100.0}], [], diagnostics, {"zones": {}}, 0,
+        )
+    messages = [r.message for r in caplog.records]
+    assert any("[ZONE_STATUS] ZILUSDT" in m and "5m=NO_5M_TOUCH" in m for m in messages)
+    assert not any("[ZONE_DIAG]" in m or "[ZONE_STATE]" in m for m in messages)
 
 
 def test_5m_zone_mode_accepts_any_zone_touch_not_only_midpoint(monkeypatch):
