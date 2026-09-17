@@ -24,7 +24,7 @@ INT_RES = 8
 SWING_LEN = 10
 ZONE_HISTORY = 20
 BOX_WIDTH = 2.5
-STRATEGY_VERSION = "zone-midpoint-v3-5m-visit-stop10-tp5-tp7-be-on-tp1"
+STRATEGY_VERSION = "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp5-tp7-be-on-tp1"
 TP1_PCT = 5.0
 TP2_PCT = 7.0
 TP1_FRACTION = 0.50
@@ -33,7 +33,6 @@ TP2_FRACTION = 0.50
 MIN_BARS = 70
 # Production entry filters selected from the last completed audit. Keep them
 # explicit and small so their effect remains observable in the new trade set.
-MAX_ZONE_AGE_BARS = int(os.environ.get("MAX_ZONE_AGE_BARS", "30"))
 FIXED_STOP_PCT = float(os.environ.get("FIXED_STOP_PCT", "10.00"))
 if not (0.0 < FIXED_STOP_PCT <= 10.0):
     raise ValueError("FIXED_STOP_PCT must be in (0, 10]")
@@ -839,11 +838,10 @@ def generate_zone_signals(
         if not current_midpoint_touch or prev_midpoint_touch:
             continue
 
-        # Audit-derived entry filters. These are applied only after a literal
-        # fresh zone touch, never to ordinary in-zone observations.
+        # Record zone age for analytics only. Zone age never invalidates an
+        # otherwise-valid midpoint touch; an active zone may be traded regardless
+        # of how long it has remained untouched, until the zone itself is broken.
         zone_age_bars = max(0, int(i - int(trade_zone.get("start", i))))
-        if zone_age_bars > MAX_ZONE_AGE_BARS:
-            continue
         if REQUIRE_DIRECTIONAL_CANDLE:
             # Require a real directional close. Doji candles are neutral and
             # must not qualify as confirmation for either side.
@@ -961,7 +959,6 @@ def generate_zone_signals(
                     "alma_cross": False,
                     "directional_candle_required": REQUIRE_DIRECTIONAL_CANDLE,
                     "directional_candle_ok": (cur_c >= cur_o) if direction == "LONG" else (cur_c <= cur_o),
-                    "zone_age_limit_bars": MAX_ZONE_AGE_BARS,
                     "zone_age_bars": zone_age_bars,
                     "minimum_structure_room_r": MIN_STRUCTURE_ROOM_R,
                     "zone_touch": True,
