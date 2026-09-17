@@ -962,12 +962,14 @@ def _log_5m_zone_diagnostics(
             display, kind, zone_key,
             zdiag.get("state_after"), start_idx, age_bars, bottom, midpoint, top, width,
             (width / midpoint * 100.0) if midpoint else 0.0, latest_price, in_zone,
-            f"{dist_mid:.4f}" if dist_mid is not None else "None", int(zdiag.get("bars_in_zone", 0)),
-            int(zdiag.get("midpoint_touches", 0)), int(zdiag.get("same_visit_blocks", 0)),
-            int(zdiag.get("ambiguous_blocks", 0)), int(zdiag.get("stale_touches", 0)),
-            int(zdiag.get("activation_blocks", 0)), int(zdiag.get("structure_rejects", 0)),
-            int(zdiag.get("directional_rejects", 0)), int(zdiag.get("other_rejects", 0)),
-            int(zdiag.get("signals_created", 0)), int(zdiag.get("rearms", 0)),
+            f"{dist_mid:.4f}" if dist_mid is not None else "None", int(zdiag.get("window_bars_in_zone", 0)),
+            int(zdiag.get("window_midpoint_touches", 0)), zdiag.get("window_last_midpoint_touch"),
+            int(zdiag.get("bars_in_zone", 0)), int(zdiag.get("midpoint_touches", 0)),
+            int(zdiag.get("same_visit_blocks", 0)), int(zdiag.get("ambiguous_blocks", 0)),
+            int(zdiag.get("stale_touches", 0)), int(zdiag.get("activation_blocks", 0)),
+            int(zdiag.get("structure_rejects", 0)), int(zdiag.get("directional_rejects", 0)),
+            int(zdiag.get("other_rejects", 0)), int(zdiag.get("signals_created", 0)),
+            int(zdiag.get("rearms", 0)),
         )
         state_record = (symbol_state.get("zones") or {}).get(zone_key, {})
         log.info(
