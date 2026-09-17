@@ -1,0 +1,70 @@
+name: Ajay R5.41 Pine SR Diagnostic
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: "Symbol, for example BTC-USDT"
+        required: true
+        default: "BTC-USDT"
+        type: string
+      bars:
+        description: "Closed 1H bars (300-1000)"
+        required: false
+        default: "1000"
+        type: string
+  repository_dispatch:
+    types: [run_pine_sr_diagnostic]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install requests
+        run: python -m pip install --disable-pip-version-check requests
+
+      - name: Resolve inputs
+        id: inputs
+        shell: bash
+        env:
+          EVENT_SYMBOL: ${{ github.event.client_payload.symbol }}
+          EVENT_BARS: ${{ github.event.client_payload.bars }}
+          INPUT_SYMBOL: ${{ inputs.symbol }}
+          INPUT_BARS: ${{ inputs.bars }}
+        run: |
+          set -euo pipefail
+          symbol="${INPUT_SYMBOL:-}"
+          bars="${INPUT_BARS:-}"
+          if [[ -z "$symbol" ]]; then symbol="${EVENT_SYMBOL:-BTC-USDT}"; fi
+          if [[ -z "$bars" ]]; then bars="${EVENT_BARS:-1000}"; fi
+          echo "symbol=$symbol" >> "$GITHUB_OUTPUT"
+          echo "bars=$bars" >> "$GITHUB_OUTPUT"
+
+      - name: Run exact Pine SR diagnostic
+        env:
+          DIAG_SYMBOL: ${{ steps.inputs.outputs.symbol }}
+          DIAG_BARS: ${{ steps.inputs.outputs.bars }}
+        run: |
+          set -euo pipefail
+          python pine_sr_diagnostic.py --symbol "$DIAG_SYMBOL" --limit "$DIAG_BARS" | tee pine-sr-diagnostic.log
+
+      - name: Upload diagnostic log
+        uses: actions/upload-artifact@v4
+        with:
+          name: pine-sr-${{ steps.inputs.outputs.symbol }}
+          path: pine-sr-diagnostic.log
+          if-no-files-found: error
