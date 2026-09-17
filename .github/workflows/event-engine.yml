@@ -92,6 +92,15 @@ jobs:
       - name: Run engine
         run: python run_once.py
 
+      - name: Upload full diagnostic log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zone-engine-diagnostic-${{ github.run_id }}
+          path: data/zone_engine_diagnostic.log
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Commit state
         if: always()
         shell: bash
@@ -103,7 +112,7 @@ jobs:
           # Stage all persistent engine state, including newly-created files.
           # Keep the unbounded scan journal local-only.
           git add data/
-          git reset -- data/scan_history.jsonl data/scan_history.jsonl.* 2>/dev/null || true
+          git reset -- data/scan_history.jsonl data/scan_history.jsonl.* data/zone_engine_diagnostic.log 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "No state changes"
             exit 0
