@@ -723,6 +723,7 @@ def _process_5m_zone_visits(
                 "window_closest_midpoint_distance_pct": None,
                 "window_closest_midpoint_bar": None,
                 "window_last_midpoint_touch": None,
+                "window_last_zone_touch": None,
             }
 
     # Diagnostic-only pass over all fetched closed 5m bars. This does not alter
@@ -743,6 +744,7 @@ def _process_5m_zone_visits(
                 if zone_touched:
                     zdiag["window_bars_in_zone"] += 1
                     zdiag["window_zone_touches"] += 1
+                    zdiag["window_last_zone_touch"] = ts.isoformat()
                 touched = low <= midpoint <= high
                 distance_pct = 0.0 if touched else ((midpoint - high) if high < midpoint else (low - midpoint)) / midpoint * 100.0 if midpoint else None
                 if distance_pct is not None and (zdiag["window_closest_midpoint_distance_pct"] is None or distance_pct < zdiag["window_closest_midpoint_distance_pct"]):
@@ -1015,19 +1017,33 @@ def _log_5m_zone_diagnostics(
             age_bars = max(0, int((diagnostics.get("current_1h_idx", 0) or 0) - start_idx))
         else:
             age_bars = None
+        width_pct = (width / midpoint * 100.0) if midpoint else 0.0
+        processed_mode_touch_key = "midpoint_touches" if ZONE_TRIGGER_MODE == "midpoint" else "zone_touches"
+        window_mode_touch_key = "window_midpoint_touches" if ZONE_TRIGGER_MODE == "midpoint" else "window_zone_touches"
+        last_mode_touch = zdiag.get("window_last_midpoint_touch") if ZONE_TRIGGER_MODE == "midpoint" else zdiag.get("window_last_zone_touch")
+        dist_mid_text = f"{dist_mid:.4f}" if dist_mid is not None else "None"
         log.info(
-            "[ZONE_DIAG] %s | %s | key=%s | mode=%s | state=%s | start_idx=%s age_1h=%s | bottom=%.12g midpoint=%.12g top=%.12g width=%.12g width_pct=%.6f%% | price=%.12g in_zone=%s dist_mid=%s%% | window_zone_bars=%d window_zone_touches=%d window_midpoint_touches=%d window_last_touch=%s processed_zone_bars=%d processed_zone_touches=%d processed_midpoint_touches=%d same_visit=%d ambiguous=%d stale=%d activation_block=%d structure_reject=%d directional_reject=%d other_reject=%d signals_created=%d rearm=%d",
-            display, kind, zone_key,
-            ZONE_TRIGGER_MODE, zdiag.get("state_after"), start_idx, age_bars, bottom, midpoint, top, width,
-            (width / midpoint * 100.0) if midpoint else 0.0, latest_price, in_zone,
-            f"{dist_mid:.4f}" if dist_mid is not None else "None", int(zdiag.get("window_bars_in_zone", 0)),
-            int(zdiag.get("window_zone_touches", 0)), int(zdiag.get("window_midpoint_touches", 0)), zdiag.get("window_last_midpoint_touch"),
-            int(zdiag.get("bars_in_zone", 0)), int(zdiag.get("zone_touches", 0)), int(zdiag.get("midpoint_touches", 0)),
-            int(zdiag.get("same_visit_blocks", 0)), int(zdiag.get("ambiguous_blocks", 0)),
-            int(zdiag.get("stale_touches", 0)), int(zdiag.get("activation_blocks", 0)),
-            int(zdiag.get("structure_rejects", 0)), int(zdiag.get("directional_rejects", 0)),
-            int(zdiag.get("other_rejects", 0)), int(zdiag.get("signals_created", 0)),
-            int(zdiag.get("rearms", 0)),
+            f"[ZONE_DIAG] {display} | {kind} | key={zone_key} | mode={ZONE_TRIGGER_MODE} | "
+            f"state={zdiag.get('state_after')} | start_idx={start_idx} age_1h={age_bars} | "
+            f"bottom={bottom:.12g} midpoint={midpoint:.12g} top={top:.12g} width={width:.12g} width_pct={width_pct:.6f}% | "
+            f"price={latest_price:.12g} in_zone={in_zone} dist_mid={dist_mid_text}% | "
+            f"window_zone_bars={int(zdiag.get('window_bars_in_zone', 0))} "
+            f"window_mode_touches={int(zdiag.get(window_mode_touch_key, 0))} "
+            f"window_zone_touches={int(zdiag.get('window_zone_touches', 0))} "
+            f"window_midpoint_touches={int(zdiag.get('window_midpoint_touches', 0))} "
+            f"window_last_mode_touch={last_mode_touch} | "
+            f"processed_zone_bars={int(zdiag.get('bars_in_zone', 0))} "
+            f"processed_mode_touches={int(zdiag.get(processed_mode_touch_key, 0))} "
+            f"processed_zone_touches={int(zdiag.get('zone_touches', 0))} "
+            f"processed_midpoint_touches={int(zdiag.get('midpoint_touches', 0))} "
+            f"same_visit={int(zdiag.get('same_visit_blocks', 0))} "
+            f"ambiguous={int(zdiag.get('ambiguous_blocks', 0))} stale={int(zdiag.get('stale_touches', 0))} "
+            f"activation_block={int(zdiag.get('activation_blocks', 0))} "
+            f"structure_reject={int(zdiag.get('structure_rejects', 0))} "
+            f"directional_reject={int(zdiag.get('directional_rejects', 0))} "
+            f"other_reject={int(zdiag.get('other_rejects', 0))} "
+            f"signals_created={int(zdiag.get('signals_created', 0))} "
+            f"rearm={int(zdiag.get('rearms', 0))}"
         )
         state_record = (symbol_state.get("zones") or {}).get(zone_key, {})
         log.info(

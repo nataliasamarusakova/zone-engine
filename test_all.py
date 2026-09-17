@@ -60,6 +60,12 @@ def _isolate_runtime_state(monkeypatch, tmp_path):
     monkeypatch.setattr(run_once, "EVENT_CLAIMS_LOCK_PATH", runtime_data / "event_execution_claims.json.lock")
     monkeypatch.setattr(run_once, "ACTIONS_PATH", runtime_data / "actions.jsonl")
 
+    # The workflow deliberately uses temporary full-universe + zone-touch
+    # environment variables only for the engine step. Tests stay pinned to the
+    # production defaults unless a test explicitly opts into zone mode.
+    monkeypatch.setattr(run_once, "FUNDAMENTAL_WHITELIST_ENABLED", True)
+    monkeypatch.setattr(run_once, "ZONE_TRIGGER_MODE", "midpoint")
+
     monkeypatch.setattr(analytics, "DATA_DIR", runtime_data)
     monkeypatch.setattr(analytics, "SCAN_JSONL", runtime_data / "scan_history.jsonl")
     monkeypatch.setattr(analytics, "SIGNALS_JSONL", runtime_data / "signal_history.jsonl")
@@ -1100,6 +1106,52 @@ def test_directional_zone_requires_exact_midpoint_touch():
     assert _find_directional_zone("LONG", 110.0, 112.0, 111.0, demand, supply) is None
     assert _find_directional_zone("LONG", 104.9, 105.0, 106.0, demand, supply) == demand[0]
     assert _find_directional_zone("SHORT", 123.0, 125.0, 126.0, demand, supply) == supply[0]
+
+def test_5m_zone_diagnostics_formatter_never_raises_with_percent_literals(monkeypatch, caplog):
+    import logging
+    import pandas as pd
+    import run_once
+
+    monkeypatch.setattr(run_once, "ZONE_TRIGGER_MODE", "zone")
+    diagnostics = {
+        "bars_received": 3,
+        "bars_closed": 3,
+        "processed_bars": 3,
+        "last_processed_before": None,
+        "last_processed_after": "2026-09-17T10:05:00+00:00",
+        "latest_closed_5m_ts": "2026-09-17T10:05:00+00:00",
+        "zones": {
+            "DEMAND:0:110.000000000000:100.000000000000": {
+                "kind": "DEMAND", "start_idx": 0, "top": 110.0, "bottom": 100.0,
+                "midpoint": 105.0, "width": 10.0, "state_after": "LOCKED",
+                "window_bars_in_zone": 1, "window_zone_touches": 1,
+                "window_midpoint_touches": 0, "bars_in_zone": 1,
+                "zone_touches": 1, "midpoint_touches": 0,
+                "same_visit_blocks": 0, "ambiguous_blocks": 0,
+                "stale_touches": 0, "activation_blocks": 0,
+                "structure_rejects": 0, "directional_rejects": 0,
+                "other_rejects": 0, "signals_created": 1, "rearms": 0,
+                "window_last_midpoint_touch": None,
+                "window_last_zone_touch": "2026-09-17T10:05:00+00:00",
+            }
+        },
+        "touch_events": [],
+    }
+    state = {"zones": {
+        "DEMAND:0:110.000000000000:100.000000000000": {
+            "state": "LOCKED", "visit_id": "VISIT-1", "first_touch_ts": "2026-09-17T10:05:00+00:00",
+            "last_touch_ts": "2026-09-17T10:05:00+00:00", "touch_count": 1, "lock_reason": "zone_touch",
+            "trigger_event_id": "EVT-1", "pending_signal": None,
+        }
+    }}
+    with caplog.at_level(logging.INFO):
+        run_once._log_5m_zone_diagnostics(
+            "ZRX-USDT", 103.0, pd.Timestamp("2026-09-17T10:00:00+00:00"),
+            [{"start": 0, "top": 110.0, "btm": 100.0}], [], diagnostics, state, 1,
+        )
+    assert any("[ZONE_DIAG] ZRXUSDT" in r.message for r in caplog.records)
+    assert any("window_last_mode_touch=" in r.message for r in caplog.records)
+
 
 def test_5m_zone_mode_accepts_any_zone_touch_not_only_midpoint(monkeypatch):
     import pandas as pd
