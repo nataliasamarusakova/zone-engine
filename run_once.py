@@ -78,6 +78,13 @@ MARGIN_USDT = float(os.environ.get("BINGX_MARGIN_USDT", "1"))
 MAX_TRADES_PER_CYCLE = int(os.environ.get("MAX_TRADES_PER_CYCLE", "5"))
 MAX_SCAN_SYMBOLS = int(os.environ.get("MAX_SCAN_SYMBOLS", "0"))
 WATCHLIST_ONLY = os.environ.get("WATCHLIST_ONLY", "false").lower() == "true"
+# Temporary test switches. Normal mode keeps the curated 150-asset whitelist and
+# midpoint trigger. The test workflow can disable either without changing the
+# underlying 1H Demand/Supply zone-construction algorithm.
+FUNDAMENTAL_WHITELIST_ENABLED = os.environ.get("FUNDAMENTAL_WHITELIST_ENABLED", "true").lower() == "true"
+ZONE_TRIGGER_MODE = os.environ.get("ZONE_TRIGGER_MODE", "midpoint").strip().lower()
+if ZONE_TRIGGER_MODE not in {"midpoint", "zone"}:
+    raise ValueError("ZONE_TRIGGER_MODE must be midpoint or zone")
 WATCHLIST_SYMBOLS = tuple(x.strip().upper() for x in os.environ.get(
     "WATCHLIST_SYMBOLS",
     "BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT,TAO-USDT,LTC-USDT,BCH-USDT,AVAX-USDT,LINK-USDT,ETC-USDT,ADA-USDT,UNI-USDT,XRP-USDT,ICP-USDT,HYPE-USDT,DOGE-USDT,HBAR-USDT,ARB-USDT,POL-USDT,SUI-USDT",
@@ -113,6 +120,7 @@ INITIAL_5M_TRIGGER_LOOKBACK_MINUTES = float(os.environ.get("INITIAL_5M_TRIGGER_L
 ZONE_VISIT_STATE_PATH = DATA / "zone_visit_state.json"
 ZONE_VISIT_STATE_LOCK_PATH = DATA / "zone_visit_state.json.lock"
 ZONE_VISIT_STATE_VERSION = 1
+RESET_ZONE_VISIT_STATE_ON_START = os.environ.get("RESET_ZONE_VISIT_STATE_ON_START", "false").lower() == "true"
 DIAGNOSTIC_LOG_PATH = DATA / "zone_engine_diagnostic.log"
 
 
@@ -406,20 +414,20 @@ def get_scan_symbols() -> list[str]:
         if symbol:
             available.add(symbol)
 
-    # Strategic universe is ALWAYS limited to the curated 150-asset fundamental
-    # whitelist. WATCHLIST_ONLY can only make that universe smaller; it can never
-    # reintroduce an asset outside the whitelist.
-    fundamental_available = available.intersection(FUNDAMENTAL_ASSET_SYMBOLS)
-    if WATCHLIST_ONLY:
-        symbols = [s for s in WATCHLIST_SYMBOLS if s in fundamental_available]
-        missing = [s for s in WATCHLIST_SYMBOLS if s not in fundamental_available]
-        if missing:
-            log.warning("[WATCHLIST_MISSING] symbols_not_active_or_not_whitelisted=%s", ",".join(_display_symbol(x) for x in missing))
+    if FUNDAMENTAL_WHITELIST_ENABLED:
+        universe_available = available.intersection(FUNDAMENTAL_ASSET_SYMBOLS)
     else:
-        symbols = sorted(fundamental_available)
+        universe_available = available
+    if WATCHLIST_ONLY:
+        symbols = [s for s in WATCHLIST_SYMBOLS if s in universe_available]
+        missing = [s for s in WATCHLIST_SYMBOLS if s not in universe_available]
+        if missing:
+            log.warning("[WATCHLIST_MISSING] symbols_not_active_or_unavailable=%s", ",".join(_display_symbol(x) for x in missing))
+    else:
+        symbols = sorted(universe_available)
     if MAX_SCAN_SYMBOLS > 0:
         symbols = symbols[:MAX_SCAN_SYMBOLS]
-    log.info("[UNIVERSE] fundamental_whitelist=%d active_bingx=%d", len(FUNDAMENTAL_ASSET_SYMBOLS), len(symbols))
+    log.info("[UNIVERSE] fundamental_whitelist=%s active_bingx=%d", len(FUNDAMENTAL_ASSET_SYMBOLS) if FUNDAMENTAL_WHITELIST_ENABLED else "DISABLED", len(symbols))
     return symbols
 
 
@@ -432,22 +440,27 @@ def _zone_visit_key(zone: dict[str, Any], kind: str) -> str:
 def _load_zone_visit_state() -> dict[str, Any]:
     """Load only the new zone-visit state schema; no legacy migration is supported."""
     if not ZONE_VISIT_STATE_PATH.exists():
-        return {"version": ZONE_VISIT_STATE_VERSION, "symbols": {}}
+        return {"version": ZONE_VISIT_STATE_VERSION, "trigger_mode": ZONE_TRIGGER_MODE, "symbols": {}}
     try:
         raw = json.loads(ZONE_VISIT_STATE_PATH.read_text(encoding="utf-8"))
     except Exception as exc:
         log.warning("[ZONE_STATE] load failed; starting empty state: %s", exc)
-        return {"version": ZONE_VISIT_STATE_VERSION, "symbols": {}}
+        return {"version": ZONE_VISIT_STATE_VERSION, "trigger_mode": ZONE_TRIGGER_MODE, "symbols": {}}
     if not isinstance(raw, dict) or int(raw.get("version", -1)) != ZONE_VISIT_STATE_VERSION or not isinstance(raw.get("symbols"), dict):
         log.warning("[ZONE_STATE] invalid/newer schema; starting empty state")
-        return {"version": ZONE_VISIT_STATE_VERSION, "symbols": {}}
+        return {"version": ZONE_VISIT_STATE_VERSION, "trigger_mode": ZONE_TRIGGER_MODE, "symbols": {}}
+    stored_mode = str(raw.get("trigger_mode", "")).strip().lower()
+    if stored_mode and stored_mode != ZONE_TRIGGER_MODE:
+        log.warning("[ZONE_STATE] trigger_mode changed %s -> %s; starting empty visit state", stored_mode, ZONE_TRIGGER_MODE)
+        return {"version": ZONE_VISIT_STATE_VERSION, "trigger_mode": ZONE_TRIGGER_MODE, "symbols": {}}
+    raw["trigger_mode"] = ZONE_TRIGGER_MODE
     return raw
 
 
 def _save_zone_visit_state(state: dict[str, Any]) -> None:
     """Atomically persist zone-visit state after a complete scan batch."""
     DATA.mkdir(parents=True, exist_ok=True)
-    payload = {"version": ZONE_VISIT_STATE_VERSION, "symbols": state.get("symbols", {})}
+    payload = {"version": ZONE_VISIT_STATE_VERSION, "trigger_mode": ZONE_TRIGGER_MODE, "symbols": state.get("symbols", {})}
     lock_path = ZONE_VISIT_STATE_LOCK_PATH
     with lock_path.open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
@@ -504,11 +517,15 @@ def _build_5m_zone_signal(
     supply: list[dict[str, Any]],
     zone_state: dict[str, Any],
 ) -> dict[str, Any]:
-    """Build an execution-ready signal from a 5m midpoint touch of an existing 1H zone."""
+    """Build an execution-ready signal from the configured 5m touch of an existing 1H zone."""
     top = float(zone["top"])
     bottom = float(zone["btm"])
     midpoint = (top + bottom) / 2.0
-    entry = midpoint
+    midpoint_touch = float(bar["low"]) <= midpoint <= float(bar["high"])
+    zone_touch = float(bar["low"]) <= top and float(bar["high"]) >= bottom
+    if not zone_touch:
+        raise ValueError("zone_touch_required")
+    entry = midpoint if ZONE_TRIGGER_MODE == "midpoint" else float(bar["close"])
     fixed_stop_pct = FIXED_STOP_PCT
     risk = entry * fixed_stop_pct / 100.0
     stop = entry - risk if direction == "LONG" else entry + risk
@@ -568,18 +585,22 @@ def _build_5m_zone_signal(
         "tp1_rr": TP1_PCT / fixed_stop_pct,
         "tp2_rr": TP2_PCT / fixed_stop_pct,
         "strategy": "Demand/Supply Zone First",
-        "strategy_version": STRATEGY_VERSION,
+        "strategy_version": (STRATEGY_VERSION if ZONE_TRIGGER_MODE == "midpoint" else f"{STRATEGY_VERSION}-zone-touch-test"),
         "entry_bar": entry_bar,
         "previous_bar": prev_bar_dict,
         "trigger": {
-            "type": "ZONE_MIDPOINT_TOUCH_5M",
+            "type": ("ZONE_MIDPOINT_TOUCH_5M" if ZONE_TRIGGER_MODE == "midpoint" else "ZONE_TOUCH_5M"),
             "alma_required": False,
             "alternate_timeframe": "8h",
-            "zone_touch": True,
-            "zone_entry_rule": "fresh_midpoint_touch_5m",
+            "zone_touch": zone_touch,
+            "zone_entry_rule": ("fresh_midpoint_touch_5m" if ZONE_TRIGGER_MODE == "midpoint" else "fresh_zone_touch_5m"),
+            "zone_trigger_mode": ZONE_TRIGGER_MODE,
             "zone_midpoint": midpoint,
             "zone_midpoint_pct": 50.0,
+            "midpoint_touched_diagnostic": midpoint_touch,
             "previous_bar_midpoint_touch": bool(zone_state.get("previous_midpoint_touch", False)),
+            "previous_bar_zone_touch": bool(zone_state.get("previous_zone_touch", False)),
+            "trigger_entry_reference": ("midpoint" if ZONE_TRIGGER_MODE == "midpoint" else "trigger_bar_close"),
             "zone_visit_id": zone_state.get("visit_id"),
             "zone_visit_state": "TRIGGERED",
         },
@@ -606,9 +627,10 @@ def _build_5m_zone_signal(
             "directional_candle_ok": (float(bar["close"]) >= float(bar["open"])) if direction == "LONG" else (float(bar["close"]) <= float(bar["open"])),
             "zone_age_bars": zone_age_bars,
             "minimum_structure_room_r": MIN_STRUCTURE_ROOM_R,
-            "zone_touch": True,
-            "midpoint_touch": True,
+            "zone_touch": zone_touch,
+            "midpoint_touch": midpoint_touch,
             "trigger_timeframe": "5m",
+            "zone_trigger_mode": ZONE_TRIGGER_MODE,
             "volume_ratio": vol_ratio,
             "bullish_candle": float(bar["close"]) >= float(bar["open"]),
             "bearish_candle": float(bar["close"]) <= float(bar["open"]),
@@ -681,6 +703,7 @@ def _process_5m_zone_visits(
                 "state_before": None,
                 "state_after": None,
                 "bars_in_zone": 0,
+                "zone_touches": 0,
                 "midpoint_touches": 0,
                 "same_visit_blocks": 0,
                 "ambiguous_blocks": 0,
@@ -695,6 +718,7 @@ def _process_5m_zone_visits(
                 "closest_midpoint_distance_pct": None,
                 "closest_midpoint_bar": None,
                 "window_bars_in_zone": 0,
+                "window_zone_touches": 0,
                 "window_midpoint_touches": 0,
                 "window_closest_midpoint_distance_pct": None,
                 "window_closest_midpoint_bar": None,
@@ -715,8 +739,10 @@ def _process_5m_zone_visits(
                 low = float(wbar["low"]); high = float(wbar["high"]); ts = pd.Timestamp(wbar["timestamp"])
                 if activation_ts is not None and ts < activation_ts:
                     continue
-                if low <= float(zone["top"]) and high >= float(zone["btm"]):
+                zone_touched = low <= float(zone["top"]) and high >= float(zone["btm"])
+                if zone_touched:
                     zdiag["window_bars_in_zone"] += 1
+                    zdiag["window_zone_touches"] += 1
                 touched = low <= midpoint <= high
                 distance_pct = 0.0 if touched else ((midpoint - high) if high < midpoint else (low - midpoint)) / midpoint * 100.0 if midpoint else None
                 if distance_pct is not None and (zdiag["window_closest_midpoint_distance_pct"] is None or distance_pct < zdiag["window_closest_midpoint_distance_pct"]):
@@ -734,7 +760,12 @@ def _process_5m_zone_visits(
         last_processed = pd.Timestamp(last_processed_raw)
         start_mask = x["timestamp"] > last_processed
     else:
-        start_mask = x["timestamp"] >= (now - pd.Timedelta(minutes=INITIAL_5M_TRIGGER_LOOKBACK_MINUTES))
+        # Align the initial lookback boundary to the 5m bar clock. Without this,
+        # cron seconds can make a bar exactly at the configured lookback edge fall
+        # just outside the >= cutoff (e.g. 10:40:00 vs 10:40:47), causing the first
+        # actionable 5m touch to be skipped on a fresh state.
+        initial_cutoff = (now - pd.Timedelta(minutes=INITIAL_5M_TRIGGER_LOOKBACK_MINUTES)).floor("5min")
+        start_mask = x["timestamp"] >= initial_cutoff
 
     signals: list[dict[str, Any]] = []
     trigger_text: str | None = None
@@ -779,27 +810,30 @@ def _process_5m_zone_visits(
                     continue
             midpoint = (float(zone["top"]) + float(zone["btm"])) / 2.0
             zone_overlap = float(bar["low"]) <= float(zone["top"]) and float(bar["high"]) >= float(zone["btm"])
+            midpoint_touch = float(bar["low"]) <= midpoint <= float(bar["high"])
             if diagnostics is not None and zone_overlap:
                 diagnostics["zones"][zone_key]["bars_in_zone"] += 1
-            distance_pct = 0.0 if float(bar["low"]) <= midpoint <= float(bar["high"]) else ((midpoint - float(bar["high"])) if float(bar["high"]) < midpoint else (float(bar["low"]) - midpoint)) / midpoint * 100.0 if midpoint else None
+            distance_pct = 0.0 if midpoint_touch else ((midpoint - float(bar["high"])) if float(bar["high"]) < midpoint else (float(bar["low"]) - midpoint)) / midpoint * 100.0 if midpoint else None
             if diagnostics is not None and distance_pct is not None:
                 zdiag = diagnostics["zones"][zone_key]
                 if zdiag["closest_midpoint_distance_pct"] is None or distance_pct < zdiag["closest_midpoint_distance_pct"]:
                     zdiag["closest_midpoint_distance_pct"] = distance_pct
                     zdiag["closest_midpoint_bar"] = {"timestamp": bar_ts.isoformat(), "open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"]), "distance_pct": distance_pct}
-            touch = float(bar["low"]) <= midpoint <= float(bar["high"])
+            touch = midpoint_touch if ZONE_TRIGGER_MODE == "midpoint" else zone_overlap
             if not touch:
                 continue
             if diagnostics is not None:
                 zdiag = diagnostics["zones"][zone_key]
-                zdiag["midpoint_touches"] += 1
+                zdiag["zone_touches"] += 1
+                if midpoint_touch:
+                    zdiag["midpoint_touches"] += 1
                 zdiag["touch_timestamps"].append(bar_ts.isoformat())
             # Ambiguous overlap is a no-trade state; still record the visit so it
             # cannot create repeated directional attempts while price oscillates.
             if direction == "LONG":
-                opposite_touch = any(float(bar["low"]) <= (float(z["top"]) + float(z["btm"])) / 2.0 <= float(bar["high"]) for z in supply)
+                opposite_touch = any(float(bar["low"]) <= float(z["top"]) and float(bar["high"]) >= float(z["btm"]) for z in supply)
             else:
-                opposite_touch = any(float(bar["low"]) <= (float(z["top"]) + float(z["btm"])) / 2.0 <= float(bar["high"]) for z in demand)
+                opposite_touch = any(float(bar["low"]) <= float(z["top"]) and float(bar["high"]) >= float(z["btm"]) for z in demand)
             if opposite_touch:
                 zs.update({"state": "LOCKED", "first_touch_ts": bar_ts.isoformat(), "last_touch_ts": bar_ts.isoformat(), "touch_count": int(zs.get("touch_count", 0)) + 1, "lock_reason": "ambiguous_overlap", "visit_id": f"{symbol}:{zone_key}:{int(bar_ts.timestamp()*1000)}"})
                 if diagnostics is not None:
@@ -808,17 +842,41 @@ def _process_5m_zone_visits(
                     diagnostics["zones"][zone_key]["state_after"] = "LOCKED"
                 continue
             state = dict(zs)
-            state["previous_midpoint_touch"] = bool(prev is not None and float(prev["low"]) <= midpoint <= float(prev["high"]))
-            if state["previous_midpoint_touch"]:
+            # Only the previous bar that was actually processed in this scan batch
+            # participates in the continuous-visit guard. The first processed bar
+            # often has one older fetched bar before it; that bar may already belong
+            # to the pre-run history and must not suppress the first actionable touch
+            # after a fresh/empty durable state. Prior-run touches are represented by
+            # the persisted zone state itself (LOCKED), so they do not need this guard.
+            prev_was_processed_now = False
+            if prev is not None:
+                prev_ts = pd.Timestamp(prev["timestamp"])
+                if last_processed_raw:
+                    try:
+                        prev_was_processed_now = prev_ts > last_processed
+                    except Exception:
+                        prev_was_processed_now = True
+                else:
+                    prev_was_processed_now = bool(prev_ts >= processed_rows["timestamp"].min())
+            state["previous_midpoint_touch"] = bool(
+                prev_was_processed_now and prev is not None and
+                float(prev["low"]) <= midpoint <= float(prev["high"])
+            )
+            state["previous_zone_touch"] = bool(
+                prev_was_processed_now and prev is not None and
+                float(prev["low"]) <= float(zone["top"]) and float(prev["high"]) >= float(zone["btm"])
+            )
+            previous_touch = state["previous_midpoint_touch"] if ZONE_TRIGGER_MODE == "midpoint" else state["previous_zone_touch"]
+            if previous_touch:
                 # This is still the same continuous visit, not a new touch event.
                 zs.update({"state": "LOCKED", "last_touch_ts": bar_ts.isoformat(), "touch_count": int(zs.get("touch_count", 0)) + 1})
                 if diagnostics is not None:
                     diagnostics["zones"][zone_key]["same_visit_blocks"] += 1
-                    diagnostics["touch_events"].append({"timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction, "midpoint": midpoint, "state_before": "LOCKED_OR_CONTINUOUS", "reason": "previous_5m_midpoint_touch", "bar": {"open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"])}})
+                    diagnostics["touch_events"].append({"timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction, "midpoint": midpoint, "state_before": "LOCKED_OR_CONTINUOUS", "reason": ("previous_5m_midpoint_touch" if ZONE_TRIGGER_MODE == "midpoint" else "previous_5m_zone_touch"), "bar": {"open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"])}})
                 continue
             if not zs.get("first_touch_ts"):
                 visit_id = f"{symbol}:{zone_key}:{int(bar_ts.timestamp()*1000)}"
-                zs.update({"state": "LOCKED", "first_touch_ts": bar_ts.isoformat(), "last_touch_ts": bar_ts.isoformat(), "touch_count": int(zs.get("touch_count", 0)), "visit_id": visit_id, "lock_reason": "midpoint_touch"})
+                zs.update({"state": "LOCKED", "first_touch_ts": bar_ts.isoformat(), "last_touch_ts": bar_ts.isoformat(), "touch_count": int(zs.get("touch_count", 0)), "visit_id": visit_id, "lock_reason": ("midpoint_touch" if ZONE_TRIGGER_MODE == "midpoint" else "zone_touch")})
             try:
                 signal = _build_5m_zone_signal(symbol, direction, zone, bar, prev, df_1h, demand, supply, zs)
             except ValueError as exc:
@@ -844,13 +902,13 @@ def _process_5m_zone_visits(
                     "state": "ARMED",
                     "last_touch_ts": bar_ts.isoformat(),
                     "touch_count": int(zs.get("touch_count", 0)) + 1,
-                    "lock_reason": "stale_midpoint_touch_ignored",
+                    "lock_reason": ("stale_midpoint_touch_ignored" if ZONE_TRIGGER_MODE == "midpoint" else "stale_zone_touch_ignored"),
                     "trigger_event_id": None,
                     "pending_signal": None,
                 })
                 if diagnostics is not None:
                     diagnostics["zones"][zone_key]["stale_touches"] += 1
-                    diagnostics["touch_events"].append({"timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction, "midpoint": midpoint, "state_before": "ARMED", "reason": "stale_midpoint_touch_ignored", "age_min": age_min, "bar": {"open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"])}})
+                    diagnostics["touch_events"].append({"timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction, "midpoint": midpoint, "state_before": "ARMED", "reason": ("stale_midpoint_touch_ignored" if ZONE_TRIGGER_MODE == "midpoint" else "stale_zone_touch_ignored"), "age_min": age_min, "bar": {"open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"])}})
                 continue
             zs["trigger_event_id"] = event_id
             zs["pending_signal"] = signal
@@ -858,12 +916,12 @@ def _process_5m_zone_visits(
             # Re-use the same event for a retryable execution failure.
             if event_id not in successful_ids and event_id not in terminal_event_ids:
                 signals.append(signal)
-                trigger_text = f"{direction} @ {midpoint:.12g} 5m_midpoint"
+                trigger_text = f"{direction} @ {float(signal.get('entry', midpoint)):.12g} 5m_{ZONE_TRIGGER_MODE}_touch"
                 if diagnostics is not None:
                     diagnostics["zones"][zone_key]["signals_created"] += 1
                     diagnostics["touch_events"].append({
                         "timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction,
-                        "midpoint": midpoint, "state_before": "ARMED", "reason": "signal_created",
+                        "midpoint": midpoint, "state_before": "ARMED", "reason": "signal_created", "touch_mode": ZONE_TRIGGER_MODE,
                         "event_id": event_id, "age_min": age_min,
                         "entry_ref": float(signal.get("entry", midpoint) or midpoint),
                         "sl_ref": float(signal.get("sl", 0.0) or 0.0),
@@ -901,7 +959,7 @@ def _process_5m_zone_visits(
             signals.append(pending)
             if diagnostics is not None:
                 diagnostics["pending_retries"] += 1
-            trigger_text = trigger_text or f"{pending.get('type')} @ {pending.get('entry')} 5m_midpoint_retry"
+            trigger_text = trigger_text or f"{pending.get('type')} @ {pending.get('entry')} 5m_{ZONE_TRIGGER_MODE}_touch_retry"
     return signals, symbol_state, trigger_text
 
 def _log_5m_zone_diagnostics(
@@ -958,13 +1016,13 @@ def _log_5m_zone_diagnostics(
         else:
             age_bars = None
         log.info(
-            "[ZONE_DIAG] %s | %s | key=%s | state=%s | start_idx=%s age_1h=%s | bottom=%.12g midpoint=%.12g top=%.12g width=%.12g width_pct=%.6f%% | price=%.12g in_zone=%s dist_mid=%s%% | window_zone_bars=%d window_midpoint_touches=%d window_last_touch=%s processed_zone_bars=%d processed_midpoint_touches=%d same_visit=%d ambiguous=%d stale=%d activation_block=%d structure_reject=%d directional_reject=%d other_reject=%d signals_created=%d rearm=%d",
+            "[ZONE_DIAG] %s | %s | key=%s | mode=%s | state=%s | start_idx=%s age_1h=%s | bottom=%.12g midpoint=%.12g top=%.12g width=%.12g width_pct=%.6f%% | price=%.12g in_zone=%s dist_mid=%s%% | window_zone_bars=%d window_zone_touches=%d window_midpoint_touches=%d window_last_touch=%s processed_zone_bars=%d processed_zone_touches=%d processed_midpoint_touches=%d same_visit=%d ambiguous=%d stale=%d activation_block=%d structure_reject=%d directional_reject=%d other_reject=%d signals_created=%d rearm=%d",
             display, kind, zone_key,
-            zdiag.get("state_after"), start_idx, age_bars, bottom, midpoint, top, width,
+            ZONE_TRIGGER_MODE, zdiag.get("state_after"), start_idx, age_bars, bottom, midpoint, top, width,
             (width / midpoint * 100.0) if midpoint else 0.0, latest_price, in_zone,
             f"{dist_mid:.4f}" if dist_mid is not None else "None", int(zdiag.get("window_bars_in_zone", 0)),
-            int(zdiag.get("window_midpoint_touches", 0)), zdiag.get("window_last_midpoint_touch"),
-            int(zdiag.get("bars_in_zone", 0)), int(zdiag.get("midpoint_touches", 0)),
+            int(zdiag.get("window_zone_touches", 0)), int(zdiag.get("window_midpoint_touches", 0)), zdiag.get("window_last_midpoint_touch"),
+            int(zdiag.get("bars_in_zone", 0)), int(zdiag.get("zone_touches", 0)), int(zdiag.get("midpoint_touches", 0)),
             int(zdiag.get("same_visit_blocks", 0)), int(zdiag.get("ambiguous_blocks", 0)),
             int(zdiag.get("stale_touches", 0)), int(zdiag.get("activation_blocks", 0)),
             int(zdiag.get("structure_rejects", 0)), int(zdiag.get("directional_rejects", 0)),
@@ -1014,7 +1072,7 @@ def _log_5m_zone_diagnostics(
                 float(bar.get("low", 0.0) or 0.0), float(bar.get("close", 0.0) or 0.0), event.get("event_id"),
             )
     else:
-        log.info("[5M_TOUCH_EVENT] %s | no_midpoint_touch_events_in_processed_bars", display)
+        log.info("[5M_TOUCH_EVENT] %s | no_zone_touch_events_in_processed_bars", display)
 
 
 def _log_5m_gate_summary(symbol: str, diagnostics: dict[str, Any], signal_count: int) -> None:
@@ -1031,10 +1089,12 @@ def _log_5m_gate_summary(symbol: str, diagnostics: dict[str, Any], signal_count:
     other = sum(int(z.get("other_rejects", 0)) for z in zones)
     signals_created = sum(int(z.get("signals_created", 0)) for z in zones)
     rearms = sum(int(z.get("rearms", 0)) for z in zones)
+    window_zone_touches = sum(int(z.get("window_zone_touches", 0)) for z in zones)
+    processed_zone_touches = sum(int(z.get("zone_touches", 0)) for z in zones)
     log.info(
-        "[5M_GATE_SUMMARY] %s | zones=%d | fetched_closed=%d processed=%d | window_midpoint_touches=%d processed_midpoint_touches=%d | same_visit=%d ambiguous=%d stale=%d activation_block=%d structure_reject=%d directional_reject=%d other_reject=%d signals_created=%d pending_or_returned_signals=%d rearms=%d",
-        display, len(zones), int(diagnostics.get("bars_closed", 0)), int(diagnostics.get("processed_bars", 0)),
-        window_touches, processed_touches, same_visit, ambiguous, stale, activation, structure, directional, other,
+        "[5M_GATE_SUMMARY] %s | trigger_mode=%s | zones=%d | fetched_closed=%d processed=%d | window_zone_touches=%d processed_zone_touches=%d | window_midpoint_touches=%d processed_midpoint_touches=%d | same_visit=%d ambiguous=%d stale=%d activation_block=%d structure_reject=%d directional_reject=%d other_reject=%d signals_created=%d pending_or_returned_signals=%d rearms=%d",
+        display, ZONE_TRIGGER_MODE, len(zones), int(diagnostics.get("bars_closed", 0)), int(diagnostics.get("processed_bars", 0)),
+        window_zone_touches, processed_zone_touches, window_touches, processed_touches, same_visit, ambiguous, stale, activation, structure, directional, other,
         signals_created, signal_count, rearms,
     )
 
@@ -1833,7 +1893,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         qty=qty,
         tp_orders=protection.get("tp_orders", []),
         sl_result=protection.get("sl_result", {}),
-        event_type=f"{setup['zone'].get('kind', 'ZONE')}_MIDPOINT_TOUCH_5M",
+        event_type=f"{setup['zone'].get('kind', 'ZONE')}_{'MIDPOINT_TOUCH_5M' if ZONE_TRIGGER_MODE == 'midpoint' else 'ZONE_TOUCH_5M'}",
         timeframe="5m",
         score=float(signal.get("score", 0.0)),
         setup={**setup, "protection_status": protection.get("status"), "protection_result": protection},
@@ -1887,8 +1947,8 @@ def main() -> None:
     scan_id = f"SCAN_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8].upper()}"
     _init_diagnostic_log()
     log.info(
-        "[RUN_DIAGNOSTIC] scan_id=%s strategy=%s | universe=150 | trigger=5m_midpoint | zone_tf=1h | stop=%.2f%% | tp1=%.2f%% | tp2=%.2f%% | be=after_tp1_filled | max_5m_age_min=%.1f | structure_min=%.2fR | data_stale_hours=%.2f",
-        scan_id, STRATEGY_VERSION, FIXED_STOP_PCT, TP1_PCT, TP2_PCT,
+        "[RUN_DIAGNOSTIC] scan_id=%s strategy=%s | universe=%s | trigger=5m_%s | zone_tf=1h | stop=%.2f%% | tp1=%.2f%% | tp2=%.2f%% | be=after_tp1_filled | max_5m_age_min=%.1f | structure_min=%.2fR | data_stale_hours=%.2f",
+        scan_id, (STRATEGY_VERSION if ZONE_TRIGGER_MODE == "midpoint" else f"{STRATEGY_VERSION}-zone-touch-test"), ("150" if FUNDAMENTAL_WHITELIST_ENABLED else "ALL_ACTIVE_BINGX"), ZONE_TRIGGER_MODE, FIXED_STOP_PCT, TP1_PCT, TP2_PCT,
         MAX_5M_TRIGGER_AGE_MINUTES, MIN_STRUCTURE_ROOM_R, MAX_DATA_STALENESS_HOURS,
     )
 
@@ -1953,7 +2013,7 @@ def main() -> None:
     analysis_meta = {str(item["bingx_symbol"]): item for item in analysis_universe}
     crypto_n = sum(1 for x in analysis_universe if str(x.get("asset_class")).upper() == "CRYPTO")
     equity_n = sum(1 for x in analysis_universe if str(x.get("asset_class")).upper() == "EQUITY")
-    log.info("[SCAN] Eligible symbols: %d | crypto=%d equity=%d | strategy_mode=ZONE_1H_5M_MIDPOINT | diagnostics_mode=%s", len(symbols), crypto_n, equity_n, DIAGNOSTICS_MODE)
+    log.info("[SCAN] Eligible symbols: %d | crypto=%d equity=%d | strategy_mode=ZONE_1H_5M_%s | universe_mode=%s | diagnostics_mode=%s", len(symbols), crypto_n, equity_n, ZONE_TRIGGER_MODE.upper(), "FUNDAMENTAL_150" if FUNDAMENTAL_WHITELIST_ENABLED else "ALL_ACTIVE_BINGX", DIAGNOSTICS_MODE)
     if not symbols:
         log.error("[SCAN] No eligible symbols for signal scan")
 
@@ -1971,6 +2031,9 @@ def main() -> None:
         open_keys = set()
     log.info("[POSITIONS] open_position_keys=%s", json.dumps([f"{_display_symbol(sym)}:{direction}" for sym, direction in sorted(open_keys)], ensure_ascii=False))
     zone_visit_state = _load_zone_visit_state()
+    if RESET_ZONE_VISIT_STATE_ON_START:
+        log.warning("[ZONE_STATE] RESET_ZONE_VISIT_STATE_ON_START=true | starting the 5m visit state empty for this test run")
+        zone_visit_state = {"version": ZONE_VISIT_STATE_VERSION, "trigger_mode": ZONE_TRIGGER_MODE, "symbols": {}}
     scan_rows: list[dict[str, Any]] = []
     fresh_signals: list[dict[str, Any]] = []
 
@@ -2154,7 +2217,7 @@ def main() -> None:
             else:
                 latest_signal = _select_latest_signal(recent)
                 fresh_text = trigger_text or (
-                    f"{latest_signal['type']} @ {latest_signal['entry']} score={latest_signal.get('score', 0):.1f} 5m_midpoint"
+                    f"{latest_signal['type']} @ {latest_signal['entry']} score={latest_signal.get('score', 0):.1f} 5m_{ZONE_TRIGGER_MODE}_touch"
                     if latest_signal else "—"
                 )
             price_position = _price_position(latest_price, demand, supply)

@@ -492,6 +492,19 @@ def test_scan_universe_is_limited_to_150_fundamental_assets(monkeypatch):
     assert "DOGE-USDT" not in out
 
 
+def test_scan_universe_can_temporarily_disable_150_whitelist(monkeypatch):
+    import run_once
+    monkeypatch.setattr(run_once, "contracts", lambda: {
+        "BTC-USDT": {"symbol": "BTC-USDT"},
+        "DOGE-USDT": {"symbol": "DOGE-USDT"},
+        "ETH-USDT": {"symbol": "ETH-USDT"},
+    })
+    monkeypatch.setattr(run_once, "WATCHLIST_ONLY", False)
+    monkeypatch.setattr(run_once, "FUNDAMENTAL_WHITELIST_ENABLED", False)
+    out = run_once.get_scan_symbols()
+    assert set(out) == {"BTC-USDT", "DOGE-USDT", "ETH-USDT"}
+
+
 def test_telegram_uses_zone_only_label_and_dynamic_rr_values():
     from event_engine.telegram import format_signal
     msg = format_signal({
@@ -1087,6 +1100,38 @@ def test_directional_zone_requires_exact_midpoint_touch():
     assert _find_directional_zone("LONG", 110.0, 112.0, 111.0, demand, supply) is None
     assert _find_directional_zone("LONG", 104.9, 105.0, 106.0, demand, supply) == demand[0]
     assert _find_directional_zone("SHORT", 123.0, 125.0, 126.0, demand, supply) == supply[0]
+
+def test_5m_zone_mode_accepts_any_zone_touch_not_only_midpoint(monkeypatch):
+    import pandas as pd
+    import run_once
+    monkeypatch.setattr(run_once, "ZONE_TRIGGER_MODE", "zone")
+    monkeypatch.setattr(run_once, "MIN_STRUCTURE_ROOM_R", 0.0)
+    monkeypatch.setattr(run_once, "REQUIRE_STRUCTURE_OBSTACLE", False)
+    monkeypatch.setattr(run_once, "_nearest_opposing_level", lambda *args, **kwargs: None)
+    monkeypatch.setattr(run_once, "MAX_5M_TRIGGER_AGE_MINUTES", 60.0)
+    now = pd.Timestamp.now(tz="UTC").floor("5min")
+    df_1h = pd.DataFrame([
+        {"timestamp": now - pd.Timedelta(hours=12-i), "open": 100, "high": 111, "low": 99, "close": 105, "volume": 100, "atr50": 2.0}
+        for i in range(12)
+    ])
+    zone = {"start": 0, "top": 110.0, "btm": 100.0, "poi": 105.0}
+    bar = pd.Series({
+        "timestamp": now - pd.Timedelta(minutes=5), "open": 108.0, "high": 104.0,
+        "low": 102.0, "close": 103.0, "volume": 10.0,
+    })
+    prev = pd.Series({
+        "timestamp": now - pd.Timedelta(minutes=10), "open": 112.0, "high": 113.0,
+        "low": 111.0, "close": 112.0, "volume": 10.0,
+    })
+    signal = run_once._build_5m_zone_signal(
+        "TEST-USDT", "LONG", zone, bar, prev, df_1h, [zone], [], {"visit_id": "VISIT"}
+    )
+    assert signal["entry"] == 103.0
+    assert signal["trigger"]["zone_trigger_mode"] == "zone"
+    assert signal["trigger"]["type"] == "ZONE_TOUCH_5M"
+    assert signal["trigger"]["midpoint_touched_diagnostic"] is False
+    assert signal["zone"]["poi"] == 105.0
+
 
 def test_run_once_import_regression():
     # run_once.py uses SWING_LEN for its per-symbol minimum-history guard.
@@ -2442,6 +2487,65 @@ def test_5m_zone_visit_rearms_only_after_closed_bar_exits_far_edge_then_allows_n
     signals, state, _ = _process_5m_zone_visits("TEST-USDT", bars, [zone], [], df1h, None, set(), set())
     assert len(signals) == 2
     assert signals[0]["trigger_bar_time"] != signals[1]["trigger_bar_time"]
+    assert state["zones"]["DEMAND:0:110.000000000000:100.000000000000"]["state"] == "LOCKED"
+
+
+def test_5m_zone_mode_locks_first_zone_touch_and_ignores_later_chop(monkeypatch):
+    import pandas as pd
+    import run_once
+    from run_once import _process_5m_zone_visits
+    monkeypatch.setattr(run_once, "ZONE_TRIGGER_MODE", "zone")
+    monkeypatch.setattr(run_once, "MIN_STRUCTURE_ROOM_R", 0.0)
+    monkeypatch.setattr(run_once, "REQUIRE_STRUCTURE_OBSTACLE", False)
+    monkeypatch.setattr(run_once, "_nearest_opposing_level", lambda *args, **kwargs: None)
+    monkeypatch.setattr(run_once, "MAX_5M_TRIGGER_AGE_MINUTES", 60.0)
+    now = pd.Timestamp.now(tz="UTC").floor("5min")
+    zone = {"start": 0, "top": 110.0, "btm": 100.0, "poi": 105.0}
+    vals = [
+        (108, 104, 102, 103),
+        (103, 107, 101, 104),
+        (104, 109, 100, 103),
+    ]
+    bars = []
+    for i, (o, h, l, c) in enumerate(vals):
+        ts = now - pd.Timedelta(minutes=15 - 5*i)
+        bars.append({"timestamp": int(ts.timestamp()*1000), "open": o, "high": h, "low": l, "close": c, "volume": 10})
+    df1h = pd.DataFrame([{
+        "timestamp": now-pd.Timedelta(hours=12-i), "open":100, "high":111, "low":99, "close":105, "volume":100, "atr50":2.0
+    } for i in range(12)])
+    sigs, state, _ = _process_5m_zone_visits("TEST-USDT", bars, [zone], [], df1h, None, set(), set())
+    key = "DEMAND:0:110.000000000000:100.000000000000"
+    assert len(sigs) == 1
+    assert sigs[0]["trigger"]["type"] == "ZONE_TOUCH_5M"
+    assert sigs[0]["trigger"]["midpoint_touched_diagnostic"] is False
+    assert state["zones"][key]["state"] == "LOCKED"
+    assert state["zones"][key]["lock_reason"] == "zone_touch"
+
+
+def test_5m_first_processed_bar_is_not_suppressed_by_unprocessed_history_touch(monkeypatch):
+    import pandas as pd
+    import run_once
+    from run_once import _process_5m_zone_visits
+    monkeypatch.setattr(run_once, "ZONE_TRIGGER_MODE", "zone")
+    monkeypatch.setattr(run_once, "MAX_5M_TRIGGER_AGE_MINUTES", 60.0)
+    monkeypatch.setattr(run_once, "INITIAL_5M_TRIGGER_LOOKBACK_MINUTES", 10.0)
+    monkeypatch.setattr(run_once, "MIN_STRUCTURE_ROOM_R", 0.0)
+    monkeypatch.setattr(run_once, "REQUIRE_STRUCTURE_OBSTACLE", False)
+    monkeypatch.setattr(run_once, "_nearest_opposing_level", lambda *args, **kwargs: None)
+    now = pd.Timestamp.now(tz="UTC").floor("5min")
+    zone = {"start": 0, "top": 110.0, "btm": 100.0, "poi": 105.0}
+    bars = [
+        {"timestamp": int((now-pd.Timedelta(minutes=15)).timestamp()*1000), "open":108, "high":109, "low":101, "close":103, "volume":10},
+        {"timestamp": int((now-pd.Timedelta(minutes=10)).timestamp()*1000), "open":108, "high":109, "low":101, "close":103, "volume":10},
+        {"timestamp": int((now-pd.Timedelta(minutes=5)).timestamp()*1000), "open":90, "high":95, "low":80, "close":85, "volume":10},
+    ]
+    df1h = pd.DataFrame([{
+        "timestamp": now-pd.Timedelta(hours=12-i), "open":100, "high":111, "low":99, "close":105, "volume":100, "atr50":2.0
+    } for i in range(12)])
+    sigs, state, _ = _process_5m_zone_visits("TEST-USDT", bars, [zone], [], df1h, None, set(), set())
+    assert len(sigs) == 1
+    assert sigs[0]["trigger"]["type"] == "ZONE_TOUCH_5M"
+    assert sigs[0]["trigger_bar_time"] == pd.Timestamp(bars[1]["timestamp"], unit="ms", tz="UTC").isoformat()
     assert state["zones"]["DEMAND:0:110.000000000000:100.000000000000"]["state"] == "LOCKED"
 
 
