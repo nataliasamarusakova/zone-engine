@@ -2583,3 +2583,37 @@ def test_register_active_trade_preserves_5m_trigger_metadata(monkeypatch, tmp_pa
     trade = state["EVT_META_5M"]
     assert trade["timeframe"] == "5m"
     assert trade["event_type"] == "DEMAND_MIDPOINT_TOUCH_5M"
+
+
+def test_display_symbol_removes_hyphen_only_for_human_log_output():
+    import run_once
+    assert run_once._display_symbol("NEAR-USDT") == "NEARUSDT"
+    assert run_once._display_symbol("btc-usdt") == "BTCUSDT"
+
+
+def test_5m_zone_diagnostics_capture_window_and_processed_reasons(monkeypatch):
+    import pandas as pd
+    import run_once
+    from run_once import _process_5m_zone_visits
+    monkeypatch.setattr(run_once, "INITIAL_5M_TRIGGER_LOOKBACK_MINUTES", 60.0)
+    monkeypatch.setattr(run_once, "MAX_5M_TRIGGER_AGE_MINUTES", 60.0)
+    now = pd.Timestamp.now(tz="UTC").floor("5min")
+    zone = {"start": 0, "top": 110.0, "btm": 100.0, "poi": 105.0}
+    t0 = now - pd.Timedelta(minutes=15)
+    bars = [
+        {"timestamp": int(t0.timestamp()*1000), "open": 108, "high": 109, "low": 104, "close": 106, "volume": 10},
+        {"timestamp": int((t0+pd.Timedelta(minutes=5)).timestamp()*1000), "open": 106, "high": 107, "low": 103, "close": 104, "volume": 10},
+        {"timestamp": int((t0+pd.Timedelta(minutes=10)).timestamp()*1000), "open": 104, "high": 106, "low": 104, "close": 105, "volume": 10},
+    ]
+    df1h = pd.DataFrame([{"timestamp": now-pd.Timedelta(hours=12-i), "open":100, "high":111, "low":99, "close":105, "volume":100, "atr50":2.0} for i in range(12)])
+    diagnostics = {"current_1h_idx": len(df1h)-1}
+    sigs, state, _ = _process_5m_zone_visits("TEST-USDT", bars, [zone], [], df1h, None, set(), set(), diagnostics=diagnostics)
+    key = "DEMAND:0:110.000000000000:100.000000000000"
+    assert diagnostics["bars_received"] == len(bars)
+    assert diagnostics["bars_closed"] == len(bars)
+    assert diagnostics["processed_bars"] >= 1
+    assert diagnostics["zones"][key]["window_midpoint_touches"] >= 1
+    assert diagnostics["zones"][key]["midpoint_touches"] >= 1
+    assert diagnostics["zones"][key]["signals_created"] >= 1
+    assert sigs
+    assert state["zones"][key]["state"] == "LOCKED"
