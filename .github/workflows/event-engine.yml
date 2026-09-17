@@ -27,8 +27,6 @@ jobs:
       MAX_TRADES_PER_CYCLE: "5"
       MAX_SCAN_SYMBOLS: "0"
       WATCHLIST_ONLY: "false"
-      FUNDAMENTAL_WHITELIST_ENABLED: "false"
-      ZONE_TRIGGER_MODE: "zone"
       RESET_ZONE_VISIT_STATE_ON_START: "false"
       WATCHLIST_SYMBOLS: "BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT,TAO-USDT,LTC-USDT,BCH-USDT,AVAX-USDT,LINK-USDT,ETC-USDT,ADA-USDT,UNI-USDT,XRP-USDT,ICP-USDT,HYPE-USDT,DOGE-USDT,HBAR-USDT,ARB-USDT,POL-USDT,SUI-USDT"
       KLINE_LIMIT_1H: "1000"
@@ -92,7 +90,10 @@ jobs:
       - name: Run tests
         run: python -m pytest -q
 
-      - name: Run engine
+      - name: Run engine (temporary full-universe zone-touch test)
+        env:
+          FUNDAMENTAL_WHITELIST_ENABLED: "false"
+          ZONE_TRIGGER_MODE: "zone"
         run: python run_once.py
 
       - name: Upload full diagnostic log
