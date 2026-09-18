@@ -1457,6 +1457,8 @@ def get_execution_quote(symbol: str, *, min_interval_sec: float | None = None, r
                 "status": "ok", "symbol": bx, "bid": bid, "ask": ask,
                 "spread_pct": ((ask - bid) / bid * 100.0) if bid > 0 else None,
                 "time": quote_time, "last_price": None, "quote_source": "bookTicker",
+                "quote_sources_attempted": ["bookTicker"],
+                "quote_fallback_reason": None,
             }
 
         ticker_resp = _call(TICKER_PATH)
@@ -1469,6 +1471,8 @@ def get_execution_quote(symbol: str, *, min_interval_sec: float | None = None, r
                 "status": "ok", "symbol": bx, "bid": bid, "ask": ask,
                 "spread_pct": ((ask - bid) / bid * 100.0) if bid > 0 else None,
                 "time": quote_time, "last_price": None, "quote_source": "ticker",
+                "quote_sources_attempted": [source for source, _ in attempts],
+                "quote_fallback_reason": _quote_error("bookTicker", attempts[0][1], bx) if attempts else "bookTicker_invalid",
             }
 
         depth_resp = _call(DEPTH_PATH)
@@ -1481,6 +1485,8 @@ def get_execution_quote(symbol: str, *, min_interval_sec: float | None = None, r
                 "status": "ok", "symbol": bx, "bid": bid, "ask": ask,
                 "spread_pct": ((ask - bid) / bid * 100.0) if bid > 0 else None,
                 "time": quote_time, "last_price": None, "quote_source": "depth",
+                "quote_sources_attempted": [source for source, _ in attempts],
+                "quote_fallback_reason": "; ".join(_quote_error(source, response, bx) for source, response in attempts[:-1]),
             }
 
     details = "; ".join(_quote_error(source, response, bx) for source, response in attempts)
@@ -1645,6 +1651,7 @@ def _research_trade_metrics(data: Any) -> dict[str, Any]:
         return {"status": "error", "error": "trades_data_invalid"}
     buy_quote = sell_quote = 0.0
     buy_count = sell_count = 0
+    buyer_maker_present_count = buyer_maker_missing_count = 0
     prices: list[float] = []
     latest_ts = None
     earliest_ts = None
@@ -1661,6 +1668,10 @@ def _research_trade_metrics(data: Any) -> dict[str, Any]:
         if not (math.isfinite(price) and price > 0 and math.isfinite(quote_qty) and quote_qty >= 0):
             continue
         prices.append(price)
+        if "buyerMaker" not in row or row.get("buyerMaker") is None:
+            buyer_maker_missing_count += 1
+        else:
+            buyer_maker_present_count += 1
         maker_buyer = _research_bool(row.get("buyerMaker"))
         # buyerMaker=true means the buyer was the maker; the aggressor was the seller.
         if maker_buyer:
@@ -1681,6 +1692,9 @@ def _research_trade_metrics(data: Any) -> dict[str, Any]:
         "sell_aggressor_quote": sell_quote,
         "buy_aggressor_count": buy_count,
         "sell_aggressor_count": sell_count,
+        "buyer_maker_field_present_count": buyer_maker_present_count,
+        "buyer_maker_field_missing_count": buyer_maker_missing_count,
+        "buyer_maker_field_coverage": (buyer_maker_present_count / len(prices)) if prices else None,
         "aggressor_delta_quote": buy_quote - sell_quote,
         "buy_aggressor_ratio": (buy_quote / total) if total > 0 else None,
         "trade_min_price": min(prices) if prices else None,

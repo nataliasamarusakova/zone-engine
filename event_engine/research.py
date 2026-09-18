@@ -852,13 +852,17 @@ def build_research_features(
                 features["account_used_margin_ratio"] = used / equity
         except (TypeError, ValueError):
             features["account_used_margin_ratio"] = None
-    for src, dst in (("funding_rate","funding_rate"),("mark_price","mark_price"),("index_price","index_price"),("open_interest","open_interest"),("open_interest_ts","open_interest_ts"),("premium_index_ts","premium_index_ts"),("next_funding_time_ms","next_funding_time_ms")):
+    for src, dst in (("funding_rate","funding_rate"),("mark_price","mark_price"),("index_price","index_price"),("open_interest","open_interest"),("open_interest_ts","open_interest_ts"),("premium_index_ts","premium_index_ts"),("next_funding_time_ms","next_funding_time_ms"),("analysis_provider","analysis_provider"),("analysis_source","analysis_source"),("context_provider","context_provider"),("context_source","context_source"),("cross_venue_binance_price","cross_venue_binance_price"),("cross_venue_bingx_price","cross_venue_bingx_price"),("cross_venue_deviation_pct","cross_venue_deviation_pct"),("cross_venue_metric","cross_venue_metric")):
         if src in context: features[dst] = context.get(src)
     book = context.get("order_book") or {}
     for src, dst in (("best_bid","book_best_bid"),("best_ask","book_best_ask"),("spread_pct","book_spread_pct"),("bid_qty_5","book_bid_qty_5"),("ask_qty_5","book_ask_qty_5"),("bid_qty_10","book_bid_qty_10"),("ask_qty_10","book_ask_qty_10"),("book_imbalance_5","book_imbalance_5"),("book_imbalance_10","book_imbalance_10"),("bid_quote_5","book_bid_quote_5"),("ask_quote_5","book_ask_quote_5"),("bid_quote_10","book_bid_quote_10"),("ask_quote_10","book_ask_quote_10"),("book_quote_imbalance_5","book_quote_imbalance_5"),("book_quote_imbalance_10","book_quote_imbalance_10"),("microprice","book_microprice"),("bid_depth_quote_0_1pct","book_bid_depth_quote_0_1pct"),("ask_depth_quote_0_1pct","book_ask_depth_quote_0_1pct"),("bid_depth_quote_0_5pct","book_bid_depth_quote_0_5pct"),("ask_depth_quote_0_5pct","book_ask_depth_quote_0_5pct"),("bid_depth_quote_1pct","book_bid_depth_quote_1pct"),("ask_depth_quote_1pct","book_ask_depth_quote_1pct")):
         if src in book: features[dst] = book.get(src)
+    features["quote_source"] = context.get("quote_source")
+    features["quote_sources_attempted"] = context.get("quote_sources_attempted")
+    features["quote_fallback_reason"] = context.get("quote_fallback_reason")
+    features["quote_captured_at"] = context.get("captured_at")
     trades = context.get("recent_trades") or {}
-    for src, dst in (("valid_trade_count","recent_trade_count"),("buy_aggressor_quote","recent_buy_aggressor_quote"),("sell_aggressor_quote","recent_sell_aggressor_quote"),("aggressor_delta_quote","recent_aggressor_delta_quote"),("buy_aggressor_ratio","recent_buy_aggressor_ratio"),("trade_min_price","recent_trade_min_price"),("trade_max_price","recent_trade_max_price"),("last_trade_ts","recent_last_trade_ts"),("first_trade_ts","recent_first_trade_ts"),("sample_span_seconds","recent_trade_sample_span_seconds"),("avg_trade_quote","recent_avg_trade_quote")):
+    for src, dst in (("valid_trade_count","recent_trade_count"),("buy_aggressor_quote","recent_buy_aggressor_quote"),("sell_aggressor_quote","recent_sell_aggressor_quote"),("aggressor_delta_quote","recent_aggressor_delta_quote"),("buy_aggressor_ratio","recent_buy_aggressor_ratio"),("buyer_maker_field_present_count","recent_buyer_maker_present_count"),("buyer_maker_field_missing_count","recent_buyer_maker_missing_count"),("buyer_maker_field_coverage","recent_buyer_maker_coverage"),("trade_min_price","recent_trade_min_price"),("trade_max_price","recent_trade_max_price"),("last_trade_ts","recent_last_trade_ts"),("first_trade_ts","recent_first_trade_ts"),("sample_span_seconds","recent_trade_sample_span_seconds"),("avg_trade_quote","recent_avg_trade_quote")):
         if src in trades: features[dst] = trades.get(src)
     # Zone-departure measurements from the existing origin; these never gate production.
     if df_1h is not None and not df_1h.empty and zone.get("start") is not None:
@@ -1195,6 +1199,10 @@ def record_scan_symbol(
     if market_context:
         context_payload = dict(market_context)
         context_payload.update({"scan_id": scan_id, "strategy_version": strategy_version, "code_commit_sha": code_commit_sha, "symbol": symbol.upper(), "provider": provider, "source": source})
+        context_payload.setdefault("analysis_provider", provider)
+        context_payload.setdefault("analysis_source", source)
+        context_payload.setdefault("context_provider", "bingx")
+        context_payload.setdefault("context_source", "bingx_swap_public")
         context_payload.setdefault("context_id", stable_id("market-context-v1", scan_id, symbol, provider, context_payload.get("captured_at_ms", ""), prefix="MC_"))
         market_context_persisted = record_market_context(context_payload)
         counts["market_context"] = 1 if market_context_persisted else 0
