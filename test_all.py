@@ -42,6 +42,11 @@ def _isolate_runtime_state(monkeypatch, tmp_path):
             "spread_pct": 0.0,
         },
     )
+    monkeypatch.setattr(
+        run_once,
+        "prepare_protection_capacity",
+        lambda symbol, direction: {"status": "ready", "symbol": symbol, "direction": direction},
+    )
     monkeypatch.setattr(run_once, "get_contract", lambda symbol: {
         "symbol": symbol, "pricePrecision": 8, "quantityPrecision": 4,
         "tradeMinQuantity": 0.0001, "maxLeverage": 10,
@@ -59,6 +64,7 @@ def _isolate_runtime_state(monkeypatch, tmp_path):
     monkeypatch.setattr(run_once, "EVENT_CLAIMS_PATH", runtime_data / "event_execution_claims.json")
     monkeypatch.setattr(run_once, "EVENT_CLAIMS_LOCK_PATH", runtime_data / "event_execution_claims.json.lock")
     monkeypatch.setattr(run_once, "ACTIONS_PATH", runtime_data / "actions.jsonl")
+    monkeypatch.setattr(run_once, "ENTRY_DECISIONS_PATH", runtime_data / "entry_decisions.jsonl")
 
     # The workflow deliberately uses temporary full-universe + zone-touch
     # environment variables only for the engine step. Tests stay pinned to the
@@ -702,7 +708,7 @@ def test_invalid_setup_is_rejected_before_protection_preflight(monkeypatch):
         "score": 75, "zone": {"kind": "SUPPLY", "btm": 0.089, "top": 0.091},
     }
     called = {"preflight": False, "open": False}
-    monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: called.__setitem__("preflight", True) or {"status": "ok"})
+    monkeypatch.setattr(run_once, "prepare_protection_capacity", lambda *a, **k: called.__setitem__("preflight", True) or {"status": "ok"})
     monkeypatch.setattr(run_once, "open_market", lambda *a, **k: called.__setitem__("open", True))
     result = run_once.execute_new_position(signal)
     assert result["status"] == "skipped_invalid_setup"
@@ -718,7 +724,7 @@ def test_protection_endpoint_failure_blocks_market_entry(monkeypatch):
         "target": {"obstacle_price": 90.0},
     }
     called = {"open": False}
-    monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {"status": "error", "error": "code:100410 disabled period"})
+    monkeypatch.setattr(run_once, "prepare_protection_capacity", lambda *a, **k: {"status": "error", "error": "code:100410 disabled period"})
     monkeypatch.setattr(run_once, "open_market", lambda *a, **k: called.__setitem__("open", True))
     result = run_once.execute_new_position(signal)
     assert result["status"] == "blocked_protection_preflight"
@@ -2848,3 +2854,87 @@ def test_5m_zone_diagnostics_capture_window_and_processed_reasons(monkeypatch):
     assert diagnostics["zones"][key]["signals_created"] >= 1
     assert sigs
     assert state["zones"][key]["state"] == "LOCKED"
+
+
+def test_build_zone_rejects_non_finite_atr_and_anchor():
+    from event_engine.signals import _build_zone
+
+    with pytest.raises(ValueError, match="ATR"):
+        _build_zone(100.0, 1, float("nan"), 10)
+    with pytest.raises(ValueError, match="anchor"):
+        _build_zone(float("nan"), 1, 1.0, 10)
+
+
+def test_zone_id_is_stable_when_dataframe_start_index_changes():
+    from event_engine.signals import _build_zone
+
+    z1 = _build_zone(100.0, 1, 2.0, 10, origin_ts_ms=1735732800000, symbol="TEST-USDT")
+    z2 = _build_zone(100.0, 1, 2.0, 1010, origin_ts_ms=1735732800000, symbol="TEST-USDT")
+    assert z1["zone_id"] == z2["zone_id"]
+    assert z1["start"] != z2["start"]
+
+
+def test_5m_event_id_uses_stable_zone_identity():
+    import run_once
+
+    z1 = {"zone_id": "ZID_TEST", "start": 10, "top": 101.0, "btm": 99.0}
+    z2 = {"zone_id": "ZID_TEST", "start": 1010, "top": 101.0, "btm": 99.0}
+    assert run_once._make_5m_event_id("TEST-USDT", "LONG", 1735732800000, z1) == run_once._make_5m_event_id("TEST-USDT", "LONG", 1735732800000, z2)
+
+
+def test_validate_trade_geometry_uses_module_structure_obstacle_default(monkeypatch):
+    import run_once
+
+    signal = {
+        "type": "LONG", "entry": 100.0, "sl": 90.0, "tp1": 103.0, "tp2": 106.0,
+        "risk_pct": 10.0, "target": {},
+    }
+    monkeypatch.setattr(run_once, "REQUIRE_STRUCTURE_OBSTACLE", False)
+    ok, reason = run_once._validate_trade_geometry(signal)
+    assert ok and reason == "ok"
+    monkeypatch.setattr(run_once, "REQUIRE_STRUCTURE_OBSTACLE", True)
+    ok, reason = run_once._validate_trade_geometry(signal)
+    assert not ok and reason == "missing_structural_obstacle"
+
+
+def test_entry_decision_journal_records_cycle_cap_and_has_stable_decision_id(tmp_path, monkeypatch):
+    import run_once
+
+    path = tmp_path / "entry_decisions.jsonl"
+    monkeypatch.setattr(run_once, "ENTRY_DECISIONS_PATH", path)
+    signal = {"event_id": "ZONE_TEST", "symbol": "TEST-USDT", "type": "SHORT", "time": "2026-01-01T00:00:00+00:00"}
+    run_once._record_entry_decision("SCAN_TEST", signal, "CYCLE_CAP", "max_trades_per_cycle_reached", selection_rank=6)
+    run_once._record_entry_decision("SCAN_TEST", signal, "CYCLE_CAP", "max_trades_per_cycle_reached", selection_rank=6)
+    rows = [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 2
+    assert rows[0]["stage"] == "CYCLE_CAP"
+    assert rows[0]["selection_rank"] == 6
+    assert rows[0]["decision_id"] == rows[1]["decision_id"]
+
+
+def test_prepare_protection_capacity_cleans_stale_engine_orders(monkeypatch):
+    from event_engine import bingx
+
+    monkeypatch.setattr(bingx, "get_position_directional", lambda *a, **k: {"status": "not_found"})
+    states = iter([
+        {"status": "ok", "sl_orders": [{"orderId": "1", "clientOrderId": "EVT_OLD_SL"}], "tp_orders": [{"orderId": "2", "clientOrderId": "EVT_OLD_TP1"}]},
+        {"status": "ok", "sl_orders": [], "tp_orders": []},
+    ])
+    monkeypatch.setattr(bingx, "get_open_protection_directional", lambda *a, **k: next(states))
+    monkeypatch.setattr(bingx, "cancel_order", lambda *a, **k: {"code": 0})
+    result = bingx.prepare_protection_capacity("TEST-USDT", "LONG")
+    assert result["status"] == "ready"
+    assert result["cancelled_order_ids"] == ["1", "2"]
+
+
+def test_prepare_protection_capacity_blocks_external_orders(monkeypatch):
+    from event_engine import bingx
+
+    monkeypatch.setattr(bingx, "get_position_directional", lambda *a, **k: {"status": "not_found"})
+    monkeypatch.setattr(bingx, "get_open_protection_directional", lambda *a, **k: {
+        "status": "ok", "sl_orders": [], "tp_orders": [{"orderId": "X1", "clientOrderId": "MANUAL"}],
+    })
+    monkeypatch.setattr(bingx, "cancel_order", lambda *a, **k: pytest.fail("manual order must not be cancelled"))
+    result = bingx.prepare_protection_capacity("TEST-USDT", "LONG")
+    assert result["status"] == "blocked_external_protection"
+    assert result["external_order_ids"] == ["X1"]

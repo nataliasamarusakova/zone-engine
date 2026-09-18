@@ -27,7 +27,10 @@ from event_engine.bingx import (
     get_position_mode,
     get_position_directional,
     get_open_protection_directional,
+    prepare_protection_capacity,
     get_execution_quote,
+    fetch_research_market_context,
+    fetch_research_account_snapshot,
     cancel_order,
     close_position_market,
     open_market,
@@ -37,6 +40,7 @@ from event_engine.signals import STRATEGY_VERSION, SWING_LEN, TP1_PCT, TP2_PCT, 
 from event_engine.fundamental_assets import FUNDAMENTAL_ASSET_SYMBOLS
 from event_engine.telegram import format_signal, send as send_tg
 from event_engine.tracker import register_active_trade, update_active_trades, update_active_trade_protection
+from event_engine import research
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("zone_engine")
@@ -69,6 +73,7 @@ FAILED_SIGNAL_MAX_RETRIES = max(1, int(os.environ.get("FAILED_SIGNAL_MAX_RETRIES
 FAILED_SIGNAL_RETRY_BASE_SEC = max(1, int(os.environ.get("FAILED_SIGNAL_RETRY_BASE_SEC", "300")))
 FAILED_SIGNAL_RETRY_MAX_SEC = max(FAILED_SIGNAL_RETRY_BASE_SEC, int(os.environ.get("FAILED_SIGNAL_RETRY_MAX_SEC", str(3600))))
 ACTIONS_PATH = DATA / "actions.jsonl"
+ENTRY_DECISIONS_PATH = DATA / "entry_decisions.jsonl"
 EVENT_CLAIMS_PATH = DATA / "event_execution_claims.json"
 EVENT_CLAIMS_LOCK_PATH = DATA / "event_execution_claims.json.lock"
 EVENT_CLAIM_LEASE_SEC = max(60, int(os.environ.get("EVENT_CLAIM_LEASE_SEC", "900")))
@@ -124,6 +129,38 @@ RESET_ZONE_VISIT_STATE_ON_START = os.environ.get("RESET_ZONE_VISIT_STATE_ON_STAR
 DIAGNOSTIC_LOG_PATH = DATA / "zone_engine_diagnostic.log"
 
 
+def _effective_strategy_version() -> str:
+    """Return the exact strategy variant that is actually running."""
+    return STRATEGY_VERSION if ZONE_TRIGGER_MODE == "midpoint" else f"{STRATEGY_VERSION}-zone-touch-test"
+
+
+def _code_commit_sha() -> str | None:
+    """Best-effort repository revision for immutable trade/decision lineage."""
+    value = str(os.environ.get("GITHUB_SHA", "")).strip()
+    if value:
+        return value
+    if not (PROJECT_ROOT / ".git").exists():
+        return None
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=PROJECT_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        value = result.stdout.strip()
+        return value or None
+    except Exception:
+        return None
+
+
+CODE_COMMIT_SHA = _code_commit_sha()
+
+
 def _init_diagnostic_log() -> None:
     """Create one complete text log for the current engine run.
 
@@ -165,9 +202,64 @@ def _display_symbol(symbol: Any) -> str:
 
 
 def _append_jsonl(path: Path, obj: dict[str, Any]) -> None:
+    """Append one JSONL record with a cross-process lock and durable flush."""
     DATA.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(obj, ensure_ascii=False, default=str) + "\n")
+    lock_path = path.with_name(path.name + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(obj, ensure_ascii=False, default=str, allow_nan=False) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+        finally:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+
+def _record_entry_decision(
+    scan_id: str,
+    signal: dict[str, Any],
+    stage: str,
+    reason: str,
+    *,
+    selection_rank: int | None = None,
+    attempt_id: str | None = None,
+    execution_status: str | None = None,
+    terminal: bool | None = None,
+) -> None:
+    """Persist a compact, append-only decision lineage record.
+
+    This is intentionally separate from ``actions.jsonl`` (notifications) and
+    ``trades.jsonl`` (execution records). It closes the audit gap between a
+    generated signal and its eventual execution outcome.
+    """
+    event_id = str(signal.get("event_id", ""))
+    payload = {
+        "decision_id": hashlib.sha256(
+            f"{scan_id}:{event_id}:{stage}:{reason}:{attempt_id or ''}".encode("utf-8")
+        ).hexdigest().upper()[:24],
+        "scan_id": str(scan_id),
+        "ts": int(time.time() * 1000),
+        "stage": str(stage),
+        "reason": str(reason),
+        "event_id": event_id,
+        "symbol": str(signal.get("symbol", "")),
+        "direction": str(signal.get("type", "")),
+        "strategy_version": _effective_strategy_version(),
+        "code_commit_sha": CODE_COMMIT_SHA,
+        "trigger_bar_time": signal.get("trigger_bar_time") or signal.get("time"),
+        "selection_rank": selection_rank,
+        "attempt_id": attempt_id,
+        "execution_status": execution_status,
+        "terminal": terminal,
+    }
+    try:
+        ok = research.record_entry_decision(payload, path=ENTRY_DECISIONS_PATH)
+        if not ok:
+            log.error("[ENTRY_DECISION_WRITE_FAILED] event_id=%s stage=%s error=persistence_returned_false", event_id, stage)
+    except Exception as exc:
+        # Decision telemetry is fail-open by design, but the loss is visible in logs.
+        log.error("[ENTRY_DECISION_WRITE_FAILED] event_id=%s stage=%s error=%s", event_id, stage, exc)
 
 
 
@@ -433,6 +525,14 @@ def get_scan_symbols() -> list[str]:
 
 def _zone_visit_key(zone: dict[str, Any], kind: str) -> str:
     """Stable identity for one 1H zone across repeated scans."""
+    zone_id = str(zone.get("zone_id", "")).strip()
+    if zone_id:
+        return f"{kind.upper()}:{zone_id}"
+    origin_ts_ms = int(zone.get("origin_ts_ms", -1) or -1)
+    if origin_ts_ms > 0:
+        return f"{kind.upper()}:ORIGIN:{origin_ts_ms}:{float(zone.get('top', 0.0)):.12f}:{float(zone.get('btm', 0.0)):.12f}"
+    # Backward-compatible fallback for pre-fix in-memory callers only. Newly
+    # generated zones always carry origin_ts_ms/zone_id.
     return f"{kind.upper()}:{int(zone.get('start', -1))}:{float(zone.get('top', 0.0)):.12f}:{float(zone.get('btm', 0.0)):.12f}"
 
 
@@ -470,9 +570,15 @@ def _save_zone_visit_state(state: dict[str, Any]) -> None:
 
 
 def _make_5m_event_id(symbol: str, direction: str, trigger_ts_ms: int, zone: dict[str, Any]) -> str:
+    zone_id = str(zone.get("zone_id", "")).strip()
+    if zone_id:
+        zone_component = zone_id
+    else:
+        origin_ts_ms = int(zone.get("origin_ts_ms", -1) or -1)
+        zone_component = f"ORIGIN:{origin_ts_ms}:{float(zone.get('top', 0.0)):.12f}:{float(zone.get('btm', 0.0)):.12f}"
     raw = (
         f"ZONE5M:{symbol.upper()}:{direction.upper()}:{int(trigger_ts_ms)}:"
-        f"{int(zone.get('start', -1))}:{float(zone.get('top', 0.0)):.12f}:{float(zone.get('btm', 0.0)):.12f}"
+        f"{zone_component}"
     )
     return "ZONE_" + hashlib.sha256(raw.encode("utf-8")).hexdigest().upper()[:24]
 
@@ -584,7 +690,7 @@ def _build_5m_zone_signal(
         "tp1_rr": TP1_PCT / fixed_stop_pct,
         "tp2_rr": TP2_PCT / fixed_stop_pct,
         "strategy": "Demand/Supply Zone First",
-        "strategy_version": (STRATEGY_VERSION if ZONE_TRIGGER_MODE == "midpoint" else f"{STRATEGY_VERSION}-zone-touch-test"),
+        "strategy_version": _effective_strategy_version(),
         "entry_bar": entry_bar,
         "previous_bar": prev_bar_dict,
         "trigger": {
@@ -812,7 +918,11 @@ def _process_5m_zone_visits(
                     if diagnostics is not None:
                         zdiag = diagnostics["zones"][zone_key]
                         zdiag["rearms"] += 1
-                        diagnostics["rearm_events"].append({"zone_key": zone_key, "direction": direction, "timestamp": bar_ts.isoformat(), "close": close})
+                        diagnostics["rearm_events"].append({
+                            "zone_key": zone_key, "direction": direction, "timestamp": bar_ts.isoformat(), "close": close,
+                            "open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "volume": float(bar["volume"]),
+                            "visit_id": zs.get("visit_id")
+                        })
                         zdiag["state_after"] = "ARMED"
                     continue
             if zs.get("state") != "ARMED":
@@ -823,7 +933,14 @@ def _process_5m_zone_visits(
                 if bar_ts < activation_ts:
                     if diagnostics is not None:
                         diagnostics["zones"][zone_key]["activation_blocks"] += 1
-                    _set_decision("BLOCKED_ZONE_NOT_ACTIVE", zone_key=zone_key, direction=direction, timestamp=bar_ts.isoformat())
+                        diagnostics["touch_events"].append({
+                            "timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction,
+                            "midpoint": float((float(zone["top"]) + float(zone["btm"])) / 2.0),
+                            "state_before": zs.get("state", "ARMED"), "reason": "zone_not_active",
+                            "visit_id": zs.get("visit_id"),
+                            "bar": {"open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"]), "volume": float(bar["volume"])}
+                        })
+                    _set_decision("BLOCKED_ZONE_NOT_ACTIVE", zone_key=zone_key, direction=direction, reason="zone_not_active", timestamp=bar_ts.isoformat())
                     continue
             midpoint = (float(zone["top"]) + float(zone["btm"])) / 2.0
             zone_overlap = float(bar["low"]) <= float(zone["top"]) and float(bar["high"]) >= float(zone["btm"])
@@ -855,7 +972,7 @@ def _process_5m_zone_visits(
                 zs.update({"state": "LOCKED", "first_touch_ts": bar_ts.isoformat(), "last_touch_ts": bar_ts.isoformat(), "touch_count": int(zs.get("touch_count", 0)) + 1, "lock_reason": "ambiguous_overlap", "visit_id": f"{symbol}:{zone_key}:{int(bar_ts.timestamp()*1000)}"})
                 if diagnostics is not None:
                     diagnostics["zones"][zone_key]["ambiguous_blocks"] += 1
-                    diagnostics["touch_events"].append({"timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction, "midpoint": midpoint, "state_before": "ARMED", "reason": "ambiguous_overlap", "bar": {"open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"])}})
+                    diagnostics["touch_events"].append({"timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction, "midpoint": midpoint, "state_before": "ARMED", "reason": "ambiguous_overlap", "visit_id": zs.get("visit_id"), "bar": {"open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"]), "volume": float(bar["volume"])}})
                     diagnostics["zones"][zone_key]["state_after"] = "LOCKED"
                 _set_decision("BLOCKED_AMBIGUOUS", zone_key=zone_key, direction=direction, reason="ambiguous_overlap", timestamp=bar_ts.isoformat())
                 continue
@@ -890,7 +1007,7 @@ def _process_5m_zone_visits(
                 zs.update({"state": "LOCKED", "last_touch_ts": bar_ts.isoformat(), "touch_count": int(zs.get("touch_count", 0)) + 1})
                 if diagnostics is not None:
                     diagnostics["zones"][zone_key]["same_visit_blocks"] += 1
-                    diagnostics["touch_events"].append({"timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction, "midpoint": midpoint, "state_before": "LOCKED_OR_CONTINUOUS", "reason": ("previous_5m_midpoint_touch" if ZONE_TRIGGER_MODE == "midpoint" else "previous_5m_zone_touch"), "bar": {"open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"])}})
+                    diagnostics["touch_events"].append({"timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction, "midpoint": midpoint, "state_before": "LOCKED_OR_CONTINUOUS", "reason": ("previous_5m_midpoint_touch" if ZONE_TRIGGER_MODE == "midpoint" else "previous_5m_zone_touch"), "visit_id": zs.get("visit_id"), "touch_count_before_trigger": int(zs.get("touch_count", 0)), "bar": {"open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"]), "volume": float(bar["volume"])}})
                 _set_decision("BLOCKED_SAME_VISIT", zone_key=zone_key, direction=direction, reason=("previous_5m_midpoint_touch" if ZONE_TRIGGER_MODE == "midpoint" else "previous_5m_zone_touch"), timestamp=bar_ts.isoformat())
                 continue
             if not zs.get("first_touch_ts"):
@@ -911,7 +1028,7 @@ def _process_5m_zone_visits(
                     else:
                         diagnostics["zones"][zone_key]["other_rejects"] += 1
                         decision = "BLOCKED_SIGNAL_BUILD"
-                    diagnostics["touch_events"].append({"timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction, "midpoint": midpoint, "state_before": "ARMED", "reason": reason, "bar": {"open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"])}})
+                    diagnostics["touch_events"].append({"timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction, "midpoint": midpoint, "state_before": "ARMED", "reason": reason, "visit_id": zs.get("visit_id"), "touch_count_before_trigger": int(zs.get("touch_count", 0)), "bar": {"open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"]), "volume": float(bar["volume"])}})
                     diagnostics["zones"][zone_key]["state_after"] = "LOCKED"
                     _set_decision(decision, zone_key=zone_key, direction=direction, reason=reason, timestamp=bar_ts.isoformat())
                 continue
@@ -931,7 +1048,7 @@ def _process_5m_zone_visits(
                 })
                 if diagnostics is not None:
                     diagnostics["zones"][zone_key]["stale_touches"] += 1
-                    diagnostics["touch_events"].append({"timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction, "midpoint": midpoint, "state_before": "ARMED", "reason": ("stale_midpoint_touch_ignored" if ZONE_TRIGGER_MODE == "midpoint" else "stale_zone_touch_ignored"), "age_min": age_min, "bar": {"open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"])}})
+                    diagnostics["touch_events"].append({"timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction, "midpoint": midpoint, "state_before": "ARMED", "reason": ("stale_midpoint_touch_ignored" if ZONE_TRIGGER_MODE == "midpoint" else "stale_zone_touch_ignored"), "age_min": age_min, "visit_id": zs.get("visit_id"), "touch_count_before_trigger": int(zs.get("touch_count", 0)), "bar": {"open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"]), "volume": float(bar["volume"])}})
                 _set_decision("BLOCKED_STALE_TOUCH", zone_key=zone_key, direction=direction, reason=("stale_midpoint_touch_ignored" if ZONE_TRIGGER_MODE == "midpoint" else "stale_zone_touch_ignored"), timestamp=bar_ts.isoformat())
                 continue
             zs["trigger_event_id"] = event_id
@@ -946,6 +1063,7 @@ def _process_5m_zone_visits(
                     diagnostics["touch_events"].append({
                         "timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction,
                         "midpoint": midpoint, "state_before": "ARMED", "reason": "signal_created", "touch_mode": ZONE_TRIGGER_MODE,
+                        "visit_id": zs.get("visit_id"), "touch_count_before_trigger": int(zs.get("touch_count", 0)),
                         "event_id": event_id, "age_min": age_min,
                         "entry_ref": float(signal.get("entry", midpoint) or midpoint),
                         "sl_ref": float(signal.get("sl", 0.0) or 0.0),
@@ -953,7 +1071,8 @@ def _process_5m_zone_visits(
                         "tp2": float(signal.get("tp2", 0.0) or 0.0),
                         "obstacle_price": (signal.get("target") or {}).get("obstacle_price"),
                         "zone_age_bars": (signal.get("confirmation") or {}).get("zone_age_bars"),
-                        "bar": {"open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"])},
+                        "bar": {"open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"]), "volume": float(bar["volume"])},
+                        "previous_bar": ({"timestamp": pd.Timestamp(prev["timestamp"]).isoformat(), "open": float(prev["open"]), "high": float(prev["high"]), "low": float(prev["low"]), "close": float(prev["close"]), "volume": float(prev["volume"])} if prev is not None else {}),
                     })
                 _set_decision("SIGNAL_CREATED", zone_key=zone_key, direction=direction, reason="signal_created", timestamp=bar_ts.isoformat())
 
@@ -1328,9 +1447,9 @@ def _validate_trade_geometry(signal: dict[str, Any]) -> tuple[bool, str]:
         obstacle_price = float(obstacle_price) if obstacle_price is not None else None
     except (TypeError, ValueError):
         obstacle_price = None
-    min_room_r = float(os.environ.get("MIN_STRUCTURE_ROOM_R", "1.20"))
+    min_room_r = MIN_STRUCTURE_ROOM_R
     risk_abs = abs(entry - sl)
-    if obstacle_price is None and os.environ.get("REQUIRE_STRUCTURE_OBSTACLE", "true").lower() == "true":
+    if obstacle_price is None and REQUIRE_STRUCTURE_OBSTACLE:
         return False, "missing_structural_obstacle"
     if obstacle_price is not None and risk_abs > 0:
         room = (obstacle_price - entry) if direction == "LONG" else (entry - obstacle_price)
@@ -1604,15 +1723,23 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     # Do not open first and discover that the trigger-order endpoint is unavailable.
     # BingX can temporarily disable this endpoint under its trigger-frequency rule;
     # in that state there must be NO market entry because mandatory protection cannot
-    # be installed/verified safely.
+    # be installed/verified safely. Also clear any stale engine-owned protection on
+    # a flat symbol before the market order so old TP/SLs cannot consume protection
+    # capacity and cause an avoidable emergency rollback.
     try:
-        protection_preflight = get_open_protection_directional(symbol, direction)
+        protection_capacity = prepare_protection_capacity(symbol, direction)
     except Exception as exc:
-        protection_preflight = {"status": "error", "error": str(exc)}
-    if protection_preflight.get("status") != "ok":
-        reason = str(protection_preflight.get("error", "protection endpoint unavailable"))
+        protection_capacity = {"status": "error", "error": str(exc)}
+    if protection_capacity.get("status") not in {"ready"}:
+        reason = str(protection_capacity.get("error", protection_capacity.get("status", "protection capacity unavailable")))
         log.error("[EXEC_BLOCKED_PROTECTION_PRECHECK] %s %s | %s", symbol, direction, reason)
-        return {"status": "blocked_protection_preflight", "symbol": symbol, "direction": direction, "error": reason}
+        return {
+            "status": "blocked_protection_preflight",
+            "symbol": symbol,
+            "direction": direction,
+            "error": reason,
+            "protection_preflight": protection_capacity,
+        }
 
     # Revalidate against the actual BingX top-of-book immediately before MARKET.
     # The previous implementation validated the stale signal price and only
@@ -1726,13 +1853,16 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     pre_entry_bid = float(execution_quote["bid"])
     pre_entry_ask = float(execution_quote["ask"])
     executable_reference_price = pre_entry_ask if direction == "LONG" else pre_entry_bid
+    signed_entry_slippage_pct = None
     try:
+        signed_entry_slippage_pct = (avg_price - executable_reference_price) / executable_reference_price * 100.0
         execution_slippage_pct = (
             max(0.0, avg_price - pre_entry_ask) / pre_entry_ask * 100.0
             if direction == "LONG"
             else max(0.0, pre_entry_bid - avg_price) / pre_entry_bid * 100.0
         )
     except (TypeError, ValueError, ZeroDivisionError):
+        signed_entry_slippage_pct = float("inf")
         execution_slippage_pct = float("inf")
 
     if execution_slippage_pct > MAX_ENTRY_SLIPPAGE_PCT:
@@ -1752,6 +1882,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
             "pre_entry_ask": pre_entry_ask,
             "execution_reference_price": executable_reference_price,
             "signal_drift_pct": signal_drift_pct,
+            "signed_entry_slippage_pct": signed_entry_slippage_pct,
             "execution_slippage_pct": execution_slippage_pct,
             "executed_signal": dict(signal),
         }
@@ -1807,7 +1938,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     setup["entry_order"] = order if isinstance(order, dict) else {}
     setup["fill_position"] = position if isinstance(position, dict) else {}
     setup["execution_snapshot"] = {
-        "strategy_version": STRATEGY_VERSION,
+        "strategy_version": _effective_strategy_version(),
         "signal_entry": entry_price,
         "requested_entry": entry_price,
         "pre_entry_bid": pre_entry_bid,
@@ -1815,7 +1946,9 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         "execution_reference_price": executable_reference_price,
         "signal_drift_pct": signal_drift_pct,
         "fill_price": avg_price,
-        "entry_slippage_pct": execution_slippage_pct,
+        "entry_slippage_pct": signed_entry_slippage_pct,
+        "signed_entry_slippage_pct": signed_entry_slippage_pct,
+        "execution_slippage_pct": execution_slippage_pct,
         "adverse_entry_slippage_pct": execution_slippage_pct,
         "sl_price": sl_price,
         "tp1_price": tp1_price,
@@ -1827,6 +1960,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         "tp2_fraction": 0.50,
         "be_rule": "after_tp1_filled",
     }
+    setup["code_commit_sha"] = CODE_COMMIT_SHA
 
     log.info(
         "[EXEC_POST_FILL_REBASED] %s %s | fill=%s sl=%s tp1=%s tp2=%s tp1_rr=%.3f tp2_rr=%.3f target_source=%s",
@@ -1884,7 +2018,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         "position": position,
         "protection": protection,
         "execution_snapshot": {
-            "strategy_version": STRATEGY_VERSION,
+            "strategy_version": _effective_strategy_version(),
             "signal_entry": entry_price,
             "requested_entry": entry_price,
             "pre_entry_bid": pre_entry_bid,
@@ -1892,7 +2026,9 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
             "execution_reference_price": executable_reference_price,
             "signal_drift_pct": signal_drift_pct,
             "fill_price": avg_price,
-            "entry_slippage_pct": execution_slippage_pct,
+            "entry_slippage_pct": signed_entry_slippage_pct,
+            "signed_entry_slippage_pct": signed_entry_slippage_pct,
+            "execution_slippage_pct": execution_slippage_pct,
             "adverse_entry_slippage_pct": execution_slippage_pct,
             "sl_price": sl_price,
             "tp1_price": tp1_price,
@@ -1932,6 +2068,17 @@ def main() -> None:
         "[RUN_DIAGNOSTIC] scan_id=%s strategy=%s | universe=%s | trigger=5m_%s | zone_tf=1h | stop=%.2f%% | tp1=%.2f%% | tp2=%.2f%% | be=after_tp1_filled | max_5m_age_min=%.1f | structure_min=%.2fR | data_stale_hours=%.2f",
         scan_id, (STRATEGY_VERSION if ZONE_TRIGGER_MODE == "midpoint" else f"{STRATEGY_VERSION}-zone-touch-test"), ("150" if FUNDAMENTAL_WHITELIST_ENABLED else "ALL_ACTIVE_BINGX"), ZONE_TRIGGER_MODE, FIXED_STOP_PCT, TP1_PCT, TP2_PCT,
         MAX_5M_TRIGGER_AGE_MINUTES, MIN_STRUCTURE_ROOM_R, MAX_DATA_STALENESS_HOURS,
+    )
+    research.update_manifest_run(
+        scan_id=scan_id, code_commit_sha=CODE_COMMIT_SHA,
+        effective_config={
+            "execution_enabled": EXECUTION_ENABLED, "fundamental_whitelist_enabled": FUNDAMENTAL_WHITELIST_ENABLED,
+            "zone_trigger_mode": ZONE_TRIGGER_MODE, "fixed_stop_pct": FIXED_STOP_PCT,
+            "tp1_pct": TP1_PCT, "tp2_pct": TP2_PCT, "min_structure_room_r": MIN_STRUCTURE_ROOM_R,
+            "require_directional_candle": REQUIRE_DIRECTIONAL_CANDLE, "require_structure_obstacle": REQUIRE_STRUCTURE_OBSTACLE,
+            "max_trades_per_cycle": MAX_TRADES_PER_CYCLE, "max_entry_slippage_pct": MAX_ENTRY_SLIPPAGE_PCT,
+            "max_market_spread_pct": MAX_MARKET_SPREAD_PCT, "max_5m_trigger_age_minutes": MAX_5M_TRIGGER_AGE_MINUTES,
+        },
     )
 
     # 1) Private account layer is optional for a scan. Never let missing credentials
@@ -1989,6 +2136,41 @@ def main() -> None:
         elif asset_class == "EQUITY":
             item["market_provider"] = "bingx"
         analysis_universe.append(item)
+
+    # Research-only account context is fetched once per scan and reused by all observations.
+    research_account_context = None
+    if research.RESEARCH_ENABLED:
+        try:
+            research_account_context = fetch_research_account_snapshot()
+            if research_account_context is not None:
+                research_account_context["scan_id"] = scan_id
+                research_account_context["strategy_version"] = _effective_strategy_version()
+                research_account_context["code_commit_sha"] = CODE_COMMIT_SHA
+                research_account_context["account_context_id"] = research_account_context.get("account_context_id") or research.stable_id(
+                    "account-context-v1", scan_id, research_account_context.get("captured_at_ms", ""), prefix="AC_"
+                )
+                research_account_context["persisted"] = bool(research.record_account_context(research_account_context))
+        except Exception as exc:
+            log.warning("[RESEARCH_ACCOUNT] account context unavailable: %s", exc)
+
+    # Research-only BTC context is fetched once per scan and reused by all symbol observations.
+    btc_research_df_5m = pd.DataFrame()
+    btc_research_df_1h = pd.DataFrame()
+    if research.RESEARCH_ENABLED:
+        try:
+            btc_raw_5m = fetch_binance_klines("BTCUSDT", interval="5m", limit=288, retryable=False)
+            if btc_raw_5m:
+                btc_research_df_5m = pd.DataFrame(btc_raw_5m)
+                research.persist_market_bars("BTC-USDT", "5m", btc_raw_5m, provider="binance", source="binance_spot_btc_context", scan_id=scan_id, code_commit_sha=CODE_COMMIT_SHA)
+        except Exception as exc:
+            log.warning("[RESEARCH_BTC] 5m context unavailable: %s", exc)
+        try:
+            btc_raw_1h = fetch_binance_klines("BTCUSDT", interval="1h", limit=300, retryable=False)
+            if btc_raw_1h:
+                btc_research_df_1h = pd.DataFrame(btc_raw_1h)
+                research.persist_market_bars("BTC-USDT", "1h", btc_raw_1h, provider="binance", source="binance_spot_btc_context", scan_id=scan_id, code_commit_sha=CODE_COMMIT_SHA)
+        except Exception as exc:
+            log.warning("[RESEARCH_BTC] 1h context unavailable: %s", exc)
 
     symbols = [str(item["bingx_symbol"]) for item in analysis_universe]
     analysis_meta = {str(item["bingx_symbol"]): item for item in analysis_universe}
@@ -2051,6 +2233,7 @@ def main() -> None:
                 }
 
             df, supply, demand, signals = generate_zone_signals(pd.DataFrame(bars), symbol=symbol, mode=DIAGNOSTICS_MODE)
+            research.persist_market_bars(symbol, "1h", bars, provider=provider, source=source_name, scan_id=scan_id, code_commit_sha=CODE_COMMIT_SHA)
             latest_price = float(df["close"].iloc[-1])
             bingx_price = _bingx_last_price(contract)
             latest_closed_idx = len(df) - 1
@@ -2092,6 +2275,7 @@ def main() -> None:
             # observable to a 5-minute cron. Zone-visit state prevents repeated entries
             # while price chops around the same zone.
             zone_signals: list[dict[str, Any]] = []
+            trigger_bars_raw: list[dict[str, Any]] = []
             symbol_state = zone_visit_state.get("symbols", {}).get(symbol, {}) if isinstance(zone_visit_state.get("symbols"), dict) else {}
             five_min_diag: dict[str, Any] = {
                 "decision": {
@@ -2151,6 +2335,10 @@ def main() -> None:
                     "zone_visit_id": (sig.get("zone_visit") or {}).get("visit_id"),
                 }
 
+            # Keep an immutable copy for research even when the later market gate rejects
+            # the signal. Research must observe the full candidate population.
+            research_signals = list(recent)
+
             # Only validate BingX live price when a fresh 5m trigger exists. This keeps
             # the full-market scan on Binance while spending extra venue requests only
             # on actionable candidates.
@@ -2184,9 +2372,82 @@ def main() -> None:
                     "bingx_live_price": bingx_price,
                     "binance_live_price": binance_live_price,
                     "market_spread_pct": spread_pct,
+                    "venue_price_deviation_pct": spread_pct,
+                    "market_spread_metric": "cross_venue_price_deviation",
                     "scan_time": pd.Timestamp.now(tz="UTC").isoformat(),
                     "trigger_age_minutes_at_scan": max(0.0, (pd.Timestamp.now(tz="UTC") - trigger_ts).total_seconds() / 60.0),
                 })
+
+            # Research market snapshot is captured only for symbols that reached at least one
+            # observation boundary. It is best-effort and never gates production execution.
+            # Raw market bars are persisted only for boundary symbols so a 5-minute universe scan
+            # does not grow the journal with irrelevant 5m history.
+            research_context = None
+            research_bars_5m_raw = []
+            research_bars_1h_raw = []
+            touch_events = five_min_diag.get("touch_events") or []
+            rearm_events = five_min_diag.get("rearm_events") or []
+            has_nearest = any(isinstance(z, dict) and isinstance(z.get("closest_midpoint_bar"), dict) for z in (five_min_diag.get("zones") or {}).values())
+            rich_nearest_context = os.environ.get("RESEARCH_CONTEXT_NEAREST_APPROACH", "false").lower() == "true"
+            rich_rejection_context = os.environ.get("RESEARCH_CONTEXT_FOR_REJECTIONS", "false").lower() == "true"
+            boundary_types: list[str] = []
+            if research_signals:
+                boundary_types.append("SIGNAL_CREATED")
+            if touch_events:
+                boundary_types.extend(sorted({str(e.get("reason", "TOUCH_EVENT")) for e in touch_events if isinstance(e, dict)}))
+            if rearm_events:
+                boundary_types.append("REARM")
+            if has_nearest and rich_nearest_context:
+                boundary_types.append("NEAREST_APPROACH")
+            has_research_boundary = bool(boundary_types)
+            if research.RESEARCH_ENABLED and has_research_boundary:
+                research_bars_1h_raw = bars
+                research_bars_5m_raw = trigger_bars_raw
+            collect_rich_context = bool(research_signals) or (rich_rejection_context and bool(touch_events or rearm_events))
+            if research.RESEARCH_ENABLED and has_research_boundary and collect_rich_context:
+                # Pull a larger 5m history only for research-boundary symbols. This gives
+                # enough lookback for 12h/24h returns without increasing the production
+                # trigger fetch for the entire universe.
+                try:
+                    research_limit = max(
+                        len(trigger_bars_raw),
+                        int(os.environ.get("RESEARCH_5M_HISTORY_LIMIT", "288")),
+                    )
+                    if research_limit > len(trigger_bars_raw):
+                        if provider == "bingx":
+                            research_bars_5m_raw = fetch_bingx_klines(symbol, "5m", limit=research_limit, retryable=False)
+                        else:
+                            research_bars_5m_raw = fetch_binance_klines(binance_symbol, "5m", limit=research_limit, retryable=False)
+                except Exception as bar_exc:
+                    log.warning("[RESEARCH_BARS] %s | extended 5m history unavailable: %s", _display_symbol(symbol), bar_exc)
+                try:
+                    research_context = fetch_research_market_context(
+                        symbol,
+                        depth_limit=max(5, int(os.environ.get("RESEARCH_DEPTH_LEVELS", "20"))),
+                        trades_limit=max(10, int(os.environ.get("RESEARCH_RECENT_TRADES_LIMIT", "100"))),
+                    )
+                    if research_context is not None:
+                        research_context.update({
+                            "asset_class": meta.get("asset_class", "UNKNOWN"),
+                            "analysis_provider": provider,
+                            "analysis_source": source_name,
+                            "binance_symbol": binance_symbol,
+                            "boundary_types": sorted(set(boundary_types)),
+                            "boundary_event_ids": [str(s.get("event_id")) for s in research_signals if s.get("event_id")],
+                        })
+                except Exception as context_exc:
+                    log.warning("[RESEARCH_CONTEXT] %s | collection failed: %s", _display_symbol(symbol), context_exc)
+
+            # Research is persisted after all pre-entry market-context fields are known,
+            # but before any production gate can remove a candidate from the population.
+            research.record_scan_symbol(
+                scan_id=scan_id, symbol=symbol, strategy_version=_effective_strategy_version(),
+                code_commit_sha=CODE_COMMIT_SHA, provider=provider, source=source_name,
+                bars_1h=research_bars_1h_raw, bars_5m=research_bars_5m_raw, df_1h=df, demand=demand, supply=supply,
+                diagnostics=five_min_diag, symbol_state=symbol_state, signals=research_signals,
+                decision_ts=pd.Timestamp.now(tz="UTC").isoformat(), market_context=research_context,
+                account_context=research_account_context, btc_df_5m=btc_research_df_5m, btc_df_1h=btc_research_df_1h,
+            )
 
             if spread_pct is not None and spread_pct > MAX_MARKET_SPREAD_PCT:
                 log.warning("[MARKET_SPREAD] %s | Binance=%s | BingX=%s | spread=%.4f%% > %.4f%%", _display_symbol(symbol), binance_live_price, bingx_price, spread_pct, MAX_MARKET_SPREAD_PCT)
@@ -2206,6 +2467,8 @@ def main() -> None:
                 "binance_price": latest_price,
                 "bingx_price": bingx_price,
                 "market_spread_pct": spread_pct,
+                "venue_price_deviation_pct": spread_pct,
+                "market_spread_metric": "cross_venue_price_deviation",
                 "market_source": source_name,
                 "binance_symbol": binance_symbol,
                 "asset_class": meta.get("asset_class", "UNKNOWN"),
@@ -2279,6 +2542,14 @@ def main() -> None:
         total, scan_errors, scan_skips, len(fresh_signals), time.time() - started,
     )
 
+    # Normalize execution-facing metadata once at the runtime boundary. The
+    # signal builder keeps the base strategy version for backwards-compatible
+    # analytics, while the live workflow may select a trigger-mode variant.
+    effective_version = _effective_strategy_version()
+    for sig in fresh_signals:
+        sig["strategy_version"] = effective_version
+        sig["code_commit_sha"] = CODE_COMMIT_SHA
+
     # Persist visit locks before any exchange execution. A process crash after scanning
     # must not make the same midpoint visit eligible again on the next cron run.
     _save_zone_visit_state(zone_visit_state)
@@ -2292,12 +2563,27 @@ def main() -> None:
         previous_key = (int(previous.get("idx", 0)), float(previous.get("score", 0.0))) if previous else None
         if previous is None or candidate_key > previous_key:
             latest_by_symbol[symbol_key] = signal
+            if previous is not None:
+                _record_entry_decision(
+                    scan_id,
+                    previous,
+                    "SIGNAL_DEDUPLICATED",
+                    "newer_signal_same_symbol_selected",
+                )
+        else:
+            _record_entry_decision(
+                scan_id,
+                signal,
+                "SIGNAL_DEDUPLICATED",
+                "older_signal_same_symbol_not_selected",
+            )
 
     executable: list[dict[str, Any]] = []
     exec_gate_stats: dict[str, int] = {}
 
     def _exec_gate(reason: str, signal: dict[str, Any]) -> None:
         exec_gate_stats[reason] = exec_gate_stats.get(reason, 0) + 1
+        _record_entry_decision(scan_id, signal, "EXECUTION_GATE_REJECT", reason)
         log.info(
             "[EXEC_GATE] %s | direction=%s | event_id=%s | gate=%s",
             _display_symbol(signal.get("symbol")), signal.get("type"), signal.get("event_id"), reason,
@@ -2378,9 +2664,33 @@ def main() -> None:
     log.info("[EXEC_GATE_SUMMARY] input_signals=%d executable=%d rejected=%d reasons=%s", len(latest_by_symbol), len(executable), sum(exec_gate_stats.values()), json.dumps(exec_gate_stats, ensure_ascii=False, sort_keys=True))
 
     executed = 0
-    for signal in executable[:MAX_TRADES_PER_CYCLE]:
+    selected_signals = executable[:MAX_TRADES_PER_CYCLE]
+    cycle_cap_signals = executable[MAX_TRADES_PER_CYCLE:]
+    for rank, signal in enumerate(cycle_cap_signals, start=MAX_TRADES_PER_CYCLE + 1):
+        _record_entry_decision(
+            scan_id,
+            signal,
+            "CYCLE_CAP",
+            "max_trades_per_cycle_reached",
+            selection_rank=rank,
+        )
+        log.warning(
+            "[EXEC_CYCLE_CAP] symbol=%s direction=%s event_id=%s rank=%d cap=%d score=%.2f trigger=%s",
+            signal.get("symbol"), signal.get("type"), signal.get("event_id"), rank,
+            MAX_TRADES_PER_CYCLE, signal.get("score", 0.0), signal.get("trigger_bar_time") or signal.get("time"),
+        )
+
+    for rank, signal in enumerate(selected_signals, start=1):
+        _record_entry_decision(
+            scan_id,
+            signal,
+            "EXECUTION_SELECTED",
+            "selected_within_cycle_cap",
+            selection_rank=rank,
+        )
         if not EXECUTION_ENABLED:
             _send_signal(signal, {"status": "DISABLED"})
+            _record_entry_decision(scan_id, signal, "EXECUTION_RESULT", "execution_disabled", selection_rank=rank, execution_status="DISABLED")
             continue
         log.info(
             "[EXEC_SIGNAL] symbol=%s direction=%s signal_idx=%s signal_time=%s age_bars=%s "
@@ -2406,13 +2716,16 @@ def main() -> None:
                 "signal": signal,
                 "result": blocked,
             })
+            _record_entry_decision(scan_id, signal, "EXECUTION_RESULT", "missing_private_credentials", selection_rank=rank, execution_status=blocked.get("status"), terminal=True)
             _send_signal(signal, blocked)
             continue
         event_id = str(signal["event_id"])
         claimed, claim_reason, attempt_id = _claim_event_for_execution(event_id)
         if not claimed:
+            _record_entry_decision(scan_id, signal, "EXECUTION_CLAIM", claim_reason, selection_rank=rank, execution_status="CLAIM_REJECTED", terminal=(claim_reason in {"terminal", "completed", "claim_error"}))
             log.info("[EXEC_SKIP_CLAIM] %s %s | event_id=%s reason=%s", signal["symbol"], signal["type"], event_id, claim_reason)
             continue
+        _record_entry_decision(scan_id, signal, "EXECUTION_CLAIM", "claimed", selection_rank=rank, attempt_id=attempt_id, execution_status="CLAIMED", terminal=False)
         execution = execute_new_position(signal)
         execution["attempt_id"] = attempt_id
         execution_status = str(execution.get("status", ""))
@@ -2434,6 +2747,16 @@ def main() -> None:
                 terminal_failure = False
         else:
             terminal_failure = False
+        _record_entry_decision(
+            scan_id,
+            signal,
+            "EXECUTION_RESULT",
+            execution_status or "empty_execution_status",
+            selection_rank=rank,
+            attempt_id=attempt_id,
+            execution_status=execution_status,
+            terminal=(True if execution_status == "opened_protected" else bool(_is_terminal_execution_failure(execution))),
+        )
         if execution_status == "opened_protected":
             _finalize_event_claim(event_id, attempt_id, terminal=True, status=execution_status)
         elif _is_terminal_execution_failure(execution):
@@ -2448,7 +2771,8 @@ def main() -> None:
             "symbol": signal["symbol"],
             "direction": signal["type"],
             "score": signal["score"],
-            "strategy_version": signal.get("strategy_version", STRATEGY_VERSION),
+            "strategy_version": signal.get("strategy_version", _effective_strategy_version()),
+            "code_commit_sha": CODE_COMMIT_SHA,
             "entry_rule": (signal.get("trigger") or {}).get("zone_entry_rule"),
             "zone_midpoint": signal.get("zone_midpoint") or (signal.get("trigger") or {}).get("zone_midpoint"),
             "stop_pct": (signal.get("risk_model") or {}).get("fixed_stop_pct"),
