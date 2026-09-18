@@ -7,6 +7,7 @@ import math
 import os
 import tempfile
 import logging
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -19,7 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 
 RESEARCH_ENABLED = os.environ.get("RESEARCH_ENABLED", "true").lower() == "true"
-RESEARCH_SCHEMA_VERSION = 1
+RESEARCH_SCHEMA_VERSION = 2
 
 ZONE_OBSERVATIONS_PATH = DATA_DIR / "zone_observations.jsonl"
 ENTRY_DECISIONS_PATH = DATA_DIR / "entry_decisions.jsonl"
@@ -36,6 +37,9 @@ ACCOUNT_CONTEXT_PATH = DATA_DIR / "account_context.jsonl"
 INITIAL_1H_BARS = max(1, int(os.environ.get("RESEARCH_INITIAL_1H_BARS", "48")))
 INITIAL_5M_BARS = max(1, int(os.environ.get("RESEARCH_INITIAL_5M_BARS", "24")))
 NEAREST_APPROACH_MAX_PCT = max(0.0, float(os.environ.get("RESEARCH_NEAREST_APPROACH_MAX_PCT", "1.0")))
+
+_OBSERVATION_SEEN_IDS: set[str] | None = None
+_OBSERVATION_SEEN_LOCK = threading.RLock()
 
 
 def _now_iso() -> str:
@@ -205,7 +209,64 @@ def _record_error(kind: str, path: Path, exc: Exception, *, symbol: str | None =
         logging.getLogger(__name__).error("research persistence error: %s", payload)
 
 
+def _load_existing_observation_ids() -> set[str]:
+    ids: set[str] = set()
+    path = ZONE_OBSERVATIONS_PATH
+    if not path.exists():
+        return ids
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                text = line.strip()
+                if not text:
+                    continue
+                try:
+                    row = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict) and row.get("observation_id"):
+                    ids.add(str(row["observation_id"]))
+    except OSError as exc:
+        log.warning("[RESEARCH_OBSERVATION_INDEX_LOAD_FAILED] path=%s error=%s", path, exc)
+    return ids
+
+
+def pending_forward_symbols(*, horizon_hours: float = 24.0) -> set[str]:
+    """Return symbols with observations whose 24h forward path is still maturing.
+
+    This is intentionally read-only and is used by the scan to keep persisting fresh
+    5m bars even when a symbol has no new observation in the current scan.
+    """
+    if not RESEARCH_ENABLED or not ZONE_OBSERVATIONS_PATH.exists():
+        return set()
+    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=max(1.0, float(horizon_hours)))
+    out: set[str] = set()
+    try:
+        with ZONE_OBSERVATIONS_PATH.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                text = line.strip()
+                if not text:
+                    continue
+                try:
+                    row = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    ts = _parse_timestamp(row.get("observation_ts"))
+                except Exception:
+                    ts = None
+                symbol = str(row.get("symbol", "")).upper().strip()
+                if symbol and ts is not None and ts >= cutoff:
+                    out.add(symbol)
+    except OSError as exc:
+        log.warning("[RESEARCH_PENDING_SYMBOLS_FAILED] path=%s error=%s", ZONE_OBSERVATIONS_PATH, exc)
+    return out
+
+
 def record_zone_observations(records: Iterable[dict[str, Any]]) -> int:
+    global _OBSERVATION_SEEN_IDS
     if not RESEARCH_ENABLED:
         return 0
     rows = []
@@ -224,24 +285,36 @@ def record_zone_observations(records: Iterable[dict[str, Any]]) -> int:
                 visit_id=str(payload.get("zone_visit_id", "")),
             )
         rows.append(payload)
-    unique_rows = []
-    seen_ids: set[str] = set()
-    for row in rows:
-        oid = str(row.get("observation_id", ""))
-        if oid and oid in seen_ids:
-            continue
-        if oid:
-            seen_ids.add(oid)
-        unique_rows.append(row)
-    rows = unique_rows
-    try:
-        count = _append_jsonl_locked(ZONE_OBSERVATIONS_PATH, rows)
-        _bump_manifest("zone_observations_written", count)
-        return count
-    except Exception as exc:
-        _record_error("zone_observation_write", ZONE_OBSERVATIONS_PATH, exc)
-        _bump_manifest("persistence_errors", 1)
-        return 0
+
+    # Cross-scan idempotency: observation_id is the logical research boundary ID.
+    # Keep only the first occurrence so repeated cron scans cannot overweight one event.
+    with _OBSERVATION_SEEN_LOCK:
+        if _OBSERVATION_SEEN_IDS is None:
+            _OBSERVATION_SEEN_IDS = _load_existing_observation_ids()
+        unique_rows: list[dict[str, Any]] = []
+        batch_seen: set[str] = set()
+        skipped = 0
+        for row in rows:
+            oid = str(row.get("observation_id", ""))
+            if oid and (oid in _OBSERVATION_SEEN_IDS or oid in batch_seen):
+                skipped += 1
+                continue
+            if oid:
+                batch_seen.add(oid)
+            unique_rows.append(row)
+        try:
+            count = _append_jsonl_locked(ZONE_OBSERVATIONS_PATH, unique_rows)
+            if count:
+                _OBSERVATION_SEEN_IDS.update(str(r["observation_id"]) for r in unique_rows if r.get("observation_id"))
+            if count:
+                _bump_manifest("zone_observations_written", count)
+            if skipped:
+                _bump_manifest("observation_duplicates_skipped", skipped)
+            return count
+        except Exception as exc:
+            _record_error("zone_observation_write", ZONE_OBSERVATIONS_PATH, exc)
+            _bump_manifest("persistence_errors", 1)
+            return 0
 
 
 def record_entry_decision(row: dict[str, Any], *, path: Path | None = None) -> bool:
@@ -882,6 +955,16 @@ def build_research_features(
     return sanitize(features)
 
 
+def _elapsed_minutes_safe(start_ts: Any, end_ts: Any) -> float | None:
+    try:
+        a = _parse_timestamp(start_ts); b = _parse_timestamp(end_ts)
+        if a is None or b is None:
+            return None
+        return max(0.0, (b - a).total_seconds() / 60.0)
+    except Exception:
+        return None
+
+
 def _safe_float(value: Any) -> float | None:
     try:
         x = float(value)
@@ -1053,6 +1136,7 @@ def _observation_from_signal(
     zone = dict(signal.get("zone") or {})
     direction = str(signal.get("type", "")).upper()
     bar = dict(signal.get("entry_bar") or {})
+    ts = signal.get("trigger_bar_time") or signal.get("time")
     features = build_research_features(
         symbol=str(signal.get("symbol", "")),
         direction=direction,
@@ -1072,10 +1156,15 @@ def _observation_from_signal(
         "signal_drift_pct": signal.get("signal_drift_pct"),
         "market_spread_pct": (signal.get("market_snapshot") or {}).get("market_spread_pct"),
         "venue_price_deviation_pct": (signal.get("market_snapshot") or {}).get("venue_price_deviation_pct"),
-        "execution_age_minutes": signal.get("execution_age_minutes"),
+        # Execution age does not exist yet when this observation is created: the
+        # observation is persisted before the execution stage. Keep it explicitly
+        # null rather than copying a later-mutated signal field. Join actual
+        # execution age later via event_id -> entry_decisions / trades.
+        "execution_age_minutes": None,
         "execution_age_bars": signal.get("execution_age_bars"),
+        "execution_age_semantics": "not_available_at_observation_generation",
+        "trigger_to_observation_minutes": _elapsed_minutes_safe(ts, decision_ts),
     })
-    ts = signal.get("trigger_bar_time") or signal.get("time")
     event_id = str(signal.get("event_id", ""))
     zid = str(zone.get("zone_id", ""))
     visit_id = str((signal.get("zone_visit") or {}).get("visit_id") or (signal.get("trigger") or {}).get("zone_visit_id") or "")
@@ -1172,6 +1261,7 @@ def record_scan_symbol(
     account_context: dict[str, Any] | None = None,
     btc_df_5m: pd.DataFrame | None = None,
     btc_df_1h: pd.DataFrame | None = None,
+    persist_bars_for_forward: bool = False,
 ) -> dict[str, int]:
     """Persist one symbol's shadow observations and market bars.
 
@@ -1317,7 +1407,7 @@ def record_scan_symbol(
     # Persist raw market bars only when this symbol produced at least one research observation.
     # This keeps the low-level API safe even when called directly, and prevents irrelevant
     # 5m/1h universe history from growing the research journals.
-    if observations:
+    if observations or persist_bars_for_forward:
         counts["bars_1h"] = persist_market_bars(
             symbol, "1h", bars_1h, provider=provider, source=source, scan_id=scan_id, code_commit_sha=code_commit_sha
         )
@@ -1343,12 +1433,7 @@ def record_scan_symbol(
         observation["account_context_age_ms_at_decision"] = account_context_age_ms_at_decision
 
     try:
-        expected = len({str(r.get("observation_id", "")) for r in observations if r.get("observation_id")})
         counts["observations"] = record_zone_observations(observations)
-        if counts["observations"] != expected:
-            exc = RuntimeError(f"research observation persistence mismatch: expected={expected} written={counts['observations']}")
-            _record_error("scan_symbol_observation_batch", ZONE_OBSERVATIONS_PATH, exc, symbol=symbol)
-            _bump_manifest("persistence_errors", 1)
     except Exception as exc:
         _record_error("scan_symbol_observation_batch", ZONE_OBSERVATIONS_PATH, exc, symbol=symbol)
     return counts
