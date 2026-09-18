@@ -1,4 +1,4 @@
-# Zone Engine Shadow Research Schema v1
+# Zone Engine Shadow Research Schema v2
 
 Research telemetry is observational only. It does not gate or modify production entries.
 
@@ -20,7 +20,8 @@ Research telemetry is observational only. It does not gate or modify production 
 
 - `zone_id` is stable across rolling DataFrame windows because it uses zone origin timestamp and geometry. `provider` is stored on observations and bars so forward outcomes never mix venues when the same symbol has data from more than one provider.
 - `bar_id` is deterministic from symbol, timeframe, timestamp and provider.
-- `observation_id` is deterministic from event type, symbol, direction, zone identity, observation timestamp and visit identity.
+- `observation_id` is deterministic from event type, symbol, direction, zone identity, source event timestamp and visit identity. It is therefore stable across repeated cron scans of the same logical event.
+- `record_zone_observations()` is idempotent across process calls for an existing journal: an already-seen `observation_id` is not appended again. The manifest records `observation_duplicates_skipped`.
 - `decision_id` is deterministic from scan, event, stage, reason and attempt identity.
 
 ## Shadow feature families
@@ -62,6 +63,9 @@ Funding, OI, CVD, FVG, liquidity sweeps, BTC context and session state are inten
 - execution quote provenance: `quote_source`, `quote_sources_attempted`, `quote_fallback_reason`, `quote_time` are recorded on execution snapshots.
 
 These fields are observational only. No funding, OI, order-book or flow value is used as a production gate.
+
+### Forward-path persistence
+Symbols with observations younger than the 24h outcome horizon are treated as pending-forward symbols. The main scan continues persisting newly closed 5m/1h bars for those symbols even if the zone has disappeared and there is no new observation. This prevents a valid observation from becoming permanently censored merely because the zone stopped generating new events. The pending 5m fetch is limited to a small incremental window and is research-only.
 
 ### Nearest-approach cost control
 Nearest-approach observations remain enabled as cheap analytical boundaries, but the expensive four-endpoint BingX microstructure snapshot is disabled for nearest-only boundaries by default (`RESEARCH_CONTEXT_NEAREST_APPROACH=false`). Rich market context is collected by default for `SIGNAL_CREATED` boundaries; rejected-touch/rearm boundaries keep the full OHLCV-derived research feature set but do not delay the trading cycle with extra private/public context requests unless `RESEARCH_CONTEXT_FOR_REJECTIONS=true` is explicitly enabled. This keeps observational enrichment from changing production execution timing.

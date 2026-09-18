@@ -234,12 +234,13 @@ def _record_entry_decision(
     generated signal and its eventual execution outcome.
     """
     event_id = str(signal.get("event_id", ""))
+    decision_ts = pd.Timestamp.now(tz="UTC")
     payload = {
         "decision_id": hashlib.sha256(
             f"{scan_id}:{event_id}:{stage}:{reason}:{attempt_id or ''}".encode("utf-8")
         ).hexdigest().upper()[:24],
         "scan_id": str(scan_id),
-        "ts": int(time.time() * 1000),
+        "ts": int(decision_ts.timestamp() * 1000),
         "stage": str(stage),
         "reason": str(reason),
         "event_id": event_id,
@@ -252,6 +253,11 @@ def _record_entry_decision(
         "attempt_id": attempt_id,
         "execution_status": execution_status,
         "terminal": terminal,
+        "decision_ts": decision_ts.isoformat(),
+        "execution_gate_ts": signal.get("execution_gate_ts"),
+        "execution_age_minutes": signal.get("execution_age_minutes"),
+        "execution_age_semantics": "trigger_to_execution_gate_when_available",
+        "trigger_to_decision_minutes": _elapsed_minutes(signal.get("trigger_bar_time") or signal.get("time"), decision_ts),
     }
     try:
         ok = research.record_entry_decision(payload, path=ENTRY_DECISIONS_PATH)
@@ -2248,6 +2254,13 @@ def main() -> None:
         except Exception as exc:
             log.warning("[RESEARCH_BTC] 1h context unavailable: %s", exc)
 
+    research_pending_forward_symbols: set[str] = set()
+    if research.RESEARCH_ENABLED:
+        try:
+            research_pending_forward_symbols = research.pending_forward_symbols(horizon_hours=24.0)
+        except Exception as exc:
+            log.warning("[RESEARCH_PENDING_SYMBOLS] unable to load pending symbols: %s", exc)
+
     symbols = [str(item["bingx_symbol"]) for item in analysis_universe]
     analysis_meta = {str(item["bingx_symbol"]): item for item in analysis_universe}
     crypto_n = sum(1 for x in analysis_universe if str(x.get("asset_class")).upper() == "CRYPTO")
@@ -2389,6 +2402,18 @@ def main() -> None:
                 )
                 zone_visit_state.setdefault("symbols", {})[symbol] = symbol_state
             else:
+                # A symbol may have a still-maturing research observation even after
+                # its zone disappears. Keep persisting new 5m bars for that symbol so
+                # the 24h forward path can actually mature. This is research-only.
+                if research.RESEARCH_ENABLED and str(symbol).upper() in research_pending_forward_symbols:
+                    try:
+                        pending_limit = max(12, int(os.environ.get("RESEARCH_PENDING_5M_FETCH_LIMIT", "24")))
+                        if provider == "bingx":
+                            trigger_bars_raw = fetch_bingx_klines(symbol, "5m", limit=pending_limit, retryable=False)
+                        else:
+                            trigger_bars_raw = fetch_binance_klines(binance_symbol, "5m", limit=pending_limit, retryable=False)
+                    except Exception as pending_exc:
+                        log.warning("[RESEARCH_PENDING_BARS] %s | 5m fetch unavailable: %s", _display_symbol(symbol), pending_exc)
                 zone_visit_state.setdefault("symbols", {})[symbol] = {
                     "version": ZONE_VISIT_STATE_VERSION,
                     "zones": {},
@@ -2537,6 +2562,7 @@ def main() -> None:
                 bars_1h=research_bars_1h_raw, bars_5m=research_bars_5m_raw, df_1h=df, demand=demand, supply=supply,
                 diagnostics=five_min_diag, symbol_state=symbol_state, signals=research_signals,
                 decision_ts=pd.Timestamp.now(tz="UTC").isoformat(), market_context=research_context,
+                persist_bars_for_forward=(str(symbol).upper() in research_pending_forward_symbols),
                 account_context=research_account_context, btc_df_5m=btc_research_df_5m, btc_df_1h=btc_research_df_1h,
             )
 
@@ -2893,6 +2919,9 @@ def main() -> None:
             "stop_pct": (signal.get("risk_model") or {}).get("fixed_stop_pct"),
             "tp1_pct": (signal.get("target") or {}).get("tp1_pct"),
             "tp2_pct": (signal.get("target") or {}).get("tp2_pct"),
+            "execution_age_minutes": signal.get("execution_age_minutes"),
+            "trigger_to_execution_gate_minutes": signal.get("trigger_to_execution_gate_minutes"),
+            "trigger_to_execution_finish_minutes": execution.get("trigger_to_execution_finish_minutes"),
             "be_rule": (signal.get("target") or {}).get("be_rule", "after_tp1_filled"),
             "entry_bar": signal.get("entry_bar", {}),
             "previous_bar": signal.get("previous_bar", {}),

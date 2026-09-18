@@ -52,7 +52,7 @@ def test_record_entry_decision_uses_requested_path(tmp_path: Path):
     assert research.record_entry_decision(row, path=path) is True
     stored = json.loads(path.read_text(encoding="utf-8").strip())
     assert stored["decision_id"].startswith("DEC_")
-    assert stored["schema_version"] == 1
+    assert stored["schema_version"] == research.RESEARCH_SCHEMA_VERSION
 
 
 def test_persist_market_bars_bootstrap_and_cursor(tmp_path: Path, monkeypatch):
@@ -826,3 +826,121 @@ def test_quote_snapshot_provenance_fields_are_optional_and_non_ambiguous():
     assert f["quote_source"] == "ticker"
     assert f["quote_sources_attempted"] == ["bookTicker", "ticker"]
     assert f["quote_fallback_reason"] == "bookTicker invalid"
+
+
+def test_observation_journal_deduplicates_across_calls_and_counts_skips(tmp_path, monkeypatch):
+    import event_engine.research as research
+    monkeypatch.setattr(research, "ZONE_OBSERVATIONS_PATH", tmp_path / "zone_observations.jsonl")
+    monkeypatch.setattr(research, "RESEARCH_MANIFEST_PATH", tmp_path / "research_manifest.json")
+    monkeypatch.setattr(research, "RESEARCH_ERRORS_PATH", tmp_path / "research_persistence_errors.jsonl")
+    monkeypatch.setattr(research, "_OBSERVATION_SEEN_IDS", None)
+    row = {"observation_id": "OBS_DUP", "event_type": "SIGNAL_CREATED", "symbol": "TEST-USDT", "direction": "LONG", "zone_id": "Z"}
+    assert research.record_zone_observations([row]) == 1
+    assert research.record_zone_observations([row]) == 0
+    lines = (tmp_path / "zone_observations.jsonl").read_text().splitlines()
+    assert len(lines) == 1
+    manifest = json.loads((tmp_path / "research_manifest.json").read_text())
+    assert manifest["observation_duplicates_skipped"] == 1
+
+
+def test_observation_generation_does_not_claim_execution_age(tmp_path, monkeypatch):
+    import event_engine.research as research
+    for name in ["ZONE_OBSERVATIONS_PATH", "RESEARCH_MANIFEST_PATH", "RESEARCH_ERRORS_PATH"]:
+        monkeypatch.setattr(research, name, tmp_path / getattr(research, name).name)
+    monkeypatch.setattr(research, "_OBSERVATION_SEEN_IDS", None)
+    df = _df_1h()
+    ts = "2026-01-02T00:00:00Z"
+    zone = {"zone_id":"Z_AGE", "top":105.0, "btm":95.0, "poi":100.0, "origin_ts_ms":int(df["timestamp"].iloc[0].timestamp()*1000), "start":0}
+    signal = {"event_id":"E_AGE", "symbol":"TEST-USDT", "type":"LONG", "trigger_bar_time":ts, "time":ts,
+              "entry":100.0, "sl":90.0, "tp1":103.0, "tp2":106.0, "zone":zone,
+              "zone_visit":{"visit_id":"V_AGE", "touch_count_before_trigger":0},
+              "entry_bar":{"timestamp":ts,"open":99.0,"high":101.0,"low":98.0,"close":100.0,"volume":100.0}}
+    out = research._observation_from_signal(signal, scan_id="S", strategy_version="v1", code_commit_sha="abc", df_1h=df,
+                                            decision_ts="2026-01-02T00:05:00Z")
+    assert out["features"]["execution_age_minutes"] is None
+    assert out["features"]["execution_age_semantics"] == "not_available_at_observation_generation"
+    assert out["features"]["trigger_to_observation_minutes"] == pytest.approx(5.0)
+
+
+def test_pending_forward_symbols_identifies_recent_observations(tmp_path, monkeypatch):
+    import event_engine.research as research
+    monkeypatch.setattr(research, "ZONE_OBSERVATIONS_PATH", tmp_path / "zone_observations.jsonl")
+    recent = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(minutes=10)).isoformat()
+    old = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=30)).isoformat()
+    rows = [
+        {"observation_id":"O1", "symbol":"AAA-USDT", "observation_ts":recent},
+        {"observation_id":"O2", "symbol":"BBB-USDT", "observation_ts":old},
+    ]
+    (tmp_path / "zone_observations.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    assert research.pending_forward_symbols(horizon_hours=24) == {"AAA-USDT"}
+
+
+def test_record_scan_symbol_persists_pending_forward_bars_without_new_observation(tmp_path, monkeypatch):
+    import event_engine.research as research
+    for name in ["ZONE_OBSERVATIONS_PATH", "MARKET_BARS_1H_PATH", "MARKET_BARS_5M_PATH", "RESEARCH_BAR_CURSORS_PATH", "RESEARCH_MANIFEST_PATH", "RESEARCH_ERRORS_PATH"]:
+        monkeypatch.setattr(research, name, tmp_path / getattr(research, name).name)
+    monkeypatch.setattr(research, "_OBSERVATION_SEEN_IDS", None)
+    ts = pd.Timestamp.now(tz="UTC").floor("5min") - pd.Timedelta(minutes=5)
+    bar5 = {"timestamp": ts.isoformat(), "open":100.0,"high":101.0,"low":99.0,"close":100.5,"volume":10.0}
+    bar1 = {"timestamp": (ts.floor("h") - pd.Timedelta(hours=1)).isoformat(), "open":100.0,"high":101.0,"low":99.0,"close":100.5,"volume":100.0}
+    out = research.record_scan_symbol(
+        scan_id="S_PENDING", symbol="TEST-USDT", strategy_version="v1", code_commit_sha="abc",
+        provider="binance", source="binance_spot", bars_1h=[bar1], bars_5m=[bar5],
+        df_1h=pd.DataFrame([bar1]), demand=[], supply=[], diagnostics={"touch_events":[],"rearm_events":[],"zones":{}},
+        symbol_state={}, signals=[], decision_ts=ts.isoformat(), persist_bars_for_forward=True,
+    )
+    assert out["observations"] == 0
+    assert out["bars_5m"] == 1
+    assert out["bars_1h"] == 1
+
+
+def test_observation_id_remains_stable_across_scans_for_same_signal_event():
+    import event_engine.research as research
+    ts = "2026-01-02T00:05:00Z"
+    a = research.observation_id("SIGNAL_CREATED", "TEST-USDT", "SHORT", "ZONE_1", ts, visit_id="VISIT_1")
+    b = research.observation_id("SIGNAL_CREATED", "TEST-USDT", "SHORT", "ZONE_1", int(pd.Timestamp(ts).timestamp() * 1000), visit_id="VISIT_1")
+    assert a == b
+
+
+def test_research_record_scan_symbol_accepts_pending_forward_flag_without_observations(tmp_path, monkeypatch):
+    import event_engine.research as research
+    for name in ["ZONE_OBSERVATIONS_PATH", "MARKET_BARS_1H_PATH", "MARKET_BARS_5M_PATH", "RESEARCH_BAR_CURSORS_PATH", "RESEARCH_MANIFEST_PATH", "RESEARCH_ERRORS_PATH"]:
+        monkeypatch.setattr(research, name, tmp_path / getattr(research, name).name)
+    monkeypatch.setattr(research, "_OBSERVATION_SEEN_IDS", None)
+    ts = pd.Timestamp.now(tz="UTC").floor("5min") - pd.Timedelta(minutes=5)
+    bar5 = {"timestamp": ts.isoformat(), "open":100.0, "high":101.0, "low":99.0, "close":100.5, "volume":10.0}
+    bar1 = {"timestamp": (ts.floor("h") - pd.Timedelta(hours=1)).isoformat(), "open":100.0, "high":101.0, "low":99.0, "close":100.5, "volume":100.0}
+    out = research.record_scan_symbol(
+        scan_id="S_PENDING_FLAG", symbol="TEST-USDT", strategy_version="v1", code_commit_sha="abc",
+        provider="binance", source="binance_spot", bars_1h=[bar1], bars_5m=[bar5], df_1h=pd.DataFrame([bar1]),
+        demand=[], supply=[], diagnostics={"touch_events":[], "rearm_events":[], "zones":{}}, symbol_state={}, signals=[],
+        decision_ts=ts.isoformat(), persist_bars_for_forward=True,
+    )
+    assert out["observations"] == 0
+    assert out["bars_5m"] == 1
+    assert out["bars_1h"] == 1
+
+
+def test_observation_dedup_loads_existing_journal_on_new_process_state(tmp_path, monkeypatch):
+    import event_engine.research as research
+    monkeypatch.setattr(research, "ZONE_OBSERVATIONS_PATH", tmp_path / "zone_observations.jsonl")
+    monkeypatch.setattr(research, "RESEARCH_MANIFEST_PATH", tmp_path / "research_manifest.json")
+    monkeypatch.setattr(research, "RESEARCH_ERRORS_PATH", tmp_path / "research_persistence_errors.jsonl")
+    (tmp_path / "zone_observations.jsonl").write_text(json.dumps({"observation_id":"OBS_EXISTING", "event_type":"SIGNAL_CREATED"}) + "\n")
+    monkeypatch.setattr(research, "_OBSERVATION_SEEN_IDS", None)
+    assert research.record_zone_observations([{"observation_id":"OBS_EXISTING", "event_type":"SIGNAL_CREATED"}]) == 0
+    assert len((tmp_path / "zone_observations.jsonl").read_text().splitlines()) == 1
+
+
+def test_observation_dedup_is_thread_safe(tmp_path, monkeypatch):
+    import concurrent.futures
+    import event_engine.research as research
+    monkeypatch.setattr(research, "ZONE_OBSERVATIONS_PATH", tmp_path / "zone_observations.jsonl")
+    monkeypatch.setattr(research, "RESEARCH_MANIFEST_PATH", tmp_path / "research_manifest.json")
+    monkeypatch.setattr(research, "RESEARCH_ERRORS_PATH", tmp_path / "research_persistence_errors.jsonl")
+    monkeypatch.setattr(research, "_OBSERVATION_SEEN_IDS", None)
+    row = {"observation_id":"OBS_THREAD", "event_type":"SIGNAL_CREATED", "symbol":"TEST-USDT", "direction":"LONG"}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(ex.map(lambda _: research.record_zone_observations([row]), range(16)))
+    assert sum(results) == 1
+    assert len((tmp_path / "zone_observations.jsonl").read_text().splitlines()) == 1
