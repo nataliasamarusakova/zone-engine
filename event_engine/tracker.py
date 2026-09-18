@@ -128,18 +128,29 @@ def _close_record_exists(event_id: str) -> bool:
 
 _JOURNAL_LOCK = threading.Lock()
 
-def _append_trade_record(record: dict) -> None:
-    TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
+def _append_journal_record(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".lock")
     with _JOURNAL_LOCK:
-        with TRADES_PATH.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        with lock_path.open("a+", encoding="utf-8") as lockf:
+            if fcntl is not None:
+                fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+            try:
+                with path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
+
+
+def _append_trade_record(record: dict) -> None:
+    _append_journal_record(TRADES_PATH, record)
 
 
 def _append_action_record(record: dict) -> None:
-    ACTIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with _JOURNAL_LOCK:
-        with ACTIONS_PATH.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    _append_journal_record(ACTIONS_PATH, record)
 
 
 def _send_tracker_notification(kind: str, event_id: str, text: str, *, symbol: str, leg: str | None = None) -> bool:
@@ -200,7 +211,9 @@ def _append_trade_close_once(record: dict) -> bool:
                             if obj.get("record_type") == "TRADE_CLOSE" and str(obj.get("event_id")) == event_id:
                                 return False
                 with TRADES_PATH.open("a", encoding="utf-8") as wf:
-                    wf.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    wf.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
+                    wf.flush()
+                    os.fsync(wf.fileno())
                 return True
             finally:
                 if fcntl is not None:
@@ -373,6 +386,7 @@ def register_active_trade(
         "signal_drift_pct": signal_drift_pct,
         "execution_slippage_pct": execution_slippage_pct,
         "entry_slippage_pct": entry_slippage_pct,
+        "signed_entry_slippage_pct": entry_slippage_pct,
         "adverse_entry_slippage_pct": adverse_entry_slippage_pct,
         "initial_qty": actual_qty,
         "remaining_qty": actual_qty,
@@ -398,6 +412,7 @@ def register_active_trade(
         "current_pnl_pct": 0.0,
         "score": _safe_float(score, 50.0),
         "strategy_version": setup_metrics.get("strategy_version"),
+        "code_commit_sha": setup_metrics.get("code_commit_sha"),
         "entry_bar": entry_bar,
         "previous_bar": previous_bar,
         "signal_snapshot": signal_snapshot,
@@ -1537,6 +1552,7 @@ def update_active_trades() -> None:
                 "effective_weighted_rr": planned_rr,
                 "tp_mode": trade.get("tp_mode", "multi_tp"),
                 "strategy_version": trade.get("strategy_version"),
+                "code_commit_sha": trade.get("code_commit_sha"),
                 "be_trigger_rule": trade.get("be_trigger_rule", "after_tp1_filled"),
                 "entry_bar": trade.get("entry_bar", {}),
                 "previous_bar": trade.get("previous_bar", {}),

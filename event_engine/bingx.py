@@ -13,7 +13,7 @@ import time
 import threading
 import uuid
 from email.utils import parsedate_to_datetime
-from datetime import timezone
+from datetime import datetime, timezone
 from decimal import (
     Decimal,
     ROUND_CEILING,
@@ -50,6 +50,15 @@ OPEN_ORDERS_PATH = "/openApi/swap/v2/trade/openOrders"
 BOOK_TICKER_PATH = "/openApi/swap/v2/quote/bookTicker"
 TICKER_PATH = "/openApi/swap/v2/quote/ticker"
 DEPTH_PATH = "/openApi/swap/v2/quote/depth"
+TRADES_PATH = "/openApi/swap/v2/quote/trades"
+PREMIUM_INDEX_PATH = "/openApi/swap/v2/quote/premiumIndex"
+OPEN_INTEREST_PATH = "/openApi/swap/v2/quote/openInterest"
+FUNDING_RATE_PATH = "/openApi/swap/v2/quote/fundingRate"
+BALANCE_PATH = "/openApi/swap/v3/user/balance"
+COMMISSION_RATE_PATH = "/openApi/swap/v2/user/commissionRate"
+INCOME_PATH = "/openApi/swap/v2/user/income"
+FORCE_ORDERS_PATH = "/openApi/swap/v2/trade/forceOrders"
+ALL_FILL_ORDERS_PATH = "/openApi/swap/v2/trade/allFillOrders"
 
 CACHE = {
     "ts": 0.0,
@@ -61,6 +70,9 @@ SERVER_TIME_OFFSET_MS = 0
 _POSITION_MODE_CACHE: dict[str, Any] = {"ts": 0.0, "dual": None}
 _BOOK_TICKER_LOCK = threading.Lock()
 _LAST_BOOK_TICKER_TS = 0.0
+_RESEARCH_RATE_LOCK_GUARD = threading.Lock()
+_RESEARCH_RATE_LOCKS: dict[str, threading.Lock] = {}
+_RESEARCH_RATE_LAST_TS: dict[str, float] = {}
 
 # Requests Session is not used concurrently across scan worker threads.
 # Public scan requests get one Session per worker thread, each with a small bounded
@@ -990,6 +1002,124 @@ def get_open_protection_directional(
     return {"status": "ok", "symbol": bx_symbol, "positionSide": direction, "tp_orders": tp_orders, "sl_orders": sl_orders}
 
 
+def prepare_protection_capacity(symbol: str, direction: str) -> dict:
+    """Ensure a flat symbol is not carrying stale engine protection.
+
+    A new trade needs one SL plus two TP legs. Opening the market position first
+    and only then discovering stale TP/SL orders can trigger the exchange order
+    limit and force an emergency exit. When no position exists, engine-owned
+    protective orders are stale by definition and can be safely cancelled.
+
+    Manual/non-engine protection is never cancelled. Its presence blocks a new
+    engine entry for this symbol/direction because the exchange-side protection
+    capacity cannot be proven safely.
+    """
+    direction = str(direction).upper()
+    if direction not in {"LONG", "SHORT"}:
+        return {"status": "error", "error": f"invalid direction={direction}"}
+
+    position = get_position_directional(symbol, direction)
+    if position.get("status") == "found":
+        return {
+            "status": "blocked_existing_position",
+            "symbol": symbol,
+            "direction": direction,
+            "position": position,
+        }
+    if position.get("status") not in {"not_found", "found"}:
+        return {
+            "status": "error",
+            "symbol": symbol,
+            "direction": direction,
+            "error": position.get("error", "position state unavailable"),
+        }
+
+    existing = get_open_protection_directional(symbol, direction)
+    if existing.get("status") != "ok":
+        return {"status": "error", "symbol": symbol, "direction": direction, "error": existing.get("error", "openOrders unavailable")}
+
+    orders = list(existing.get("sl_orders", [])) + list(existing.get("tp_orders", []))
+    stale_engine_ids = []
+    external_ids = []
+    for order in orders:
+        oid = str(order.get("orderId", ""))
+        cid = str(order.get("clientOrderId", "")).upper()
+        if not oid:
+            continue
+        if cid.startswith("EVT_"):
+            stale_engine_ids.append(oid)
+        else:
+            external_ids.append(oid)
+
+    if external_ids:
+        return {
+            "status": "blocked_external_protection",
+            "symbol": symbol,
+            "direction": direction,
+            "external_order_ids": external_ids,
+            "existing_engine_order_ids": stale_engine_ids,
+            "existing_sl_count": len(existing.get("sl_orders", [])),
+            "existing_tp_count": len(existing.get("tp_orders", [])),
+            "error": "non-engine protection orders are present; exchange protection capacity cannot be proven safely",
+        }
+
+    cancelled = []
+    for order_id in stale_engine_ids:
+        try:
+            resp = cancel_order(symbol, order_id)
+        except Exception as exc:
+            return {
+                "status": "error",
+                "symbol": symbol,
+                "direction": direction,
+                "error": f"stale engine protection cleanup failed for {order_id}: {exc}",
+                "cancelled_order_ids": cancelled,
+            }
+        if not isinstance(resp, dict) or resp.get("code") not in (0, "0"):
+            return {
+                "status": "error",
+                "symbol": symbol,
+                "direction": direction,
+                "error": f"stale engine protection cleanup failed for {order_id}: {resp}",
+                "cancelled_order_ids": cancelled,
+            }
+        cancelled.append(order_id)
+
+    if stale_engine_ids:
+        verified = get_open_protection_directional(symbol, direction)
+        if verified.get("status") != "ok":
+            return {
+                "status": "error",
+                "symbol": symbol,
+                "direction": direction,
+                "error": "stale engine protection cleanup verification failed",
+                "cancelled_order_ids": cancelled,
+            }
+        remaining = [
+            str(o.get("orderId", ""))
+            for o in list(verified.get("sl_orders", [])) + list(verified.get("tp_orders", []))
+            if str(o.get("orderId", "")) in set(stale_engine_ids)
+        ]
+        if remaining:
+            return {
+                "status": "error",
+                "symbol": symbol,
+                "direction": direction,
+                "error": f"stale engine protection still visible after cleanup: {remaining}",
+                "cancelled_order_ids": cancelled,
+            }
+
+    return {
+        "status": "ready",
+        "symbol": symbol,
+        "direction": direction,
+        "cancelled_order_ids": cancelled,
+        "existing_sl_count": 0,
+        "existing_tp_count": 0,
+        "required_new_protection_orders": 3,
+    }
+
+
 def _round_qty(qty: float, precision: int) -> float:
     if precision < 0:
         return float(qty)
@@ -1253,6 +1383,535 @@ def get_execution_quote(symbol: str, *, min_interval_sec: float | None = None, r
         "symbol": bx,
         "quote_sources_attempted": [source for source, _ in attempts],
     }
+
+
+
+def _research_endpoint_lock(endpoint_key: str) -> threading.Lock:
+    with _RESEARCH_RATE_LOCK_GUARD:
+        lock = _RESEARCH_RATE_LOCKS.get(endpoint_key)
+        if lock is None:
+            lock = threading.Lock()
+            _RESEARCH_RATE_LOCKS[endpoint_key] = lock
+        return lock
+
+
+def _research_public_get(endpoint_key: str, path: str, params: dict[str, Any], *, timeout_sec: float = 3.0) -> dict[str, Any]:
+    """Rate-limit each public research endpoint independently to the documented BingX rate."""
+    try:
+        interval = max(1.01, float(os.environ.get("RESEARCH_BINGX_ENDPOINT_INTERVAL_SEC", "1.05")))
+    except (TypeError, ValueError):
+        interval = 1.05
+    lock = _research_endpoint_lock(endpoint_key)
+    with lock:
+        wait = interval - (time.monotonic() - _RESEARCH_RATE_LAST_TS.get(endpoint_key, 0.0))
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            resp = _request("GET", path, params, signed=False, timeout_sec=timeout_sec, retryable=False)
+        finally:
+            _RESEARCH_RATE_LAST_TS[endpoint_key] = time.monotonic()
+    return resp if isinstance(resp, dict) else {"code": -1, "msg": "invalid response type"}
+
+
+def _research_symbol_row(data: Any, symbol: str) -> dict[str, Any] | None:
+    bx = str(symbol).upper()
+    if isinstance(data, dict):
+        if str(data.get("symbol", "")).upper() in {"", bx}:
+            return data
+        return None
+    if isinstance(data, list):
+        for row in data:
+            if isinstance(row, dict) and str(row.get("symbol", "")).upper() == bx:
+                return row
+        if len(data) == 1 and isinstance(data[0], dict):
+            return data[0]
+    return None
+
+
+def _research_depth_metrics(data: Any, *, mid_price: float | None = None) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        return {"status": "error", "error": "depth_data_invalid"}
+    bids = data.get("bids") or []
+    asks = data.get("asks") or []
+
+    def parse_level(level: Any) -> tuple[float, float] | None:
+        try:
+            if isinstance(level, (list, tuple)) and len(level) >= 2:
+                price, qty = float(level[0]), float(level[1])
+            elif isinstance(level, dict):
+                price = float(level.get("price") or level.get("p"))
+                qty = float(level.get("quantity") or level.get("qty") or level.get("q"))
+            else:
+                return None
+            if not (math.isfinite(price) and math.isfinite(qty)) or price <= 0 or qty < 0:
+                return None
+            return price, qty
+        except (TypeError, ValueError):
+            return None
+
+    bp = [x for x in (parse_level(v) for v in bids) if x]
+    ap = [x for x in (parse_level(v) for v in asks) if x]
+    best_bid = bp[0][0] if bp else None
+    best_ask = ap[0][0] if ap else None
+    mid = mid_price or ((best_bid + best_ask) / 2.0 if best_bid and best_ask else None)
+
+    def depth_quote(levels: list[tuple[float, float]], pct: float) -> float:
+        if mid is None or mid <= 0:
+            return 0.0
+        lo = mid * (1.0 - pct / 100.0)
+        hi = mid * (1.0 + pct / 100.0)
+        return sum(price * qty for price, qty in levels if lo <= price <= hi)
+
+    bid_qty_5 = sum(q for _, q in bp[:5])
+    ask_qty_5 = sum(q for _, q in ap[:5])
+    bid_qty_10 = sum(q for _, q in bp[:10])
+    ask_qty_10 = sum(q for _, q in ap[:10])
+    total5 = bid_qty_5 + ask_qty_5
+    total10 = bid_qty_10 + ask_qty_10
+    bid_quote_5 = sum(price * qty for price, qty in bp[:5])
+    ask_quote_5 = sum(price * qty for price, qty in ap[:5])
+    bid_quote_10 = sum(price * qty for price, qty in bp[:10])
+    ask_quote_10 = sum(price * qty for price, qty in ap[:10])
+    quote_total5 = bid_quote_5 + ask_quote_5
+    quote_total10 = bid_quote_10 + ask_quote_10
+    microprice = None
+    if best_bid is not None and best_ask is not None and bp and ap:
+        if (bp[0][1] + ap[0][1]) > 0:
+            microprice = ((best_ask * bp[0][1]) + (best_bid * ap[0][1])) / (bp[0][1] + ap[0][1])
+    return {
+        "status": "ok",
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "spread_pct": ((best_ask - best_bid) / ((best_ask + best_bid) / 2.0) * 100.0) if best_bid and best_ask and best_bid > 0 else None,
+        "mid_price": mid,
+        "bid_qty_5": bid_qty_5,
+        "ask_qty_5": ask_qty_5,
+        "bid_qty_10": bid_qty_10,
+        "ask_qty_10": ask_qty_10,
+        "book_imbalance_5": ((bid_qty_5 - ask_qty_5) / total5) if total5 > 0 else None,
+        "book_imbalance_10": ((bid_qty_10 - ask_qty_10) / total10) if total10 > 0 else None,
+        "bid_quote_5": bid_quote_5,
+        "ask_quote_5": ask_quote_5,
+        "bid_quote_10": bid_quote_10,
+        "ask_quote_10": ask_quote_10,
+        "book_quote_imbalance_5": ((bid_quote_5 - ask_quote_5) / quote_total5) if quote_total5 > 0 else None,
+        "book_quote_imbalance_10": ((bid_quote_10 - ask_quote_10) / quote_total10) if quote_total10 > 0 else None,
+        "microprice": microprice,
+        "bid_depth_quote_0_1pct": depth_quote(bp, 0.1),
+        "ask_depth_quote_0_1pct": depth_quote(ap, 0.1),
+        "bid_depth_quote_0_5pct": depth_quote(bp, 0.5),
+        "ask_depth_quote_0_5pct": depth_quote(ap, 0.5),
+        "bid_depth_quote_1pct": depth_quote(bp, 1.0),
+        "ask_depth_quote_1pct": depth_quote(ap, 1.0),
+        "bids_top10": [[p, q] for p, q in bp[:10]],
+        "asks_top10": [[p, q] for p, q in ap[:10]],
+        "timestamp": data.get("T") or data.get("timestamp") or data.get("time"),
+    }
+
+
+def _research_sanitize(value: Any) -> Any:
+    """Convert optional research payload values to strict JSON-safe Python types."""
+    if isinstance(value, dict):
+        return {str(k): _research_sanitize(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_research_sanitize(v) for v in value]
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if hasattr(value, "item"):
+        try:
+            return _research_sanitize(value.item())
+        except Exception:
+            pass
+    return value
+
+
+def _research_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _research_trade_metrics(data: Any) -> dict[str, Any]:
+    if not isinstance(data, list):
+        return {"status": "error", "error": "trades_data_invalid"}
+    buy_quote = sell_quote = 0.0
+    buy_count = sell_count = 0
+    prices: list[float] = []
+    latest_ts = None
+    earliest_ts = None
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        try:
+            price = float(row.get("price"))
+            raw_quote = row.get("quoteQty") or row.get("quote_qty")
+            quote_qty = float(raw_quote) if raw_quote is not None else (price * float(row.get("qty")))
+            ts = int(row.get("time")) if row.get("time") is not None else None
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(price) and price > 0 and math.isfinite(quote_qty) and quote_qty >= 0):
+            continue
+        prices.append(price)
+        maker_buyer = _research_bool(row.get("buyerMaker"))
+        # buyerMaker=true means the buyer was the maker; the aggressor was the seller.
+        if maker_buyer:
+            sell_quote += quote_qty
+            sell_count += 1
+        else:
+            buy_quote += quote_qty
+            buy_count += 1
+        if ts is not None:
+            latest_ts = max(latest_ts or ts, ts)
+            earliest_ts = min(earliest_ts or ts, ts)
+    total = buy_quote + sell_quote
+    return {
+        "status": "ok",
+        "sample_count": len(data),
+        "valid_trade_count": len(prices),
+        "buy_aggressor_quote": buy_quote,
+        "sell_aggressor_quote": sell_quote,
+        "buy_aggressor_count": buy_count,
+        "sell_aggressor_count": sell_count,
+        "aggressor_delta_quote": buy_quote - sell_quote,
+        "buy_aggressor_ratio": (buy_quote / total) if total > 0 else None,
+        "trade_min_price": min(prices) if prices else None,
+        "trade_max_price": max(prices) if prices else None,
+        "last_trade_ts": latest_ts,
+        "first_trade_ts": earliest_ts,
+        "sample_span_seconds": ((latest_ts - earliest_ts) / 1000.0) if latest_ts is not None and earliest_ts is not None and latest_ts >= earliest_ts else None,
+        "avg_trade_quote": (total / len(prices)) if prices else None,
+    }
+
+
+def fetch_research_market_context(
+    symbol: str,
+    *,
+    depth_limit: int = 20,
+    trades_limit: int = 100,
+) -> dict[str, Any]:
+    """Collect a decision-time BingX market snapshot for research only.
+
+    This is deliberately best-effort: failure of one optional public context endpoint
+    must never block the production signal/execution path. The returned record contains
+    enough metadata to distinguish missing context from a real zero measurement.
+    """
+    bx = to_bx_symbol(symbol)
+    captured_ms = int(time.time() * 1000)
+    collection_started = time.monotonic()
+    result: dict[str, Any] = {
+        "schema": "bingx_research_market_context_v1",
+        "symbol": str(symbol).upper(),
+        "bingx_symbol": bx,
+        "captured_at_ms": captured_ms,
+        "captured_at": datetime.fromtimestamp(captured_ms / 1000.0, tz=timezone.utc).isoformat(),
+        "status": "ok",
+        "errors": [],
+        "endpoint_status": {},
+        "endpoint_latency_ms": {},
+    }
+    if not bx:
+        result["status"] = "error"
+        result["errors"].append("contract_not_found")
+        return result
+
+    def call(key: str, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        started = time.monotonic()
+        try:
+            resp = _research_public_get(key, path, params)
+            result["endpoint_latency_ms"][key] = round((time.monotonic() - started) * 1000.0, 3)
+            if int(resp.get("code")) != 0:
+                result["endpoint_status"][key] = "error"
+                result["errors"].append(f"{key}:code={resp.get('code')}:msg={resp.get('msg')}")
+            else:
+                result["endpoint_status"][key] = "ok"
+            return resp
+        except Exception as exc:
+            result["endpoint_latency_ms"][key] = round((time.monotonic() - started) * 1000.0, 3)
+            result["endpoint_status"][key] = "error"
+            result["errors"].append(f"{key}:{type(exc).__name__}:{exc}")
+            return {"code": -1, "msg": str(exc)}
+
+    premium = call("premiumIndex", PREMIUM_INDEX_PATH, {"symbol": bx})
+    prow = _research_symbol_row(premium.get("data"), bx) if isinstance(premium, dict) else None
+    if prow:
+        for source_key, out_key in (("markPrice", "mark_price"), ("indexPrice", "index_price"), ("lastFundingRate", "funding_rate"), ("nextFundingTime", "next_funding_time_ms"), ("time", "premium_index_ts")):
+            if prow.get(source_key) is not None:
+                try:
+                    result[out_key] = float(prow[source_key]) if source_key not in {"nextFundingTime", "time"} else int(prow[source_key])
+                except (TypeError, ValueError):
+                    result[out_key] = None
+
+    if result.get("mark_price") and result.get("index_price"):
+        idx = float(result["index_price"])
+        if idx > 0:
+            result["mark_index_basis_pct"] = (float(result["mark_price"]) / idx - 1.0) * 100.0
+
+    oi = call("openInterest", OPEN_INTEREST_PATH, {"symbol": bx})
+    orow = _research_symbol_row(oi.get("data"), bx) if isinstance(oi, dict) else None
+    if orow:
+        try:
+            result["open_interest"] = float(orow.get("openInterest"))
+        except (TypeError, ValueError):
+            result["open_interest"] = None
+        result["open_interest_ts"] = orow.get("time")
+
+    book = call("depth", DEPTH_PATH, {"symbol": bx, "limit": int(depth_limit)})
+    if isinstance(book, dict) and isinstance(book.get("data"), dict):
+        result["order_book"] = _research_depth_metrics(book["data"], mid_price=result.get("mark_price"))
+        result["order_book_timestamp"] = result["order_book"].get("timestamp")
+
+    trades = call("trades", TRADES_PATH, {"symbol": bx, "limit": int(trades_limit)})
+    result["recent_trades"] = _research_trade_metrics(trades.get("data")) if isinstance(trades, dict) else {"status": "error", "error": "trades_response_invalid"}
+
+    if result["errors"]:
+        result["status"] = "partial" if len(result["errors"]) < 4 else "error"
+    result["collection_latency_ms"] = round((time.monotonic() - collection_started) * 1000.0, 3)
+    return _research_sanitize(result)
+
+
+def fetch_research_account_snapshot() -> dict[str, Any]:
+    """Collect a read-only BingX futures account snapshot for research/risk attribution.
+
+    This is called at most once per scan, never from the per-symbol worker pool.
+    No order execution depends on this snapshot.
+    """
+    captured_ms = int(time.time() * 1000)
+    result: dict[str, Any] = {
+        "schema": "bingx_research_account_context_v1",
+        "captured_at_ms": captured_ms,
+        "captured_at": datetime.fromtimestamp(captured_ms / 1000.0, tz=timezone.utc).isoformat(),
+        "status": "ok",
+        "errors": [],
+    }
+    api_key, secret_key = get_credentials()
+    if not api_key or not secret_key:
+        result["status"] = "unavailable"
+        result["errors"].append("missing_credentials")
+        return result
+    try:
+        balance = _request("GET", BALANCE_PATH, {}, signed=True, timeout_sec=min(5.0, float(os.environ.get("RESEARCH_ACCOUNT_TIMEOUT_SEC", "5"))), retryable=False)
+        if not isinstance(balance, dict) or int(balance.get("code", -1)) != 0:
+            result["status"] = "partial"
+            result["errors"].append(f"balance:code={balance.get('code') if isinstance(balance, dict) else 'invalid'}:msg={balance.get('msg') if isinstance(balance, dict) else 'invalid_response'}")
+        else:
+            rows = balance.get("data")
+            row = rows[0] if isinstance(rows, list) and rows else rows if isinstance(rows, dict) else None
+            if isinstance(row, dict):
+                for src, dst in (("asset", "asset"), ("balance", "balance"), ("equity", "equity"), ("unrealizedProfit", "unrealized_profit"), ("realisedProfit", "realized_profit"), ("realizedProfit", "realized_profit"), ("availableMargin", "available_margin"), ("usedMargin", "used_margin"), ("freezedMargin", "freezed_margin")):
+                    value = row.get(src)
+                    if value is None:
+                        continue
+                    if dst == "asset":
+                        result[dst] = str(value)
+                    else:
+                        try:
+                            num = float(value)
+                            result[dst] = num if math.isfinite(num) else None
+                        except (TypeError, ValueError):
+                            result[dst] = None
+            else:
+                result["status"] = "partial"
+                result["errors"].append("balance:payload_missing")
+    except Exception as exc:
+        result["status"] = "partial"
+        result["errors"].append(f"balance:{type(exc).__name__}:{exc}")
+
+    activity_lookback_min = max(5, min(60, int(os.environ.get("RESEARCH_ACCOUNT_ACTIVITY_LOOKBACK_MINUTES", "15"))))
+    activity_start_ms = max(0, captured_ms - activity_lookback_min * 60 * 1000)
+    activity_end_ms = captured_ms
+    try:
+        fills = _request(
+            "GET", ALL_FILL_ORDERS_PATH,
+            {"tradingUnit": "CONT", "startTs": activity_start_ms, "endTs": activity_end_ms, "currency": "USDT"},
+            signed=True, timeout_sec=min(5.0, float(os.environ.get("RESEARCH_ACCOUNT_TIMEOUT_SEC", "5"))), retryable=False,
+        )
+        if isinstance(fills, dict) and int(fills.get("code", -1)) == 0:
+            raw_rows = fills.get("data") if isinstance(fills.get("data"), list) else []
+            activity_rows = []
+            fee_total = realized_total = 0.0
+            for row in raw_rows:
+                if not isinstance(row, dict):
+                    continue
+                item: dict[str, Any] = {}
+                for src, dst in (("tradeId", "trade_id"), ("orderId", "order_id"), ("symbol", "symbol"), ("side", "side"), ("positionSide", "position_side")):
+                    if row.get(src) not in (None, ""):
+                        item[dst] = str(row.get(src))
+                for src, dst in (("price", "price"), ("qty", "qty"), ("realizedPnl", "realized_pnl"), ("fee", "fee"), ("time", "time_ms")):
+                    if row.get(src) in (None, ""):
+                        continue
+                    try:
+                        val = float(row.get(src))
+                        if dst == "time_ms":
+                            val = int(val)
+                        item[dst] = val if math.isfinite(float(val)) else None
+                    except (TypeError, ValueError):
+                        item[dst] = None
+                if item.get("fee") is not None:
+                    fee_total += float(item["fee"])
+                if item.get("realized_pnl") is not None:
+                    realized_total += float(item["realized_pnl"])
+                activity_rows.append(item)
+            result["recent_fill_window_start_ms"] = activity_start_ms
+            result["recent_fill_window_end_ms"] = activity_end_ms
+            result["recent_fills"] = activity_rows
+            result["recent_fill_count"] = len(activity_rows)
+            result["recent_fill_fee_total"] = fee_total
+            result["recent_fill_realized_pnl_total"] = realized_total
+        else:
+            result.setdefault("errors", []).append(f"fills:code={fills.get('code') if isinstance(fills, dict) else 'invalid'}")
+    except Exception as exc:
+        result.setdefault("errors", []).append(f"fills:{type(exc).__name__}:{exc}")
+
+    try:
+        income = _request(
+            "GET", INCOME_PATH,
+            {"startTime": activity_start_ms, "endTime": activity_end_ms, "limit": 1000},
+            signed=True, timeout_sec=min(5.0, float(os.environ.get("RESEARCH_ACCOUNT_TIMEOUT_SEC", "5"))), retryable=False,
+        )
+        if isinstance(income, dict) and int(income.get("code", -1)) == 0:
+            raw_rows = income.get("data") if isinstance(income.get("data"), list) else []
+            income_rows = []
+            totals: dict[str, float] = {}
+            for row in raw_rows:
+                if not isinstance(row, dict):
+                    continue
+                item: dict[str, Any] = {}
+                for src, dst in (("symbol", "symbol"), ("incomeType", "income_type"), ("asset", "asset"), ("info", "info"), ("tranId", "tran_id"), ("tradeId", "trade_id")):
+                    if row.get(src) not in (None, ""):
+                        item[dst] = str(row.get(src))
+                for src, dst in (("income", "income"), ("time", "time_ms")):
+                    if row.get(src) in (None, ""):
+                        continue
+                    try:
+                        val = float(row.get(src))
+                        if dst == "time_ms":
+                            val = int(val)
+                        item[dst] = val if math.isfinite(float(val)) else None
+                    except (TypeError, ValueError):
+                        item[dst] = None
+                income_type = str(item.get("income_type") or "UNKNOWN")
+                value = item.get("income")
+                if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                    totals[income_type] = totals.get(income_type, 0.0) + float(value)
+                income_rows.append(item)
+            result["recent_income"] = income_rows
+            result["recent_income_count"] = len(income_rows)
+            result["recent_income_totals"] = totals
+        else:
+            result.setdefault("errors", []).append(f"income:code={income.get('code') if isinstance(income, dict) else 'invalid'}")
+    except Exception as exc:
+        result.setdefault("errors", []).append(f"income:{type(exc).__name__}:{exc}")
+
+    try:
+        forced = _request(
+            "GET", FORCE_ORDERS_PATH,
+            {"currency": "USDT", "startTime": activity_start_ms, "endTime": activity_end_ms, "limit": 100},
+            signed=True, timeout_sec=min(5.0, float(os.environ.get("RESEARCH_ACCOUNT_TIMEOUT_SEC", "5"))), retryable=False,
+        )
+        if isinstance(forced, dict) and int(forced.get("code", -1)) == 0:
+            raw_rows = forced.get("data") if isinstance(forced.get("data"), list) else []
+            force_rows = []
+            liq_n = adl_n = 0
+            for row in raw_rows:
+                if not isinstance(row, dict):
+                    continue
+                item: dict[str, Any] = {}
+                for src, dst in (("symbol", "symbol"), ("side", "side"), ("positionSide", "position_side"), ("autoCloseType", "auto_close_type"), ("orderId", "order_id"), ("time", "time_ms")):
+                    if row.get(src) not in (None, ""):
+                        item[dst] = str(row.get(src)) if dst != "time_ms" else int(float(row.get(src)))
+                for src, dst in (("price", "price"), ("origQty", "qty"), ("avgPrice", "avg_price")):
+                    if row.get(src) in (None, ""):
+                        continue
+                    try:
+                        val = float(row.get(src))
+                        item[dst] = val if math.isfinite(val) else None
+                    except (TypeError, ValueError):
+                        item[dst] = None
+                kind = str(item.get("auto_close_type") or "").upper()
+                liq_n += kind == "LIQUIDATION"
+                adl_n += kind == "ADL"
+                force_rows.append(item)
+            result["recent_force_orders"] = force_rows
+            result["recent_force_order_count"] = len(force_rows)
+            result["recent_liquidation_count"] = liq_n
+            result["recent_adl_count"] = adl_n
+        else:
+            result.setdefault("errors", []).append(f"force_orders:code={forced.get('code') if isinstance(forced, dict) else 'invalid'}")
+    except Exception as exc:
+        result.setdefault("errors", []).append(f"force_orders:{type(exc).__name__}:{exc}")
+
+    try:
+        positions = _request("GET", POSITION_PATH, {}, signed=True, timeout_sec=min(5.0, float(os.environ.get("RESEARCH_ACCOUNT_TIMEOUT_SEC", "5"))), retryable=False)
+        if isinstance(positions, dict) and int(positions.get("code", -1)) == 0:
+            rows = _normalize_orders_list(positions)
+            position_rows = []
+            total_notional = 0.0
+            total_unrealized = 0.0
+            long_n = short_n = 0
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                item: dict[str, Any] = {}
+                for src, dst in (("symbol", "symbol"), ("positionSide", "position_side"), ("side", "side")):
+                    if row.get(src) not in (None, ""):
+                        item[dst] = str(row.get(src))
+                for src, dst in (("positionAmt", "position_amt"), ("positionAmtAbs", "position_amt_abs"), ("avgPrice", "entry_price"), ("entryPrice", "entry_price"), ("markPrice", "mark_price"), ("liquidationPrice", "liquidation_price"), ("leverage", "leverage"), ("unrealizedProfit", "unrealized_profit"), ("initialMargin", "initial_margin")):
+                    if row.get(src) in (None, ""):
+                        continue
+                    try:
+                        val = float(row.get(src))
+                        item[dst] = val if math.isfinite(val) else None
+                    except (TypeError, ValueError):
+                        item[dst] = None
+                if item.get("position_amt") is not None and item.get("mark_price") is not None:
+                    item["notional_usdt"] = abs(float(item["position_amt"]) * float(item["mark_price"]))
+                else:
+                    item["notional_usdt"] = None
+                if item.get("position_amt") is not None and abs(float(item["position_amt"])) <= 0:
+                    continue
+                if item.get("notional_usdt") is not None:
+                    total_notional += float(item["notional_usdt"])
+                if item.get("unrealized_profit") is not None:
+                    total_unrealized += float(item["unrealized_profit"])
+                direction = str(item.get("side") or item.get("position_side") or "").upper()
+                if direction in {"LONG", "BUY"}:
+                    long_n += 1
+                elif direction in {"SHORT", "SELL"}:
+                    short_n += 1
+                position_rows.append(item)
+            result["positions"] = position_rows
+            result["open_positions_count"] = len(position_rows)
+            result["long_positions_count"] = long_n
+            result["short_positions_count"] = short_n
+            result["open_positions_notional_usdt"] = total_notional
+            result["open_positions_unrealized_profit"] = total_unrealized
+        else:
+            result.setdefault("errors", []).append(f"positions:code={positions.get('code') if isinstance(positions, dict) else 'invalid'}")
+    except Exception as exc:
+        result.setdefault("errors", []).append(f"positions:{type(exc).__name__}:{exc}")
+
+    try:
+        commission = _request("GET", COMMISSION_RATE_PATH, {}, signed=True, timeout_sec=min(5.0, float(os.environ.get("RESEARCH_ACCOUNT_TIMEOUT_SEC", "5"))), retryable=False)
+        if isinstance(commission, dict) and int(commission.get("code", -1)) == 0:
+            row = commission.get("data") if isinstance(commission.get("data"), dict) else commission.get("data", {})
+            if isinstance(row, dict):
+                payload = row.get("commission") if isinstance(row.get("commission"), dict) else row
+                for src, dst in (("takerCommissionRate", "taker_commission_rate"), ("makerCommissionRate", "maker_commission_rate")):
+                    try:
+                        val = float(payload.get(src))
+                        result[dst] = val if math.isfinite(val) else None
+                    except (TypeError, ValueError):
+                        result[dst] = None
+        else:
+            result.setdefault("errors", []).append(f"commission:code={commission.get('code') if isinstance(commission, dict) else 'invalid'}")
+    except Exception as exc:
+        result["errors"].append(f"commission:{type(exc).__name__}:{exc}")
+
+    if result["errors"] and result["status"] == "ok":
+        result["status"] = "partial"
+    return _research_sanitize(result)
 
 
 def _current_close_price(symbol: str) -> float | None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,10 +16,31 @@ LATEST_SCAN_JSON = DATA_DIR / "latest_scan.json"
 LATEST_SCAN_TXT = DATA_DIR / "latest_scan.txt"
 
 
+def _json_safe(value: Any) -> Any:
+    """Recursively convert non-finite floats to JSON null values."""
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    try:
+        if hasattr(value, "item"):
+            item = value.item()
+            if isinstance(item, float) and not math.isfinite(item):
+                return None
+            if item is not value:
+                return _json_safe(item)
+    except Exception:
+        pass
+    return value
+
+
 def _append_jsonl(path: Path, row: dict[str, Any]) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    safe_row = _json_safe(row)
     with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+        fh.write(json.dumps(safe_row, ensure_ascii=False, default=str, allow_nan=False) + "\n")
 
 
 def _rotate_scan_history() -> None:
@@ -44,7 +66,8 @@ def _rotate_scan_history() -> None:
 def _atomic_json(path: Path, payload: Any) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    safe_payload = _json_safe(payload)
+    tmp.write_text(json.dumps(safe_payload, ensure_ascii=False, indent=2, default=str, allow_nan=False), encoding="utf-8")
     tmp.replace(path)
 
 

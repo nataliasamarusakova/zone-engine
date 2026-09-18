@@ -180,6 +180,17 @@ def fetch_klines(symbol: str, interval: str = "1h", limit: int = 120, *, retryab
                 "close_time": int(row[6]) if len(row) > 6 else None,
                 "quote_volume": float(row[7]) if len(row) > 7 else None,
                 "trade_count": int(row[8]) if len(row) > 8 and str(row[8]).isdigit() else None,
+                "taker_buy_base": float(row[9]) if len(row) > 9 else None,
+                "taker_buy_quote": float(row[10]) if len(row) > 10 else None,
+                "taker_flow_valid": (
+                    len(row) > 10
+                    and float(row[7]) >= 0
+                    and float(row[9]) >= 0
+                    and float(row[10]) >= 0
+                    and float(row[9]) <= float(row[5]) * 1.001 + 1e-8
+                    and float(row[10]) <= float(row[7]) * 1.001 + 1e-8
+                ),
+                "bar_delta_usdt": (2.0 * float(row[10]) - float(row[7])) if len(row) > 10 else None,
                 "source": "binance_spot",
                 "binance_symbol": bsym,
             }

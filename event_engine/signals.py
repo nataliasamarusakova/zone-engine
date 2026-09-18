@@ -161,8 +161,24 @@ def compute_pine_keltner_channels(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(bands, index=out.index)
 
 
-def _make_event_id(symbol: str, direction: str, timestamp: int, zone_start: int | None, entry: float) -> str:
-    raw = f"AJAY_R541:{symbol.upper()}:{direction.upper()}:{timestamp}:{zone_start if zone_start is not None else -1}:{entry:.12f}"
+def _make_zone_id(symbol: str, kind: str, zone: dict[str, Any]) -> str:
+    """Return a stable identity for one economic zone.
+
+    Do not use the rolling DataFrame integer index as the identity.  The same
+    historical candle can have a different integer position when the API
+    window changes.  The zone origin timestamp plus geometry is stable.
+    """
+    origin_ts_ms = int(zone.get("origin_ts_ms", -1) or -1)
+    top = _safe_num(zone.get("top"), float("nan"))
+    btm = _safe_num(zone.get("btm"), float("nan"))
+    raw = f"ZONE:{symbol.upper()}:{kind.upper()}:{origin_ts_ms}:{top:.12f}:{btm:.12f}"
+    return "ZID_" + hashlib.sha256(raw.encode("utf-8")).hexdigest().upper()[:24]
+
+
+def _make_event_id(symbol: str, direction: str, timestamp: int, zone_origin_ts_ms: int | None, entry: float) -> str:
+    # The trigger timestamp keeps each visit event unique; the zone component
+    # uses the stable zone-origin timestamp rather than a rolling DataFrame index.
+    raw = f"AJAY_R541:{symbol.upper()}:{direction.upper()}:{timestamp}:{zone_origin_ts_ms if zone_origin_ts_ms is not None else -1}:{entry:.12f}"
     return "ZONE_" + hashlib.sha256(raw.encode()).hexdigest().upper()[:24]
 
 
@@ -360,7 +376,19 @@ def _pine_overlap_check(new_poi: float, zones: list[dict[str, Any]], atr: float)
     return okay
 
 
-def _build_zone(top_or_bottom: float, box_type: int, atr: float, start: int) -> dict[str, Any]:
+def _build_zone(
+    top_or_bottom: float,
+    box_type: int,
+    atr: float,
+    start: int,
+    *,
+    origin_ts_ms: int | None = None,
+    symbol: str = "",
+) -> dict[str, Any]:
+    if not math.isfinite(float(top_or_bottom)):
+        raise ValueError(f"zone anchor must be finite, got {top_or_bottom!r}")
+    if not math.isfinite(float(atr)) or float(atr) <= 0:
+        raise ValueError(f"zone ATR must be finite and > 0, got {atr!r}")
     buffer = atr * (BOX_WIDTH / 10.0)
     if box_type == 1:
         top = top_or_bottom
@@ -368,12 +396,17 @@ def _build_zone(top_or_bottom: float, box_type: int, atr: float, start: int) -> 
     else:
         bottom = top_or_bottom
         top = bottom + buffer
-    return {
+    zone = {
         "top": top,
         "btm": bottom,
         "poi": (top + bottom) / 2.0,
         "start": int(start),
+        "origin_ts_ms": int(origin_ts_ms) if origin_ts_ms is not None else -1,
     }
+    if symbol:
+        kind = "SUPPLY" if box_type == 1 else "DEMAND"
+        zone["zone_id"] = _make_zone_id(symbol, kind, zone)
+    return zone
 
 
 def _pine_zone_walk(df: pd.DataFrame) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -388,7 +421,10 @@ def _pine_zone_walk(df: pd.DataFrame) -> tuple[list[dict[str, Any]], list[dict[s
         p = i - SWING_LEN
         h = float(df.loc[p, "high"])
         l = float(df.loc[p, "low"])
-        atr = max(float(df.loc[i, "atr50"]), 1e-12)
+        atr_raw = float(df.loc[i, "atr50"])
+        atr_valid = math.isfinite(atr_raw) and atr_raw > 0
+        atr = atr_raw if atr_valid else 0.0
+        origin_ts_ms = int(pd.Timestamp(df.loc[p, "timestamp"]).timestamp() * 1000)
 
         is_ph = all(h >= float(df.loc[p-k, "high"]) for k in range(1, SWING_LEN+1)) and all(
             h >= float(df.loc[p+k, "high"]) for k in range(1, SWING_LEN+1)
@@ -398,13 +434,13 @@ def _pine_zone_walk(df: pd.DataFrame) -> tuple[list[dict[str, Any]], list[dict[s
         )
 
         # Pine is if swing_high, else if swing_low.
-        if is_ph:
-            zone = _build_zone(h, 1, atr, p)
+        if is_ph and atr_valid:
+            zone = _build_zone(h, 1, atr, p, origin_ts_ms=origin_ts_ms)
             if _pine_overlap_check(zone["poi"], supply, atr):
                 supply.insert(0, zone)
                 del supply[ZONE_HISTORY:]
-        elif is_pl:
-            zone = _build_zone(l, -1, atr, p)
+        elif is_pl and atr_valid:
+            zone = _build_zone(l, -1, atr, p, origin_ts_ms=origin_ts_ms)
             if _pine_overlap_check(zone["poi"], demand, atr):
                 demand.insert(0, zone)
                 del demand[ZONE_HISTORY:]
@@ -448,6 +484,8 @@ def _zone_context(zone: dict[str, Any], current_idx: int, df: pd.DataFrame) -> d
     atr = max(_safe_num(df.loc[start, "atr50"], 0.0), 1e-12)
     return {
         "start_idx": start,
+        "origin_ts_ms": int(zone.get("origin_ts_ms", -1) or -1),
+        "zone_id": zone.get("zone_id"),
         "age_bars": max(0, current_idx - start),
         "impulse_atr": round(abs(end_close - base) / atr, 3),
     }
@@ -793,7 +831,10 @@ def generate_zone_signals(
         p = i - SWING_LEN
         h = float(df.loc[p, "high"])
         l = float(df.loc[p, "low"])
-        atr = max(float(df.loc[i, "atr50"]), 1e-12)
+        atr_raw = float(df.loc[i, "atr50"])
+        atr_valid = math.isfinite(atr_raw) and atr_raw > 0
+        atr = atr_raw if atr_valid else 0.0
+        origin_ts_ms = int(pd.Timestamp(df.loc[p, "timestamp"]).timestamp() * 1000)
 
         is_ph = all(h >= float(df.loc[p-k, "high"]) for k in range(1, SWING_LEN+1)) and all(
             h >= float(df.loc[p+k, "high"]) for k in range(1, SWING_LEN+1)
@@ -801,13 +842,13 @@ def generate_zone_signals(
         is_pl = all(l <= float(df.loc[p-k, "low"]) for k in range(1, SWING_LEN+1)) and all(
             l <= float(df.loc[p+k, "low"]) for k in range(1, SWING_LEN+1)
         )
-        if is_ph:
-            zone = _build_zone(h, 1, atr, p)
+        if is_ph and atr_valid:
+            zone = _build_zone(h, 1, atr, p, origin_ts_ms=origin_ts_ms, symbol=symbol or "")
             if _pine_overlap_check(zone["poi"], active_supply, atr):
                 active_supply.insert(0, zone)
                 del active_supply[ZONE_HISTORY:]
-        elif is_pl:
-            zone = _build_zone(l, -1, atr, p)
+        elif is_pl and atr_valid:
+            zone = _build_zone(l, -1, atr, p, origin_ts_ms=origin_ts_ms, symbol=symbol or "")
             if _pine_overlap_check(zone["poi"], active_demand, atr):
                 active_demand.insert(0, zone)
                 del active_demand[ZONE_HISTORY:]
@@ -817,8 +858,8 @@ def generate_zone_signals(
         active_demand = [z for z in active_demand if close > float(z["btm"])]
         cur_l, cur_h, cur_c, cur_o = map(float, [df.loc[i, "low"], df.loc[i, "high"], df.loc[i, "close"], df.loc[i, "open"]])
 
-        demand_zone = _find_directional_zone("LONG", cur_l, cur_h, cur_c, active_demand, active_supply)
-        supply_zone = _find_directional_zone("SHORT", cur_l, cur_h, cur_c, active_demand, active_supply)
+        demand_zone = _find_directional_zone("LONG", cur_l, cur_h, cur_c, active_demand, active_supply) if atr_valid else None
+        supply_zone = _find_directional_zone("SHORT", cur_l, cur_h, cur_c, active_demand, active_supply) if atr_valid else None
         if demand_zone is not None and supply_zone is not None:
             # Ambiguous overlap: do not guess a direction.
             continue
@@ -882,8 +923,8 @@ def generate_zone_signals(
         avg_vol = _safe_num(df.loc[i, "vol_sma20"], 0.0)
         vol_ratio = (_safe_num(df.loc[i, "volume"]) / avg_vol) if avg_vol > 0 else None
         event_ts = int(df.loc[i, "timestamp"].timestamp() * 1000)
-        zone_start = int(trade_zone["start"])
-        event_id = _make_event_id(symbol or "UNKNOWN", direction, event_ts, zone_start, cur_c)
+        zone_origin_ts_ms = int(trade_zone.get("origin_ts_ms", -1) or -1)
+        event_id = _make_event_id(symbol or "UNKNOWN", direction, event_ts, zone_origin_ts_ms, cur_c)
         zone_ctx = {
             **trade_zone,
             **_zone_context(trade_zone, i, df),
