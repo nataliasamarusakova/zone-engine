@@ -3059,3 +3059,32 @@ def test_prepare_protection_capacity_blocks_external_orders(monkeypatch):
     result = bingx.prepare_protection_capacity("TEST-USDT", "LONG")
     assert result["status"] == "blocked_external_protection"
     assert result["external_order_ids"] == ["X1"]
+
+
+def test_rejected_touch_research_payload_keeps_structure_room(monkeypatch):
+    import run_once
+    ts = pd.date_range("2026-01-01", periods=80, freq="1h", tz="UTC")
+    closes = [100 + i * 0.1 for i in range(80)]
+    df1h = pd.DataFrame({
+        "timestamp": ts, "open": closes, "high": [x + 1 for x in closes],
+        "low": [x - 1 for x in closes], "close": closes,
+        "volume": [1000.0] * 80, "atr50": [2.0] * 80,
+    })
+    zone = {"zone_id": "Z_STRUCT_REJ", "top": 105.0, "btm": 95.0, "poi": 100.0,
+            "origin_ts_ms": int(ts[10].timestamp() * 1000), "start": 10}
+    bar_ts = (pd.Timestamp.now(tz="UTC").floor("5min") - pd.Timedelta(minutes=5)).isoformat()
+    bars = [{"timestamp": bar_ts, "open": 100.0, "high": 106.0,
+             "low": 99.0, "close": 99.0, "volume": 1000.0}]
+    monkeypatch.setattr(run_once, "REQUIRE_DIRECTIONAL_CANDLE", True)
+    monkeypatch.setattr(run_once, "MIN_STRUCTURE_ROOM_R", 999.0)
+    monkeypatch.setattr(run_once, "_nearest_opposing_level", lambda *args, **kwargs: {"price": 92.0, "source": "test_obstacle"})
+    diagnostics = {}
+    obstacle = {"zone_id": "Z_OBS", "top": 92.0, "btm": 90.0, "poi": 91.0, "origin_ts_ms": int(ts[11].timestamp() * 1000), "start": 11}
+    signals, _, _ = run_once._process_5m_zone_visits(
+        "TEST-USDT", bars, [obstacle], [zone], df1h, None, set(), set(), diagnostics=diagnostics
+    )
+    assert signals == []
+    reasons = [e for e in diagnostics["touch_events"] if e.get("reason", "").startswith("insufficient_structure_room")]
+    assert reasons, diagnostics["touch_events"]
+    assert reasons[0]["structure_room_R"] is not None
+    assert reasons[0]["structural_distance"] is not None

@@ -740,3 +740,89 @@ def test_no_research_boundary_does_not_persist_irrelevant_market_bars(tmp_path: 
     assert out["observations"] == 0
     assert out["bars_1h"] == 0
     assert out["bars_5m"] == 0
+
+
+def test_recent_trade_metrics_reports_buyer_maker_field_coverage():
+    from event_engine import bingx
+    out = bingx._research_trade_metrics([
+        {"price": "100", "qty": "1", "quoteQty": "100", "time": 1000, "buyerMaker": False},
+        {"price": "101", "qty": "1", "quoteQty": "101", "time": 2000, "buyerMaker": True},
+        {"price": "102", "qty": "1", "quoteQty": "102", "time": 3000},
+    ])
+    assert out["buyer_maker_field_present_count"] == 2
+    assert out["buyer_maker_field_missing_count"] == 1
+    assert out["buyer_maker_field_coverage"] == pytest.approx(2 / 3)
+
+
+def test_research_context_provenance_preserves_analysis_and_context_sources(tmp_path: Path, monkeypatch):
+    for name in ["ZONE_OBSERVATIONS_PATH", "MARKET_BARS_1H_PATH", "MARKET_BARS_5M_PATH", "RESEARCH_BAR_CURSORS_PATH", "RESEARCH_MANIFEST_PATH", "RESEARCH_ERRORS_PATH", "MARKET_CONTEXT_PATH"]:
+        monkeypatch.setattr(research, name, tmp_path / getattr(research, name).name)
+    df = _df_1h()
+    zone = {"zone_id": "Z_PROV", "top": 105.0, "btm": 95.0, "poi": 100.0, "origin_ts_ms": int(df["timestamp"].iloc[0].timestamp() * 1000), "start": 0}
+    bar = {"timestamp": "2026-01-02T00:00:00Z", "open": 101.0, "high": 104.0, "low": 99.0, "close": 103.0, "volume": 100.0}
+    signal = {
+        "event_id": "E_PROV", "symbol": "TEST-USDT", "type": "LONG", "trigger_bar_time": bar["timestamp"], "entry": 103.0,
+        "sl": 92.7, "tp1": 106.09, "tp2": 109.18, "tp1_rr": 0.3, "tp2_rr": 0.6, "score": 60.0,
+        "zone": zone, "zone_visit": {"visit_id": "V_PROV", "touch_count_before_trigger": 0}, "entry_bar": bar,
+        "previous_bar": {}, "target": {"obstacle_price": 120.0}, "trigger": {"zone_trigger_mode": "zone"},
+    }
+    out = research.record_scan_symbol(
+        scan_id="S_PROV", symbol="TEST-USDT", strategy_version="v1", code_commit_sha="abc",
+        provider="binance", source="binance_spot", bars_1h=df.to_dict("records"), bars_5m=[bar], df_1h=df,
+        demand=[zone], supply=[], diagnostics={"touch_events": [], "rearm_events": [], "zones": {}}, symbol_state={},
+        signals=[signal], decision_ts="2026-01-02T00:10:00Z",
+        market_context={"context_id": "MC_PROV", "analysis_provider": "binance", "analysis_source": "binance_spot", "context_provider": "bingx", "context_source": "bingx_swap_public", "cross_venue_metric": "binance_bingx_last_price_deviation"},
+    )
+    assert out["market_context"] == 1
+    context = json.loads((tmp_path / "market_context.jsonl").read_text().splitlines()[0])
+    assert context["analysis_provider"] == "binance"
+    assert context["analysis_source"] == "binance_spot"
+    assert context["context_provider"] == "bingx"
+    assert context["context_source"] == "bingx_swap_public"
+    obs = next(json.loads(x) for x in (tmp_path / "zone_observations.jsonl").read_text().splitlines() if json.loads(x)["event_type"] == "SIGNAL_CREATED")
+    assert obs["features"]["context_provider"] == "bingx"
+    assert obs["features"]["context_source"] == "bingx_swap_public"
+
+
+def test_elapsed_minutes_is_monotonic_and_utc_safe():
+    import run_once
+    assert run_once._elapsed_minutes("2026-01-01T00:00:00Z", "2026-01-01T00:05:30Z") == pytest.approx(5.5)
+    assert run_once._elapsed_seconds("2026-01-01T00:00:00Z", "2026-01-01T00:00:01Z") == pytest.approx(1.0)
+
+
+def test_shadow_context_exposes_buyer_maker_coverage():
+    from event_engine import bingx
+    ctx = {
+        "recent_trades": {
+            "valid_trade_count": 3,
+            "buyer_maker_field_present_count": 2,
+            "buyer_maker_field_missing_count": 1,
+            "buyer_maker_field_coverage": 2 / 3,
+        }
+    }
+    # Build from minimal context and verify the exact feature names used by research.
+    df = _df_1h()
+    features = research.build_research_features(
+        symbol="TEST-USDT", direction="LONG",
+        zone={"zone_id": "Z", "top": 105, "btm": 95, "poi": 100, "origin_ts_ms": int(df["timestamp"].iloc[0].timestamp() * 1000), "start": 0},
+        bar={"timestamp": "2026-01-02T00:00:00Z", "open": 100, "high": 101, "low": 99, "close": 100.5, "volume": 10},
+        df_1h=df, market_context=ctx, decision_ts="2026-01-02T00:10:00Z",
+    )
+    assert features["recent_buyer_maker_present_count"] == 2
+    assert features["recent_buyer_maker_missing_count"] == 1
+    assert features["recent_buyer_maker_coverage"] == pytest.approx(2 / 3)
+
+
+def test_quote_snapshot_provenance_fields_are_optional_and_non_ambiguous():
+    from event_engine import research
+    df = _df_1h()
+    zone = {"zone_id": "Z_Q", "top": 105, "btm": 95, "poi": 100, "origin_ts_ms": int(df["timestamp"].iloc[0].timestamp() * 1000), "start": 0}
+    f = research.build_research_features(
+        symbol="TEST-USDT", direction="SHORT", zone=zone,
+        bar={"timestamp": "2026-01-02T00:00:00Z", "open": 100, "high": 101, "low": 99, "close": 100, "volume": 10},
+        df_1h=df, decision_ts="2026-01-02T00:05:00Z",
+        market_context={"quote_source":"ticker","quote_sources_attempted":["bookTicker","ticker"],"quote_fallback_reason":"bookTicker invalid"},
+    )
+    assert f["quote_source"] == "ticker"
+    assert f["quote_sources_attempted"] == ["bookTicker", "ticker"]
+    assert f["quote_fallback_reason"] == "bookTicker invalid"

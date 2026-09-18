@@ -1013,6 +1013,29 @@ def _process_5m_zone_visits(
             if not zs.get("first_touch_ts"):
                 visit_id = f"{symbol}:{zone_key}:{int(bar_ts.timestamp()*1000)}"
                 zs.update({"state": "LOCKED", "first_touch_ts": bar_ts.isoformat(), "last_touch_ts": bar_ts.isoformat(), "touch_count": int(zs.get("touch_count", 0)), "visit_id": visit_id, "lock_reason": ("midpoint_touch" if ZONE_TRIGGER_MODE == "midpoint" else "zone_touch")})
+            # Compute the structural obstacle independently before signal construction so
+            # rejected touches retain the same research feature that would have been used
+            # for an executable signal. This does not change the production decision.
+            research_entry_ref = midpoint if ZONE_TRIGGER_MODE == "midpoint" else float(bar["close"])
+            research_risk_abs = research_entry_ref * FIXED_STOP_PCT / 100.0 if research_entry_ref > 0 else None
+            research_obstacle = _nearest_opposing_level(direction, research_entry_ref, demand, supply, df_1h, len(df_1h) - 1)
+            if diagnostics is not None:
+                touch_payload = {
+                    "timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction,
+                    "midpoint": midpoint, "visit_id": zs.get("visit_id"),
+                    "touch_count_before_trigger": int(zs.get("touch_count", 0)),
+                    "entry_ref": research_entry_ref,
+                    "bar": {"open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"]), "volume": float(bar["volume"])},
+                }
+                if research_obstacle is not None:
+                    obstacle_price = float(research_obstacle.get("price"))
+                    structural_distance = obstacle_price - research_entry_ref if direction == "LONG" else research_entry_ref - obstacle_price
+                    touch_payload.update({
+                        "obstacle_price": obstacle_price,
+                        "obstacle_source": research_obstacle.get("source"),
+                        "structural_distance": structural_distance,
+                        "structure_room_R": (structural_distance / research_risk_abs) if research_risk_abs else None,
+                    })
             try:
                 signal = _build_5m_zone_signal(symbol, direction, zone, bar, prev, df_1h, demand, supply, zs)
             except ValueError as exc:
@@ -1028,7 +1051,9 @@ def _process_5m_zone_visits(
                     else:
                         diagnostics["zones"][zone_key]["other_rejects"] += 1
                         decision = "BLOCKED_SIGNAL_BUILD"
-                    diagnostics["touch_events"].append({"timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction, "midpoint": midpoint, "state_before": "ARMED", "reason": reason, "visit_id": zs.get("visit_id"), "touch_count_before_trigger": int(zs.get("touch_count", 0)), "bar": {"open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"]), "volume": float(bar["volume"])}})
+                    touch_payload["state_before"] = "ARMED"
+                    touch_payload["reason"] = reason
+                    diagnostics["touch_events"].append(touch_payload)
                     diagnostics["zones"][zone_key]["state_after"] = "LOCKED"
                     _set_decision(decision, zone_key=zone_key, direction=direction, reason=reason, timestamp=bar_ts.isoformat())
                 continue
@@ -1708,11 +1733,28 @@ def _is_terminal_execution_failure(execution: dict[str, Any]) -> bool:
     return any(fragment in error for fragment in terminal_fragments)
 
 
+def _elapsed_seconds(start_ts: Any, end_ts: Any) -> float | None:
+    try:
+        a = pd.Timestamp(start_ts); b = pd.Timestamp(end_ts)
+        if a.tzinfo is None: a = a.tz_localize("UTC")
+        if b.tzinfo is None: b = b.tz_localize("UTC")
+        return max(0.0, (b - a).total_seconds())
+    except Exception:
+        return None
+
+
+def _elapsed_minutes(start_ts: Any, end_ts: Any) -> float | None:
+    sec = _elapsed_seconds(start_ts, end_ts)
+    return sec / 60.0 if sec is not None else None
+
+
 def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     symbol = str(signal["symbol"])
     direction = str(signal["type"]).upper()
     event_id = str(signal["event_id"])
     entry_price = float(signal["entry"])
+    execution_started_ts = pd.Timestamp.now(tz="UTC")
+    signal["execution_started_ts"] = execution_started_ts.isoformat()
 
     # Validate the planned setup before making any network call or opening a position.
     valid, reason = _validate_trade_geometry(signal)
@@ -1794,6 +1836,8 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         return {"status": "skipped_invalid_setup", "error": reason, "symbol": symbol, "direction": direction}
 
     setup = _build_setup(signal)
+    order_submit_ts = pd.Timestamp.now(tz="UTC")
+    signal["order_submit_ts"] = order_submit_ts.isoformat()
     order = open_market(symbol, direction, entry_price, event_id, execution_quote=execution_quote)
     if order.get("status") == "skipped_min_qty":
         return order
@@ -1848,6 +1892,8 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
                 "error": f"entry state could not be authoritatively reconciled: {error_detail}",
             }
 
+    fill_observed_ts = pd.Timestamp.now(tz="UTC")
+    signal["fill_observed_ts"] = fill_observed_ts.isoformat()
     avg_price = float(position["avgPrice"])
     qty = abs(float(position["positionAmt"]))
     pre_entry_bid = float(execution_quote["bid"])
@@ -1959,6 +2005,19 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         "tp1_fraction": 0.50,
         "tp2_fraction": 0.50,
         "be_rule": "after_tp1_filled",
+        "quote_source": execution_quote.get("quote_source"),
+        "quote_sources_attempted": execution_quote.get("quote_sources_attempted"),
+        "quote_fallback_reason": execution_quote.get("quote_fallback_reason"),
+        "quote_time": execution_quote.get("time"),
+        "execution_started_ts": signal.get("execution_started_ts"),
+        "order_submit_ts": signal.get("order_submit_ts"),
+        "fill_observed_ts": signal.get("fill_observed_ts"),
+        "protection_started_ts": signal.get("protection_started_ts"),
+        "protection_finished_ts": signal.get("protection_finished_ts"),
+        "trigger_to_order_minutes": _elapsed_minutes(signal.get("trigger_bar_time") or signal.get("time"), signal.get("order_submit_ts")),
+        "order_to_fill_seconds": _elapsed_seconds(signal.get("order_submit_ts"), signal.get("fill_observed_ts")),
+        "fill_to_protection_seconds": _elapsed_seconds(signal.get("fill_observed_ts"), signal.get("protection_started_ts")),
+        "protection_seconds": _elapsed_seconds(signal.get("protection_started_ts"), signal.get("protection_finished_ts")),
     }
     setup["code_commit_sha"] = CODE_COMMIT_SHA
 
@@ -1968,10 +2027,14 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         actual_signal["tp1_rr"], actual_signal["tp2_rr"], rebased["target_source"],
     )
 
+    protection_started_ts = pd.Timestamp.now(tz="UTC")
+    signal["protection_started_ts"] = protection_started_ts.isoformat()
     protection = ensure_directional_protection(
         symbol, direction, avg_price, qty,
         actual_risk_pct, setup["tp_levels"], trade_id=event_id,
     )
+    protection_finished_ts = pd.Timestamp.now(tz="UTC")
+    signal["protection_finished_ts"] = protection_finished_ts.isoformat()
     setup["execution_snapshot"]["protection_status"] = protection.get("status")
     if protection.get("status") != "PROTECTED":
         log.critical("[SAFETY_CLOSE] %s %s | mandatory protection incomplete | %s", symbol, direction, protection)
@@ -2039,6 +2102,19 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
             "tp1_fraction": 0.50,
             "tp2_fraction": 0.50,
             "be_rule": "after_tp1_filled",
+            "quote_source": execution_quote.get("quote_source"),
+            "quote_sources_attempted": execution_quote.get("quote_sources_attempted"),
+            "quote_fallback_reason": execution_quote.get("quote_fallback_reason"),
+            "quote_time": execution_quote.get("time"),
+            "execution_started_ts": signal.get("execution_started_ts"),
+            "order_submit_ts": signal.get("order_submit_ts"),
+            "fill_observed_ts": signal.get("fill_observed_ts"),
+            "protection_started_ts": signal.get("protection_started_ts"),
+            "protection_finished_ts": signal.get("protection_finished_ts"),
+            "trigger_to_order_minutes": _elapsed_minutes(signal.get("trigger_bar_time") or signal.get("time"), signal.get("order_submit_ts")),
+            "order_to_fill_seconds": _elapsed_seconds(signal.get("order_submit_ts"), signal.get("fill_observed_ts")),
+            "fill_to_protection_seconds": _elapsed_seconds(signal.get("fill_observed_ts"), signal.get("protection_started_ts")),
+            "protection_seconds": _elapsed_seconds(signal.get("protection_started_ts"), signal.get("protection_finished_ts")),
         },
         "executed_signal": actual_signal,
     }
@@ -2387,7 +2463,14 @@ def main() -> None:
             research_bars_1h_raw = []
             touch_events = five_min_diag.get("touch_events") or []
             rearm_events = five_min_diag.get("rearm_events") or []
-            has_nearest = any(isinstance(z, dict) and isinstance(z.get("closest_midpoint_bar"), dict) for z in (five_min_diag.get("zones") or {}).values())
+            near_approach_limit = max(0.0, float(os.environ.get("RESEARCH_NEAREST_APPROACH_MAX_PCT", "1.0")))
+            has_nearest = any(
+                isinstance(z, dict)
+                and isinstance(z.get("closest_midpoint_bar"), dict)
+                and z.get("closest_midpoint_distance_pct") is not None
+                and 0.0 < float(z.get("closest_midpoint_distance_pct")) <= near_approach_limit
+                for z in (five_min_diag.get("zones") or {}).values()
+            )
             rich_nearest_context = os.environ.get("RESEARCH_CONTEXT_NEAREST_APPROACH", "false").lower() == "true"
             rich_rejection_context = os.environ.get("RESEARCH_CONTEXT_FOR_REJECTIONS", "false").lower() == "true"
             boundary_types: list[str] = []
@@ -2397,7 +2480,9 @@ def main() -> None:
                 boundary_types.extend(sorted({str(e.get("reason", "TOUCH_EVENT")) for e in touch_events if isinstance(e, dict)}))
             if rearm_events:
                 boundary_types.append("REARM")
-            if has_nearest and rich_nearest_context:
+            # Persist the 5m path for a qualifying nearest approach even when the
+            # expensive order-book/funding/OI context is deliberately disabled.
+            if has_nearest:
                 boundary_types.append("NEAREST_APPROACH")
             has_research_boundary = bool(boundary_types)
             if research.RESEARCH_ENABLED and has_research_boundary:
@@ -2431,7 +2516,13 @@ def main() -> None:
                             "asset_class": meta.get("asset_class", "UNKNOWN"),
                             "analysis_provider": provider,
                             "analysis_source": source_name,
+                            "context_provider": "bingx",
+                            "context_source": "bingx_swap_public",
                             "binance_symbol": binance_symbol,
+                            "cross_venue_binance_price": binance_live_price,
+                            "cross_venue_bingx_price": bingx_price,
+                            "cross_venue_deviation_pct": spread_pct,
+                            "cross_venue_metric": "binance_bingx_last_price_deviation",
                             "boundary_types": sorted(set(boundary_types)),
                             "boundary_event_ids": [str(s.get("event_id")) for s in research_signals if s.get("event_id")],
                         })
@@ -2536,10 +2627,18 @@ def main() -> None:
             time.sleep(SCAN_BATCH_PAUSE_SEC)
 
     scan_errors = sum(1 for row in scan_rows if row.get("price_position") == "ERROR")
-    scan_skips = sum(1 for row in scan_rows if row.get("price_position") in {"INSUFFICIENT_DATA", "CONTRACT_NOT_FOUND"})
+    scan_insufficient_data = sum(1 for row in scan_rows if row.get("price_position") == "INSUFFICIENT_DATA")
+    scan_contract_not_found = sum(1 for row in scan_rows if row.get("price_position") == "CONTRACT_NOT_FOUND")
+    scan_stale_rejects = sum(
+        1 for row in scan_rows
+        if str(row.get("trigger_status", "")) in {"BLOCKED_STALE_TOUCH", "DATA_STALE_REJECT"}
+        or "DATA_STALE_REJECT" in str(row.get("fresh_signal", ""))
+    )
+    scan_skips = scan_insufficient_data + scan_contract_not_found + scan_stale_rejects
+    scan_duration_sec = time.time() - started
     log.info(
-        "[SCAN_DONE] symbols=%d errors=%d skipped=%d fresh_signals=%d duration=%.1fs",
-        total, scan_errors, scan_skips, len(fresh_signals), time.time() - started,
+        "[SCAN_DONE] symbols=%d errors=%d skipped=%d insufficient_data=%d contract_not_found=%d stale_rejects=%d fresh_signals=%d duration=%.1fs",
+        total, scan_errors, scan_skips, scan_insufficient_data, scan_contract_not_found, scan_stale_rejects, len(fresh_signals), scan_duration_sec,
     )
 
     # Normalize execution-facing metadata once at the runtime boundary. The
@@ -2681,6 +2780,16 @@ def main() -> None:
         )
 
     for rank, signal in enumerate(selected_signals, start=1):
+        execution_gate_ts = pd.Timestamp.now(tz="UTC")
+        signal["execution_gate_ts"] = execution_gate_ts.isoformat()
+        trigger_raw = signal.get("trigger_bar_time") or signal.get("time")
+        try:
+            trigger_ts = pd.Timestamp(trigger_raw)
+            if trigger_ts.tzinfo is None:
+                trigger_ts = trigger_ts.tz_localize("UTC")
+            signal["trigger_to_execution_gate_minutes"] = max(0.0, (execution_gate_ts - trigger_ts).total_seconds() / 60.0)
+        except Exception:
+            signal["trigger_to_execution_gate_minutes"] = None
         _record_entry_decision(
             scan_id,
             signal,
@@ -2726,8 +2835,14 @@ def main() -> None:
             log.info("[EXEC_SKIP_CLAIM] %s %s | event_id=%s reason=%s", signal["symbol"], signal["type"], event_id, claim_reason)
             continue
         _record_entry_decision(scan_id, signal, "EXECUTION_CLAIM", "claimed", selection_rank=rank, attempt_id=attempt_id, execution_status="CLAIMED", terminal=False)
+        execution_call_start_ts = pd.Timestamp.now(tz="UTC")
         execution = execute_new_position(signal)
+        execution_finish_ts = pd.Timestamp.now(tz="UTC")
         execution["attempt_id"] = attempt_id
+        execution["execution_call_start_ts"] = execution_call_start_ts.isoformat()
+        execution["execution_finish_ts"] = execution_finish_ts.isoformat()
+        execution["execution_wall_clock_seconds"] = max(0.0, (execution_finish_ts - execution_call_start_ts).total_seconds())
+        execution["trigger_to_execution_finish_minutes"] = _elapsed_minutes(signal.get("trigger_bar_time") or signal.get("time"), execution_finish_ts.isoformat())
         execution_status = str(execution.get("status", ""))
         if execution_status in {"skipped_min_qty", "skipped_tp_min_qty", "skipped_invalid_setup"}:
             log.warning(
@@ -2808,7 +2923,8 @@ def main() -> None:
         except Exception as exc:
             log.exception("[RECON_FINAL] reconciliation failed: %s", exc)
 
-    log.info("[DONE] symbols=%d fresh_signals=%d executed=%d duration=%.1fs", len(scan_rows), len(fresh_signals), executed, time.time() - started)
+    total_duration_sec = time.time() - started
+    log.info("[DONE] symbols=%d fresh_signals=%d executed=%d duration=%.1fs", len(scan_rows), len(fresh_signals), executed, total_duration_sec)
 
 
 if __name__ == "__main__":
