@@ -430,13 +430,134 @@ def test_execute_emergency_closes_when_protection_fails(monkeypatch):
     assert closed.get("called") is True
 
 
-def test_open_client_order_id_is_unique():
+def test_open_client_order_id_is_deterministic_per_logical_event():
     from event_engine import bingx
     a = bingx._new_open_client_order_id("ALT-USDT", "ZONE_TEST")
     b = bingx._new_open_client_order_id("ALT-USDT", "ZONE_TEST")
-    assert a != b
-    assert len(a) <= 32
-    assert len(b) <= 32
+    c = bingx._new_open_client_order_id("ALT-USDT", "ZONE_TEST_2")
+    assert a == b
+    assert a != c
+    assert len(a) <= 40
+    assert len(b) <= 40
+
+
+def test_get_order_accepts_client_order_id(monkeypatch):
+    from event_engine import bingx
+    seen = {}
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "TESTUSDT")
+    monkeypatch.setattr(
+        bingx,
+        "_request",
+        lambda method, path, params, **kwargs: (seen.setdefault("params", params), {
+            "code": 0,
+            "data": {
+                "order": {
+                    "orderId": "123",
+                    "symbol": "TESTUSDT",
+                    "side": "BUY",
+                    "positionSide": "LONG",
+                    "type": "MARKET",
+                    "status": "NEW",
+                    "clientOrderId": "CID_X",
+                    "origQty": "2",
+                    "executedQty": "0",
+                }
+            },
+        })[1],
+    )
+    out = bingx.get_order("TEST-USDT", client_order_id="CID_X")
+    assert out["status"] == "ok"
+    assert seen["params"]["clientOrderId"] == "CID_X"
+    assert "orderId" not in seen["params"]
+
+
+def test_open_market_resolves_existing_client_order_before_post(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "TESTUSDT")
+    monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
+    monkeypatch.setattr(bingx, "get_contract", lambda symbol: {
+        "quantityPrecision": 2, "tradeMinQuantity": 0.01, "multiplier": 1, "maxLeverage": 20,
+    })
+    monkeypatch.setattr(bingx, "has_open_position", lambda *a, **k: False)
+    monkeypatch.setattr(bingx, "get_execution_quote", lambda *a, **k: {"status": "ok", "bid": 99.9, "ask": 100.1, "mid": 100.0})
+    monkeypatch.setattr(bingx, "_set_leverage", lambda *a, **k: True)
+    monkeypatch.setattr(bingx, "position_side_param", lambda *a, **k: "LONG")
+    monkeypatch.setattr(bingx, "get_order", lambda *a, **k: {
+        "status": "ok", "symbol": "TESTUSDT", "side": "BUY", "order_type": "MARKET",
+        "position_side": "LONG", "order_status": "NEW", "order_id": "321", "client_order_id": k["client_order_id"],
+    })
+    monkeypatch.setattr(bingx, "_request", lambda *a, **k: pytest.fail("MARKET POST must not happen when clientOrderId already exists"))
+    out = bingx.open_market("TEST-USDT", "LONG", 100.0, "EVENT_X")
+    assert out["status"] == "opened"
+    assert out["idempotency"] == "existing_client_order_resolved_before_post"
+
+
+def test_open_market_transport_error_reconciles_client_order_without_repost(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "TESTUSDT")
+    monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
+    monkeypatch.setattr(bingx, "get_contract", lambda symbol: {
+        "quantityPrecision": 2, "tradeMinQuantity": 0.01, "multiplier": 1, "maxLeverage": 20,
+    })
+    monkeypatch.setattr(bingx, "has_open_position", lambda *a, **k: False)
+    monkeypatch.setattr(bingx, "get_execution_quote", lambda *a, **k: {"status": "ok", "bid": 99.9, "ask": 100.1, "mid": 100.0})
+    monkeypatch.setattr(bingx, "_set_leverage", lambda *a, **k: True)
+    monkeypatch.setattr(bingx, "position_side_param", lambda *a, **k: "LONG")
+    lookup_calls = {"n": 0}
+    def fake_get_order(*a, **k):
+        lookup_calls["n"] += 1
+        if lookup_calls["n"] == 1:
+            return {"status": "error", "error": "order not found"}
+        return {
+            "status": "ok", "symbol": "TESTUSDT", "side": "BUY", "order_type": "MARKET",
+            "position_side": "LONG", "order_status": "FILLED", "order_id": "654",
+            "client_order_id": k["client_order_id"],
+        }
+    monkeypatch.setattr(bingx, "get_order", fake_get_order)
+    calls = []
+    def fake_request(method, path, params, **kwargs):
+        calls.append((method, path))
+        if method == "POST":
+            return {"code": -1, "msg": "read timeout"}
+        return {"code": 0, "data": {}}
+    monkeypatch.setattr(bingx, "_request", fake_request)
+    out = bingx.open_market("TEST-USDT", "LONG", 100.0, "EVENT_X_TRANSPORT")
+    assert out["status"] == "opened"
+    assert out["idempotency"] == "client_order_id_verified_after_transport_error"
+    assert [c[0] for c in calls] == ["POST"]
+
+
+def test_open_market_refuses_reuse_of_terminal_client_order(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "TESTUSDT")
+    monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
+    monkeypatch.setattr(bingx, "get_contract", lambda symbol: {
+        "quantityPrecision": 2, "tradeMinQuantity": 0.01, "multiplier": 1, "maxLeverage": 20,
+    })
+    monkeypatch.setattr(bingx, "has_open_position", lambda *a, **k: False)
+    monkeypatch.setattr(bingx, "get_execution_quote", lambda *a, **k: {"status": "ok", "bid": 99.9, "ask": 100.1, "mid": 100.0})
+    monkeypatch.setattr(bingx, "_set_leverage", lambda *a, **k: True)
+    monkeypatch.setattr(bingx, "position_side_param", lambda *a, **k: "LONG")
+    monkeypatch.setattr(bingx, "get_order", lambda *a, **k: {
+        "status": "ok", "symbol": "TESTUSDT", "side": "BUY", "order_type": "MARKET",
+        "position_side": "LONG", "order_status": "CANCELED", "order_id": "999",
+        "client_order_id": k["client_order_id"],
+    })
+    monkeypatch.setattr(bingx, "_request", lambda *a, **k: pytest.fail("terminal clientOrderId must not be reposted"))
+    out = bingx.open_market("TEST-USDT", "LONG", 100.0, "EVENT_X")
+    assert out["status"] == "error"
+    assert "terminal exchange order" in out["error"]
+
+
+def test_binance_parser_rejects_invalid_ohlc(monkeypatch):
+    from event_engine import binance
+    invalid = [
+        [1767225600000, "100", "99", "101", "101", "10", 1767225659999, "1010", 1, "6", "606", "0"],
+        [1767225900000, "100", "102", "99", "101", "nan", 1767225959999, "1010", 1, "6", "606", "0"],
+    ]
+    monkeypatch.setattr(binance, "_get", lambda *args, **kwargs: invalid)
+    rows = binance.fetch_klines("BTCUSDT", interval="5m", limit=2)
+    assert rows == []
 
 
 def test_tp_constants_are_one_and_two_r():
