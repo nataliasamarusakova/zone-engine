@@ -44,6 +44,14 @@ jobs:
       FAILED_SIGNAL_TTL_SEC: "86400"
       EXECUTION_MAX_SIGNAL_AGE_BARS: "0"
       DIAGNOSTICS_MODE: "historical"
+      RESEARCH_ENABLED: "true"
+      RESEARCH_5M_HISTORY_LIMIT: "288"
+      RESEARCH_DEPTH_LEVELS: "20"
+      RESEARCH_RECENT_TRADES_LIMIT: "100"
+      RESEARCH_CONTEXT_NEAREST_APPROACH: "false"
+      RESEARCH_CONTEXT_FOR_REJECTIONS: "false"
+      RESEARCH_ACCOUNT_TIMEOUT_SEC: "5"
+      RESEARCH_ACCOUNT_ACTIVITY_LOOKBACK_MINUTES: "15"
       SCAN_WORKERS: "12"
       SCAN_BATCH_SIZE: "48"
       SCAN_BATCH_PAUSE_SEC: "0.10"
@@ -85,7 +93,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Syntax check
-        run: python -m compileall -q event_engine run_once.py pine_r541_sr.py pine_sr_diagnostic.py test_all.py test_pine_sr_diagnostic.py
+        run: python -m compileall -q event_engine run_once.py research_forward.py pine_r541_sr.py pine_sr_diagnostic.py test_all.py test_pine_sr_diagnostic.py test_research_layer.py
 
       - name: Run tests
         run: python -m pytest -q
@@ -96,6 +104,10 @@ jobs:
           ZONE_TRIGGER_MODE: "zone"
           MIN_STRUCTURE_ROOM_R: "0"
         run: python run_once.py
+
+      - name: Update research outcomes
+        if: always()
+        run: python research_forward.py --write
 
       - name: Upload diagnostic log
         if: always()
