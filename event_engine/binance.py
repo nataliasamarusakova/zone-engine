@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import json
 import logging
 import os
@@ -169,28 +170,58 @@ def fetch_klines(symbol: str, interval: str = "1h", limit: int = 120, *, retryab
     for row in payload:
         if not isinstance(row, list) or len(row) < 6:
             continue
+        try:
+            ts = int(row[0])
+            open_price = float(row[1])
+            high = float(row[2])
+            low = float(row[3])
+            close = float(row[4])
+            volume = float(row[5])
+            close_time = int(row[6]) if len(row) > 6 else None
+            quote_volume = float(row[7]) if len(row) > 7 else None
+            trade_count = int(row[8]) if len(row) > 8 and str(row[8]).isdigit() else None
+            taker_buy_base = float(row[9]) if len(row) > 9 else None
+            taker_buy_quote = float(row[10]) if len(row) > 10 else None
+        except (TypeError, ValueError, OverflowError):
+            continue
+
+        base_values = (open_price, high, low, close, volume)
+        if not all(math.isfinite(v) for v in base_values):
+            continue
+        if min(open_price, high, low, close) <= 0 or volume < 0:
+            continue
+        if high < max(open_price, close) or low > min(open_price, close) or high < low:
+            continue
+        if quote_volume is not None and (not math.isfinite(quote_volume) or quote_volume < 0):
+            quote_volume = None
+        if taker_buy_base is not None and (not math.isfinite(taker_buy_base) or taker_buy_base < 0):
+            taker_buy_base = None
+        if taker_buy_quote is not None and (not math.isfinite(taker_buy_quote) or taker_buy_quote < 0):
+            taker_buy_quote = None
+
+        taker_flow_valid = (
+            quote_volume is not None
+            and taker_buy_base is not None
+            and taker_buy_quote is not None
+            and taker_buy_base <= volume * 1.001 + 1e-8
+            and taker_buy_quote <= quote_volume * 1.001 + 1e-8
+        )
+
         rows.append(
             {
-                "timestamp": int(row[0]),
-                "open": float(row[1]),
-                "high": float(row[2]),
-                "low": float(row[3]),
-                "close": float(row[4]),
-                "volume": float(row[5]),
-                "close_time": int(row[6]) if len(row) > 6 else None,
-                "quote_volume": float(row[7]) if len(row) > 7 else None,
-                "trade_count": int(row[8]) if len(row) > 8 and str(row[8]).isdigit() else None,
-                "taker_buy_base": float(row[9]) if len(row) > 9 else None,
-                "taker_buy_quote": float(row[10]) if len(row) > 10 else None,
-                "taker_flow_valid": (
-                    len(row) > 10
-                    and float(row[7]) >= 0
-                    and float(row[9]) >= 0
-                    and float(row[10]) >= 0
-                    and float(row[9]) <= float(row[5]) * 1.001 + 1e-8
-                    and float(row[10]) <= float(row[7]) * 1.001 + 1e-8
-                ),
-                "bar_delta_usdt": (2.0 * float(row[10]) - float(row[7])) if len(row) > 10 else None,
+                "timestamp": ts,
+                "open": open_price,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": volume,
+                "close_time": close_time,
+                "quote_volume": quote_volume,
+                "trade_count": trade_count,
+                "taker_buy_base": taker_buy_base,
+                "taker_buy_quote": taker_buy_quote,
+                "taker_flow_valid": taker_flow_valid,
+                "bar_delta_usdt": (2.0 * taker_buy_quote - quote_volume) if taker_flow_valid else None,
                 "source": "binance_spot",
                 "binance_symbol": bsym,
             }

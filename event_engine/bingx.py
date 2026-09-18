@@ -565,37 +565,59 @@ def get_positions(*, timeout_sec: float | None = None, retryable: bool = True) -
     return _normalize_orders_list(resp)
 
 
-def get_order(symbol: str, order_id: str | int) -> dict:
+def get_order(
+    symbol: str,
+    order_id: str | int | None = None,
+    *,
+    client_order_id: str | None = None,
+) -> dict:
+    """Query an order by system orderId or exchange-supported clientOrderId."""
     bx = to_bx_symbol(symbol)
     if not bx:
         return {"status": "error", "error": "contract_not_found"}
+    if order_id in (None, "") and client_order_id in (None, ""):
+        return {"status": "error", "error": "order_id_or_client_order_id_required"}
 
-    resp = _request("GET", ORDER_PATH, {"symbol": bx, "orderId": str(order_id)}, signed=True)
+    params: dict[str, Any] = {"symbol": bx}
+    if client_order_id not in (None, ""):
+        params["clientOrderId"] = str(client_order_id)
+    else:
+        params["orderId"] = str(order_id)
+
+    resp = _request("GET", ORDER_PATH, params, signed=True)
     if resp.get("code") != 0:
         return {"status": "error", "error": resp.get("msg"), "code": resp.get("code")}
 
     data = resp.get("data") or {}
     order = data.get("order") or data
+    if not isinstance(order, dict):
+        return {"status": "error", "error": "order_payload_missing"}
 
-    avg_price_raw = order.get("avgPrice")
-    try:
-        avg_price = float(avg_price_raw) if avg_price_raw not in (None, "") else 0.0
-    except (TypeError, ValueError):
-        avg_price = 0.0
-    try:
-        trigger_price = float(order.get("stopPrice", 0) or 0)
-    except (TypeError, ValueError):
-        trigger_price = 0.0
+    def _num(key: str, fallback: str | None = None) -> float:
+        raw = order.get(key)
+        if raw in (None, "") and fallback:
+            raw = order.get(fallback)
+        try:
+            value = float(raw) if raw not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+        return value if math.isfinite(value) else 0.0
 
     return {
         "status": "ok",
-        "order_id": str(order.get("orderId", order_id)),
+        "order_id": str(order.get("orderId", order_id or "")),
         "order_status": str(order.get("status", "")).upper(),
-        "avg_price": avg_price,
-        "trigger_price": trigger_price,
-        "executed_qty": float(order.get("executedQty", 0) or order.get("cumQty", 0) or 0),
-        "orig_qty": float(order.get("origQty", 0) or order.get("quantity", 0) or 0),
-        "client_order_id": str(order.get("clientOrderId", "")),
+        "symbol": str(order.get("symbol", bx)).upper(),
+        "side": str(order.get("side", "")).upper(),
+        "position_side": str(order.get("positionSide", "")).upper(),
+        "order_type": str(order.get("type", "")).upper(),
+        "avg_price": _num("avgPrice"),
+        "trigger_price": _num("stopPrice"),
+        "executed_qty": _num("executedQty", "cumQty"),
+        "orig_qty": _num("origQty", "quantity"),
+        "client_order_id": str(order.get("clientOrderId", client_order_id or "")),
+        "time_ms": int(_num("time")) if _num("time") > 0 else None,
+        "update_time_ms": int(_num("updateTime")) if _num("updateTime") > 0 else None,
     }
 
 
@@ -694,11 +716,15 @@ def _trade_digest(trade_id: str) -> str:
 
 
 def _new_open_client_order_id(bx_symbol: str, trade_id: str) -> str:
-    # ENTRY ids must be unique for every new order attempt. Idempotency is
-    # provided by the position check before POST, not by reusing a client ID.
-    nonce = uuid.uuid4().hex.upper()[:12]
-    digest = hashlib.sha256(f"{bx_symbol}:{trade_id}:{nonce}".encode()).hexdigest().upper()[:10]
-    return f"EVT_OPEN_{digest}_{nonce}"
+    """Return one deterministic clientOrderId for one logical entry event.
+
+    BingX requires clientOrderId to be unique per order and supports querying an
+    order by this ID. A deterministic ID lets a retry/concurrent worker refer to
+    the same logical order instead of manufacturing a second identity.
+    """
+    raw = f"{bx_symbol.upper()}:{trade_id}"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest().upper()[:24]
+    return f"EVT_OPEN_{digest}"[:40]
 
 
 def _find_recent_order_by_client_id(symbol: str, client_order_id: str, lookback_ms: int = 120_000) -> dict | None:
@@ -822,6 +848,48 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str, *, exe
         "clientOrderId": client_order_id,
     }
 
+    # Exchange-side idempotency guard: if another worker already submitted this
+    # logical event, resolve its existing order instead of placing a second one.
+    try:
+        existing_order = get_order(symbol, client_order_id=client_order_id)
+    except Exception:
+        existing_order = {"status": "error"}
+    if existing_order.get("status") == "ok":
+        same_order = (
+            existing_order.get("symbol", bx) == bx
+            and existing_order.get("side", "") == side
+            and existing_order.get("order_type", "") == "MARKET"
+            and existing_order.get("position_side", position_side) == position_side
+        )
+        if same_order:
+            order_status = str(existing_order.get("order_status", "")).upper()
+            if order_status in {"NEW", "PARTIALLY_FILLED", "FILLED"}:
+                return {
+                    "status": "opened",
+                    "symbol": bx,
+                    "qty": qty,
+                    "leverage": leverage,
+                    "sizing_price": sizing_price,
+                    "signal_price": float(price),
+                    "order_reference_price": sizing_price,
+                    "order_id": existing_order.get("order_id"),
+                    "client_order_id": existing_order.get("client_order_id") or client_order_id,
+                    "idempotency": "existing_client_order_resolved_before_post",
+                    "response": {"code": 0, "data": existing_order},
+                    "execution_quote": execution_quote,
+                }
+            if order_status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}:
+                return {
+                    "status": "error",
+                    "symbol": bx,
+                    "error": f"clientOrderId already used by terminal exchange order status={order_status}; refusing reuse",
+                    "order_id": existing_order.get("order_id"),
+                    "client_order_id": existing_order.get("client_order_id") or client_order_id,
+                    "idempotency": "terminal_client_order_prevents_reuse",
+                    "response": {"code": 0, "data": existing_order},
+                    "execution_quote": execution_quote,
+                }
+
     response = _request("POST", ORDER_PATH, params)
     log.info("[BINGX] OPEN order response: symbol=%s direction=%s positionSide=%s code=%s msg=%s", bx, direction, position_side, response.get("code") if isinstance(response, dict) else None, response.get("msg") if isinstance(response, dict) else None)
 
@@ -837,9 +905,48 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str, *, exe
         )
         if transport_error:
             log.warning("[BINGX] Order POST transport error for %s (%s); reconciling clientOrderId before using position state...", bx, response.get("msg"))
+            resolved_order = get_order(symbol, client_order_id=client_order_id)
+            if resolved_order.get("status") == "ok":
+                same_order = (
+                    resolved_order.get("symbol", bx) == bx
+                    and resolved_order.get("side", "") == side
+                    and resolved_order.get("order_type", "") == "MARKET"
+                    and resolved_order.get("position_side", position_side) == position_side
+                )
+                if same_order:
+                    order_status = str(resolved_order.get("order_status", "")).upper()
+                    if order_status in {"NEW", "PARTIALLY_FILLED", "FILLED"}:
+                        log.warning("[BINGX] Matching active/filled clientOrderId found after transport error; treating MARKET order as resolved.")
+                        return {
+                            "status": "opened",
+                            "symbol": bx,
+                            "qty": qty,
+                            "leverage": leverage,
+                            "sizing_price": sizing_price,
+                            "signal_price": float(price),
+                            "order_reference_price": sizing_price,
+                            "order_id": resolved_order.get("order_id"),
+                            "client_order_id": resolved_order.get("client_order_id") or client_order_id,
+                            "idempotency": "client_order_id_verified_after_transport_error",
+                            "response": response,
+                            "execution_quote": execution_quote,
+                            "historical_order": resolved_order,
+                        }
+                    if order_status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}:
+                        return {
+                            "status": "error",
+                            "symbol": bx,
+                            "error": f"clientOrderId already used by terminal exchange order status={order_status}; refusing reuse",
+                            "order_id": resolved_order.get("order_id"),
+                            "client_order_id": resolved_order.get("client_order_id") or client_order_id,
+                            "idempotency": "terminal_client_order_prevents_reuse",
+                            "response": response,
+                            "execution_quote": execution_quote,
+                            "historical_order": resolved_order,
+                        }
             historical_order = _find_recent_order_by_client_id(symbol, client_order_id)
             if historical_order is not None:
-                log.warning("[BINGX] Matching clientOrderId found after transport error; treating MARKET order as resolved.")
+                log.warning("[BINGX] Matching historical clientOrderId found after transport error; treating MARKET order as resolved.")
                 return {
                     "status": "opened",
                     "symbol": bx,
