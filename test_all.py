@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from pathlib import Path
+import time
 
 from event_engine.signals import (
     calc_hma,
@@ -65,6 +66,7 @@ def _isolate_runtime_state(monkeypatch, tmp_path):
     monkeypatch.setattr(run_once, "EVENT_CLAIMS_LOCK_PATH", runtime_data / "event_execution_claims.json.lock")
     monkeypatch.setattr(run_once, "ACTIONS_PATH", runtime_data / "actions.jsonl")
     monkeypatch.setattr(run_once, "ENTRY_DECISIONS_PATH", runtime_data / "entry_decisions.jsonl")
+    monkeypatch.setattr(run_once, "EXECUTION_LEDGER_PATH", runtime_data / "execution_ledger.jsonl")
 
     # The workflow deliberately uses temporary full-universe + zone-touch
     # environment variables only for the engine step. Tests stay pinned to the
@@ -2492,7 +2494,22 @@ def test_workflow_stages_all_data_but_excludes_scan_history():
     text = Path(".github/workflows/event-engine.yml").read_text(encoding="utf-8")
     assert "git add data/" in text
     assert "git reset -- data/scan_history.jsonl" in text
-    assert 'schedule:' not in text
+    assert "schedule:" in text
+    assert '- cron: "*/5 * * * *"' in text
+
+
+def test_execution_ledger_is_append_only_and_carries_attempt_lineage(tmp_path, monkeypatch):
+    import run_once
+    monkeypatch.setattr(run_once, "EXECUTION_LEDGER_PATH", tmp_path / "execution_ledger.jsonl")
+    run_once._append_execution_ledger("EVT_TEST", "ATT_TEST", "TEST_STAGE", {"status": "ok"})
+    row = json.loads((tmp_path / "execution_ledger.jsonl").read_text(encoding="utf-8").strip())
+    assert row["record_type"] == "EXECUTION_LEDGER"
+    assert row["event_id"] == "EVT_TEST"
+    assert row["attempt_id"] == "ATT_TEST"
+    assert row["stage"] == "TEST_STAGE"
+    assert row["status"] == "ok"
+    assert row["strategy_version"] == run_once._effective_strategy_version()
+    assert row["code_commit_sha"] == run_once.CODE_COMMIT_SHA
 
 
 def test_emergency_be_rollback_cleans_engine_orders_before_close(monkeypatch):
@@ -2689,10 +2706,13 @@ def test_update_mfe_mae_records_threshold_milestones():
     assert trade["mfe_milestones_r"]["2.00"] == 1_183
 
 
-def test_5m_zone_visit_locks_after_midpoint_touch_and_does_not_retrigger_in_chop():
+def test_5m_zone_visit_locks_after_midpoint_touch_and_does_not_retrigger_in_chop(monkeypatch):
     import time
     import pandas as pd
+    import run_once
     from run_once import _process_5m_zone_visits
+    monkeypatch.setattr(run_once, "MIN_STRUCTURE_ROOM_R", 0.0)
+    monkeypatch.setattr(run_once, "MAX_5M_TRIGGER_AGE_MINUTES", 60.0)
 
     now = pd.Timestamp.now(tz="UTC").floor("5min")
     t0 = now - pd.Timedelta(minutes=15)
@@ -2803,9 +2823,12 @@ def test_5m_first_processed_bar_is_not_suppressed_by_unprocessed_history_touch(m
     assert state["zones"]["DEMAND:0:110.000000000000:100.000000000000"]["state"] == "LOCKED"
 
 
-def test_5m_pending_event_is_reused_for_retry_without_new_event_id():
+def test_5m_pending_event_is_reused_for_retry_without_new_event_id(monkeypatch):
     import pandas as pd
+    import run_once
     from run_once import _process_5m_zone_visits
+    monkeypatch.setattr(run_once, "MIN_STRUCTURE_ROOM_R", 0.0)
+    monkeypatch.setattr(run_once, "MAX_5M_TRIGGER_AGE_MINUTES", 60.0)
 
     now = pd.Timestamp.now(tz="UTC").floor("5min")
     t0 = now - pd.Timedelta(minutes=10)
@@ -2842,7 +2865,7 @@ def test_5m_touch_before_zone_activation_is_ignored(monkeypatch):
         for i in range(12)
     ])
     assert SWING_LEN == 10
-    activation_ts = pd.Timestamp(df1h.loc[10, "timestamp"])
+    activation_ts = pd.Timestamp(df1h.loc[10, "timestamp"]) + pd.Timedelta(hours=1)
     assert t0 < activation_ts
     signals, _, _ = _process_5m_zone_visits("TEST-USDT", bars, [zone], [], df1h, None, set(), set())
     assert signals == []
@@ -3088,3 +3111,71 @@ def test_rejected_touch_research_payload_keeps_structure_room(monkeypatch):
     assert reasons, diagnostics["touch_events"]
     assert reasons[0]["structure_room_R"] is not None
     assert reasons[0]["structural_distance"] is not None
+
+
+def test_quote_freshness_uses_exchange_timestamp(monkeypatch):
+    from event_engine import bingx
+    now_ms = int(time.time() * 1000)
+    monkeypatch.setattr(bingx, "SERVER_TIME_OFFSET_MS", 0)
+    fresh = {"quote_observed_at_ms": now_ms, "quote_exchange_time_ms": now_ms - 500}
+    stale = {"quote_observed_at_ms": now_ms, "quote_exchange_time_ms": now_ms - 5000}
+    assert bingx._quote_freshness(fresh, 2.0)[0] is True
+    assert bingx._quote_freshness(stale, 2.0)[0] is False
+
+
+def test_quote_freshness_uses_local_clock_for_local_observation(monkeypatch):
+    from event_engine import bingx
+    local_now_ms = int(time.time() * 1000)
+    monkeypatch.setattr(bingx, "SERVER_TIME_OFFSET_MS", 5000)
+    quote = {"quote_observed_at_ms": local_now_ms, "quote_exchange_time_ms": None}
+    ok, local_age, exchange_age, source = bingx._quote_freshness(quote, 2.0)
+    assert ok is True
+    assert local_age is not None and local_age < 1.0
+    assert exchange_age is None
+    assert source == "local_observed_elapsed"
+
+
+def test_open_market_uses_final_venue_quote_not_preflight_quote(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "TESTUSDT")
+    monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
+    monkeypatch.setattr(bingx, "get_contract", lambda symbol: {"quantityPrecision": 2, "tradeMinQuantity": 0.01, "multiplier": 1, "maxLeverage": 20})
+    monkeypatch.setattr(bingx, "has_open_position", lambda *a, **k: False)
+    monkeypatch.setattr(bingx, "_set_leverage", lambda *a, **k: True)
+    monkeypatch.setattr(bingx, "position_side_param", lambda *a, **k: "LONG")
+    monkeypatch.setattr(bingx, "get_order", lambda *a, **k: {"status": "error", "error": "not found"})
+    now_ms = int(time.time() * 1000)
+    preflight_quote = {"status":"ok","symbol":"TESTUSDT","bid":90.0,"ask":90.1,"quote_observed_at_ms":now_ms - 60000,"quote_exchange_time_ms":now_ms - 60000,"quote_source":"old_preflight"}
+    final_quote = {"status":"ok","symbol":"TESTUSDT","bid":100.0,"ask":100.2,"quote_observed_at_ms":now_ms,"quote_exchange_time_ms":now_ms,"quote_source":"bookTicker"}
+    calls = {"n": 0}
+    def fake_quote(*a, **k):
+        calls["n"] += 1
+        return final_quote
+    monkeypatch.setattr(bingx, "get_execution_quote", fake_quote)
+    posted = {}
+    monkeypatch.setattr(bingx, "_request", lambda method, path, params, **kwargs: posted.update(params) or {"code":0,"data":{"order":{"orderId":"1","clientOrderId":params["clientOrderId"]}}})
+    out = bingx.open_market("TEST-USDT", "LONG", 100.0, "EVENT_FINAL_QUOTE", execution_quote=preflight_quote)
+    assert out["status"] == "opened"
+    assert calls["n"] == 1
+    assert out["execution_quote"]["ask"] == 100.2
+    assert isinstance(out.get("order_submit_at_ms"), int)
+    assert out["execution_quote"]["order_submit_at_ms"] == out["order_submit_at_ms"]
+    assert float(posted["quantity"]) > 0
+
+
+def test_open_market_final_drift_blocks_post(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "TESTUSDT")
+    monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
+    monkeypatch.setattr(bingx, "get_contract", lambda symbol: {"quantityPrecision": 2, "tradeMinQuantity": 0.01, "multiplier": 1, "maxLeverage": 20})
+    monkeypatch.setattr(bingx, "has_open_position", lambda *a, **k: False)
+    monkeypatch.setattr(bingx, "_set_leverage", lambda *a, **k: True)
+    monkeypatch.setattr(bingx, "position_side_param", lambda *a, **k: "LONG")
+    monkeypatch.setattr(bingx, "get_order", lambda *a, **k: {"status": "error", "error": "not found"})
+    now_ms = int(time.time() * 1000)
+    quote = {"status":"ok","symbol":"TESTUSDT","bid":102.0,"ask":102.2,"quote_observed_at_ms":now_ms,"quote_exchange_time_ms":now_ms,"quote_source":"bookTicker"}
+    monkeypatch.setattr(bingx, "get_execution_quote", lambda *a, **k: quote)
+    monkeypatch.setattr(bingx, "_request", lambda *a, **k: pytest.fail("market POST must not happen after final drift rejection"))
+    out = bingx.open_market("TEST-USDT", "LONG", 100.0, "EVENT_DRIFT_FINAL")
+    assert out["status"] == "skipped_stale_signal"
+    assert "signal_drift_pct" in out["error"]

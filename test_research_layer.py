@@ -439,6 +439,18 @@ def test_recent_trade_boolean_parser_handles_string_flags(monkeypatch):
     ] == pytest.approx(0.0)
 
 
+def test_recent_trade_missing_buyer_maker_is_unknown_not_buy():
+    from event_engine import bingx
+
+    metrics = bingx._research_trade_metrics([
+        {"price": "100", "qty": "1", "quoteQty": "100", "time": 1000},
+        {"price": "101", "qty": "1", "quoteQty": "101", "time": 2000, "buyerMaker": "true"},
+    ])
+    assert metrics["aggressor_validity"] == "partial"
+    assert metrics["buyer_maker_field_coverage"] == pytest.approx(0.5)
+    assert metrics["buy_aggressor_ratio"] == pytest.approx(0.0)
+
+
 def test_binance_kline_parser_preserves_taker_flow(monkeypatch):
     from event_engine import binance
     row = [

@@ -9,6 +9,7 @@ import uuid
 import fcntl
 import hashlib
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -74,6 +75,7 @@ FAILED_SIGNAL_RETRY_BASE_SEC = max(1, int(os.environ.get("FAILED_SIGNAL_RETRY_BA
 FAILED_SIGNAL_RETRY_MAX_SEC = max(FAILED_SIGNAL_RETRY_BASE_SEC, int(os.environ.get("FAILED_SIGNAL_RETRY_MAX_SEC", str(3600))))
 ACTIONS_PATH = DATA / "actions.jsonl"
 ENTRY_DECISIONS_PATH = DATA / "entry_decisions.jsonl"
+EXECUTION_LEDGER_PATH = DATA / "execution_ledger.jsonl"
 EVENT_CLAIMS_PATH = DATA / "event_execution_claims.json"
 EVENT_CLAIMS_LOCK_PATH = DATA / "event_execution_claims.json.lock"
 EVENT_CLAIM_LEASE_SEC = max(60, int(os.environ.get("EVENT_CLAIM_LEASE_SEC", "900")))
@@ -81,6 +83,7 @@ EVENT_CLAIM_LEASE_SEC = max(60, int(os.environ.get("EVENT_CLAIM_LEASE_SEC", "900
 EXECUTION_ENABLED = os.environ.get("EXECUTION_ENABLED", "true").lower() == "true"
 MARGIN_USDT = float(os.environ.get("BINGX_MARGIN_USDT", "1"))
 MAX_TRADES_PER_CYCLE = int(os.environ.get("MAX_TRADES_PER_CYCLE", "5"))
+MAX_OPEN_POSITIONS = max(1, int(os.environ.get("MAX_OPEN_POSITIONS", "20")))
 MAX_SCAN_SYMBOLS = int(os.environ.get("MAX_SCAN_SYMBOLS", "0"))
 WATCHLIST_ONLY = os.environ.get("WATCHLIST_ONLY", "false").lower() == "true"
 # Temporary test switches. Normal mode keeps the curated 150-asset whitelist and
@@ -112,6 +115,9 @@ SCAN_BATCH_PAUSE_SEC = max(0.0, float(os.environ.get("SCAN_BATCH_PAUSE_SEC", "0.
 BINANCE_ASSET_CLASSES = {x.strip().upper() for x in os.environ.get("BINANCE_ASSET_CLASSES", "CRYPTO,EQUITY").split(",") if x.strip()}
 MAX_MARKET_SPREAD_PCT = float(os.environ.get("MAX_MARKET_SPREAD_PCT", "1.50"))
 MAX_ENTRY_SLIPPAGE_PCT = max(0.0, float(os.environ.get("MAX_ENTRY_SLIPPAGE_PCT", "1.00")))
+EXECUTION_QUOTE_MAX_AGE_SEC = max(0.0, float(os.environ.get("EXECUTION_QUOTE_MAX_AGE_SEC", "2.0")))
+RESEARCH_RICH_CONTEXT_ENABLED = os.environ.get("RESEARCH_RICH_CONTEXT_ENABLED", "false").lower() == "true"
+RESEARCH_DEFER_UNTIL_AFTER_EXECUTION = os.environ.get("RESEARCH_DEFER_UNTIL_AFTER_EXECUTION", "true").lower() == "true"
 RECONCILIATION_MAX_SECONDS = float(os.environ.get("RECONCILIATION_MAX_SECONDS", "45"))
 # Live execution requires the signal timestamp to be exactly the latest closed 1H bar.
 # Also reject stale market data so a symbol with an old/delisted Binance series cannot
@@ -120,7 +126,7 @@ MAX_DATA_STALENESS_HOURS = float(os.environ.get("MAX_DATA_STALENESS_HOURS", "2.0
 # Zone geometry remains 1H; trigger detection runs on closed 5m bars so a short
 # midpoint visit cannot be missed merely because the 1H candle later closes elsewhere.
 KLINE_LIMIT_5M = int(os.environ.get("KLINE_LIMIT_5M", "144"))  # 12h of 5m bars
-MAX_5M_TRIGGER_AGE_MINUTES = float(os.environ.get("MAX_5M_TRIGGER_AGE_MINUTES", "15"))
+MAX_5M_TRIGGER_AGE_MINUTES = float(os.environ.get("MAX_5M_TRIGGER_AGE_MINUTES", "10"))
 INITIAL_5M_TRIGGER_LOOKBACK_MINUTES = float(os.environ.get("INITIAL_5M_TRIGGER_LOOKBACK_MINUTES", "15"))
 ZONE_VISIT_STATE_PATH = DATA / "zone_visit_state.json"
 ZONE_VISIT_STATE_LOCK_PATH = DATA / "zone_visit_state.json.lock"
@@ -214,6 +220,32 @@ def _append_jsonl(path: Path, obj: dict[str, Any]) -> None:
                 os.fsync(fh.fileno())
         finally:
             fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+
+
+def _append_execution_ledger(event_id: str, attempt_id: str | None, stage: str, payload: dict[str, Any] | None = None) -> None:
+    """Append one immutable execution-lifecycle event.
+
+    This journal is observability-only: a ledger write failure must never alter
+    a trading decision. The record is intentionally append-only and carries the
+    strategy/commit lineage needed to reconstruct one attempt end-to-end.
+    """
+    record = {
+        "record_type": "EXECUTION_LEDGER",
+        "ledger_ts": pd.Timestamp.now(tz="UTC").isoformat(),
+        "ts_ms": int(time.time() * 1000),
+        "event_id": str(event_id),
+        "attempt_id": attempt_id,
+        "stage": str(stage),
+        "strategy_version": _effective_strategy_version(),
+        "code_commit_sha": CODE_COMMIT_SHA,
+    }
+    if isinstance(payload, dict):
+        record.update(payload)
+    try:
+        _append_jsonl(EXECUTION_LEDGER_PATH, record)
+    except Exception as exc:
+        log.error("[EXECUTION_LEDGER_WRITE_FAILED] event_id=%s attempt_id=%s stage=%s error=%s", event_id, attempt_id, stage, exc)
 
 
 def _record_entry_decision(
@@ -761,6 +793,28 @@ def _build_5m_zone_signal(
     }
 
 
+def _zone_activation_timestamp(zone: dict[str, Any], df_1h: pd.DataFrame) -> pd.Timestamp | None:
+    """Return the first timestamp at which a zone is live in real time.
+
+    ``zone.start + SWING_LEN`` identifies the 1H confirmation candle. Its stored
+    timestamp is the candle OPEN, so the zone cannot be known until that candle
+    has CLOSED one hour later. Using the open timestamp contaminates historical
+    candidate populations with information that was not yet available live.
+    """
+    try:
+        activation_idx = int(zone.get("start", -1)) + SWING_LEN
+    except (TypeError, ValueError):
+        return None
+    if activation_idx < 0 or activation_idx >= len(df_1h):
+        return None
+    ts = pd.Timestamp(df_1h.loc[activation_idx, "timestamp"])
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return ts + pd.Timedelta(hours=1)
+
+
 def _process_5m_zone_visits(
     symbol: str,
     bars: list[dict[str, Any]],
@@ -860,8 +914,7 @@ def _process_5m_zone_visits(
         for zone_key, (direction, zone) in active_zone_map.items():
             zdiag = diagnostics["zones"][zone_key]
             midpoint = float(zdiag["midpoint"])
-            activation_idx = int(zone.get("start", -1)) + SWING_LEN
-            activation_ts = pd.Timestamp(df_1h.loc[activation_idx, "timestamp"]) if 0 <= activation_idx < len(df_1h) else None
+            activation_ts = _zone_activation_timestamp(zone, df_1h)
             for _, wbar in x.iterrows():
                 low = float(wbar["low"]); high = float(wbar["high"]); ts = pd.Timestamp(wbar["timestamp"])
                 if activation_ts is not None and ts < activation_ts:
@@ -933,9 +986,8 @@ def _process_5m_zone_visits(
                     continue
             if zs.get("state") != "ARMED":
                 continue
-            activation_idx = int(zone.get("start", -1)) + SWING_LEN
-            if activation_idx >= 0 and activation_idx < len(df_1h):
-                activation_ts = pd.Timestamp(df_1h.loc[activation_idx, "timestamp"])
+            activation_ts = _zone_activation_timestamp(zone, df_1h)
+            if activation_ts is not None:
                 if bar_ts < activation_ts:
                     if diagnostics is not None:
                         diagnostics["zones"][zone_key]["activation_blocks"] += 1
@@ -1761,11 +1813,13 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     entry_price = float(signal["entry"])
     execution_started_ts = pd.Timestamp.now(tz="UTC")
     signal["execution_started_ts"] = execution_started_ts.isoformat()
+    _append_execution_ledger(event_id, signal.get("attempt_id"), "EXECUTION_START", {"symbol": symbol, "direction": direction, "signal_price": entry_price, "trigger_bar_time": signal.get("trigger_bar_time") or signal.get("time")})
 
     # Validate the planned setup before making any network call or opening a position.
     valid, reason = _validate_trade_geometry(signal)
     if not valid:
         log.warning("[EXEC_SKIPPED] %s %s | invalid_setup | %s", symbol, direction, reason)
+        _append_execution_ledger(event_id, signal.get("attempt_id"), "SETUP_REJECTED", {"status": "skipped_invalid_setup", "error": reason})
         return {"status": "skipped_invalid_setup", "error": reason, "symbol": symbol, "direction": direction}
 
     # Do not open first and discover that the trigger-order endpoint is unavailable.
@@ -1781,6 +1835,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     if protection_capacity.get("status") not in {"ready"}:
         reason = str(protection_capacity.get("error", protection_capacity.get("status", "protection capacity unavailable")))
         log.error("[EXEC_BLOCKED_PROTECTION_PRECHECK] %s %s | %s", symbol, direction, reason)
+        _append_execution_ledger(event_id, signal.get("attempt_id"), "PROTECTION_PREFLIGHT_BLOCKED", {"status": "blocked_protection_preflight", "error": reason, "protection_preflight": protection_capacity})
         return {
             "status": "blocked_protection_preflight",
             "symbol": symbol,
@@ -1788,6 +1843,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
             "error": reason,
             "protection_preflight": protection_capacity,
         }
+    _append_execution_ledger(event_id, signal.get("attempt_id"), "PROTECTION_PREFLIGHT_READY", {"cancelled_order_ids": protection_capacity.get("cancelled_order_ids", []), "required_new_protection_orders": protection_capacity.get("required_new_protection_orders")})
 
     # Revalidate against the actual BingX top-of-book immediately before MARKET.
     # The previous implementation validated the stale signal price and only
@@ -1796,13 +1852,27 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     if execution_quote.get("status") != "ok":
         reason = execution_quote.get("error", "execution quote unavailable")
         log.error("[EXEC_BLOCKED_QUOTE] %s %s | %s", symbol, direction, reason)
+        _append_execution_ledger(event_id, signal.get("attempt_id"), "QUOTE_UNAVAILABLE", {"status": "execution_quote_unavailable", "error": reason})
         return {"status": "execution_quote_unavailable", "error": reason, "symbol": symbol, "direction": direction}
 
+    _append_execution_ledger(event_id, signal.get("attempt_id"), "PRE_ENTRY_QUOTE", {"bid": execution_quote.get("bid"), "ask": execution_quote.get("ask"), "quote_source": execution_quote.get("quote_source"), "quote_time": execution_quote.get("time"), "quote_observed_at_ms": execution_quote.get("quote_observed_at_ms")})
+    observed_at_ms = execution_quote.get("quote_observed_at_ms")
+    if observed_at_ms is not None and EXECUTION_QUOTE_MAX_AGE_SEC > 0:
+        try:
+            quote_age_sec = max(0.0, (time.time() * 1000.0 - float(observed_at_ms)) / 1000.0)
+        except (TypeError, ValueError):
+            quote_age_sec = None
+        if quote_age_sec is not None and quote_age_sec > EXECUTION_QUOTE_MAX_AGE_SEC:
+            reason = f"execution_quote_age={quote_age_sec:.3f}s > {EXECUTION_QUOTE_MAX_AGE_SEC:.3f}s"
+            log.warning("[EXEC_REJECT_QUOTE_AGE] %s %s | %s", symbol, direction, reason)
+            _append_execution_ledger(event_id, signal.get("attempt_id"), "QUOTE_REJECTED_STALE", {"error": reason, "quote_age_sec": quote_age_sec})
+            return {"status": "skipped_stale_signal", "error": reason, "symbol": symbol, "direction": direction, "execution_quote": execution_quote}
     executable_price = float(execution_quote["ask"] if direction == "LONG" else execution_quote["bid"])
     signal_drift_pct = _adverse_signal_drift_pct(entry_price, executable_price, direction)
     if signal_drift_pct > MAX_ENTRY_SLIPPAGE_PCT:
         reason = f"signal_drift_pct={signal_drift_pct:.4f}% > {MAX_ENTRY_SLIPPAGE_PCT:.4f}%"
         log.warning("[EXEC_REJECT_STALE] %s %s | %s | signal=%s executable=%s", symbol, direction, reason, entry_price, executable_price)
+        _append_execution_ledger(event_id, signal.get("attempt_id"), "SIGNAL_DRIFT_REJECTED", {"status": "skipped_stale_signal", "error": reason, "signal_price": entry_price, "execution_reference_price": executable_price, "signal_drift_pct": signal_drift_pct})
         return {
             "status": "skipped_stale_signal",
             "error": reason,
@@ -1822,11 +1892,13 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         reason = f"pre-entry protection rebase failed: {exc}"
         log.warning("[EXEC_REJECT_GEOMETRY] %s %s | %s", symbol, direction, reason)
+        _append_execution_ledger(event_id, signal.get("attempt_id"), "PRE_ENTRY_GEOMETRY_REJECTED", {"status": "skipped_invalid_setup", "error": reason})
         return {"status": "skipped_invalid_setup", "error": reason, "symbol": symbol, "direction": direction}
 
     valid, reason = _validate_trade_geometry(preflight_signal)
     if not valid:
         log.warning("[EXEC_REJECT_GEOMETRY] %s %s | %s", symbol, direction, reason)
+        _append_execution_ledger(event_id, signal.get("attempt_id"), "PRE_ENTRY_GEOMETRY_REJECTED", {"status": "skipped_invalid_setup", "error": reason, "execution_reference_price": executable_price, "signal_drift_pct": signal_drift_pct})
         return {
             "status": "skipped_invalid_setup",
             "error": f"pre_entry_current_price_geometry: {reason}",
@@ -1839,16 +1911,36 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     distinct, reason = _validate_exchange_price_distinctness(preflight_signal)
     if not distinct:
         log.warning("[EXEC_REJECT_PRECISION] %s %s | %s", symbol, direction, reason)
+        _append_execution_ledger(event_id, signal.get("attempt_id"), "PRE_ENTRY_PRECISION_REJECTED", {"status": "skipped_invalid_setup", "error": reason})
         return {"status": "skipped_invalid_setup", "error": reason, "symbol": symbol, "direction": direction}
 
     setup = _build_setup(signal)
-    order_submit_ts = pd.Timestamp.now(tz="UTC")
-    signal["order_submit_ts"] = order_submit_ts.isoformat()
+    # ``order_submit_ts`` is reserved for an actual MARKET POST. Do not populate
+    # it with the function-call start time because rejected/stale attempts did not
+    # submit an order. ``execution_call_start_ts`` is recorded separately below.
+    signal.pop("order_submit_ts", None)
     order = open_market(symbol, direction, entry_price, event_id, execution_quote=execution_quote)
+    exact_order_submit_ms = order.get("order_submit_at_ms") if isinstance(order, dict) else None
+    try:
+        if exact_order_submit_ms is not None:
+            signal["order_submit_ts"] = pd.to_datetime(int(exact_order_submit_ms), unit="ms", utc=True).isoformat()
+    except (TypeError, ValueError, OverflowError):
+        log.warning("[EXEC_LEDGER] invalid order_submit_at_ms for %s: %r", event_id, exact_order_submit_ms)
     if order.get("status") == "skipped_min_qty":
+        _append_execution_ledger(event_id, signal.get("attempt_id"), "ORDER_REJECTED", {"status": order.get("status"), "error": order.get("error")})
         return order
     if order.get("status") != "opened":
+        _append_execution_ledger(event_id, signal.get("attempt_id"), "ORDER_REJECTED", {"status": order.get("status"), "error": order.get("error")})
         return {"status": str(order.get("status", "error")).upper(), "error": order.get("error"), "order": order}
+
+    # open_market owns the final venue-quote gate immediately before POST. Use that
+    # authoritative quote for all post-fill execution-quality calculations rather
+    # than the earlier preflight quote captured before the idempotency/protection path.
+    authoritative_execution_quote = order.get("execution_quote")
+    if isinstance(authoritative_execution_quote, dict) and authoritative_execution_quote.get("status") == "ok":
+        execution_quote = authoritative_execution_quote
+
+    _append_execution_ledger(event_id, signal.get("attempt_id"), "ORDER_ACK", {"order_id": order.get("order_id"), "client_order_id": order.get("client_order_id"), "qty": order.get("qty"), "sizing_price": order.get("sizing_price"), "order_submit_at_ms": order.get("order_submit_at_ms"), "execution_quote": execution_quote})
 
     position = wait_for_position_fill_directional(
         symbol,
@@ -1902,6 +1994,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     signal["fill_observed_ts"] = fill_observed_ts.isoformat()
     avg_price = float(position["avgPrice"])
     qty = abs(float(position["positionAmt"]))
+    _append_execution_ledger(event_id, signal.get("attempt_id"), "POSITION_FILL", {"avg_price": avg_price, "qty": qty, "position_side": direction, "fill_observed_ts": signal.get("fill_observed_ts")})
     pre_entry_bid = float(execution_quote["bid"])
     pre_entry_ask = float(execution_quote["ask"])
     executable_reference_price = pre_entry_ask if direction == "LONG" else pre_entry_bid
@@ -2042,6 +2135,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     protection_finished_ts = pd.Timestamp.now(tz="UTC")
     signal["protection_finished_ts"] = protection_finished_ts.isoformat()
     setup["execution_snapshot"]["protection_status"] = protection.get("status")
+    _append_execution_ledger(event_id, signal.get("attempt_id"), "PROTECTION_RESULT", {"status": protection.get("status"), "error": protection.get("error"), "sl_order": protection.get("sl_result"), "tp_orders": protection.get("tp_orders", [])})
     if protection.get("status") != "PROTECTED":
         log.critical("[SAFETY_CLOSE] %s %s | mandatory protection incomplete | %s", symbol, direction, protection)
         # Mandatory rule: never leave a newly-opened position live without BOTH
@@ -2064,6 +2158,8 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
             "close_verification": verify_closed,
             "executed_signal": actual_signal,
         }
+
+    _append_execution_ledger(event_id, signal.get("attempt_id"), "PROTECTED_POSITION", {"fill_price": avg_price, "sl_price": sl_price, "tp1_price": tp1_price, "tp2_price": tp2_price, "risk_pct": actual_risk_pct, "planned_weighted_rr": setup["planned_weighted_rr"]})
 
     register_active_trade(
         event_id=event_id,
@@ -2158,7 +2254,10 @@ def main() -> None:
             "zone_trigger_mode": ZONE_TRIGGER_MODE, "fixed_stop_pct": FIXED_STOP_PCT,
             "tp1_pct": TP1_PCT, "tp2_pct": TP2_PCT, "min_structure_room_r": MIN_STRUCTURE_ROOM_R,
             "require_directional_candle": REQUIRE_DIRECTIONAL_CANDLE, "require_structure_obstacle": REQUIRE_STRUCTURE_OBSTACLE,
-            "max_trades_per_cycle": MAX_TRADES_PER_CYCLE, "max_entry_slippage_pct": MAX_ENTRY_SLIPPAGE_PCT,
+            "max_trades_per_cycle": MAX_TRADES_PER_CYCLE, "max_open_positions": MAX_OPEN_POSITIONS, "max_entry_slippage_pct": MAX_ENTRY_SLIPPAGE_PCT,
+            "execution_quote_max_age_sec": EXECUTION_QUOTE_MAX_AGE_SEC,
+            "research_rich_context_enabled": RESEARCH_RICH_CONTEXT_ENABLED,
+            "research_defer_until_after_execution": RESEARCH_DEFER_UNTIL_AFTER_EXECUTION,
             "max_market_spread_pct": MAX_MARKET_SPREAD_PCT, "max_5m_trigger_age_minutes": MAX_5M_TRIGGER_AGE_MINUTES,
         },
     )
@@ -2221,7 +2320,7 @@ def main() -> None:
 
     # Research-only account context is fetched once per scan and reused by all observations.
     research_account_context = None
-    if research.RESEARCH_ENABLED:
+    if research.RESEARCH_ENABLED and not RESEARCH_DEFER_UNTIL_AFTER_EXECUTION:
         try:
             research_account_context = fetch_research_account_snapshot()
             if research_account_context is not None:
@@ -2238,7 +2337,7 @@ def main() -> None:
     # Research-only BTC context is fetched once per scan and reused by all symbol observations.
     btc_research_df_5m = pd.DataFrame()
     btc_research_df_1h = pd.DataFrame()
-    if research.RESEARCH_ENABLED:
+    if research.RESEARCH_ENABLED and not RESEARCH_DEFER_UNTIL_AFTER_EXECUTION:
         try:
             btc_raw_5m = fetch_binance_klines("BTCUSDT", interval="5m", limit=288, retryable=False)
             if btc_raw_5m:
@@ -2289,6 +2388,8 @@ def main() -> None:
         zone_visit_state = {"version": ZONE_VISIT_STATE_VERSION, "trigger_mode": ZONE_TRIGGER_MODE, "symbols": {}}
     scan_rows: list[dict[str, Any]] = []
     fresh_signals: list[dict[str, Any]] = []
+    deferred_research_rows: list[dict[str, Any]] = []
+    deferred_research_lock = threading.Lock()
 
     def scan_one(symbol: str) -> dict[str, Any]:
         """Public-market scan for one symbol. Safe to run concurrently."""
@@ -2322,7 +2423,6 @@ def main() -> None:
                 }
 
             df, supply, demand, signals = generate_zone_signals(pd.DataFrame(bars), symbol=symbol, mode=DIAGNOSTICS_MODE)
-            research.persist_market_bars(symbol, "1h", bars, provider=provider, source=source_name, scan_id=scan_id, code_commit_sha=CODE_COMMIT_SHA)
             latest_price = float(df["close"].iloc[-1])
             bingx_price = _bingx_last_price(contract)
             latest_closed_idx = len(df) - 1
@@ -2405,7 +2505,7 @@ def main() -> None:
                 # A symbol may have a still-maturing research observation even after
                 # its zone disappears. Keep persisting new 5m bars for that symbol so
                 # the 24h forward path can actually mature. This is research-only.
-                if research.RESEARCH_ENABLED and str(symbol).upper() in research_pending_forward_symbols:
+                if research.RESEARCH_ENABLED and not RESEARCH_DEFER_UNTIL_AFTER_EXECUTION and str(symbol).upper() in research_pending_forward_symbols:
                     try:
                         pending_limit = max(12, int(os.environ.get("RESEARCH_PENDING_5M_FETCH_LIMIT", "24")))
                         if provider == "bingx":
@@ -2513,7 +2613,7 @@ def main() -> None:
             if research.RESEARCH_ENABLED and has_research_boundary:
                 research_bars_1h_raw = bars
                 research_bars_5m_raw = trigger_bars_raw
-            collect_rich_context = bool(research_signals) or (rich_rejection_context and bool(touch_events or rearm_events))
+            collect_rich_context = RESEARCH_RICH_CONTEXT_ENABLED and not RESEARCH_DEFER_UNTIL_AFTER_EXECUTION and (bool(research_signals) or (rich_rejection_context and bool(touch_events or rearm_events)))
             if research.RESEARCH_ENABLED and has_research_boundary and collect_rich_context:
                 # Pull a larger 5m history only for research-boundary symbols. This gives
                 # enough lookback for 12h/24h returns without increasing the production
@@ -2554,17 +2654,40 @@ def main() -> None:
                 except Exception as context_exc:
                     log.warning("[RESEARCH_CONTEXT] %s | collection failed: %s", _display_symbol(symbol), context_exc)
 
-            # Research is persisted after all pre-entry market-context fields are known,
-            # but before any production gate can remove a candidate from the population.
-            research.record_scan_symbol(
-                scan_id=scan_id, symbol=symbol, strategy_version=_effective_strategy_version(),
-                code_commit_sha=CODE_COMMIT_SHA, provider=provider, source=source_name,
-                bars_1h=research_bars_1h_raw, bars_5m=research_bars_5m_raw, df_1h=df, demand=demand, supply=supply,
-                diagnostics=five_min_diag, symbol_state=symbol_state, signals=research_signals,
-                decision_ts=pd.Timestamp.now(tz="UTC").isoformat(), market_context=research_context,
-                persist_bars_for_forward=(str(symbol).upper() in research_pending_forward_symbols),
-                account_context=research_account_context, btc_df_5m=btc_research_df_5m, btc_df_1h=btc_research_df_1h,
-            )
+            # When live execution is enabled, keep the production critical path free of
+            # research persistence/I/O. Capture the exact decision-time inputs in memory
+            # and flush them after all selected live attempts are finished.
+            research_decision_ts = pd.Timestamp.now(tz="UTC").isoformat()
+            if research.RESEARCH_ENABLED and RESEARCH_DEFER_UNTIL_AFTER_EXECUTION:
+                with deferred_research_lock:
+                    deferred_research_rows.append({
+                        "symbol": symbol,
+                        "strategy_version": _effective_strategy_version(),
+                        "code_commit_sha": CODE_COMMIT_SHA,
+                        "provider": provider,
+                        "source": source_name,
+                        "bars_1h": research_bars_1h_raw,
+                        "bars_5m": research_bars_5m_raw,
+                        "df_1h": df.copy(),
+                        "demand": demand,
+                        "supply": supply,
+                        "diagnostics": five_min_diag,
+                        "symbol_state": symbol_state,
+                        "signals": research_signals,
+                        "decision_ts": research_decision_ts,
+                        "market_context": None,
+                        "persist_bars_for_forward": (str(symbol).upper() in research_pending_forward_symbols),
+                    })
+            elif research.RESEARCH_ENABLED:
+                research.record_scan_symbol(
+                    scan_id=scan_id, symbol=symbol, strategy_version=_effective_strategy_version(),
+                    code_commit_sha=CODE_COMMIT_SHA, provider=provider, source=source_name,
+                    bars_1h=research_bars_1h_raw, bars_5m=research_bars_5m_raw, df_1h=df, demand=demand, supply=supply,
+                    diagnostics=five_min_diag, symbol_state=symbol_state, signals=research_signals,
+                    decision_ts=research_decision_ts, market_context=research_context,
+                    persist_bars_for_forward=(str(symbol).upper() in research_pending_forward_symbols),
+                    account_context=research_account_context, btc_df_5m=btc_research_df_5m, btc_df_1h=btc_research_df_1h,
+                )
 
             if spread_pct is not None and spread_pct > MAX_MARKET_SPREAD_PCT:
                 log.warning("[MARKET_SPREAD] %s | Binance=%s | BingX=%s | spread=%.4f%% > %.4f%%", _display_symbol(symbol), binance_live_price, bingx_price, spread_pct, MAX_MARKET_SPREAD_PCT)
@@ -2789,23 +2912,40 @@ def main() -> None:
     log.info("[EXEC_GATE_SUMMARY] input_signals=%d executable=%d rejected=%d reasons=%s", len(latest_by_symbol), len(executable), sum(exec_gate_stats.values()), json.dumps(exec_gate_stats, ensure_ascii=False, sort_keys=True))
 
     executed = 0
-    selected_signals = executable[:MAX_TRADES_PER_CYCLE]
-    cycle_cap_signals = executable[MAX_TRADES_PER_CYCLE:]
-    for rank, signal in enumerate(cycle_cap_signals, start=MAX_TRADES_PER_CYCLE + 1):
-        _record_entry_decision(
-            scan_id,
-            signal,
-            "CYCLE_CAP",
-            "max_trades_per_cycle_reached",
-            selection_rank=rank,
-        )
-        log.warning(
-            "[EXEC_CYCLE_CAP] symbol=%s direction=%s event_id=%s rank=%d cap=%d score=%.2f trigger=%s",
-            signal.get("symbol"), signal.get("type"), signal.get("event_id"), rank,
-            MAX_TRADES_PER_CYCLE, signal.get("score", 0.0), signal.get("trigger_bar_time") or signal.get("time"),
-        )
+    # Hard account-level admission control. ``open_keys`` is an exchange-authoritative
+    # snapshot captured immediately before selection and includes external positions.
+    # It prevents the engine from creating a portfolio whose protection orders can
+    # exhaust the exchange account/order budget before the three required protections
+    # (SL + TP1 + TP2) are installed.
+    open_position_count = len(open_keys)
+    available_position_slots = max(0, MAX_OPEN_POSITIONS - open_position_count)
+    selection_limit = min(MAX_TRADES_PER_CYCLE, available_position_slots)
+    selected_signals = executable[:selection_limit]
+    deferred_signals = executable[selection_limit:]
+    for rank, signal in enumerate(deferred_signals, start=selection_limit + 1):
+        if rank <= MAX_TRADES_PER_CYCLE:
+            stage = "ACCOUNT_POSITION_CAP"
+            reason = "max_open_positions_reached"
+            log.warning(
+                "[EXEC_ACCOUNT_CAP] symbol=%s direction=%s event_id=%s rank=%d open=%d cap=%d score=%.2f trigger=%s",
+                signal.get("symbol"), signal.get("type"), signal.get("event_id"), rank,
+                open_position_count, MAX_OPEN_POSITIONS, signal.get("score", 0.0), signal.get("trigger_bar_time") or signal.get("time"),
+            )
+        else:
+            stage = "CYCLE_CAP"
+            reason = "max_trades_per_cycle_reached"
+            log.warning(
+                "[EXEC_CYCLE_CAP] symbol=%s direction=%s event_id=%s rank=%d cap=%d score=%.2f trigger=%s",
+                signal.get("symbol"), signal.get("type"), signal.get("event_id"), rank,
+                MAX_TRADES_PER_CYCLE, signal.get("score", 0.0), signal.get("trigger_bar_time") or signal.get("time"),
+            )
+        _record_entry_decision(scan_id, signal, stage, reason, selection_rank=rank)
 
     for rank, signal in enumerate(selected_signals, start=1):
+        if EXECUTION_ENABLED and len(open_keys) >= MAX_OPEN_POSITIONS:
+            _record_entry_decision(scan_id, signal, "ACCOUNT_POSITION_CAP", "max_open_positions_reached_before_execution", selection_rank=rank)
+            log.warning("[EXEC_ACCOUNT_CAP] blocking before execution | symbol=%s direction=%s open=%d cap=%d", signal.get("symbol"), signal.get("type"), len(open_keys), MAX_OPEN_POSITIONS)
+            continue
         execution_gate_ts = pd.Timestamp.now(tz="UTC")
         signal["execution_gate_ts"] = execution_gate_ts.isoformat()
         trigger_raw = signal.get("trigger_bar_time") or signal.get("time")
@@ -2861,6 +3001,7 @@ def main() -> None:
             log.info("[EXEC_SKIP_CLAIM] %s %s | event_id=%s reason=%s", signal["symbol"], signal["type"], event_id, claim_reason)
             continue
         _record_entry_decision(scan_id, signal, "EXECUTION_CLAIM", "claimed", selection_rank=rank, attempt_id=attempt_id, execution_status="CLAIMED", terminal=False)
+        signal["attempt_id"] = attempt_id
         execution_call_start_ts = pd.Timestamp.now(tz="UTC")
         execution = execute_new_position(signal)
         execution_finish_ts = pd.Timestamp.now(tz="UTC")
@@ -2870,6 +3011,16 @@ def main() -> None:
         execution["execution_wall_clock_seconds"] = max(0.0, (execution_finish_ts - execution_call_start_ts).total_seconds())
         execution["trigger_to_execution_finish_minutes"] = _elapsed_minutes(signal.get("trigger_bar_time") or signal.get("time"), execution_finish_ts.isoformat())
         execution_status = str(execution.get("status", ""))
+        _append_execution_ledger(event_id, attempt_id, "EXECUTION_RESULT", {
+            "status": execution_status,
+            "error": execution.get("error"),
+            "execution_call_start_ts": execution_call_start_ts.isoformat(),
+            "execution_finish_ts": execution_finish_ts.isoformat(),
+            "execution_wall_clock_seconds": execution.get("execution_wall_clock_seconds"),
+            "trigger_to_execution_finish_minutes": execution.get("trigger_to_execution_finish_minutes"),
+            "order_id": (execution.get("order") or {}).get("order_id") if isinstance(execution.get("order"), dict) else None,
+            "fill_price": (execution.get("position") or {}).get("avgPrice") if isinstance(execution.get("position"), dict) else None,
+        })
         if execution_status in {"skipped_min_qty", "skipped_tp_min_qty", "skipped_invalid_setup"}:
             log.warning(
                 "[EXEC_SKIPPED] %s %s | status=%s | reason=%s | error=%s | qty=%s min_qty=%s required_margin=%.4f configured_margin=%.4f",
@@ -2899,6 +3050,8 @@ def main() -> None:
             terminal=(True if execution_status == "opened_protected" else bool(_is_terminal_execution_failure(execution))),
         )
         if execution_status == "opened_protected":
+            bx_position_symbol = str(((execution.get("position") or {}).get("symbol") or signal.get("symbol"))).upper()
+            open_keys.add((bx_position_symbol, str(signal.get("type")).upper()))
             _finalize_event_claim(event_id, attempt_id, terminal=True, status=execution_status)
         elif _is_terminal_execution_failure(execution):
             terminal_event_ids.add(event_id)
@@ -2936,6 +3089,65 @@ def main() -> None:
     # Persist the complete scan for analytics/backtesting, but do not dump the
     # full inactive-symbol table into runtime logs. Runtime logs contain active
     # symbols only.
+    if research.RESEARCH_ENABLED and RESEARCH_DEFER_UNTIL_AFTER_EXECUTION and deferred_research_rows:
+        # Post-execution research phase: never attach post-trade context to earlier
+        # decision-time observations, because that would create a lookahead artifact.
+        log.info("[RESEARCH_DEFERRED_FLUSH] rows=%d | live execution path complete", len(deferred_research_rows))
+        try:
+            post_account = fetch_research_account_snapshot()
+            if post_account is not None:
+                post_account.update({
+                    "scan_id": scan_id,
+                    "strategy_version": _effective_strategy_version(),
+                    "code_commit_sha": CODE_COMMIT_SHA,
+                    "capture_phase": "post_execution",
+                    "decision_context_valid": False,
+                    "account_context_id": post_account.get("account_context_id") or research.stable_id(
+                        "account-context-post-execution-v1", scan_id, post_account.get("captured_at_ms", ""), prefix="AC_"
+                    ),
+                })
+                research.record_account_context(post_account)
+        except Exception as exc:
+            log.warning("[RESEARCH_ACCOUNT_POST] account context unavailable: %s", exc)
+        try:
+            btc_raw_5m = fetch_binance_klines("BTCUSDT", interval="5m", limit=288, retryable=False)
+            if btc_raw_5m:
+                research.persist_market_bars("BTC-USDT", "5m", btc_raw_5m, provider="binance", source="binance_spot_btc_context_post_execution", scan_id=scan_id, code_commit_sha=CODE_COMMIT_SHA)
+        except Exception as exc:
+            log.warning("[RESEARCH_BTC_POST] 5m context unavailable: %s", exc)
+        try:
+            btc_raw_1h = fetch_binance_klines("BTCUSDT", interval="1h", limit=300, retryable=False)
+            if btc_raw_1h:
+                research.persist_market_bars("BTC-USDT", "1h", btc_raw_1h, provider="binance", source="binance_spot_btc_context_post_execution", scan_id=scan_id, code_commit_sha=CODE_COMMIT_SHA)
+        except Exception as exc:
+            log.warning("[RESEARCH_BTC_POST] 1h context unavailable: %s", exc)
+
+        for payload in list(deferred_research_rows):
+            bars_5m = list(payload.get("bars_5m") or [])
+            if payload.get("persist_bars_for_forward") and not bars_5m:
+                meta = analysis_meta.get(payload["symbol"], {})
+                try:
+                    pending_limit = max(12, int(os.environ.get("RESEARCH_PENDING_5M_FETCH_LIMIT", "24")))
+                    if str(payload.get("provider") or "binance").lower() == "bingx":
+                        bars_5m = fetch_bingx_klines(payload["symbol"], "5m", limit=pending_limit, retryable=False)
+                    else:
+                        bars_5m = fetch_binance_klines(str(meta.get("binance_symbol") or payload["symbol"].replace("-", "")), "5m", limit=pending_limit, retryable=False)
+                except Exception as exc:
+                    log.warning("[RESEARCH_PENDING_BARS_POST] %s | unavailable: %s", payload["symbol"], exc)
+            try:
+                counts = research.record_scan_symbol(
+                    scan_id=scan_id, symbol=payload["symbol"], strategy_version=payload["strategy_version"],
+                    code_commit_sha=payload["code_commit_sha"], provider=payload["provider"], source=payload["source"],
+                    bars_1h=payload["bars_1h"], bars_5m=bars_5m, df_1h=payload["df_1h"],
+                    demand=payload["demand"], supply=payload["supply"], diagnostics=payload["diagnostics"],
+                    symbol_state=payload["symbol_state"], signals=payload["signals"], decision_ts=payload["decision_ts"],
+                    market_context=None, account_context=None, btc_df_5m=None, btc_df_1h=None,
+                    persist_bars_for_forward=bool(payload.get("persist_bars_for_forward")),
+                )
+                log.debug("[RESEARCH_DEFERRED_FLUSH] %s | obs=%d bars1h=%d bars5m=%d", payload["symbol"], counts.get("observations", 0), counts.get("bars_1h", 0), counts.get("bars_5m", 0))
+            except Exception as exc:
+                log.warning("[RESEARCH_DEFERRED_FLUSH] %s | persistence failed: %s", payload["symbol"], exc)
+
     save_scan(scan_rows, fresh_signals, duration_sec=time.time() - started, scan_id=scan_id)
     # Final tracking checkpoint: orders/positions can change during the scan or
     # execution phase. Reconcile once more before this process exits so a TP,
