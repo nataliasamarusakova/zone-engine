@@ -772,65 +772,11 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str, *, exe
     except (TypeError, ValueError) as exc:
         return {"status": "error", "error": f"invalid contract parameters: {exc}", "symbol": bx}
 
-    if not isinstance(execution_quote, dict) or execution_quote.get("status") != "ok":
-        execution_quote = get_execution_quote(symbol)
-    if execution_quote.get("status") != "ok":
-        return {
-            "status": "error",
-            "error": execution_quote.get("error", "execution quote unavailable"),
-            "symbol": bx,
-        }
-    bid = float(execution_quote["bid"])
-    ask = float(execution_quote["ask"])
-    sizing_price = ask if direction == "LONG" else bid
-    if sizing_price <= 0:
-        return {"status": "error", "error": "invalid sizing price", "symbol": bx}
-
+    # Do not use an early quote for sizing or admission. The only quote that can
+    # authorize the MARKET order is the final venue quote captured immediately
+    # before the final drift/freshness checks below. This avoids stale preflight
+    # quotes becoming an accidental execution reference.
     leverage = min(LEVERAGE, MAX_LEVERAGE, max_lev)
-    qty = (MARGIN_USDT * leverage) / max(sizing_price * mult, 1e-12)
-    q = Decimal(str(qty)).quantize(Decimal(1).scaleb(-prec), rounding=ROUND_DOWN)
-    qty = float(q)
-
-    # Never silently increase exposure just to satisfy an exchange minimum.
-    # Return a non-fatal sizing skip with the exact required margin so the caller
-    # can log/audit why this instrument was not traded.
-    if qty <= 0:
-        return {
-            "status": "error",
-            "error": "calculated quantity is <= 0",
-            "symbol": bx, "qty": qty, "min_qty": min_qty,
-            "leverage": leverage, "sizing_price": sizing_price, "execution_quote": execution_quote,
-        }
-    if min_qty > 0 and qty < min_qty:
-        required_margin = (min_qty * sizing_price * mult) / max(leverage, 1)
-        return {
-            "status": "skipped_min_qty",
-            "error": f"qty={qty} < min_qty={min_qty} at configured leverage={leverage}",
-            "reason": "exchange_min_quantity",
-            "symbol": bx, "qty": qty, "min_qty": min_qty,
-            "required_margin_usdt": required_margin,
-            "configured_margin_usdt": MARGIN_USDT,
-            "leverage": leverage, "sizing_price": sizing_price,
-            "execution_quote": execution_quote,
-        }
-    # Current strategy requires two TP legs. Do not open a position that can
-    # never be split into two exchange-valid quantities.
-    if min_qty > 0 and qty < (2.0 * min_qty):
-        required_margin = (2.0 * min_qty * sizing_price * mult) / max(leverage, 1)
-        return {
-            "status": "skipped_tp_min_qty",
-            "error": f"qty={qty} cannot support 2 TP legs with min_qty={min_qty}",
-            "reason": "tp_two_leg_min_quantity",
-            "symbol": bx, "qty": qty, "min_qty": min_qty,
-            "required_margin_usdt": required_margin,
-            "configured_margin_usdt": MARGIN_USDT,
-            "leverage": leverage, "sizing_price": sizing_price,
-            "execution_quote": execution_quote,
-        }
-
-
-    if not _set_leverage(bx, leverage, direction):
-        return {"status": "error", "error": f"failed to set leverage={leverage} for {direction}", "symbol": bx, "leverage": leverage}
 
     side = "BUY" if direction == "LONG" else "SELL"
     try:
@@ -838,15 +784,6 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str, *, exe
     except Exception as exc:
         return {"status": "error", "error": f"position_mode_query_failed: {exc}", "symbol": bx}
     client_order_id = _new_open_client_order_id(bx, trade_id)
-
-    params = {
-        "symbol": bx,
-        "side": side,
-        "positionSide": position_side,
-        "type": "MARKET",
-        "quantity": f"{qty:.{prec}f}",
-        "clientOrderId": client_order_id,
-    }
 
     # Exchange-side idempotency guard: if another worker already submitted this
     # logical event, resolve its existing order instead of placing a second one.
@@ -867,11 +804,11 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str, *, exe
                 return {
                     "status": "opened",
                     "symbol": bx,
-                    "qty": qty,
+                    "qty": None,
                     "leverage": leverage,
-                    "sizing_price": sizing_price,
+                    "sizing_price": None,
                     "signal_price": float(price),
-                    "order_reference_price": sizing_price,
+                    "order_reference_price": None,
                     "order_id": existing_order.get("order_id"),
                     "client_order_id": existing_order.get("client_order_id") or client_order_id,
                     "idempotency": "existing_client_order_resolved_before_post",
@@ -890,6 +827,77 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str, *, exe
                     "execution_quote": execution_quote,
                 }
 
+
+    # Final venue quote is deliberately obtained after position-mode/idempotency
+    # REST calls and before the leverage mutation. This is the quote used for final
+    # sizing and signal-drift validation.
+    final_quote = get_execution_quote(symbol, reference_price=price)
+    if final_quote.get("status") != "ok":
+        return {"status": "error", "error": final_quote.get("error", "final execution quote unavailable"), "symbol": bx}
+    try:
+        max_quote_age = max(0.0, float(os.environ.get("EXECUTION_QUOTE_MAX_AGE_SEC", "2.0")))
+    except (TypeError, ValueError):
+        max_quote_age = 2.0
+    fresh, local_age, exchange_age, freshness_source = _quote_freshness(final_quote, max_quote_age)
+    final_quote["quote_local_age_sec"] = local_age
+    final_quote["quote_exchange_age_sec"] = exchange_age
+    final_quote["quote_freshness_source"] = freshness_source
+    if not fresh:
+        return {"status": "skipped_stale_signal", "error": f"execution_quote_stale local_age={local_age} exchange_age={exchange_age} limit={max_quote_age}", "symbol": bx, "execution_quote": final_quote}
+    bid = float(final_quote["bid"])
+    ask = float(final_quote["ask"])
+    sizing_price = ask if direction == "LONG" else bid
+    if sizing_price <= 0 or float(price) <= 0:
+        return {"status": "error", "error": "invalid final execution price", "symbol": bx, "execution_quote": final_quote}
+    try:
+        max_entry_slippage_pct = max(0.0, float(os.environ.get("MAX_ENTRY_SLIPPAGE_PCT", "1.00")))
+    except (TypeError, ValueError):
+        max_entry_slippage_pct = 1.0
+    signal_drift_pct = max(0.0, (sizing_price - float(price)) / float(price) * 100.0) if direction == "LONG" else max(0.0, (float(price) - sizing_price) / float(price) * 100.0)
+    if signal_drift_pct > max_entry_slippage_pct:
+        return {"status": "skipped_stale_signal", "error": f"signal_drift_pct={signal_drift_pct:.4f}% > {max_entry_slippage_pct:.4f}% at final order gate", "symbol": bx, "execution_quote": final_quote, "signal_drift_pct": signal_drift_pct, "signal_price": float(price), "execution_reference_price": sizing_price}
+
+    # Recompute quantity from the final quote, not from a quote captured before leverage/idempotency calls.
+    qty = (MARGIN_USDT * leverage) / max(sizing_price * mult, 1e-12)
+    q = Decimal(str(qty)).quantize(Decimal(1).scaleb(-prec), rounding=ROUND_DOWN)
+    qty = float(q)
+    if qty <= 0:
+        return {"status": "error", "error": "calculated quantity is <= 0", "symbol": bx, "qty": qty, "min_qty": min_qty, "leverage": leverage, "sizing_price": sizing_price, "execution_quote": final_quote}
+    if min_qty > 0 and qty < min_qty:
+        required_margin = (min_qty * sizing_price * mult) / max(leverage, 1)
+        return {"status": "skipped_min_qty", "error": f"qty={qty} < min_qty={min_qty} at configured leverage={leverage}", "reason": "exchange_min_quantity", "symbol": bx, "qty": qty, "min_qty": min_qty, "required_margin_usdt": required_margin, "configured_margin_usdt": MARGIN_USDT, "leverage": leverage, "sizing_price": sizing_price, "execution_quote": final_quote}
+    if min_qty > 0 and qty < (2.0 * min_qty):
+        required_margin = (2.0 * min_qty * sizing_price * mult) / max(leverage, 1)
+        return {"status": "skipped_tp_min_qty", "error": f"qty={qty} cannot support 2 TP legs with min_qty={min_qty}", "reason": "tp_two_leg_min_quantity", "symbol": bx, "qty": qty, "min_qty": min_qty, "required_margin_usdt": required_margin, "configured_margin_usdt": MARGIN_USDT, "leverage": leverage, "sizing_price": sizing_price, "execution_quote": final_quote}
+
+    # Only change leverage after the final executable quote has passed all admission
+    # checks. The final micro-freshness check below covers the small REST delay from
+    # this call to the MARKET POST.
+    if not _set_leverage(bx, leverage, direction):
+        return {"status": "error", "error": f"failed to set leverage={leverage} for {direction}", "symbol": bx, "leverage": leverage, "execution_quote": final_quote}
+
+    execution_quote = final_quote
+
+
+    params = {
+        "symbol": bx,
+        "side": side,
+        "positionSide": position_side,
+        "type": "MARKET",
+        "quantity": f"{qty:.{prec}f}",
+        "clientOrderId": client_order_id,
+    }
+
+    # Last micro-check immediately before the network POST. This prevents a slow Python/network
+    # path from turning a freshly-read quote into a stale order reference.
+    fresh_now, local_age_now, exchange_age_now, freshness_source_now = _quote_freshness(execution_quote, max_quote_age)
+    execution_quote["quote_local_age_sec_at_post"] = local_age_now
+    execution_quote["quote_exchange_age_sec_at_post"] = exchange_age_now
+    execution_quote["quote_freshness_source_at_post"] = freshness_source_now
+    if not fresh_now:
+        return {"status": "skipped_stale_signal", "error": f"execution_quote_stale_at_post local_age={local_age_now} exchange_age={exchange_age_now} limit={max_quote_age}", "symbol": bx, "execution_quote": execution_quote}
+    order_submit_at_ms = int(time.time() * 1000)
+    execution_quote["order_submit_at_ms"] = order_submit_at_ms
     response = _request("POST", ORDER_PATH, params)
     log.info("[BINGX] OPEN order response: symbol=%s direction=%s positionSide=%s code=%s msg=%s", bx, direction, position_side, response.get("code") if isinstance(response, dict) else None, response.get("msg") if isinstance(response, dict) else None)
 
@@ -930,6 +938,7 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str, *, exe
                             "idempotency": "client_order_id_verified_after_transport_error",
                             "response": response,
                             "execution_quote": execution_quote,
+                            "order_submit_at_ms": order_submit_at_ms,
                             "historical_order": resolved_order,
                         }
                     if order_status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}:
@@ -960,6 +969,7 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str, *, exe
                     "idempotency": "client_order_id_verified_after_transport_error",
                     "response": response,
                     "execution_quote": execution_quote,
+                    "order_submit_at_ms": order_submit_at_ms,
                     "historical_order": historical_order,
                 }
             try:
@@ -978,6 +988,7 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str, *, exe
                         "idempotency": "position_verified_after_transport_error_no_order_match",
                         "response": response,
                         "execution_quote": execution_quote,
+                        "order_submit_at_ms": order_submit_at_ms,
                     }
             except Exception as exc:
                 log.error("[BINGX] Post-error position verification failed: %s", exc)
@@ -1000,6 +1011,7 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str, *, exe
         "client_order_id": order.get("clientOrderId") or client_order_id,
         "response": response,
         "execution_quote": execution_quote,
+        "order_submit_at_ms": order_submit_at_ms,
     }
 
 
@@ -1359,6 +1371,40 @@ def _valid_quote(bid: float, ask: float) -> bool:
     )
 
 
+def _normalize_market_timestamp_ms(value: Any) -> int | None:
+    """Normalize a BingX market timestamp to epoch milliseconds."""
+    try:
+        raw = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(raw) or raw <= 0:
+        return None
+    if raw >= 1e11:
+        return int(raw)
+    if raw >= 1e8:
+        return int(raw * 1000.0)
+    return None
+
+
+def _quote_freshness(quote: dict[str, Any], max_age_sec: float) -> tuple[bool, float | None, float | None, str]:
+    limit = max(0.0, float(max_age_sec))
+    observed_ms = _normalize_market_timestamp_ms(quote.get("quote_observed_at_ms"))
+    exchange_ms = _normalize_market_timestamp_ms(quote.get("quote_exchange_time_ms"))
+    local_now_ms = int(time.time() * 1000)
+    exchange_now_ms = local_now_ms + int(SERVER_TIME_OFFSET_MS)
+    local_age = max(0.0, (local_now_ms - observed_ms) / 1000.0) if observed_ms is not None else None
+    exchange_age = None
+    if exchange_ms is not None:
+        raw_age = (exchange_now_ms - exchange_ms) / 1000.0
+        if raw_age >= 0:
+            exchange_age = raw_age
+    if limit > 0 and exchange_age is not None and exchange_age > limit:
+        return False, local_age, exchange_age, "exchange_timestamp"
+    if limit > 0 and local_age is not None and local_age > limit:
+        return False, local_age, exchange_age, "local_observed_elapsed"
+    return True, local_age, exchange_age, "exchange_timestamp" if exchange_age is not None else "local_observed_elapsed"
+
+
 def _parse_top_of_book_payload(resp: Any, symbol: str, source: str) -> tuple[float, float, Any] | None:
     if not isinstance(resp, dict) or resp.get("code") != 0:
         return None
@@ -1456,7 +1502,7 @@ def get_execution_quote(symbol: str, *, min_interval_sec: float | None = None, r
             return {
                 "status": "ok", "symbol": bx, "bid": bid, "ask": ask,
                 "spread_pct": ((ask - bid) / bid * 100.0) if bid > 0 else None,
-                "time": quote_time, "last_price": None, "quote_source": "bookTicker",
+                "time": quote_time, "quote_exchange_time_ms": _normalize_market_timestamp_ms(quote_time), "quote_observed_at_ms": int(time.time() * 1000), "last_price": None, "quote_source": "bookTicker",
                 "quote_sources_attempted": ["bookTicker"],
                 "quote_fallback_reason": None,
             }
@@ -1470,7 +1516,7 @@ def get_execution_quote(symbol: str, *, min_interval_sec: float | None = None, r
             return {
                 "status": "ok", "symbol": bx, "bid": bid, "ask": ask,
                 "spread_pct": ((ask - bid) / bid * 100.0) if bid > 0 else None,
-                "time": quote_time, "last_price": None, "quote_source": "ticker",
+                "time": quote_time, "quote_exchange_time_ms": _normalize_market_timestamp_ms(quote_time), "quote_observed_at_ms": int(time.time() * 1000), "last_price": None, "quote_source": "ticker",
                 "quote_sources_attempted": [source for source, _ in attempts],
                 "quote_fallback_reason": _quote_error("bookTicker", attempts[0][1], bx) if attempts else "bookTicker_invalid",
             }
@@ -1484,7 +1530,7 @@ def get_execution_quote(symbol: str, *, min_interval_sec: float | None = None, r
             return {
                 "status": "ok", "symbol": bx, "bid": bid, "ask": ask,
                 "spread_pct": ((ask - bid) / bid * 100.0) if bid > 0 else None,
-                "time": quote_time, "last_price": None, "quote_source": "depth",
+                "time": quote_time, "quote_exchange_time_ms": _normalize_market_timestamp_ms(quote_time), "quote_observed_at_ms": int(time.time() * 1000), "last_price": None, "quote_source": "depth",
                 "quote_sources_attempted": [source for source, _ in attempts],
                 "quote_fallback_reason": "; ".join(_quote_error(source, response, bx) for source, response in attempts[:-1]),
             }
@@ -1668,11 +1714,13 @@ def _research_trade_metrics(data: Any) -> dict[str, Any]:
         if not (math.isfinite(price) and price > 0 and math.isfinite(quote_qty) and quote_qty >= 0):
             continue
         prices.append(price)
-        if "buyerMaker" not in row or row.get("buyerMaker") is None:
+        buyer_maker_raw = row.get("buyerMaker") if "buyerMaker" in row else None
+        if buyer_maker_raw is None:
             buyer_maker_missing_count += 1
-        else:
-            buyer_maker_present_count += 1
-        maker_buyer = _research_bool(row.get("buyerMaker"))
+            # Missing maker/taker direction is unknown. Never classify it as BUY.
+            continue
+        buyer_maker_present_count += 1
+        maker_buyer = _research_bool(buyer_maker_raw)
         # buyerMaker=true means the buyer was the maker; the aggressor was the seller.
         if maker_buyer:
             sell_quote += quote_qty
@@ -1695,8 +1743,9 @@ def _research_trade_metrics(data: Any) -> dict[str, Any]:
         "buyer_maker_field_present_count": buyer_maker_present_count,
         "buyer_maker_field_missing_count": buyer_maker_missing_count,
         "buyer_maker_field_coverage": (buyer_maker_present_count / len(prices)) if prices else None,
-        "aggressor_delta_quote": buy_quote - sell_quote,
-        "buy_aggressor_ratio": (buy_quote / total) if total > 0 else None,
+        "aggressor_validity": "valid" if buyer_maker_present_count > 0 and buyer_maker_missing_count == 0 else ("partial" if buyer_maker_present_count > 0 else "unknown"),
+        "aggressor_delta_quote": (buy_quote - sell_quote) if buyer_maker_present_count > 0 else None,
+        "buy_aggressor_ratio": (buy_quote / total) if total > 0 and buyer_maker_present_count > 0 else None,
         "trade_min_price": min(prices) if prices else None,
         "trade_max_price": max(prices) if prices else None,
         "last_trade_ts": latest_ts,
