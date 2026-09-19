@@ -3,6 +3,8 @@ name: Zone Signal Engine
 on:
   repository_dispatch:
     types: [run_event_engine]
+  schedule:
+    - cron: "*/5 * * * *"
 
 permissions:
   contents: write
@@ -25,18 +27,23 @@ jobs:
       BINGX_MAX_LEVERAGE: "10"
       EXECUTION_ENABLED: "true"
       MAX_TRADES_PER_CYCLE: "5"
+      # Account-level safety cap. Each protected position can require up to
+      # three exchange trigger orders (SL + TP1 + TP2); this prevents the
+      # engine from recreating the protection-order exhaustion seen in the audit.
+      MAX_OPEN_POSITIONS: "20"
       MAX_SCAN_SYMBOLS: "0"
       WATCHLIST_ONLY: "false"
       RESET_ZONE_VISIT_STATE_ON_START: "false"
       WATCHLIST_SYMBOLS: "BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT,TAO-USDT,LTC-USDT,BCH-USDT,AVAX-USDT,LINK-USDT,ETC-USDT,ADA-USDT,UNI-USDT,XRP-USDT,ICP-USDT,HYPE-USDT,DOGE-USDT,HBAR-USDT,ARB-USDT,POL-USDT,SUI-USDT"
       KLINE_LIMIT_1H: "1000"
       KLINE_LIMIT_5M: "144"
-      MAX_5M_TRIGGER_AGE_MINUTES: "15"
+      MAX_5M_TRIGGER_AGE_MINUTES: "10"
       INITIAL_5M_TRIGGER_LOOKBACK_MINUTES: "15"
       MAX_SIGNAL_AGE_BARS: "0"
       MAX_SIGNAL_RISK_PCT: "10.00"
       FIXED_STOP_PCT: "10.00"
       MAX_ENTRY_SLIPPAGE_PCT: "1.00"
+      EXECUTION_QUOTE_MAX_AGE_SEC: "2.0"
       MAX_SCAN_HISTORY_BYTES: "31457280"
       MIN_STRUCTURE_ROOM_R: "1.20"
       REQUIRE_DIRECTIONAL_CANDLE: "false"
@@ -48,6 +55,11 @@ jobs:
       RESEARCH_5M_HISTORY_LIMIT: "288"
       RESEARCH_DEPTH_LEVELS: "20"
       RESEARCH_RECENT_TRADES_LIMIT: "100"
+      # Research must never add the four-endpoint microstructure sweep to the
+      # production signal -> order critical path. It remains available as a
+      # deliberate opt-in for research runs.
+      RESEARCH_RICH_CONTEXT_ENABLED: "false"
+      RESEARCH_DEFER_UNTIL_AFTER_EXECUTION: "true"
       RESEARCH_CONTEXT_NEAREST_APPROACH: "false"
       RESEARCH_CONTEXT_FOR_REJECTIONS: "false"
       RESEARCH_ACCOUNT_TIMEOUT_SEC: "5"
@@ -101,8 +113,11 @@ jobs:
       - name: Run engine
         env:
           FUNDAMENTAL_WHITELIST_ENABLED: "false"
+          # Keep the explicitly tested production entry semantics: a 5m touch
+          # creates the signal and the trigger-bar close is the market-entry
+          # reference. Do not silently change this to midpoint execution.
+          # The structure-room gate comes from the top-level env (1.20R).
           ZONE_TRIGGER_MODE: "zone"
-          MIN_STRUCTURE_ROOM_R: "0"
         run: python run_once.py
 
       - name: Update research outcomes
