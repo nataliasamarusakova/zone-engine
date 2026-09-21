@@ -30,6 +30,9 @@ from event_engine.bingx import (
     get_open_protection_directional,
     prepare_protection_capacity,
     get_execution_quote,
+    OPEN_ORDERS_PATH,
+    ORDER_PATH,
+    POSITION_PATH,
     fetch_research_market_context,
     fetch_research_account_snapshot,
     cancel_order,
@@ -41,7 +44,7 @@ from event_engine.signals import STRATEGY_VERSION, SWING_LEN, TP1_PCT, TP2_PCT, 
 from event_engine.fundamental_assets import FUNDAMENTAL_ASSET_SYMBOLS
 from event_engine.telegram import format_signal, send as send_tg
 from event_engine.tracker import register_active_trade, update_active_trades, update_active_trade_protection
-from event_engine import research
+from event_engine import research, telemetry
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("zone_engine")
@@ -267,6 +270,26 @@ def _record_entry_decision(
     """
     event_id = str(signal.get("event_id", ""))
     decision_ts = pd.Timestamp.now(tz="UTC")
+    forensics = signal.get("signal_forensics") if isinstance(signal.get("signal_forensics"), dict) else {}
+    body_to_range = forensics.get("body_to_range")
+    lower_wick_ratio = forensics.get("lower_wick_ratio")
+    shadow_geometry_available = False
+    shadow_geometry_bad = None
+    try:
+        if body_to_range is not None and lower_wick_ratio is not None:
+            body_value = float(body_to_range)
+            wick_value = float(lower_wick_ratio)
+            if math.isfinite(body_value) and math.isfinite(wick_value):
+                shadow_geometry_available = True
+                shadow_geometry_bad = (
+                    str(signal.get("type", "")).upper() == "SHORT"
+                    and body_value > research.SHADOW_SHORT_BODY_TO_RANGE_GT
+                    and wick_value < research.SHADOW_SHORT_LOWER_WICK_LT
+                )
+    except (TypeError, ValueError):
+        shadow_geometry_available = False
+        shadow_geometry_bad = None
+
     payload = {
         "decision_id": hashlib.sha256(
             f"{scan_id}:{event_id}:{stage}:{reason}:{attempt_id or ''}".encode("utf-8")
@@ -290,6 +313,11 @@ def _record_entry_decision(
         "execution_age_minutes": signal.get("execution_age_minutes"),
         "execution_age_semantics": "trigger_to_execution_gate_when_available",
         "trigger_to_decision_minutes": _elapsed_minutes(signal.get("trigger_bar_time") or signal.get("time"), decision_ts),
+        "shadow_short_filter_experiment": research.SHADOW_SHORT_FILTER_EXPERIMENT,
+        "shadow_short_geometry_available": shadow_geometry_available,
+        "shadow_short_geometry_bad": shadow_geometry_bad,
+        "shadow_short_body_to_range_gt": research.SHADOW_SHORT_BODY_TO_RANGE_GT,
+        "shadow_short_lower_wick_lt": research.SHADOW_SHORT_LOWER_WICK_LT,
     }
     try:
         ok = research.record_entry_decision(payload, path=ENTRY_DECISIONS_PATH)
@@ -1499,6 +1527,7 @@ def _build_setup(signal: dict[str, Any]) -> dict[str, Any]:
         "signal_forensics": signal.get("signal_forensics", {}),
         "score": float(signal.get("score", 0.0)),
         "event_time": signal.get("time"),
+        "attempt_id": signal.get("attempt_id"),
     }
 
 
@@ -1836,6 +1865,22 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         reason = str(protection_capacity.get("error", protection_capacity.get("status", "protection capacity unavailable")))
         log.error("[EXEC_BLOCKED_PROTECTION_PRECHECK] %s %s | %s", symbol, direction, reason)
         _append_execution_ledger(event_id, signal.get("attempt_id"), "PROTECTION_PREFLIGHT_BLOCKED", {"status": "blocked_protection_preflight", "error": reason, "protection_preflight": protection_capacity})
+        error_code, error_message = telemetry.parse_exchange_error(protection_capacity.get("error") or reason)
+        if protection_capacity.get("status") == "error" or error_code not in (None, "", 0, "0"):
+            telemetry.record_exchange_error(
+                event_id=event_id,
+                attempt_id=signal.get("attempt_id"),
+                position_id=None,
+                order_id=None,
+                symbol=symbol,
+                endpoint=OPEN_ORDERS_PATH if "openOrders" in error_message or "100410" in str(error_code) else POSITION_PATH,
+                method="GET",
+                error_code=error_code,
+                message=error_message,
+                error_class="PROTECTION_PREFLIGHT",
+                blocking=True,
+                business_impact="MISSED_ENTRY",
+            )
         return {
             "status": "blocked_protection_preflight",
             "symbol": symbol,
@@ -1855,7 +1900,26 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         _append_execution_ledger(event_id, signal.get("attempt_id"), "QUOTE_UNAVAILABLE", {"status": "execution_quote_unavailable", "error": reason})
         return {"status": "execution_quote_unavailable", "error": reason, "symbol": symbol, "direction": direction}
 
-    _append_execution_ledger(event_id, signal.get("attempt_id"), "PRE_ENTRY_QUOTE", {"bid": execution_quote.get("bid"), "ask": execution_quote.get("ask"), "quote_source": execution_quote.get("quote_source"), "quote_time": execution_quote.get("time"), "quote_observed_at_ms": execution_quote.get("quote_observed_at_ms")})
+    _append_execution_ledger(event_id, signal.get("attempt_id"), "PRE_ENTRY_QUOTE", {
+        "bid": execution_quote.get("bid"),
+        "ask": execution_quote.get("ask"),
+        "spread_pct": execution_quote.get("spread_pct"),
+        "quote_source": execution_quote.get("quote_source"),
+        "quote_sources_attempted": execution_quote.get("quote_sources_attempted"),
+        "quote_fallback_reason": execution_quote.get("quote_fallback_reason"),
+        "quote_time": execution_quote.get("time"),
+        "quote_exchange_time_ms": execution_quote.get("quote_exchange_time_ms"),
+        "quote_observed_at_ms": execution_quote.get("quote_observed_at_ms"),
+    })
+    telemetry.record_quote_snapshot(
+        event_id=event_id,
+        attempt_id=signal.get("attempt_id"),
+        symbol=symbol,
+        direction=direction,
+        quote=execution_quote,
+        signal_price=entry_price,
+        stage="PRE_ENTRY_QUOTE",
+    )
     observed_at_ms = execution_quote.get("quote_observed_at_ms")
     if observed_at_ms is not None and EXECUTION_QUOTE_MAX_AGE_SEC > 0:
         try:
@@ -1919,7 +1983,42 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     # it with the function-call start time because rejected/stale attempts did not
     # submit an order. ``execution_call_start_ts`` is recorded separately below.
     signal.pop("order_submit_ts", None)
-    order = open_market(symbol, direction, entry_price, event_id, execution_quote=execution_quote)
+    telemetry.record_order_event(
+        event_id=event_id,
+        attempt_id=signal.get("attempt_id"),
+        order_id=None,
+        symbol=symbol,
+        direction=direction,
+        leg="ENTRY",
+        status="SUBMITTING",
+        order_type="MARKET",
+        reduce_only=False,
+        requested_entry_price=entry_price,
+        execution_reference_price=executable_price,
+        quote_source=execution_quote.get("quote_source"),
+        quote_exchange_time_ms=execution_quote.get("quote_exchange_time_ms"),
+        quote_observed_at_ms=execution_quote.get("quote_observed_at_ms"),
+    )
+    order = open_market(symbol, direction, entry_price, event_id, execution_quote=execution_quote, attempt_id=signal.get("attempt_id"))
+    order_status = str(order.get("status", "")).lower() if isinstance(order, dict) else ""
+    response = order.get("response") if isinstance(order, dict) and isinstance(order.get("response"), dict) else {}
+    telemetry.record_order_event(
+        event_id=event_id,
+        attempt_id=signal.get("attempt_id"),
+        order_id=order.get("order_id") if isinstance(order, dict) else None,
+        symbol=symbol,
+        direction=direction,
+        leg="ENTRY",
+        status=("ACKNOWLEDGED" if order_status == "opened" else "REJECTED"),
+        order_type="MARKET",
+        result_status=order.get("status") if isinstance(order, dict) else None,
+        exchange_code=response.get("code"),
+        exchange_message=response.get("msg"),
+        client_order_id=order.get("client_order_id") if isinstance(order, dict) else None,
+        order_submit_at_ms=order.get("order_submit_at_ms") if isinstance(order, dict) else None,
+        idempotency=order.get("idempotency") if isinstance(order, dict) else None,
+        error=order.get("error") if isinstance(order, dict) else None,
+    )
     exact_order_submit_ms = order.get("order_submit_at_ms") if isinstance(order, dict) else None
     try:
         if exact_order_submit_ms is not None:
@@ -1928,9 +2027,38 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         log.warning("[EXEC_LEDGER] invalid order_submit_at_ms for %s: %r", event_id, exact_order_submit_ms)
     if order.get("status") == "skipped_min_qty":
         _append_execution_ledger(event_id, signal.get("attempt_id"), "ORDER_REJECTED", {"status": order.get("status"), "error": order.get("error")})
+        telemetry.record_exchange_error(
+            event_id=event_id,
+            attempt_id=signal.get("attempt_id"),
+            position_id=None,
+            order_id=order.get("order_id"),
+            symbol=symbol,
+            endpoint=ORDER_PATH,
+            method="POST",
+            error_code=response.get("code"),
+            message=str(order.get("error") or response.get("msg") or "minimum quantity pre-check rejected entry"),
+            error_class="ORDER_REJECTED",
+            blocking=True,
+            business_impact="MISSED_ENTRY",
+        )
         return order
     if order.get("status") != "opened":
         _append_execution_ledger(event_id, signal.get("attempt_id"), "ORDER_REJECTED", {"status": order.get("status"), "error": order.get("error")})
+        error_code, error_message = telemetry.parse_exchange_error(order.get("error") or response, default_code=response.get("code"))
+        telemetry.record_exchange_error(
+            event_id=event_id,
+            attempt_id=signal.get("attempt_id"),
+            position_id=None,
+            order_id=order.get("order_id"),
+            symbol=symbol,
+            endpoint=ORDER_PATH,
+            method="POST",
+            error_code=error_code,
+            message=error_message,
+            error_class="ORDER_REJECTED",
+            blocking=True,
+            business_impact="MISSED_ENTRY",
+        )
         return {"status": str(order.get("status", "error")).upper(), "error": order.get("error"), "order": order}
 
     # open_market owns the final venue-quote gate immediately before POST. Use that
@@ -1978,6 +2106,20 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
             }
         else:
             error_detail = reconciled_position.get("error") or position.get("error") or position.get("last_poll_error")
+            telemetry.record_exchange_error(
+                event_id=event_id,
+                attempt_id=signal.get("attempt_id"),
+                position_id=event_id,
+                order_id=order.get("order_id"),
+                symbol=symbol,
+                endpoint=POSITION_PATH,
+                method="GET",
+                error_code=reconciled_position.get("code"),
+                message=str(error_detail or "entry position reconciliation failed"),
+                error_class="POSITION_RECONCILIATION",
+                blocking=True,
+                business_impact="ENTRY_STATE_UNVERIFIED",
+            )
             log.critical(
                 "[EXEC_ENTRY_UNVERIFIED] %s %s | position state remains ambiguous after fill timeout: %s",
                 symbol, direction, error_detail,
@@ -1995,6 +2137,19 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     avg_price = float(position["avgPrice"])
     qty = abs(float(position["positionAmt"]))
     _append_execution_ledger(event_id, signal.get("attempt_id"), "POSITION_FILL", {"avg_price": avg_price, "qty": qty, "position_side": direction, "fill_observed_ts": signal.get("fill_observed_ts")})
+    telemetry.record_order_event(
+        event_id=event_id,
+        attempt_id=signal.get("attempt_id"),
+        order_id=order.get("order_id") if isinstance(order, dict) else None,
+        symbol=symbol,
+        direction=direction,
+        leg="ENTRY",
+        status="FILL_OBSERVED",
+        exchange_fill_price=avg_price,
+        executed_qty=qty,
+        fill_observed_ts_ms=int(fill_observed_ts.timestamp() * 1000),
+        position_side=direction,
+    )
     pre_entry_bid = float(execution_quote["bid"])
     pre_entry_ask = float(execution_quote["ask"])
     executable_reference_price = pre_entry_ask if direction == "LONG" else pre_entry_bid
@@ -2136,6 +2291,73 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     signal["protection_finished_ts"] = protection_finished_ts.isoformat()
     setup["execution_snapshot"]["protection_status"] = protection.get("status")
     _append_execution_ledger(event_id, signal.get("attempt_id"), "PROTECTION_RESULT", {"status": protection.get("status"), "error": protection.get("error"), "sl_order": protection.get("sl_result"), "tp_orders": protection.get("tp_orders", [])})
+    sl_result = protection.get("sl_result") if isinstance(protection.get("sl_result"), dict) else {}
+    if str(sl_result.get("status", "")).lower() in {"error", "rejected", "failed", "unverified", "sl_unverified"} or sl_result.get("error"):
+        error_code, error_message = telemetry.parse_exchange_error(sl_result.get("error"), default_code=sl_result.get("code"))
+        telemetry.record_exchange_error(
+            event_id=event_id,
+            attempt_id=signal.get("attempt_id"),
+            position_id=event_id,
+            order_id=sl_result.get("order_id"),
+            symbol=symbol,
+            endpoint=ORDER_PATH,
+            method="POST",
+            error_code=error_code,
+            message=error_message,
+            error_class="PROTECTION_ORDER",
+            blocking=True,
+            business_impact="PROTECTION_INCOMPLETE",
+            leg="SL",
+        )
+    telemetry.record_protection_event(
+        event_id=event_id,
+        attempt_id=signal.get("attempt_id"),
+        position_id=event_id,
+        order_id=sl_result.get("order_id"),
+        symbol=symbol,
+        direction=direction,
+        leg="SL",
+        status=str(sl_result.get("status") or protection.get("status") or "UNKNOWN"),
+        price=sl_result.get("price") or sl_result.get("stop_price"),
+        qty=sl_result.get("qty"),
+        error=sl_result.get("error"),
+        verified=(str(protection.get("status")) in {"PROTECTED", "SL_ONLY"}),
+    )
+    for tp in protection.get("tp_orders", []) if isinstance(protection.get("tp_orders"), list) else []:
+        if not isinstance(tp, dict):
+            continue
+        if str(tp.get("status", "")).lower() in {"error", "rejected", "failed", "unverified"} or tp.get("error"):
+            error_code, error_message = telemetry.parse_exchange_error(tp.get("error"), default_code=tp.get("code"))
+            telemetry.record_exchange_error(
+                event_id=event_id,
+                attempt_id=signal.get("attempt_id"),
+                position_id=event_id,
+                order_id=tp.get("order_id"),
+                symbol=symbol,
+                endpoint=ORDER_PATH,
+                method="POST",
+                error_code=error_code,
+                message=error_message,
+                error_class="PROTECTION_ORDER",
+                blocking=True,
+                business_impact="PROTECTION_INCOMPLETE",
+                leg=str(tp.get("leg", "TP")).upper(),
+            )
+        telemetry.record_protection_event(
+            event_id=event_id,
+            attempt_id=signal.get("attempt_id"),
+            position_id=event_id,
+            order_id=tp.get("order_id"),
+            symbol=symbol,
+            direction=direction,
+            leg=str(tp.get("leg", "TP")).upper(),
+            status=str(tp.get("status", "UNKNOWN")),
+            price=tp.get("price"),
+            qty=tp.get("qty"),
+            pnl_pct=tp.get("pnl_pct"),
+            execution_verified=tp.get("execution_verified"),
+            error=tp.get("error"),
+        )
     if protection.get("status") != "PROTECTED":
         log.critical("[SAFETY_CLOSE] %s %s | mandatory protection incomplete | %s", symbol, direction, protection)
         # Mandatory rule: never leave a newly-opened position live without BOTH
@@ -2259,6 +2481,11 @@ def main() -> None:
             "research_rich_context_enabled": RESEARCH_RICH_CONTEXT_ENABLED,
             "research_defer_until_after_execution": RESEARCH_DEFER_UNTIL_AFTER_EXECUTION,
             "max_market_spread_pct": MAX_MARKET_SPREAD_PCT, "max_5m_trigger_age_minutes": MAX_5M_TRIGGER_AGE_MINUTES,
+            "shadow_short_filter_experiment": research.SHADOW_SHORT_FILTER_EXPERIMENT,
+            "shadow_short_body_to_range_gt": research.SHADOW_SHORT_BODY_TO_RANGE_GT,
+            "shadow_short_lower_wick_lt": research.SHADOW_SHORT_LOWER_WICK_LT,
+            "shadow_short_btc_ema50_gt_025": research.SHADOW_SHORT_BTC_EMA50_GT_025,
+            "shadow_short_btc_ema50_gt_050": research.SHADOW_SHORT_BTC_EMA50_GT_050,
         },
     )
 

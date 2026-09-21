@@ -956,3 +956,62 @@ def test_observation_dedup_is_thread_safe(tmp_path, monkeypatch):
         results = list(ex.map(lambda _: research.record_zone_observations([row]), range(16)))
     assert sum(results) == 1
     assert len((tmp_path / "zone_observations.jsonl").read_text().splitlines()) == 1
+
+
+def test_short_shadow_filter_candidates_are_observational_only():
+    ts5 = pd.date_range("2026-01-04 00:00", periods=30, freq="5min", tz="UTC")
+    df5 = pd.DataFrame({
+        "timestamp": ts5,
+        "close_time": ts5 + pd.Timedelta(minutes=5),
+        "open": [100.0] * 30,
+        "high": [100.01] * 30,
+        "low": [98.0] * 30,
+        "close": [98.1] * 30,
+        "volume": [100.0] * 30,
+    })
+    ts1 = pd.date_range("2026-01-01", periods=60, freq="1h", tz="UTC")
+    btc_close = [100.0] * 59 + [101.0]
+    btc = pd.DataFrame({
+        "timestamp": ts1,
+        "close_time": ts1 + pd.Timedelta(hours=1),
+        "open": btc_close,
+        "high": [x + 0.1 for x in btc_close],
+        "low": [x - 0.1 for x in btc_close],
+        "close": btc_close,
+        "volume": [1000.0] * 60,
+    })
+    zone = {
+        "zone_id": "Z_SHORT",
+        "top": 105.0,
+        "btm": 95.0,
+        "poi": 100.0,
+        "origin_ts_ms": int(ts1[0].timestamp() * 1000),
+        "age_bars": 20,
+    }
+    bar = {
+        "timestamp": ts5[-1],
+        "open": 100.0,
+        "high": 100.01,
+        "low": 98.0,
+        "close": 98.1,
+        "volume": 100.0,
+    }
+    features = research.build_research_features(
+        symbol="TEST-USDT",
+        direction="SHORT",
+        zone=zone,
+        bar=bar,
+        df_5m=df5,
+        df_1h=btc,
+        decision_ts=(ts5[-1] + pd.Timedelta(minutes=5)).isoformat(),
+        btc_df_1h=btc,
+    )
+    assert features["shadow_short_filter_experiment"] == "short_entry_filters_v1"
+    assert features["body_to_range"] > research.SHADOW_SHORT_BODY_TO_RANGE_GT
+    assert features["lower_wick_ratio"] < research.SHADOW_SHORT_LOWER_WICK_LT
+    assert features["shadow_short_geometry_bad"] is True
+    assert features["btc_ema50_distance_pct"] > research.SHADOW_SHORT_BTC_EMA50_GT_050
+    assert features["shadow_short_btc_ema50_gt_025"] is True
+    assert features["shadow_short_btc_ema50_gt_050"] is True
+    assert features["shadow_short_combined_gt_025"] is True
+    assert features["shadow_short_combined_gt_050"] is True

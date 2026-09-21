@@ -21,11 +21,22 @@ import pytest
 @pytest.fixture(autouse=True)
 def _isolate_runtime_state(monkeypatch, tmp_path):
     """Tests must never read/write the repository's production data/ files."""
-    from event_engine import analytics, tracker
+    from event_engine import analytics, tracker, telemetry
     import run_once
 
     runtime_data = tmp_path / "data"
     runtime_data.mkdir(parents=True, exist_ok=True)
+    # All telemetry files must be isolated from the repository's production data.
+    telemetry_paths = {
+        "DATA": runtime_data,
+        "QUOTE_SNAPSHOTS_PATH": runtime_data / "quote_snapshots.jsonl",
+        "ORDER_LIFECYCLE_PATH": runtime_data / "order_lifecycle.jsonl",
+        "PROTECTION_LIFECYCLE_PATH": runtime_data / "protection_lifecycle.jsonl",
+        "POSITION_RECONCILIATION_PATH": runtime_data / "position_reconciliation.jsonl",
+        "EXCHANGE_ERRORS_PATH": runtime_data / "exchange_errors.jsonl",
+    }
+    for name, value in telemetry_paths.items():
+        monkeypatch.setattr(telemetry, name, value)
 
     # Notifications are never sent by tests.
     monkeypatch.setattr(tracker, "send_tg", lambda *args, **kwargs: True)
@@ -2582,6 +2593,42 @@ def test_watchlist_is_exact_20_symbols():
     assert len(WATCHLIST_SYMBOLS) == 20
 
 
+def test_get_execution_quote_accepts_current_nested_bookticker_envelope(monkeypatch):
+    from event_engine import bingx
+    calls = []
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)
+    responses = [
+        {
+            "code": 0,
+            "msg": "",
+            "data": {
+                "book_ticker": {
+                    "symbol": "BTC-USDT",
+                    "bidPrice": "100.00",
+                    "bidQty": "2.5",
+                    "askPrice": "100.10",
+                    "askQty": "1.5",
+                    "time": 1234567890000,
+                }
+            },
+        },
+    ]
+    def fake_request(method, path, params, signed=True, **kwargs):
+        calls.append(path)
+        return responses.pop(0)
+    monkeypatch.setattr(bingx, "_request", fake_request)
+    monkeypatch.setenv("BINGX_BOOK_TICKER_MIN_INTERVAL_SEC", "0")
+
+    out = bingx.get_execution_quote("BTC-USDT")
+
+    assert out["status"] == "ok"
+    assert out["quote_source"] == "bookTicker"
+    assert out["bid"] == 100.00
+    assert out["ask"] == 100.10
+    assert out["quote_exchange_time_ms"] == 1234567890000
+    assert calls == [bingx.BOOK_TICKER_PATH]
+
+
 def test_get_execution_quote_falls_back_from_bookticker_to_ticker(monkeypatch):
     from event_engine import bingx
     calls = []
@@ -3163,6 +3210,56 @@ def test_open_market_uses_final_venue_quote_not_preflight_quote(monkeypatch):
     assert float(posted["quantity"]) > 0
 
 
+def test_open_market_records_authoritative_final_quote(monkeypatch):
+    from event_engine import bingx, telemetry
+
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "TESTUSDT")
+    monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
+    monkeypatch.setattr(bingx, "get_contract", lambda symbol: {"quantityPrecision": 2, "tradeMinQuantity": 0.01, "multiplier": 1, "maxLeverage": 20})
+    monkeypatch.setattr(bingx, "has_open_position", lambda *a, **k: False)
+    monkeypatch.setattr(bingx, "_set_leverage", lambda *a, **k: True)
+    monkeypatch.setattr(bingx, "position_side_param", lambda *a, **k: "LONG")
+    monkeypatch.setattr(bingx, "get_order", lambda *a, **k: {"status": "error", "error": "not found"})
+
+    now_ms = int(time.time() * 1000)
+    final_quote = {
+        "status": "ok",
+        "symbol": "TESTUSDT",
+        "bid": 100.0,
+        "ask": 100.2,
+        "quote_observed_at_ms": now_ms,
+        "quote_exchange_time_ms": now_ms,
+        "quote_source": "bookTicker",
+        "spread_pct": 0.1996,
+        "quote_sources_attempted": ["bookTicker"],
+    }
+    monkeypatch.setattr(bingx, "get_execution_quote", lambda *a, **k: final_quote.copy())
+
+    captured = []
+    monkeypatch.setattr(telemetry, "record_quote_snapshot", lambda **kwargs: captured.append(kwargs))
+
+    monkeypatch.setattr(
+        bingx,
+        "_request",
+        lambda method, path, params, **kwargs: {"code": 0, "data": {"order": {"orderId": "1", "clientOrderId": params["clientOrderId"]}}},
+    )
+
+    out = bingx.open_market("TEST-USDT", "LONG", 100.0, "EVENT_AUTH_QUOTE", attempt_id="ATT_AUTH_QUOTE")
+
+    assert out["status"] == "opened"
+    assert len(captured) == 1
+    row = captured[0]
+    assert row["event_id"] == "EVENT_AUTH_QUOTE"
+    assert row["attempt_id"] == "ATT_AUTH_QUOTE"
+    assert row["stage"] == "FINAL_PRE_POST"
+    assert row["quote"]["ask"] == 100.2
+    assert row["quote"]["quote_source"] == "bookTicker"
+    assert row["quote"]["execution_reference_price"] == 100.2
+    assert row["quote"]["signal_drift_pct"] == pytest.approx(0.2)
+    assert row["quote"]["order_submit_at_ms"] == out["order_submit_at_ms"]
+    assert row["signal_price"] == 100.0
+
+
 def test_open_market_final_drift_blocks_post(monkeypatch):
     from event_engine import bingx
     monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "TESTUSDT")
@@ -3179,3 +3276,146 @@ def test_open_market_final_drift_blocks_post(monkeypatch):
     out = bingx.open_market("TEST-USDT", "LONG", 100.0, "EVENT_DRIFT_FINAL")
     assert out["status"] == "skipped_stale_signal"
     assert "signal_drift_pct" in out["error"]
+
+
+def test_entry_decision_records_short_geometry_shadow_candidate(tmp_path, monkeypatch):
+    import run_once
+    from event_engine import research
+
+    captured = []
+    monkeypatch.setattr(research, "record_entry_decision", lambda payload, path=None: captured.append(payload) or True)
+    signal = {
+        "event_id": "ZONE_SHADOW",
+        "symbol": "TEST-USDT",
+        "type": "SHORT",
+        "trigger_bar_time": "2026-09-21T12:00:00+00:00",
+        "signal_forensics": {
+            "body_to_range": 0.81,
+            "lower_wick_ratio": 0.03,
+        },
+    }
+
+    run_once._record_entry_decision(
+        "SCAN_SHADOW", signal, "EXECUTION_SELECTED", "selected", selection_rank=1, attempt_id="ATT_SHADOW"
+    )
+
+    assert len(captured) == 1
+    row = captured[0]
+    assert row["shadow_short_filter_experiment"] == research.SHADOW_SHORT_FILTER_EXPERIMENT
+    assert row["shadow_short_geometry_available"] is True
+    assert row["shadow_short_geometry_bad"] is True
+    assert row["shadow_short_body_to_range_gt"] == 0.70
+    assert row["shadow_short_lower_wick_lt"] == 0.05
+
+
+def test_telemetry_write_failure_is_observable_without_breaking_execution(monkeypatch, tmp_path):
+    from event_engine import telemetry
+
+    telemetry._TELEMETRY_FAILURE_COUNT = 0
+    telemetry._TELEMETRY_LAST_FAILURE_TS_MS = None
+    telemetry._TELEMETRY_LAST_FAILURE_TYPE = None
+
+    def fail_write(path, record):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(telemetry, "_append_jsonl", fail_write)
+    telemetry.record_quote_snapshot(
+        event_id="EVT_HEALTH",
+        attempt_id="ATT_HEALTH",
+        symbol="AAA-USDT",
+        direction="SHORT",
+        quote={"bid": 99.0, "ask": 99.1, "quote_source": "bookTicker"},
+        signal_price=100.0,
+    )
+
+    health = telemetry.health_snapshot()
+    assert health["write_failure_count"] == 1
+    assert health["last_failure_ts_ms"] is not None
+    assert health["last_failure_type"] == "OSError"
+
+
+def test_execution_telemetry_writes_linked_jsonl_events(tmp_path, monkeypatch):
+    from event_engine import telemetry
+
+    monkeypatch.setattr(telemetry, "DATA", tmp_path)
+    paths = {
+        "QUOTE_SNAPSHOTS_PATH": tmp_path / "quote_snapshots.jsonl",
+        "ORDER_LIFECYCLE_PATH": tmp_path / "order_lifecycle.jsonl",
+        "PROTECTION_LIFECYCLE_PATH": tmp_path / "protection_lifecycle.jsonl",
+        "POSITION_RECONCILIATION_PATH": tmp_path / "position_reconciliation.jsonl",
+        "EXCHANGE_ERRORS_PATH": tmp_path / "exchange_errors.jsonl",
+    }
+    for name, value in paths.items():
+        monkeypatch.setattr(telemetry, name, value)
+    monkeypatch.setenv("TELEMETRY_FSYNC", "false")
+
+    telemetry.record_quote_snapshot(
+        event_id="EVT_1",
+        attempt_id="ATT_1",
+        symbol="AAA-USDT",
+        direction="SHORT",
+        quote={
+            "bid": 99.0,
+            "ask": 99.1,
+            "spread_pct": 0.101,
+            "quote_source": "bookTicker",
+            "quote_sources_attempted": ["bookTicker"],
+            "quote_exchange_time_ms": 1000,
+            "quote_observed_at_ms": 1050,
+            "quote_local_age_sec": 0.05,
+            "quote_exchange_age_sec": 0.04,
+        },
+        signal_price=100.0,
+    )
+    telemetry.record_order_event(
+        event_id="EVT_1",
+        attempt_id="ATT_1",
+        order_id="ORD_1",
+        symbol="AAA-USDT",
+        direction="SHORT",
+        leg="ENTRY",
+        status="ACKNOWLEDGED",
+        client_order_id="CID_1",
+    )
+    telemetry.record_protection_event(
+        event_id="EVT_1",
+        attempt_id="ATT_1",
+        position_id="POS_1",
+        order_id="SL_1",
+        symbol="AAA-USDT",
+        direction="SHORT",
+        leg="SL",
+        status="WORKING",
+    )
+    telemetry.record_position_reconciliation(
+        event_id="EVT_1",
+        attempt_id="ATT_1",
+        position_id="POS_1",
+        symbol="AAA-USDT",
+        direction="SHORT",
+        status="FOUND",
+        internal_remaining_qty=1.0,
+        exchange_position_qty=1.0,
+    )
+    telemetry.record_exchange_error(
+        event_id="EVT_1",
+        attempt_id="ATT_1",
+        position_id="POS_1",
+        order_id="SL_1",
+        symbol="AAA-USDT",
+        endpoint="/openOrders",
+        method="GET",
+        error_code=100410,
+        message="rate limited",
+        retryable=True,
+        blocking=True,
+    )
+
+    for path in paths.values():
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["schema_version"] == 1
+        assert row["event_id"] == "EVT_1"
+        assert row["attempt_id"] == "ATT_1"
+        assert row["ts_ms"] > 0
