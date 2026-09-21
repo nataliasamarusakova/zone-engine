@@ -38,6 +38,16 @@ INITIAL_1H_BARS = max(1, int(os.environ.get("RESEARCH_INITIAL_1H_BARS", "48")))
 INITIAL_5M_BARS = max(1, int(os.environ.get("RESEARCH_INITIAL_5M_BARS", "24")))
 NEAREST_APPROACH_MAX_PCT = max(0.0, float(os.environ.get("RESEARCH_NEAREST_APPROACH_MAX_PCT", "1.0")))
 
+# Frozen discovery thresholds for the SHORT-entry shadow experiment. These fields
+# are observational only and never block or alter production execution. Changing
+# them intentionally changes the experiment specification and therefore must be
+# accompanied by a new code revision / experiment version.
+SHADOW_SHORT_FILTER_EXPERIMENT = "short_entry_filters_v1"
+SHADOW_SHORT_BODY_TO_RANGE_GT = 0.70
+SHADOW_SHORT_LOWER_WICK_LT = 0.05
+SHADOW_SHORT_BTC_EMA50_GT_025 = 0.25
+SHADOW_SHORT_BTC_EMA50_GT_050 = 0.50
+
 _OBSERVATION_SEEN_IDS: set[str] | None = None
 _OBSERVATION_SEEN_LOCK = threading.RLock()
 
@@ -911,6 +921,33 @@ def build_research_features(
         direction=direction, df_5m=df_5m, df_1h=df_1h, decision_ts=decision_ts,
         btc_df_5m=btc_df_5m, btc_df_1h=btc_df_1h,
     ))
+
+    # SHORT filter candidates from the approved discovery design.  These are
+    # deliberately stored as booleans/UNKNOWN values for OOS evaluation only.
+    # No production execution gate reads these fields.
+    btc_distance = features.get("btc_ema50_distance_pct")
+    body_ratio = features.get("body_to_range")
+    lower_wick_ratio = features.get("lower_wick_ratio")
+    is_short = str(direction).upper() == "SHORT"
+    geometry_bad = (
+        is_short
+        and body_ratio is not None
+        and lower_wick_ratio is not None
+        and float(body_ratio) > SHADOW_SHORT_BODY_TO_RANGE_GT
+        and float(lower_wick_ratio) < SHADOW_SHORT_LOWER_WICK_LT
+    )
+    btc_gt_025 = None if btc_distance is None else bool(is_short and float(btc_distance) > SHADOW_SHORT_BTC_EMA50_GT_025)
+    btc_gt_050 = None if btc_distance is None else bool(is_short and float(btc_distance) > SHADOW_SHORT_BTC_EMA50_GT_050)
+    features.update({
+        "shadow_short_filter_experiment": SHADOW_SHORT_FILTER_EXPERIMENT,
+        "shadow_short_geometry_bad": geometry_bad,
+        "shadow_short_geometry_body_to_range_gt": SHADOW_SHORT_BODY_TO_RANGE_GT,
+        "shadow_short_geometry_lower_wick_lt": SHADOW_SHORT_LOWER_WICK_LT,
+        "shadow_short_btc_ema50_gt_025": btc_gt_025,
+        "shadow_short_btc_ema50_gt_050": btc_gt_050,
+        "shadow_short_combined_gt_025": (None if btc_gt_025 is None else bool(geometry_bad and btc_gt_025)),
+        "shadow_short_combined_gt_050": (None if btc_gt_050 is None else bool(geometry_bad and btc_gt_050)),
+    })
     context = dict(market_context or {})
     if account_context:
         context["account_context"] = account_context

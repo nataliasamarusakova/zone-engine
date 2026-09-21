@@ -25,6 +25,8 @@ from urllib.parse import quote, urlencode
 
 import requests
 from requests.adapters import HTTPAdapter
+
+from event_engine import telemetry
 from urllib3.util.retry import Retry
 
 log = logging.getLogger("event_engine.bingx")
@@ -745,7 +747,7 @@ def _find_recent_order_by_client_id(symbol: str, client_order_id: str, lookback_
     return None
 
 
-def open_market(symbol: str, direction: str, price: float, trade_id: str, *, execution_quote: dict[str, Any] | None = None) -> dict:
+def open_market(symbol: str, direction: str, price: float, trade_id: str, *, execution_quote: dict[str, Any] | None = None, attempt_id: str | None = None) -> dict:
     direction = str(direction).upper()
     if direction not in {"LONG", "SHORT"}:
         return {"status": "error", "error": f"invalid direction={direction}"}
@@ -896,9 +898,32 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str, *, exe
     execution_quote["quote_freshness_source_at_post"] = freshness_source_now
     if not fresh_now:
         return {"status": "skipped_stale_signal", "error": f"execution_quote_stale_at_post local_age={local_age_now} exchange_age={exchange_age_now} limit={max_quote_age}", "symbol": bx, "execution_quote": execution_quote}
+
+    # Preserve the exact venue quote that passed the final pre-POST freshness/drift
+    # gate. Do not write telemetry here: filesystem I/O between the final gate and
+    # MARKET POST would itself add avoidable execution latency.
+    execution_quote["execution_reference_price"] = sizing_price
+    execution_quote["signal_drift_pct"] = signal_drift_pct
+
     order_submit_at_ms = int(time.time() * 1000)
     execution_quote["order_submit_at_ms"] = order_submit_at_ms
     response = _request("POST", ORDER_PATH, params)
+
+    # Persist the authoritative pre-POST quote immediately after the POST attempt,
+    # with the actual submit timestamp. Telemetry remains best-effort and cannot
+    # influence order admission, submission, or reconciliation.
+    try:
+        telemetry.record_quote_snapshot(
+            event_id=trade_id,
+            attempt_id=attempt_id,
+            symbol=symbol,
+            direction=direction,
+            quote=execution_quote,
+            signal_price=float(price),
+            stage="FINAL_PRE_POST",
+        )
+    except Exception:
+        pass
     log.info("[BINGX] OPEN order response: symbol=%s direction=%s positionSide=%s code=%s msg=%s", bx, direction, position_side, response.get("code") if isinstance(response, dict) else None, response.get("msg") if isinstance(response, dict) else None)
 
     if isinstance(response, dict) and response.get("code") != 0:
@@ -1406,16 +1431,35 @@ def _quote_freshness(quote: dict[str, Any], max_age_sec: float) -> tuple[bool, f
 
 
 def _parse_top_of_book_payload(resp: Any, symbol: str, source: str) -> tuple[float, float, Any] | None:
+    """Parse BingX futures book/ticker payloads across current and legacy envelopes.
+
+    Current futures Book Ticker responses may nest the row under
+    ``data.book_ticker``; older/alternate responses may expose ``data`` directly
+    or as a one-element/list payload. Keep all accepted forms here so execution
+    quote fallback is driven by actual schema incompatibility, not by a parser gap.
+    """
     if not isinstance(resp, dict) or resp.get("code") != 0:
         return None
     data = resp.get("data")
     row: dict[str, Any] | None = None
-    if isinstance(data, list):
-        row = next((x for x in data if isinstance(x, dict) and str(x.get("symbol", "")).upper() == symbol), None)
-        if row is None and len(data) == 1 and isinstance(data[0], dict):
-            row = data[0]
-    elif isinstance(data, dict):
-        row = data
+
+    def _select_row(payload: Any) -> dict[str, Any] | None:
+        if isinstance(payload, dict):
+            nested = payload.get("book_ticker") or payload.get("bookTicker")
+            if isinstance(nested, (dict, list)):
+                selected = _select_row(nested)
+                if selected is not None:
+                    return selected
+            return payload
+        if isinstance(payload, list):
+            match = next((x for x in payload if isinstance(x, dict) and str(x.get("symbol", "")).upper() == symbol), None)
+            if match is not None:
+                return match
+            if len(payload) == 1 and isinstance(payload[0], dict):
+                return payload[0]
+        return None
+
+    row = _select_row(data)
     if not isinstance(row, dict):
         return None
     try:

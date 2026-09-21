@@ -28,10 +28,12 @@ from event_engine.bingx import (
     _format_qty,
     _request,
     ORDER_PATH,
+    POSITION_PATH,
     position_side_param,
     _validate_sl_order_for_position,
 )
 from event_engine.telegram import send as send_tg
+from event_engine import telemetry
 
 log = logging.getLogger("event_engine.tracker")
 
@@ -375,6 +377,8 @@ def register_active_trade(
     previous_bar = setup_metrics.get("previous_bar") if isinstance(setup_metrics.get("previous_bar"), dict) else {}
     trades[event_id] = {
         "event_id": event_id,
+        "attempt_id": (setup or {}).get("attempt_id") if isinstance(setup, dict) else None,
+        "position_id": event_id,
         "symbol": symbol,
         "name": name or symbol,
         "direction": direction,
@@ -1218,7 +1222,23 @@ def update_active_trades() -> None:
                 updated_trades[event_id] = trade
                 continue
 
+            local_remaining_qty_before = rem_qty
             pos_amt = abs(_safe_float(pos.get("positionAmt"))) if pos_status == "found" else 0.0
+            telemetry.record_position_reconciliation(
+                event_id=event_id,
+                attempt_id=trade.get("attempt_id") or ((trade.get("setup") or {}).get("attempt_id") if isinstance(trade.get("setup"), dict) else None),
+                position_id=trade.get("position_id") or event_id,
+                symbol=symbol,
+                direction=direction,
+                status=("FOUND" if pos_status == "found" else "NOT_FOUND" if pos_status == "not_found" else "ERROR"),
+                internal_remaining_qty=local_remaining_qty_before,
+                exchange_position_qty=pos_amt if pos_status in {"found", "not_found"} else None,
+                exchange_avg_price=pos.get("avgPrice") if pos_status == "found" else None,
+                local_be_activated=bool(trade.get("be_activated")),
+                local_tp_filled_qty=dict(trade.get("tp_filled_qty", {}) or {}),
+                local_sl_order_id=((trade.get("sl_order") or {}).get("order_id") if isinstance(trade.get("sl_order"), dict) else None),
+                exchange_error=pos.get("error") if pos_status not in {"found", "not_found"} else None,
+            )
             if pos_status == "found":
                 # The exchange is authoritative for the live position quantity.
                 # Local remaining_qty may be stale after a partial fill, manual
@@ -1280,10 +1300,41 @@ def update_active_trades() -> None:
 
                 try:
                     order_info = get_order(symbol, order_id)
-                except Exception:
+                except Exception as exc:
+                    telemetry.record_exchange_error(
+                        event_id=event_id,
+                        attempt_id=trade.get("attempt_id") or ((trade.get("setup") or {}).get("attempt_id") if isinstance(trade.get("setup"), dict) else None),
+                        position_id=trade.get("position_id") or event_id,
+                        order_id=str(order_id),
+                        symbol=symbol,
+                        endpoint=ORDER_PATH,
+                        method="GET",
+                        error_code=None,
+                        message=str(exc),
+                        error_class="TP_ORDER_QUERY",
+                        blocking=False,
+                        business_impact="TP_STATE_UNKNOWN",
+                        leg=leg.upper(),
+                    )
                     continue
 
                 if order_info.get("status") == "error":
+                    error_code, error_message = telemetry.parse_exchange_error(order_info, default_code=order_info.get("code"))
+                    telemetry.record_exchange_error(
+                        event_id=event_id,
+                        attempt_id=trade.get("attempt_id") or ((trade.get("setup") or {}).get("attempt_id") if isinstance(trade.get("setup"), dict) else None),
+                        position_id=trade.get("position_id") or event_id,
+                        order_id=str(order_id),
+                        symbol=symbol,
+                        endpoint=ORDER_PATH,
+                        method="GET",
+                        error_code=error_code,
+                        message=error_message,
+                        error_class="TP_ORDER_QUERY",
+                        blocking=False,
+                        business_impact="TP_STATE_UNKNOWN",
+                        leg=leg.upper(),
+                    )
                     continue
 
                 order_status = str(order_info.get("order_status", "")).upper()
@@ -1312,6 +1363,20 @@ def update_active_trades() -> None:
                     tp_pos = get_position_directional(symbol, direction)
                 except Exception as tp_pos_exc:
                     tp_pos = {"status": "error", "error": str(tp_pos_exc)}
+                    telemetry.record_exchange_error(
+                        event_id=event_id,
+                        attempt_id=trade.get("attempt_id") or ((trade.get("setup") or {}).get("attempt_id") if isinstance(trade.get("setup"), dict) else None),
+                        position_id=trade.get("position_id") or event_id,
+                        order_id=str(order_id),
+                        symbol=symbol,
+                        endpoint=POSITION_PATH,
+                        method="GET",
+                        error_code=None,
+                        message=str(tp_pos_exc),
+                        error_class="TP_POSITION_RECONCILIATION",
+                        blocking=False,
+                        business_impact="TP_STATE_UNKNOWN",
+                    )
                 if tp_pos.get("status") == "found":
                     rem_qty = abs(_safe_float(tp_pos.get("positionAmt")))
                     trade["current_position_qty"] = rem_qty
@@ -1341,6 +1406,22 @@ def update_active_trades() -> None:
                     "pnl_pct": pnl_tp,
                     "remaining_qty": rem_qty,
                 })
+                telemetry.record_protection_event(
+                    event_id=event_id,
+                    attempt_id=trade.get("attempt_id") or ((trade.get("setup") or {}).get("attempt_id") if isinstance(trade.get("setup"), dict) else None),
+                    position_id=trade.get("position_id") or event_id,
+                    order_id=str(order_id),
+                    symbol=symbol,
+                    direction=direction,
+                    leg=leg.upper(),
+                    status="FILLED" if order_status == "FILLED" else "PARTIALLY_FILLED",
+                    executed_qty_total=executed_qty,
+                    delta_qty=delta_qty,
+                    avg_price=exec_price,
+                    pnl_pct=pnl_tp,
+                    remaining_qty=rem_qty,
+                    order_update_time_ms=order_info.get("update_time_ms"),
+                )
 
                 if order_status == "FILLED" and leg not in hit_legs:
                     hit_legs.add(leg)
@@ -1391,6 +1472,21 @@ def update_active_trades() -> None:
                             trade["be_activation_ts"] = now_ms
                             trade["be_order_id"] = new_sl.get("order_id")
                             trade["be_trigger_price"] = _safe_float(new_sl.get("stop_price"), entry_price)
+                            telemetry.record_protection_event(
+                                event_id=event_id,
+                                attempt_id=trade.get("attempt_id") or ((trade.get("setup") or {}).get("attempt_id") if isinstance(trade.get("setup"), dict) else None),
+                                position_id=trade.get("position_id") or event_id,
+                                order_id=new_sl.get("order_id"),
+                                symbol=symbol,
+                                direction=direction,
+                                leg="BE_SL",
+                                status="ACTIVATED",
+                                stop_price=_safe_float(new_sl.get("stop_price"), entry_price),
+                                qty=rem_qty,
+                                trigger_ts_ms=now_ms,
+                                trigger_rule="tp1_filled",
+                                trigger_peak_r=peak_r,
+                            )
                             log.info(
                                 "[TRACKER_BE_ACTIVATED] %s (%s) TP1 taken. Stop-loss moved to Break-Even: %.8g (Risk: 0.00%%)",
                                 trade.get("name", symbol), symbol, entry_price
@@ -1398,6 +1494,22 @@ def update_active_trades() -> None:
                         else:
                             trade["be_required"] = True
                             trade["be_last_error"] = new_sl.get("error")
+                            telemetry.record_protection_event(
+                                event_id=event_id,
+                                attempt_id=trade.get("attempt_id") or ((trade.get("setup") or {}).get("attempt_id") if isinstance(trade.get("setup"), dict) else None),
+                                position_id=trade.get("position_id") or event_id,
+                                order_id=new_sl.get("order_id"),
+                                symbol=symbol,
+                                direction=direction,
+                                leg="BE_SL",
+                                status="FAILED",
+                                stop_price=_safe_float(new_sl.get("stop_price"), entry_price),
+                                qty=rem_qty,
+                                trigger_ts_ms=now_ms,
+                                trigger_rule="tp1_filled",
+                                error=new_sl.get("error"),
+                                safety_action=new_sl.get("safety_action"),
+                            )
                             log.error(
                                 "[TRACKER_BE_FAILED] %s (%s) Failed to move SL to Break-Even: %s",
                                 trade.get("name", symbol), symbol, new_sl.get("error")
@@ -1435,6 +1547,38 @@ def update_active_trades() -> None:
                 # for the next reconciliation cycle.
                 position_gone = False
                 trade["position_reconcile_error"] = final_pos.get("error")
+                telemetry.record_exchange_error(
+                    event_id=event_id,
+                    attempt_id=trade.get("attempt_id") or ((trade.get("setup") or {}).get("attempt_id") if isinstance(trade.get("setup"), dict) else None),
+                    position_id=trade.get("position_id") or event_id,
+                    order_id=None,
+                    symbol=symbol,
+                    endpoint=POSITION_PATH,
+                    method="GET",
+                    error_code=final_pos.get("code"),
+                    message=str(final_pos.get("error") or "position reconciliation error"),
+                    error_class="POSITION_RECONCILIATION",
+                    blocking=False,
+                    business_impact="POSITION_STATE_UNKNOWN",
+                )
+
+            telemetry.record_position_reconciliation(
+                event_id=event_id,
+                attempt_id=trade.get("attempt_id") or ((trade.get("setup") or {}).get("attempt_id") if isinstance(trade.get("setup"), dict) else None),
+                position_id=trade.get("position_id") or event_id,
+                symbol=symbol,
+                direction=direction,
+                status=("CLOSED" if final_pos_status == "not_found" else "FOUND" if final_pos_status == "found" else "ERROR"),
+                internal_remaining_qty=residual_qty_before_position_disappeared,
+                exchange_position_qty=rem_qty if final_pos_status in {"found", "not_found"} else None,
+                exchange_avg_price=final_pos.get("avgPrice") if final_pos_status == "found" else None,
+                local_realized_qty=realized_qty,
+                local_tp_filled_qty=dict(filled_by_leg),
+                local_be_activated=bool(trade.get("be_activated")),
+                local_exit_reason=trade.get("exit_reason"),
+                exchange_error=final_pos.get("error") if final_pos_status not in {"found", "not_found"} else None,
+                position_gone=position_gone,
+            )
 
             closed_by_tp = rem_qty <= 1e-12 and realized_qty > 0 and position_gone
 
