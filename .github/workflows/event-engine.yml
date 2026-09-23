@@ -121,8 +121,17 @@ jobs:
         run: python run_once.py
 
       - name: Update research outcomes
+        id: research_outcomes
         if: always()
+        continue-on-error: true
+        timeout-minutes: 3
+        env:
+          PYTHONUNBUFFERED: "1"
         run: python research_forward.py --write
+
+      - name: Report research outcome status
+        if: ${{ steps.research_outcomes.outcome != 'success' }}
+        run: echo "::warning::research_forward.py --write did not complete successfully; trading state remains commit-safe and outcomes will be retried on the next run."
 
       - name: Pre-commit data size guard
         id: size_guard
