@@ -1409,6 +1409,7 @@ def test_run_once_import_regression():
     assert module.SWING_LEN == 10
 
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -3471,9 +3472,9 @@ def test_data_retention_preserves_production_state_and_prunes_only_research_hist
     assert json.loads((data_dir / "zone_visit_state.json").read_text()) == zone_state
     assert json.loads((data_dir / "research_bar_cursors.json").read_text()) == cursors
     assert json.loads((data_dir / "research_outcome_state.json").read_text()) == outcome_state
-    assert (tmp_path / "archive" / "market_bars_5m.jsonl.pruned.jsonl.gz").exists()
-    assert (tmp_path / "archive" / "zone_observations.jsonl.pruned.jsonl.gz").exists()
-    assert not (tmp_path / "archive" / "market_bars_1h.jsonl.pruned.jsonl.gz").exists()
+    assert (tmp_path / "archive" / "20260923T130000Z" / "market_bars_5m.jsonl.pruned.jsonl.gz").exists()
+    assert (tmp_path / "archive" / "20260923T130000Z" / "zone_observations.jsonl.pruned.jsonl.gz").exists()
+    assert not (tmp_path / "archive" / "20260923T130000Z" / "market_bars_1h.jsonl.pruned.jsonl.gz").exists()
 
 
 def test_data_retention_refuses_stale_market_bar_history(tmp_path, monkeypatch):
@@ -3493,3 +3494,110 @@ def test_data_retention_refuses_stale_market_bar_history(tmp_path, monkeypatch):
 
     assert json.loads((data_dir / "active_trades.json").read_text()) == active
     assert (data_dir / "market_bars_5m.jsonl").read_text().count("\n") == 1
+
+
+def test_tracker_trade_closed_log_format_uses_matching_placeholders():
+    from event_engine import tracker
+
+    args = (
+        "💚",
+        "APE-USDT",
+        "APE-USDT",
+        4.360322467577987,
+        "0.436",
+        0.5999999999999994,
+        0.1515888888888889,
+        "TAKE_PROFIT_FULL",
+        1495.5302166666668,
+    )
+    record = logging.LogRecord(
+        name="event_engine.tracker",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg=tracker._TRACKER_TRADE_CLOSED_LOG_FORMAT,
+        args=args,
+        exc_info=None,
+    )
+    rendered = record.getMessage()
+    assert "APE-USDT (APE-USDT)" in rendered
+    assert "PnL: +4.36%" in rendered
+    assert "Realized R:R: 0.436" in rendered
+    assert "Duration: 1495.5 min" in rendered
+
+
+def test_data_retention_archives_research_outcomes_and_reconciliation_without_losing_chain(tmp_path, monkeypatch):
+    from event_engine import data_retention
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(data_retention, "DATA_DIR", data_dir)
+    monkeypatch.setattr(data_retention, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(data_retention, "RESEARCH_OUTCOME_RETENTION_HOURS", 24)
+    monkeypatch.setattr(data_retention, "POSITION_RECONCILIATION_RETENTION_HOURS", 24)
+    monkeypatch.setattr("research_forward.update_outcomes", lambda write: (0, 0))
+
+    active = {"POS_ACTIVE": {"symbol": "BTC-USDT", "position_id": "POS_ACTIVE", "closed": False}}
+    state = {"schema_version": 2, "processed_observation_ids": ["OBS_OLD", "OBS_ACTIVE"]}
+    (data_dir / "active_trades.json").write_text(json.dumps(active), encoding="utf-8")
+    (data_dir / "research_outcome_state.json").write_text(json.dumps(state), encoding="utf-8")
+
+    recent = "2026-09-23T12:00:00+00:00"
+    old = "2026-09-20T00:00:00+00:00"
+    (data_dir / "market_bars_5m.jsonl").write_text(
+        json.dumps({"timestamp": recent, "symbol": "BTC-USDT", "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}) + "\n",
+        encoding="utf-8",
+    )
+
+    outcomes = [
+        {"outcome_id": "OUT_OLD", "observation_id": "OBS_OLD", "event_id": "CLOSED_1", "observation_ts": old, "record_type": "FORWARD_OUTCOME"},
+        {"outcome_id": "OUT_ACTIVE", "observation_id": "OBS_ACTIVE", "event_id": "POS_ACTIVE", "observation_ts": old, "record_type": "FORWARD_OUTCOME"},
+        {"outcome_id": "OUT_RECENT", "observation_id": "OBS_RECENT", "event_id": "EVT_RECENT", "observation_ts": recent, "record_type": "FORWARD_OUTCOME"},
+    ]
+    outcomes_path = data_dir / "research_outcomes.jsonl"
+    outcomes_path.write_text("\n".join(json.dumps(x) for x in outcomes) + "\n", encoding="utf-8")
+
+    trades = [
+        {"record_type": "TRADE_CLOSE", "event_id": "CLOSED_1", "position_id": "CLOSED_1", "closed_ts": old},
+    ]
+    (data_dir / "trades.jsonl").write_text("\n".join(json.dumps(x) for x in trades) + "\n", encoding="utf-8")
+
+    recon = [
+        {"record_type": "POSITION_RECON", "event_id": "CLOSED_1", "position_id": "CLOSED_1", "reconciliation_status": "FOUND", "ts_ms": 1760918400000},
+        {"record_type": "POSITION_RECON", "event_id": "CLOSED_1", "position_id": "CLOSED_1", "reconciliation_status": "FOUND", "ts_ms": 1761091200000},
+        {"record_type": "POSITION_RECON", "event_id": "CLOSED_1", "position_id": "CLOSED_1", "reconciliation_status": "CLOSED", "ts_ms": 1761091201000},
+        {"record_type": "POSITION_RECON", "event_id": "POS_ACTIVE", "position_id": "POS_ACTIVE", "reconciliation_status": "FOUND", "ts_ms": 1760918400000},
+    ]
+    recon_path = data_dir / "position_reconciliation.jsonl"
+    recon_path.write_text("\n".join(json.dumps(x) for x in recon) + "\n", encoding="utf-8")
+
+    now = datetime.fromisoformat("2026-09-23T13:00:00+00:00")
+    result = data_retention.compact_data(apply=True, archive_dir=tmp_path / "archive", now=now)
+
+    kept_outcomes = [json.loads(x) for x in outcomes_path.read_text(encoding="utf-8").splitlines() if x.strip()]
+    assert {x["outcome_id"] for x in kept_outcomes} == {"OUT_ACTIVE", "OUT_RECENT"}
+
+    kept_recon = [json.loads(x) for x in recon_path.read_text(encoding="utf-8").splitlines() if x.strip()]
+    assert any(x["position_id"] == "POS_ACTIVE" for x in kept_recon)
+    assert any(x["position_id"] == "CLOSED_1" and x["reconciliation_status"] == "CLOSED" for x in kept_recon)
+    assert sum(x["position_id"] == "CLOSED_1" and x["reconciliation_status"] == "FOUND" for x in kept_recon) == 1
+
+    for filename in ("research_outcomes.jsonl", "position_reconciliation.jsonl"):
+        meta = result["files"][filename]
+        assert meta["snapshot"] is not None
+        snapshot = Path(meta["snapshot"]["path"])
+        assert snapshot.exists()
+        assert meta["sha256_before"] != meta["sha256_after"]
+        assert meta["bytes_after"] < meta["bytes_before"]
+
+    # The immutable pre-compaction snapshots must still contain every original row.
+    import gzip
+    research_snapshot = Path(result["files"]["research_outcomes.jsonl"]["snapshot"]["path"])
+    with gzip.open(research_snapshot, "rt", encoding="utf-8") as fh:
+        restored_outcomes = [json.loads(line) for line in fh if line.strip()]
+    assert {x["outcome_id"] for x in restored_outcomes} == {"OUT_OLD", "OUT_ACTIVE", "OUT_RECENT"}
+
+    recon_snapshot = Path(result["files"]["position_reconciliation.jsonl"]["snapshot"]["path"])
+    with gzip.open(recon_snapshot, "rt", encoding="utf-8") as fh:
+        restored_recon = [json.loads(line) for line in fh if line.strip()]
+    assert len(restored_recon) == len(recon)
