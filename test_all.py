@@ -1,4 +1,5 @@
 from __future__ import annotations
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -3419,3 +3420,76 @@ def test_execution_telemetry_writes_linked_jsonl_events(tmp_path, monkeypatch):
         assert row["event_id"] == "EVT_1"
         assert row["attempt_id"] == "ATT_1"
         assert row["ts_ms"] > 0
+
+
+def test_data_retention_preserves_production_state_and_prunes_only_research_history(tmp_path, monkeypatch):
+    from event_engine import data_retention
+
+    data_dir = tmp_path / "data"
+    monkeypatch.setattr(data_retention, "DATA_DIR", data_dir)
+    monkeypatch.setattr(data_retention, "PROJECT_ROOT", tmp_path)
+
+    active = {"POS1": {"symbol": "BTC-USDT", "closed": False}}
+    zone_state = {"version": 2, "symbols": {"BTC-USDT": {"last_visit": "V1"}}}
+    cursors = {"BTC-USDT|5m|binance": {"last_timestamp": "2026-09-23T10:00:00+00:00"}}
+    outcome_state = {"schema_version": 2, "processed_observation_ids": ["OBS_DONE", "OBS_SIGNAL", "OBS_NEAR_OLD"]}
+    (data_dir / "active_trades.json").write_text(json.dumps(active), encoding="utf-8")
+    (data_dir / "zone_visit_state.json").write_text(json.dumps(zone_state), encoding="utf-8")
+    (data_dir / "research_bar_cursors.json").write_text(json.dumps(cursors), encoding="utf-8")
+    (data_dir / "research_outcome_state.json").write_text(json.dumps(outcome_state), encoding="utf-8")
+
+    recent = "2026-09-23T12:00:00+00:00"
+    old = "2026-09-20T00:00:00+00:00"
+    bars = [
+        {"timestamp": recent, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},
+        {"timestamp": old, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},
+    ]
+    (data_dir / "market_bars_5m.jsonl").write_text("\n".join(json.dumps(x) for x in bars) + "\n", encoding="utf-8")
+    (data_dir / "market_bars_1h.jsonl").write_text("\n".join(json.dumps(x) for x in bars) + "\n", encoding="utf-8")
+    obs = [
+        {"observation_id": "OBS_SIGNAL", "event_type": "SIGNAL_CREATED", "observation_ts": old},
+        {"observation_id": "OBS_NEAR_OLD", "event_type": "NEAREST_APPROACH", "observation_ts": old},
+        {"observation_id": "OBS_NEAR_NEW", "event_type": "NEAREST_APPROACH", "observation_ts": recent},
+    ]
+    (data_dir / "zone_observations.jsonl").write_text("\n".join(json.dumps(x) for x in obs) + "\n", encoding="utf-8")
+
+    # Use a temporary archive and a fixed now so the test is deterministic.
+    now = datetime.fromisoformat("2026-09-23T13:00:00+00:00")
+    # Stub the research finalizer: this test validates the data migration itself.
+    monkeypatch.setattr("research_forward.update_outcomes", lambda write: (0, 0))
+
+    result = data_retention.compact_data(
+        apply=True,
+        archive_dir=tmp_path / "archive",
+        now=now,
+    )
+
+    assert result["files"]["market_bars_5m.jsonl"]["pruned"] == 1
+    assert result["files"]["market_bars_1h.jsonl"]["pruned"] == 0
+    assert result["files"]["zone_observations.jsonl"]["pruned"] == 1
+    assert json.loads((data_dir / "active_trades.json").read_text()) == active
+    assert json.loads((data_dir / "zone_visit_state.json").read_text()) == zone_state
+    assert json.loads((data_dir / "research_bar_cursors.json").read_text()) == cursors
+    assert json.loads((data_dir / "research_outcome_state.json").read_text()) == outcome_state
+    assert (tmp_path / "archive" / "market_bars_5m.jsonl.pruned.jsonl.gz").exists()
+    assert (tmp_path / "archive" / "zone_observations.jsonl.pruned.jsonl.gz").exists()
+    assert not (tmp_path / "archive" / "market_bars_1h.jsonl.pruned.jsonl.gz").exists()
+
+
+def test_data_retention_refuses_stale_market_bar_history(tmp_path, monkeypatch):
+    from event_engine import data_retention
+
+    data_dir = tmp_path / "data"
+    monkeypatch.setattr(data_retention, "DATA_DIR", data_dir)
+    monkeypatch.setattr(data_retention, "PROJECT_ROOT", tmp_path)
+    active = {"POS1": {"symbol": "BTC-USDT", "closed": False}}
+    (data_dir / "active_trades.json").write_text(json.dumps(active), encoding="utf-8")
+    (data_dir / "market_bars_5m.jsonl").write_text(json.dumps({"timestamp": "2026-09-20T00:00:00+00:00"}) + "\n", encoding="utf-8")
+    now = datetime.fromisoformat("2026-09-23T13:00:00+00:00")
+    monkeypatch.setattr("research_forward.update_outcomes", lambda write: (0, 0))
+
+    with pytest.raises(RuntimeError, match="refusing destructive compaction"):
+        data_retention.compact_data(apply=True, archive_dir=tmp_path / "archive", now=now)
+
+    assert json.loads((data_dir / "active_trades.json").read_text()) == active
+    assert (data_dir / "market_bars_5m.jsonl").read_text().count("\n") == 1
