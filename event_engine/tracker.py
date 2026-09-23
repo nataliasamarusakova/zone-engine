@@ -36,6 +36,10 @@ from event_engine.telegram import send as send_tg
 from event_engine import telemetry
 
 log = logging.getLogger("event_engine.tracker")
+_TRACKER_TRADE_CLOSED_LOG_FORMAT = (
+    "[TRACKER_TRADE_CLOSED] %s %s (%s) | PnL: %+.2f%% | "
+    "Realized R:R: %s | Planned R:R: %.2f | Exit: %.8g (%s) | Duration: %.1f min"
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA = PROJECT_ROOT / "data"
@@ -1730,7 +1734,7 @@ def update_active_trades() -> None:
                 "setup": trade.get("setup", {}),
                 })
 
-            log.info("[TRACKER_TRADE_CLOSED] %s (%s) | PnL: %+.2f%% | Realized R:R: %s | Planned R:R: %.2f | Exit: %.8g (%s) | Duration: %.1f min", emoji, trade.get("name", symbol), symbol, final_pnl, (f"{realized_rr:.3f}" if realized_rr is not None else "—"), planned_rr, exit_price, exit_reason, duration_min)
+            log.info(_TRACKER_TRADE_CLOSED_LOG_FORMAT, emoji, trade.get("name", symbol), symbol, final_pnl, (f"{realized_rr:.3f}" if realized_rr is not None else "—"), planned_rr, exit_price, exit_reason, duration_min)
 
             _send_tracker_notification(
                 "TRADE_CLOSE",
