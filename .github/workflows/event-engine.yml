@@ -124,6 +124,17 @@ jobs:
         if: always()
         run: python research_forward.py --write
 
+      - name: Pre-commit data size guard
+        id: size_guard
+        if: always()
+        env:
+          DATA_RETENTION_SIZE_GUARD_BYTES: "90000000"
+          DATA_RETENTION_SIZE_TARGET_BYTES: "80000000"
+          DATA_RETENTION_ARCHIVE_DIR: data/retention_archive
+        run: |
+          set -euo pipefail
+          python -m event_engine.data_retention --size-guard --archive-dir data/retention_archive
+
       - name: Upload diagnostic log
         if: always()
         uses: actions/upload-artifact@v4
@@ -134,7 +145,7 @@ jobs:
           retention-days: 14
 
       - name: Commit state
-        if: always()
+        if: ${{ !cancelled() && steps.size_guard.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -145,6 +156,7 @@ jobs:
           # Keep the unbounded scan journal local-only.
           git add data/
           git reset -- data/scan_history.jsonl data/scan_history.jsonl.* data/zone_engine_diagnostic.log 2>/dev/null || true
+          python -m event_engine.data_retention --check-staged
           if git diff --cached --quiet; then
             echo "No state changes"
             exit 0
