@@ -1015,3 +1015,61 @@ def test_short_shadow_filter_candidates_are_observational_only():
     assert features["shadow_short_btc_ema50_gt_050"] is True
     assert features["shadow_short_combined_gt_025"] is True
     assert features["shadow_short_combined_gt_050"] is True
+
+
+def test_forward_state_bootstrap_preserves_unknown_keys(tmp_path: Path, monkeypatch):
+    import research_forward
+    monkeypatch.setattr(research_forward.research, "ZONE_OBSERVATIONS_PATH", tmp_path / "zone_observations.jsonl")
+    monkeypatch.setattr(research_forward.research, "MARKET_BARS_5M_PATH", tmp_path / "market_bars_5m.jsonl")
+    monkeypatch.setattr(research_forward.research, "RESEARCH_OUTCOMES_PATH", tmp_path / "research_outcomes.jsonl")
+    monkeypatch.setattr(research_forward.research, "RESEARCH_OUTCOME_STATE_PATH", tmp_path / "research_outcome_state.json")
+    state = {
+        "schema_version": 1,
+        "processed_observation_ids": [],
+        "future_extension_state": {"keep": True},
+    }
+    (tmp_path / "research_outcome_state.json").write_text(json.dumps(state), encoding="utf-8")
+    (tmp_path / "zone_observations.jsonl").write_text("", encoding="utf-8")
+    research_forward.update_outcomes(write=True)
+    stored = json.loads((tmp_path / "research_outcome_state.json").read_text(encoding="utf-8"))
+    assert stored["future_extension_state"] == {"keep": True}
+    assert stored["outcome_state_bootstrap_v1"] is True
+
+
+def test_update_outcomes_scales_without_per_observation_dataframe_rescans(tmp_path: Path, monkeypatch):
+    import time
+    import research_forward
+    monkeypatch.setattr(research_forward.research, "ZONE_OBSERVATIONS_PATH", tmp_path / "zone_observations.jsonl")
+    monkeypatch.setattr(research_forward.research, "MARKET_BARS_5M_PATH", tmp_path / "market_bars_5m.jsonl")
+    monkeypatch.setattr(research_forward.research, "RESEARCH_OUTCOMES_PATH", tmp_path / "research_outcomes.jsonl")
+    monkeypatch.setattr(research_forward.research, "RESEARCH_OUTCOME_STATE_PATH", tmp_path / "research_outcome_state.json")
+    monkeypatch.setattr(research_forward.research, "RESEARCH_MANIFEST_PATH", tmp_path / "research_manifest.json")
+    base = pd.Timestamp("2026-01-01T00:00:00Z")
+    observations = []
+    for i in range(0, 2000, 10):
+        ts = base + pd.Timedelta(minutes=5 * i)
+        observations.append({
+            "observation_id": f"OBS_{i}", "event_id": f"E_{i}", "scan_id": "S",
+            "event_type": "SIGNAL_CREATED", "symbol": "TEST-USDT", "provider": "binance",
+            "direction": "LONG", "observation_ts": ts.isoformat(), "reference_price": 100.0,
+        })
+    (tmp_path / "zone_observations.jsonl").write_text(
+        "".join(json.dumps(x) + "\n" for x in observations), encoding="utf-8"
+    )
+    bars = []
+    for i in range(3000):
+        ts = base + pd.Timedelta(minutes=5 * i)
+        bars.append({
+            "symbol": "TEST-USDT", "provider": "binance", "timestamp": ts.isoformat(),
+            "close_time": (ts + pd.Timedelta(minutes=5)).isoformat(),
+            "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1.0,
+        })
+    (tmp_path / "market_bars_5m.jsonl").write_text(
+        "".join(json.dumps(x) + "\n" for x in bars), encoding="utf-8"
+    )
+    started = time.perf_counter()
+    matured, total = research_forward.update_outcomes(write=False)
+    elapsed = time.perf_counter() - started
+    assert total == len(observations)
+    assert matured > 0
+    assert elapsed < 3.0
