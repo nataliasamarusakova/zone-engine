@@ -1073,3 +1073,64 @@ def test_update_outcomes_scales_without_per_observation_dataframe_rescans(tmp_pa
     assert total == len(observations)
     assert matured > 0
     assert elapsed < 3.0
+
+
+def test_forward_observation_cursor_only_scans_appended_rows(tmp_path: Path, monkeypatch):
+    import research_forward
+    monkeypatch.setattr(research_forward.research, "ZONE_OBSERVATIONS_PATH", tmp_path / "zone_observations.jsonl")
+    monkeypatch.setattr(research_forward.research, "MARKET_BARS_5M_PATH", tmp_path / "market_bars_5m.jsonl")
+    monkeypatch.setattr(research_forward.research, "RESEARCH_OUTCOMES_PATH", tmp_path / "research_outcomes.jsonl")
+    monkeypatch.setattr(research_forward.research, "RESEARCH_OUTCOME_STATE_PATH", tmp_path / "research_outcome_state.json")
+    monkeypatch.setattr(research_forward.research, "RESEARCH_MANIFEST_PATH", tmp_path / "research_manifest.json")
+
+    base = pd.Timestamp("2026-01-01T00:00:00Z")
+    obs1 = {"observation_id": "OBS_CURSOR_1", "event_id": "E1", "scan_id": "S", "event_type": "SIGNAL_CREATED", "symbol": "TEST-USDT", "provider": "binance", "direction": "LONG", "observation_ts": base.isoformat(), "reference_price": 100.0}
+    (tmp_path / "zone_observations.jsonl").write_text(json.dumps(obs1) + "\n", encoding="utf-8")
+    bars = []
+    for i in range(289):
+        ts = base + pd.Timedelta(minutes=5 * (i + 1))
+        bars.append({"symbol": "TEST-USDT", "provider": "binance", "timestamp": ts.isoformat(), "close_time": (ts + pd.Timedelta(minutes=5)).isoformat(), "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1.0})
+    (tmp_path / "market_bars_5m.jsonl").write_text("".join(json.dumps(x) + "\n" for x in bars), encoding="utf-8")
+
+    n1, total1 = research_forward.update_outcomes(write=True)
+    state1 = json.loads((tmp_path / "research_outcome_state.json").read_text(encoding="utf-8"))
+    cursor1 = state1[research_forward.OBS_CURSOR_STATE_KEY]
+    assert total1 == 1 and n1 == 1
+    assert cursor1["offset"] == (tmp_path / "zone_observations.jsonl").stat().st_size
+
+    obs2 = dict(obs1)
+    obs2.update({"observation_id": "OBS_CURSOR_2", "event_id": "E2", "observation_ts": (base + pd.Timedelta(minutes=5)).isoformat()})
+    with (tmp_path / "zone_observations.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(obs2) + "\n")
+
+    n2, total2 = research_forward.update_outcomes(write=True)
+    state2 = json.loads((tmp_path / "research_outcome_state.json").read_text(encoding="utf-8"))
+    assert total2 == 2 and n2 == 1
+    assert state2["observation_journal_unique_count"] == 2
+    assert state2[research_forward.OBS_CURSOR_STATE_KEY]["offset"] == (tmp_path / "zone_observations.jsonl").stat().st_size
+
+
+def test_forward_cursor_resets_safely_after_journal_rewrite(tmp_path: Path, monkeypatch):
+    import research_forward
+    monkeypatch.setattr(research_forward.research, "ZONE_OBSERVATIONS_PATH", tmp_path / "zone_observations.jsonl")
+    monkeypatch.setattr(research_forward.research, "MARKET_BARS_5M_PATH", tmp_path / "market_bars_5m.jsonl")
+    monkeypatch.setattr(research_forward.research, "RESEARCH_OUTCOMES_PATH", tmp_path / "research_outcomes.jsonl")
+    monkeypatch.setattr(research_forward.research, "RESEARCH_OUTCOME_STATE_PATH", tmp_path / "research_outcome_state.json")
+    monkeypatch.setattr(research_forward.research, "RESEARCH_MANIFEST_PATH", tmp_path / "research_manifest.json")
+
+    base = pd.Timestamp("2026-01-01T00:00:00Z")
+    obs = {"observation_id": "OBS_REWRITE", "event_id": "E1", "scan_id": "S", "event_type": "SIGNAL_CREATED", "symbol": "TEST-USDT", "provider": "binance", "direction": "LONG", "observation_ts": base.isoformat(), "reference_price": 100.0}
+    (tmp_path / "zone_observations.jsonl").write_text(json.dumps(obs) + "\n", encoding="utf-8")
+    (tmp_path / "market_bars_5m.jsonl").write_text("", encoding="utf-8")
+
+    research_forward.update_outcomes(write=True)
+    state_before = json.loads((tmp_path / "research_outcome_state.json").read_text(encoding="utf-8"))
+    assert state_before[research_forward.OBS_CURSOR_STATE_KEY]["offset"] > 0
+
+    # Simulate retention/compaction rewriting the journal. The cursor must no longer be trusted.
+    (tmp_path / "zone_observations.jsonl").write_text(json.dumps({**obs, "event_id": "E_REWRITTEN"}) + "\n", encoding="utf-8")
+    n, total = research_forward.update_outcomes(write=True)
+    state_after = json.loads((tmp_path / "research_outcome_state.json").read_text(encoding="utf-8"))
+    assert total == 1
+    assert n == 0
+    assert state_after[research_forward.OBS_CURSOR_STATE_KEY]["offset"] == (tmp_path / "zone_observations.jsonl").stat().st_size

@@ -54,6 +54,84 @@ MFE_MAE_HORIZONS = (15, 30, 60, 180, 360, 720, 1440)
 FAVORABLE_THRESHOLDS = (3, 5, 6, 7, 10)
 ADVERSE_THRESHOLDS = (3, 5, 7, 10)
 
+OBS_CURSOR_STATE_KEY = "observation_journal_cursor_v1"
+PENDING_OBSERVATIONS_STATE_KEY = "pending_observations_v1"
+OBS_CURSOR_SCHEMA_VERSION = 1
+OBS_SIGNATURE_BYTES = 64 * 1024
+
+
+def _sha256_bytes(data: bytes) -> str:
+    import hashlib
+    return hashlib.sha256(data).hexdigest()
+
+
+def _journal_signature(path: Path, offset: int) -> dict[str, Any]:
+    """Return a cheap append-only journal signature around the resume offset."""
+    if not path.exists():
+        return {"size": 0, "prefix_sha256": "", "window_sha256": "", "window_start": 0}
+    size = path.stat().st_size
+    with path.open("rb") as fh:
+        prefix = fh.read(min(OBS_SIGNATURE_BYTES, size))
+        window_start = max(0, min(int(offset) - OBS_SIGNATURE_BYTES, size))
+        fh.seek(window_start)
+        window_len = max(0, min(OBS_SIGNATURE_BYTES, int(offset) - window_start))
+        window = fh.read(window_len)
+    return {
+        "size": int(size),
+        "inode": int(path.stat().st_ino),
+        "prefix_sha256": _sha256_bytes(prefix),
+        "window_start": int(window_start),
+        "window_sha256": _sha256_bytes(window),
+    }
+
+
+def _cursor_is_valid(path: Path, cursor: dict[str, Any]) -> bool:
+    if not path.exists() or not isinstance(cursor, dict):
+        return False
+    try:
+        offset = int(cursor.get("offset", -1))
+        recorded_size = int(cursor.get("size", -1))
+    except (TypeError, ValueError):
+        return False
+    if offset < 0 or recorded_size < 0:
+        return False
+    current_size = path.stat().st_size
+    if current_size < offset or current_size < recorded_size:
+        return False
+    sig = _journal_signature(path, offset)
+    recorded_inode = cursor.get("inode")
+    if recorded_inode is not None and int(recorded_inode) != int(sig.get("inode", -1)):
+        return False
+    return (
+        sig.get("prefix_sha256") == cursor.get("prefix_sha256")
+        and sig.get("window_sha256") == cursor.get("window_sha256")
+        and int(cursor.get("window_start", -1)) == int(sig.get("window_start", -2))
+    )
+
+
+def _read_observation_at(path: Path, offset: int, expected_id: str) -> dict[str, Any] | None:
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            fh.seek(int(offset))
+            line = fh.readline()
+        row = json.loads(line)
+        if not isinstance(row, dict):
+            return None
+        if str(row.get("observation_id", "")) != str(expected_id):
+            return None
+        return row
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _store_observation_cursor(state: dict[str, Any], path: Path, offset: int) -> None:
+    sig = _journal_signature(path, offset)
+    state[OBS_CURSOR_STATE_KEY] = {
+        "schema_version": OBS_CURSOR_SCHEMA_VERSION,
+        "offset": int(offset),
+        **sig,
+    }
+
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
@@ -317,18 +395,41 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
     state = _load_state()
     processed = set(str(x) for x in state.get("processed_observation_ids", []) if x)
     bootstrap_complete = bool(state.get("outcome_state_bootstrap_v1"))
-
-    # Stream observations and keep only candidates that are both unprocessed and mature.
-    # We still scan the append-only journal, but avoid building a second full in-memory copy.
-    now = pd.Timestamp.now(tz="UTC")
-    observations: list[dict[str, Any]] = []
-    candidate_symbols: set[str] = set()
-    total_observations = 0
     raw_path = research.ZONE_OBSERVATIONS_PATH
+    now = pd.Timestamp.now(tz="UTC")
+
+    cursor = state.get(OBS_CURSOR_STATE_KEY) if isinstance(state.get(OBS_CURSOR_STATE_KEY), dict) else {}
+    cursor_valid = _cursor_is_valid(raw_path, cursor)
+    full_rebuild = not cursor_valid
+    if full_rebuild:
+        read_offset = 0
+        pending: dict[str, dict[str, Any]] = {}
+    else:
+        read_offset = int(cursor.get("offset", 0))
+        pending = {
+            str(k): dict(v) for k, v in (state.get(PENDING_OBSERVATIONS_STATE_KEY) or {}).items()
+            if isinstance(v, dict) and k
+        }
+
+    observations: list[dict[str, Any]] = []
+    pending_now: dict[str, dict[str, Any]] = {} if full_rebuild else dict(pending)
+    candidate_symbols: set[str] = set()
+    candidate_meta: dict[str, dict[str, Any]] = {}
+    new_unique = 0
+    seen_new_ids: set[str] = set()
+    scan_started = time.perf_counter()
+    scan_end_offset = read_offset
+
     if raw_path.exists():
         with raw_path.open("r", encoding="utf-8") as fh:
-            seen_ids: set[str] = set()
-            for line in fh:
+            fh.seek(read_offset)
+            while True:
+                line_offset = fh.tell()
+                line = fh.readline()
+                if not line:
+                    scan_end_offset = fh.tell()
+                    break
+                scan_end_offset = fh.tell()
                 text = line.strip()
                 if not text:
                     continue
@@ -339,12 +440,109 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
                 if not isinstance(obs, dict):
                     continue
                 oid = str(obs.get("observation_id", ""))
-                if not oid or oid in seen_ids:
+                if not oid or oid in processed or oid in pending_now or oid in seen_new_ids:
                     continue
-                seen_ids.add(oid)
-                total_observations += 1
-                if oid in processed:
+                seen_new_ids.add(oid)
+                new_unique += 1
+                try:
+                    obs_ts = pd.Timestamp(obs.get("observation_ts"))
+                    if obs_ts.tzinfo is None:
+                        obs_ts = obs_ts.tz_localize("UTC")
+                    else:
+                        obs_ts = obs_ts.tz_convert("UTC")
+                except Exception:
                     continue
+                age_ready = now >= obs_ts + pd.Timedelta(hours=24)
+                if age_ready:
+                    observations.append(obs)
+                    candidate_meta[oid] = {"offset": int(line_offset), "observation_ts": obs_ts.isoformat()}
+                    symbol = str(obs.get("symbol", "")).upper()
+                    if symbol:
+                        candidate_symbols.add(symbol)
+                else:
+                    pending_now[oid] = {
+                        "offset": int(line_offset),
+                        "observation_ts": obs_ts.isoformat(),
+                    }
+
+    # Revisit only the small pending set that can have matured since the last run.
+    stale_pending: list[str] = []
+    for oid, meta in sorted(pending_now.items(), key=lambda item: int(item[1].get("offset", 0))):
+        try:
+            obs_ts = pd.Timestamp(meta.get("observation_ts"))
+            if obs_ts.tzinfo is None:
+                obs_ts = obs_ts.tz_localize("UTC")
+            else:
+                obs_ts = obs_ts.tz_convert("UTC")
+        except Exception:
+            stale_pending.append(oid)
+            continue
+        if now < obs_ts + pd.Timedelta(hours=24):
+            continue
+        obs = _read_observation_at(raw_path, int(meta.get("offset", 0)), oid)
+        if obs is None:
+            # The journal changed behind the cursor. Force a full rebuild on the next write.
+            full_rebuild = True
+            break
+        observations.append(obs)
+        candidate_meta[oid] = dict(meta)
+        symbol = str(obs.get("symbol", "")).upper()
+        if symbol:
+            candidate_symbols.add(symbol)
+
+    scan_seconds = time.perf_counter() - scan_started
+    known_total = int(state.get("observation_journal_unique_count", 0))
+    if full_rebuild:
+        # We will recompute the total from the records observed in the rebuilt journal below.
+        known_total = 0
+    total_observations = known_total + new_unique
+    if full_rebuild:
+        # A full rebuild includes all unique IDs in the current journal, including processed rows.
+        full_seen: set[str] = set()
+        with raw_path.open("r", encoding="utf-8") if raw_path.exists() else _NullContext() as fh:
+            if raw_path.exists():
+                for line in fh:
+                    text = line.strip()
+                    if not text:
+                        continue
+                    try:
+                        row = json.loads(text)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(row, dict):
+                        rid = str(row.get("observation_id", ""))
+                        if rid:
+                            full_seen.add(rid)
+        total_observations = len(full_seen)
+
+    log.info(
+        "[RESEARCH_FORWARD_SCAN] mode=%s cursor_offset=%d unique_total=%d new=%d pending=%d matured_candidates=%d symbols=%d seconds=%.3f",
+        "full_rebuild" if full_rebuild else "incremental", read_offset, total_observations, new_unique, len(pending_now), len(observations), len(candidate_symbols), scan_seconds,
+    )
+
+    if full_rebuild and raw_path.exists():
+        # Rebuild pending from the full journal, excluding processed and newly-ready entries.
+        rebuilt_pending: dict[str, dict[str, Any]] = {}
+        seen: set[str] = set()
+        with raw_path.open("r", encoding="utf-8") as fh:
+            while True:
+                line_offset = fh.tell()
+                line = fh.readline()
+                if not line:
+                    break
+                text = line.strip()
+                if not text:
+                    continue
+                try:
+                    obs = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obs, dict):
+                    continue
+                oid = str(obs.get("observation_id", ""))
+                if not oid or oid in seen or oid in processed:
+                    continue
+                seen.add(oid)
                 try:
                     obs_ts = pd.Timestamp(obs.get("observation_ts"))
                     if obs_ts.tzinfo is None:
@@ -354,24 +552,28 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
                 except Exception:
                     continue
                 if now < obs_ts + pd.Timedelta(hours=24):
-                    continue
-                symbol = str(obs.get("symbol", "")).upper()
-                if not symbol:
-                    continue
-                observations.append(obs)
-                candidate_symbols.add(symbol)
+                    rebuilt_pending[oid] = {"offset": int(line_offset), "observation_ts": obs_ts.isoformat()}
+        # Keep already-matured candidates out of pending; they'll be completed below.
+        for obs in observations:
+            oid = str(obs.get("observation_id", ""))
+            rebuilt_pending.pop(oid, None)
+        pending_now = rebuilt_pending
 
-    scan_seconds = time.perf_counter() - started
-    log.info("[RESEARCH_FORWARD_SCAN] unique_observations=%d matured_candidates=%d symbols=%d seconds=%.3f", total_observations, len(observations), len(candidate_symbols), scan_seconds)
     if not observations or not candidate_symbols:
-        if write and not bootstrap_complete:
-            # Preserve every pre-existing state key; only add the bootstrap marker.
+        if write:
             state_payload = dict(state)
             state_payload.update({
                 "schema_version": research.RESEARCH_SCHEMA_VERSION,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
                 "processed_observation_ids": sorted(processed),
                 "outcome_state_bootstrap_v1": True,
+                OBS_CURSOR_STATE_KEY: {
+                    **_journal_signature(raw_path, scan_end_offset),
+                    "schema_version": OBS_CURSOR_SCHEMA_VERSION,
+                    "offset": int(scan_end_offset),
+                },
+                PENDING_OBSERVATIONS_STATE_KEY: pending_now,
+                "observation_journal_unique_count": int(total_observations),
             })
             research._atomic_json_locked(research.RESEARCH_OUTCOME_STATE_PATH, state_payload)
         return 0, total_observations
@@ -380,12 +582,22 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
     bars_by_symbol = _load_bars(symbols=candidate_symbols)
     log.info("[RESEARCH_FORWARD_BARS] symbols=%d groups=%d seconds=%.3f", len(candidate_symbols), len(bars_by_symbol), time.perf_counter() - bars_started)
     if not bars_by_symbol:
+        if write:
+            state_payload = dict(state)
+            state_payload.update({
+                "schema_version": research.RESEARCH_SCHEMA_VERSION,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "processed_observation_ids": sorted(processed),
+                "outcome_state_bootstrap_v1": True,
+                OBS_CURSOR_STATE_KEY: {**_journal_signature(raw_path, scan_end_offset), "schema_version": OBS_CURSOR_SCHEMA_VERSION, "offset": int(scan_end_offset)},
+                PENDING_OBSERVATIONS_STATE_KEY: pending_now,
+                "observation_journal_unique_count": int(total_observations),
+            })
+            research._atomic_json_locked(research.RESEARCH_OUTCOME_STATE_PATH, state_payload)
         return 0, total_observations
 
-    # Cache the compact numeric index once per symbol/provider and reuse it for all observations.
     indexed: dict[str, _BarIndex] = {key: _BarIndex(df) for key, df in bars_by_symbol.items()}
 
-    # One-time legacy bootstrap: only if the state file has not yet recorded the bootstrap marker.
     existing_outcome_ids: set[str] = set()
     if not bootstrap_complete and research.RESEARCH_OUTCOMES_PATH.exists():
         for line in research.RESEARCH_OUTCOMES_PATH.open("r", encoding="utf-8"):
@@ -407,13 +619,22 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
         key = f"{symbol}|{provider}" if provider else symbol
         index = indexed.get(key) or indexed.get(symbol)
         if index is None:
+            if oid := str(obs.get("observation_id", "")):
+                pending_now[oid] = dict(candidate_meta.get(oid) or {"offset": 0, "observation_ts": str(obs.get("observation_ts", ""))})
             continue
         outcome = _calculate_forward_outcome_indexed(obs, index)
-        if outcome is None or not bool(outcome.get("forward_path_complete_24h")):
-            continue
         oid = str(obs.get("observation_id", ""))
+        if outcome is None or not bool(outcome.get("forward_path_complete_24h")):
+            if oid:
+                # If we cannot complete the 24h horizon yet, revisit next run.
+                meta = pending_now.get(oid) or candidate_meta.get(oid)
+                if meta is None:
+                    meta = {"offset": 0, "observation_ts": str(obs.get("observation_ts", ""))}
+                pending_now[oid] = dict(meta)
+            continue
         if not bootstrap_complete and str(outcome.get("outcome_id", "")) in existing_outcome_ids:
             processed.add(oid)
+            pending_now.pop(oid, None)
             continue
         ready.append(outcome)
 
@@ -431,6 +652,8 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
         if unique_ready:
             research._append_jsonl_locked(research.RESEARCH_OUTCOMES_PATH, unique_ready)
             processed.update(str(x["observation_id"]) for x in unique_ready if x.get("observation_id"))
+            for x in unique_ready:
+                pending_now.pop(str(x.get("observation_id", "")), None)
             ready = unique_ready
         state_payload = dict(state)
         state_payload.update({
@@ -438,11 +661,23 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "processed_observation_ids": sorted(processed),
             "outcome_state_bootstrap_v1": True,
+            OBS_CURSOR_STATE_KEY: {**_journal_signature(raw_path, scan_end_offset), "schema_version": OBS_CURSOR_SCHEMA_VERSION, "offset": int(scan_end_offset)},
+            PENDING_OBSERVATIONS_STATE_KEY: pending_now,
+            "observation_journal_unique_count": int(total_observations),
         })
         research._atomic_json_locked(research.RESEARCH_OUTCOME_STATE_PATH, state_payload)
         if ready:
             research._bump_manifest("forward_outcomes_written", len(ready))
     return len(ready), total_observations
+
+
+class _NullContext:
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        return False
+    def __iter__(self):
+        return iter(())
 
 
 def main() -> int:
