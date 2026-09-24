@@ -2507,8 +2507,10 @@ def test_workflow_stages_all_data_but_excludes_scan_history():
     text = Path(".github/workflows/event-engine.yml").read_text(encoding="utf-8")
     assert "git add data/" in text
     assert "git reset -- data/scan_history.jsonl" in text
-    assert "schedule:" in text
-    assert '- cron: "*/5 * * * *"' in text
+    assert "schedule:" not in text
+    assert 'cron: "*/5 * * * *"' not in text
+    assert "repository_dispatch:" in text
+    assert "run_event_engine" in text
 
 
 def test_execution_ledger_is_append_only_and_carries_attempt_lineage(tmp_path, monkeypatch):
