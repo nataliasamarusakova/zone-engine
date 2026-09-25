@@ -79,3 +79,68 @@ def test_check_staged_guard_blocks_large_data_file(monkeypatch, tmp_path):
         assert "data/example.jsonl" in str(exc)
     else:
         raise AssertionError("staged size guard failed to block an oversized staged file")
+
+
+def test_size_guard_zone_observations_can_archive_old_non_nearest_rows_without_touching_protected(monkeypatch, tmp_path):
+    import json
+    from event_engine import data_retention
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    now = data_retention.datetime.now(data_retention.timezone.utc)
+    old = (now - data_retention.timedelta(hours=400)).isoformat()
+    recent = (now - data_retention.timedelta(hours=1)).isoformat()
+    protected = {
+        "record_type": "ZONE_OBSERVATION",
+        "observation_id": "OBS_PROTECTED",
+        "event_type": "SIGNAL_CREATED",
+        "scan_id": "SCAN_TRADE",
+        "observation_ts": old,
+    }
+    rows = [protected] + [
+        {
+            "record_type": "ZONE_OBSERVATION",
+            "observation_id": f"OBS_OLD_{i}",
+            "event_type": "REARM" if i % 2 else "TOUCH_BLOCKED",
+            "scan_id": f"SCAN_OLD_{i}",
+            "observation_ts": old,
+            "payload": "x" * 120,
+        }
+        for i in range(400)
+    ] + [{
+        "record_type": "ZONE_OBSERVATION",
+        "observation_id": "OBS_RECENT",
+        "event_type": "TOUCH_BLOCKED",
+        "scan_id": "SCAN_RECENT",
+        "observation_ts": recent,
+    }]
+    path = data_dir / "zone_observations.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    (data_dir / "active_trades.json").write_text(json.dumps({}), encoding="utf-8")
+    (data_dir / "research_outcome_state.json").write_text(json.dumps({"processed_observation_ids": []}), encoding="utf-8")
+    (data_dir / "trades.jsonl").write_text(json.dumps({"record_type": "TRADE_OPEN", "event_id": "E1", "scan_id": "SCAN_TRADE", "observation_id": "OBS_PROTECTED"}) + "\n", encoding="utf-8")
+    monkeypatch.setattr(data_retention, "DATA_DIR", data_dir)
+    monkeypatch.setattr(data_retention, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(data_retention, "REPO_RETENTION_ARCHIVE_ROOT", data_dir / "retention_archive")
+    monkeypatch.setattr(data_retention, "GITHUB_SIZE_GUARD_BYTES", 20_000)
+    monkeypatch.setattr(data_retention, "GITHUB_SIZE_TARGET_BYTES", 10_000)
+
+    result = data_retention.apply_size_guard(now=now, archive_root=data_dir / "retention_archive")
+    meta = result["files"]["zone_observations.jsonl"]
+    assert meta["bytes_after"] < 20_000
+    kept = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    kept_ids = {row["observation_id"] for row in kept}
+    assert "OBS_PROTECTED" not in kept_ids
+    assert "OBS_RECENT" in kept_ids
+    assert any(x.get("pruned", 0) > 0 for x in meta["policies"])
+    snapshot_parts = list((data_dir / "retention_archive").rglob("zone_observations.jsonl.before.part-*.jsonl.gz"))
+    assert snapshot_parts
+    import gzip
+    restored_ids = set()
+    for part in snapshot_parts:
+        with gzip.open(part, "rt", encoding="utf-8") as fh:
+            for line in fh:
+                if line.strip():
+                    restored_ids.add(json.loads(line)["observation_id"])
+    assert "OBS_PROTECTED" in restored_ids
+    assert "OBS_OLD_0" in restored_ids

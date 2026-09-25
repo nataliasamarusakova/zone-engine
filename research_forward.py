@@ -58,6 +58,41 @@ OBS_CURSOR_STATE_KEY = "observation_journal_cursor_v1"
 PENDING_OBSERVATIONS_STATE_KEY = "pending_observations_v1"
 OBS_CURSOR_SCHEMA_VERSION = 1
 OBS_SIGNATURE_BYTES = 64 * 1024
+PENDING_META_SCHEMA_VERSION = 2
+PENDING_REPLAY_FIELDS = (
+    "observation_id", "event_id", "scan_id", "event_type", "symbol",
+    "direction", "provider", "source", "observation_ts", "reference_price",
+)
+
+
+def _pending_meta_from_observation(obs: dict[str, Any], *, offset: int) -> dict[str, Any]:
+    """Store the minimal observation payload needed to finish a 24h outcome.
+
+    The full raw observation remains in the journal/snapshot archive; this compact
+    state copy lets retention move old pending rows out of the working JSONL
+    without losing the ability to calculate their forward outcome later.
+    """
+    meta: dict[str, Any] = {
+        "schema_version": PENDING_META_SCHEMA_VERSION,
+        "offset": int(offset),
+    }
+    for field in PENDING_REPLAY_FIELDS:
+        value = obs.get(field)
+        if value not in (None, ""):
+            meta[field] = value
+    return meta
+
+
+def _pending_meta_is_replayable(meta: dict[str, Any]) -> bool:
+    return all(meta.get(field) not in (None, "") for field in PENDING_REPLAY_FIELDS if field != "event_id")
+
+
+def _observation_from_pending_meta(meta: dict[str, Any], oid: str) -> dict[str, Any] | None:
+    if not isinstance(meta, dict) or not _pending_meta_is_replayable(meta):
+        return None
+    obs = {field: meta.get(field) for field in PENDING_REPLAY_FIELDS if meta.get(field) not in (None, "")}
+    obs["observation_id"] = str(oid)
+    return obs
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -401,18 +436,27 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
     cursor = state.get(OBS_CURSOR_STATE_KEY) if isinstance(state.get(OBS_CURSOR_STATE_KEY), dict) else {}
     cursor_valid = _cursor_is_valid(raw_path, cursor)
     full_rebuild = not cursor_valid
+    pending: dict[str, dict[str, Any]] = {
+        str(k): dict(v) for k, v in (state.get(PENDING_OBSERVATIONS_STATE_KEY) or {}).items()
+        if isinstance(v, dict) and k and _pending_meta_is_replayable(v)
+    }
+    legacy_pending_present = any(
+        isinstance(v, dict) and not _pending_meta_is_replayable(v)
+        for v in (state.get(PENDING_OBSERVATIONS_STATE_KEY) or {}).values()
+    )
     if full_rebuild:
         read_offset = 0
-        pending: dict[str, dict[str, Any]] = {}
     else:
         read_offset = int(cursor.get("offset", 0))
-        pending = {
-            str(k): dict(v) for k, v in (state.get(PENDING_OBSERVATIONS_STATE_KEY) or {}).items()
-            if isinstance(v, dict) and k
-        }
+    # Older state files stored only offsets. If such entries remain, ignore them
+    # until the full journal rebuild reconstructs replayable metadata.
+    if legacy_pending_present:
+        pending = {}
+        full_rebuild = True
+        read_offset = 0
 
     observations: list[dict[str, Any]] = []
-    pending_now: dict[str, dict[str, Any]] = {} if full_rebuild else dict(pending)
+    pending_now: dict[str, dict[str, Any]] = dict(pending)
     candidate_symbols: set[str] = set()
     candidate_meta: dict[str, dict[str, Any]] = {}
     new_unique = 0
@@ -460,10 +504,7 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
                     if symbol:
                         candidate_symbols.add(symbol)
                 else:
-                    pending_now[oid] = {
-                        "offset": int(line_offset),
-                        "observation_ts": obs_ts.isoformat(),
-                    }
+                    pending_now[oid] = _pending_meta_from_observation(obs, offset=int(line_offset))
 
     # Revisit only the small pending set that can have matured since the last run.
     stale_pending: list[str] = []
@@ -479,11 +520,16 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
             continue
         if now < obs_ts + pd.Timedelta(hours=24):
             continue
-        obs = _read_observation_at(raw_path, int(meta.get("offset", 0)), oid)
+        obs = _observation_from_pending_meta(meta, oid)
+        if obs is None:
+            obs = _read_observation_at(raw_path, int(meta.get("offset", 0)), oid)
         if obs is None:
             # The journal changed behind the cursor. Force a full rebuild on the next write.
             full_rebuild = True
             break
+        # Upgrade legacy pending metadata in place so the next retention pass can
+        # safely archive the raw journal row.
+        pending_now[oid] = _pending_meta_from_observation(obs, offset=int(meta.get("offset", 0)))
         observations.append(obs)
         candidate_meta[oid] = dict(meta)
         symbol = str(obs.get("symbol", "")).upper()
@@ -520,39 +566,45 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
         "full_rebuild" if full_rebuild else "incremental", read_offset, total_observations, new_unique, len(pending_now), len(observations), len(candidate_symbols), scan_seconds,
     )
 
-    if full_rebuild and raw_path.exists():
-        # Rebuild pending from the full journal, excluding processed and newly-ready entries.
-        rebuilt_pending: dict[str, dict[str, Any]] = {}
+    if full_rebuild:
+        # Rebuild from the current journal, preserving replayable pending metadata
+        # that may now live only in the archive after retention compaction.
+        rebuilt_pending: dict[str, dict[str, Any]] = {
+            str(k): dict(v) for k, v in pending.items()
+            if isinstance(v, dict) and _pending_meta_is_replayable(v)
+        }
         seen: set[str] = set()
-        with raw_path.open("r", encoding="utf-8") as fh:
-            while True:
-                line_offset = fh.tell()
-                line = fh.readline()
-                if not line:
-                    break
-                text = line.strip()
-                if not text:
-                    continue
-                try:
-                    obs = json.loads(text)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(obs, dict):
-                    continue
-                oid = str(obs.get("observation_id", ""))
-                if not oid or oid in seen or oid in processed:
-                    continue
-                seen.add(oid)
-                try:
-                    obs_ts = pd.Timestamp(obs.get("observation_ts"))
-                    if obs_ts.tzinfo is None:
-                        obs_ts = obs_ts.tz_localize("UTC")
-                    else:
-                        obs_ts = obs_ts.tz_convert("UTC")
-                except Exception:
-                    continue
-                if now < obs_ts + pd.Timedelta(hours=24):
-                    rebuilt_pending[oid] = {"offset": int(line_offset), "observation_ts": obs_ts.isoformat()}
+        if raw_path.exists():
+            with raw_path.open("r", encoding="utf-8") as fh:
+                while True:
+                    line_offset = fh.tell()
+                    line = fh.readline()
+                    if not line:
+                        break
+                    text = line.strip()
+                    if not text:
+                        continue
+                    try:
+                        obs = json.loads(text)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(obs, dict):
+                        continue
+                    oid = str(obs.get("observation_id", ""))
+                    if not oid or oid in seen or oid in processed:
+                        continue
+                    seen.add(oid)
+                    try:
+                        obs_ts = pd.Timestamp(obs.get("observation_ts"))
+                        if obs_ts.tzinfo is None:
+                            obs_ts = obs_ts.tz_localize("UTC")
+                        else:
+                            obs_ts = obs_ts.tz_convert("UTC")
+                    except Exception:
+                        continue
+                    if now < obs_ts + pd.Timedelta(hours=24):
+                        rebuilt_pending[oid] = _pending_meta_from_observation(obs, offset=int(line_offset))
+        
         # Keep already-matured candidates out of pending; they'll be completed below.
         for obs in observations:
             oid = str(obs.get("observation_id", ""))

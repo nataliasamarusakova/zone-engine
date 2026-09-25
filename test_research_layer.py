@@ -1134,3 +1134,66 @@ def test_forward_cursor_resets_safely_after_journal_rewrite(tmp_path: Path, monk
     assert total == 1
     assert n == 0
     assert state_after[research_forward.OBS_CURSOR_STATE_KEY]["offset"] == (tmp_path / "zone_observations.jsonl").stat().st_size
+
+
+
+def test_pending_state_contains_replay_payload():
+    from event_engine import research
+    import research_forward
+
+    obs = {
+        "observation_id": "OBS_PENDING", "event_id": "E1", "scan_id": "S1",
+        "event_type": "SIGNAL_CREATED", "symbol": "BTC-USDT", "direction": "LONG",
+        "provider": "binance", "source": "test", "observation_ts": "2026-09-20T00:00:00+00:00",
+        "reference_price": 100.0,
+    }
+    meta = research_forward._pending_meta_from_observation(obs, offset=1234)
+    assert research_forward._pending_meta_is_replayable(meta)
+    restored = research_forward._observation_from_pending_meta(meta, "OBS_PENDING")
+    assert restored["observation_id"] == "OBS_PENDING"
+    assert restored["symbol"] == "BTC-USDT"
+    assert restored["reference_price"] == 100.0
+
+
+def test_pending_observation_can_be_replayed_without_raw_journal(tmp_path, monkeypatch):
+    import json
+    import pandas as pd
+    import research_forward
+    from event_engine import research
+
+    state_path = tmp_path / "research_outcome_state.json"
+    obs_path = tmp_path / "zone_observations.jsonl"
+    outcomes_path = tmp_path / "research_outcomes.jsonl"
+    ts = "2026-09-20T00:00:00+00:00"
+    state = {
+        "schema_version": 2,
+        "processed_observation_ids": [],
+        "pending_observations_v1": {
+            "OBS_PENDING": {
+                "schema_version": 2, "offset": 0, "observation_id": "OBS_PENDING",
+                "event_id": "E1", "scan_id": "S1", "event_type": "SIGNAL_CREATED",
+                "symbol": "BTC-USDT", "direction": "LONG", "provider": "binance",
+                "source": "test", "observation_ts": ts, "reference_price": 100.0,
+            }
+        },
+    }
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    obs_path.write_text("", encoding="utf-8")
+
+    bars = []
+    start = pd.Timestamp(ts)
+    for i in range(289):
+        t = start + pd.Timedelta(minutes=5*i)
+        close = 100.0 + i*0.01
+        bars.append({"timestamp": t, "open": close, "high": close+0.02, "low": close-0.02, "close": close, "volume": 1.0})
+
+    monkeypatch.setattr(research, "ZONE_OBSERVATIONS_PATH", obs_path)
+    monkeypatch.setattr(research, "RESEARCH_OUTCOME_STATE_PATH", state_path)
+    monkeypatch.setattr(research, "RESEARCH_OUTCOMES_PATH", outcomes_path)
+    monkeypatch.setattr(research_forward, "_load_bars", lambda symbols: {"BTC-USDT|binance": pd.DataFrame(bars)})
+    monkeypatch.setattr(research_forward.pd.Timestamp, "now", lambda *args, **kwargs: pd.Timestamp("2026-09-21T02:00:00Z"))
+
+    ready, _ = research_forward.update_outcomes(write=True)
+    assert ready == 1
+    rows = [json.loads(x) for x in outcomes_path.read_text(encoding="utf-8").splitlines() if x.strip()]
+    assert rows[0]["observation_id"] == "OBS_PENDING"
