@@ -1,113 +1,183 @@
 {
   "schema_version": 1,
   "mode": "size_guard",
-  "started_at": "2026-09-25T00:28:22.569373+00:00",
+  "started_at": "2026-09-25T00:34:33.747555+00:00",
   "files": {
     "market_bars_5m.jsonl": {
       "path": "data/market_bars_5m.jsonl",
-      "triggered": false,
-      "bytes_before": 89899486
+      "triggered": true,
+      "bytes_before": 90079489,
+      "bytes_after": 89896060,
+      "rows_before": 141751,
+      "rows_after": 141464,
+      "snapshot": {
+        "source_sha256": "2c433c2ce40ff38fd39aa4822596864b89827489bff4e9c5b7e71418aa893619",
+        "source_bytes": 90079489,
+        "source_rows": 141751,
+        "chunks": [
+          {
+            "path": "data/retention_archive/20260925T003433Z/market_bars_5m.jsonl/snapshot/market_bars_5m.jsonl.before.part-0001.jsonl.gz",
+            "compressed_bytes": 6472106
+          },
+          {
+            "path": "data/retention_archive/20260925T003433Z/market_bars_5m.jsonl/snapshot/market_bars_5m.jsonl.before.part-0002.jsonl.gz",
+            "compressed_bytes": 5160660
+          }
+        ]
+      },
+      "policies": [
+        {
+          "policy": "keep_newer_than_36h_with_pending_protection",
+          "path": "data/market_bars_5m.jsonl",
+          "before": 141751,
+          "after": 141464,
+          "pruned": 287,
+          "archive": "data/retention_archive/20260925T003433Z/market_bars_5m.jsonl/pruned/market_bars_5m.jsonl.pruned.jsonl.gz",
+          "snapshot": null,
+          "sha256_before": "2c433c2ce40ff38fd39aa4822596864b89827489bff4e9c5b7e71418aa893619",
+          "sha256_after": "c8ddf748ef580b59ec36fa31639053e049db4c1d2aa449e11eda2f68c1fee8c3",
+          "bytes_before": 90079489,
+          "bytes_after": 89896060
+        }
+      ],
+      "target_bytes": 80000000,
+      "guard_bytes": 90000000
     },
     "market_bars_1h.jsonl": {
       "path": "data/market_bars_1h.jsonl",
       "triggered": false,
-      "bytes_before": 22856617
+      "bytes_before": 22866307
     },
     "zone_observations.jsonl": {
       "path": "data/zone_observations.jsonl",
-      "triggered": false,
-      "bytes_before": 89910063
+      "triggered": true,
+      "bytes_before": 90031743,
+      "bytes_after": 87217805,
+      "rows_before": 17438,
+      "rows_after": 16901,
+      "snapshot": {
+        "source_sha256": "d983dbadb7923851752a7dd5f77161e6dad2d62a613a0d885bee95c4fee5c4ae",
+        "source_bytes": 90031743,
+        "source_rows": 17438,
+        "chunks": [
+          {
+            "path": "data/retention_archive/20260925T003433Z/zone_observations.jsonl/snapshot/zone_observations.jsonl.before.part-0001.jsonl.gz",
+            "compressed_bytes": 6576103
+          },
+          {
+            "path": "data/retention_archive/20260925T003433Z/zone_observations.jsonl/snapshot/zone_observations.jsonl.before.part-0002.jsonl.gz",
+            "compressed_bytes": 4656104
+          }
+        ]
+      },
+      "policies": [
+        {
+          "policy": "nearest_approach_36h",
+          "path": "data/zone_observations.jsonl",
+          "before": 17438,
+          "after": 16901,
+          "pruned": 537,
+          "archive": "data/retention_archive/20260925T003433Z/zone_observations.jsonl/pruned/zone_observations.jsonl.pruned.jsonl.gz",
+          "snapshot": null,
+          "sha256_before": "d983dbadb7923851752a7dd5f77161e6dad2d62a613a0d885bee95c4fee5c4ae",
+          "sha256_after": "aaf3a1863c12a5682ebaabc8f31b7b991acf0b6304eab32f8a34dd77e0c45803",
+          "bytes_before": 90031743,
+          "bytes_after": 87217805
+        }
+      ],
+      "target_bytes": 80000000,
+      "guard_bytes": 90000000
     },
     "research_outcomes.jsonl": {
       "path": "data/research_outcomes.jsonl",
       "triggered": false,
-      "bytes_before": 52016753
+      "bytes_before": 52070431
     },
     "position_reconciliation.jsonl": {
       "path": "data/position_reconciliation.jsonl",
       "triggered": false,
-      "bytes_before": 25618972
+      "bytes_before": 25647392
     }
   },
   "protected_state": {
-    "entry_decisions.jsonl": {
+    "active_trades.json": {
       "exists": true,
-      "sha256": "a6bbe9d45008234fed29cd97bce8690bf4c552e49a740372fc3894f1892c8d96",
-      "bytes": 747481,
+      "sha256": "e71f6e4eb64823cb7248e1a62695040243f0b41ba908d68b470e6826d6312ff8",
+      "bytes": 329778,
+      "entries": 11
+    },
+    "execution_ledger.jsonl": {
+      "exists": true,
+      "sha256": "45e3fd47045b7ea518e5a80ea5df949b96f1246484aea3b6a2697614cc060d6b",
+      "bytes": 771145,
       "entries": null
     },
-    "actions.jsonl": {
+    "trades.jsonl": {
       "exists": true,
-      "sha256": "4352d35811422f2a300f22e0e6190f36dc459f39bad2448512042d732d4e2018",
-      "bytes": 46941,
-      "entries": null
-    },
-    "event_execution_claims.json": {
-      "exists": true,
-      "sha256": "9d24b66b3d99258075d32176321e77070e89f1fce1c18b309924a583704da93e",
-      "bytes": 26537,
-      "entries": 155
-    },
-    "research_outcome_state.json": {
-      "exists": true,
-      "sha256": "6c733fddcdc00097733475c2ad36dd96ba56229cb1655563bcb5aaa75fb1f066",
-      "bytes": 2005600,
-      "entries": 7
-    },
-    "failed_signals.json": {
-      "exists": true,
-      "sha256": "c3901b46bafc0fe4781706e824b257e56648c6957379b514cbc3ad7681f0bea3",
-      "bytes": 1272,
-      "entries": 5
-    },
-    "signal_history.jsonl": {
-      "exists": true,
-      "sha256": "fb7cc6d4d0929c0cb54778b317f140d0b2ab1701160b00bbb7c0ad5291534b2c",
-      "bytes": 1549555,
+      "sha256": "f6b19230e451ec1c7cd6141850c4c2ebce2387c4a9c4fb7d9d8b5e208469aaa9",
+      "bytes": 4038647,
       "entries": null
     },
     "zone_visit_state.json": {
       "exists": true,
-      "sha256": "cc90d7e7a6880bc60bf1fcdf340b71b9225f605d4eda3e24ba25bf832e68f5b9",
-      "bytes": 489002,
+      "sha256": "91c3f63b1a6892e127b6a32a0a765ce5da9a50824913c796b6e6392fa8a335ff",
+      "bytes": 495106,
       "entries": 3
-    },
-    "research_manifest.json": {
-      "exists": true,
-      "sha256": "bfac8ffd4973cb446203cf81f317c1d32d034a7030a00ebd10212df8ebba503e",
-      "bytes": 1938,
-      "entries": 14
-    },
-    "active_trades.json": {
-      "exists": true,
-      "sha256": "1a09558ddf0817bede98d7007cb8601e13bcaa34563e6853b173f01d921e6ab9",
-      "bytes": 389861,
-      "entries": 13
     },
     "account_context.jsonl": {
       "exists": true,
-      "sha256": "13bbc14d958bb17e19a84e756cab4338e35f571dbca8cb1e2062b70d99d10811",
-      "bytes": 3759983,
+      "sha256": "880246e22d368efb44ec092ea27f4627be725f81807e9877ceed6002fa9f803a",
+      "bytes": 3763670,
+      "entries": null
+    },
+    "research_manifest.json": {
+      "exists": true,
+      "sha256": "2c7cb63c5d177d63392ec4bd170a09999feeb668715a1af50bb79f22e65d128a",
+      "bytes": 1938,
+      "entries": 14
+    },
+    "signal_history.jsonl": {
+      "exists": true,
+      "sha256": "1023198072d8e9725a31ab9ff16af36c47355b03ec4736ab2096eb240854572d",
+      "bytes": 1553846,
+      "entries": null
+    },
+    "actions.jsonl": {
+      "exists": true,
+      "sha256": "50c7212cf9f18c194a6cd83cd2e9cd9d0574f2887fbf7b50f8e3903ecdb75a5e",
+      "bytes": 47239,
+      "entries": null
+    },
+    "failed_signals.json": {
+      "exists": true,
+      "sha256": "22d59c58ea0fb8dc128e4f9ba18df7cd68dddcbd8d731e817922e6c80ec06e91",
+      "bytes": 1526,
+      "entries": 6
+    },
+    "entry_decisions.jsonl": {
+      "exists": true,
+      "sha256": "23b3408edc3c927510e633dff0ac385001dab2033701afe0f4cd0fa91d3cc9ba",
+      "bytes": 750804,
       "entries": null
     },
     "research_bar_cursors.json": {
       "exists": true,
-      "sha256": "dab9c95d48f15a4d658bfb861d48df327165ab5da38fa70dcc9a4c096484ca06",
+      "sha256": "ef88845fc9c82f5602efc664aa5ed2996f14872477e38bd991005f05e2f1fccc",
       "bytes": 152420,
       "entries": 652
     },
-    "trades.jsonl": {
+    "research_outcome_state.json": {
       "exists": true,
-      "sha256": "e303a20ba684bb3efe724124f5c16d6530c8271c4b820748091022eb351105f0",
-      "bytes": 3989911,
-      "entries": null
+      "sha256": "0df011c38cefd84b7c68314a5c6dfc462d18d20adc991d5ce2470d75afb87749",
+      "bytes": 2006898,
+      "entries": 7
     },
-    "execution_ledger.jsonl": {
+    "event_execution_claims.json": {
       "exists": true,
-      "sha256": "dd195b69b948ded5d084cabbb29e691387d514bc4cabd1c9ebbe7677a6ebeaf7",
-      "bytes": 768175,
-      "entries": null
+      "sha256": "95980a18e67d3ea78b9bd6bb0717bc2aaeb6f6c45a6cd309fcbf07d8ce0bc0e4",
+      "bytes": 26711,
+      "entries": 156
     }
   },
-  "finished_at": "2026-09-25T00:28:23.290883+00:00"
+  "finished_at": "2026-09-25T00:34:45.237869+00:00"
 }
