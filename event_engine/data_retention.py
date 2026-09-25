@@ -304,7 +304,13 @@ def check_staged_size_guard(*, limit_bytes: int = GITHUB_SIZE_GUARD_BYTES) -> di
 
 
 def _protected_audit_refs() -> tuple[set[str], set[str]]:
-    """Return (observation_ids, generic_event_refs) tied to trade/decision state."""
+    """Return (observation_ids, generic refs) tied to trade/decision state.
+
+    Generic refs intentionally include scan/zone-visit identifiers because
+    zone observations store many lifecycle links on those fields rather than
+    as a top-level event_id. This prevents size-guard archival from severing
+    the research-to-trade audit chain.
+    """
     observation_ids: set[str] = set()
     generic_refs: set[str] = set()
     for name in ("trades.jsonl", "entry_decisions.jsonl"):
@@ -316,11 +322,41 @@ def _protected_audit_refs() -> tuple[set[str], set[str]]:
                 value = row.get(field)
                 if value not in (None, ""):
                     observation_ids.add(str(value))
-            for field in ("event_id", "attempt_id", "decision_id", "position_id", "signal_id"):
+            for field in (
+                "event_id", "attempt_id", "decision_id", "position_id",
+                "signal_id", "scan_id", "zone_visit_id",
+            ):
                 value = row.get(field)
                 if value not in (None, ""):
                     generic_refs.add(str(value))
+            for nested_name in ("signal_snapshot", "executed_signal", "signal"):
+                nested = row.get(nested_name)
+                if isinstance(nested, dict):
+                    for field in ("event_id", "attempt_id", "decision_id", "position_id", "signal_id", "scan_id", "zone_visit_id", "observation_id"):
+                        value = nested.get(field)
+                        if value not in (None, ""):
+                            value_s = str(value)
+                            if field == "observation_id":
+                                observation_ids.add(value_s)
+                            else:
+                                generic_refs.add(value_s)
     return observation_ids, generic_refs
+
+
+def _zone_observation_refs(row: dict[str, Any]) -> set[str]:
+    """Return all lifecycle identifiers carried by a zone observation."""
+    refs: set[str] = set()
+    for field in ("scan_id", "zone_visit_id", "event_id", "attempt_id", "decision_id", "position_id", "signal_id", "observation_id"):
+        value = row.get(field)
+        if value not in (None, ""):
+            refs.add(str(value))
+    trigger = row.get("trigger")
+    if isinstance(trigger, dict):
+        for field in ("event_id", "attempt_id", "decision_id", "position_id", "signal_id", "zone_visit_id"):
+            value = trigger.get(field)
+            if value not in (None, ""):
+                refs.add(str(value))
+    return refs
 
 
 def _size_guard_plan(path: Path, *, now: datetime, pending_ids: set[str], pending_bar_cutoffs: dict[str, datetime], protected_observation_ids: set[str], protected_refs: set[str]) -> list[tuple[str, Callable[[dict[str, Any]], bool]]]:
@@ -366,16 +402,19 @@ def _size_guard_plan(path: Path, *, now: datetime, pending_ids: set[str], pendin
         # time-only policy never drops reconciliation evidence here.
         return []
     if name == "zone_observations.jsonl":
-        hours = [36, 24, 12, 6, 3, 1]
-        def nearest_policy(row: dict[str, Any], h: int) -> bool:
-            oid = str(row.get("observation_id", ""))
-            if oid in pending_ids or oid in protected_observation_ids:
-                return True
-            if str(row.get("event_type", "")).upper() != "NEAREST_APPROACH":
-                return True
-            ts = _parse_ts(row.get("observation_ts"))
+        # The full pre-compaction snapshot is the recovery source of truth. The
+        # working journal only needs a bounded recent window for the engine.
+        # Pending observations are replayable from research_outcome_state once
+        # the v2 pending metadata is present, so they may also be archived after
+        # their recent working window expires.
+        hours = [72, 36, 24, 12, 6, 3, 1, 0.5, 0.25]
+        def recent_policy(row: dict[str, Any], h: float) -> bool:
+            ts = _parse_ts(row.get("observation_ts") or row.get("source_event_ts"))
             return ts is None or ts >= now - timedelta(hours=h)
-        return [(f"nearest_approach_{h}h", lambda row, h=h: nearest_policy(row, h)) for h in hours]
+        return [
+            (f"zone_observations_keep_recent_{str(h).replace('.', '_')}h", lambda row, h=h: recent_policy(row, h))
+            for h in hours
+        ]
     return []
 
 
@@ -500,9 +539,9 @@ def apply_size_guard(*, now: datetime | None = None, archive_root: Path | None =
 def _compact_jsonl(path: Path, keep_fn: KeepFn, *, archive_root: Path, snapshot: bool = True, lock_held: bool = False) -> dict[str, Any]:
     """Compact one JSONL file without loading the whole file into RAM.
 
-    Before changing the working file, a byte-faithful gzip snapshot is made. The
-    snapshot is the recovery source of truth; pruned rows are also kept in a
-    smaller delta archive for convenience.
+    The pre-compaction snapshot is the recovery source of truth. Large snapshots
+    and pruned deltas are chunked so no individual archive object approaches the
+    GitHub 100 MB limit.
     """
     if not path.exists():
         return {
@@ -517,30 +556,68 @@ def _compact_jsonl(path: Path, keep_fn: KeepFn, *, archive_root: Path, snapshot:
         }
 
     snapshot_dir = archive_root / "snapshots_before"
-    snapshot_path = snapshot_dir / (path.name + ".before.jsonl.gz")
-    pruned_final = archive_root / (path.name + ".pruned.jsonl.gz")
     archive_root.mkdir(parents=True, exist_ok=True)
-
     lock_context = nullcontext() if lock_held else research._FileLock(path)
+
     with lock_context:
         before = _file_meta(path)
         snapshot_meta = None
         if snapshot:
-            snapshot_meta = _snapshot_jsonl_locked(path, snapshot_path)
+            if before["bytes"] > ARCHIVE_CHUNK_BYTES:
+                snapshot_meta = _snapshot_jsonl_chunked_locked(path, snapshot_dir)
+            else:
+                snapshot_path = snapshot_dir / (path.name + ".before.jsonl.gz")
+                snapshot_meta = _snapshot_jsonl_locked(path, snapshot_path)
             if snapshot_meta["source_sha256"] != before["sha256"] or snapshot_meta["source_bytes"] != before["bytes"]:
                 raise RuntimeError(f"pre-compaction snapshot verification failed: {path}")
 
-        kept_tmp = None
-        pruned_tmp = None
+        kept_tmp: str | None = None
+        pruned_gz = None
+        pruned_part_index = 0
+        pruned_part_raw_bytes = 0
+        pruned_current_tmp: Path | None = None
+        pruned_current_final: Path | None = None
+        pruned_paths: list[Path] = []
         kept_count = 0
         pruned_count = 0
         kept_bytes = 0
-        try:
-            fd_keep, kept_tmp = tempfile.mkstemp(
-                prefix=path.name + ".kept.", suffix=".tmp", dir=str(path.parent)
+
+        def close_pruned_part() -> None:
+            nonlocal pruned_gz, pruned_current_tmp, pruned_current_final
+            if pruned_gz is None:
+                return
+            pruned_gz.flush()
+            pruned_gz.close()
+            pruned_gz = None
+            if pruned_current_tmp is not None and pruned_current_final is not None:
+                os.replace(pruned_current_tmp, pruned_current_final)
+                pruned_paths.append(pruned_current_final)
+            pruned_current_tmp = None
+            pruned_current_final = None
+
+        def open_pruned_part() -> None:
+            nonlocal pruned_gz, pruned_part_index, pruned_part_raw_bytes
+            nonlocal pruned_current_tmp, pruned_current_final
+            close_pruned_part()
+            pruned_part_index += 1
+            if pruned_part_index == 1:
+                final_name = path.name + ".pruned.jsonl.gz"
+            else:
+                final_name = path.name + f".pruned.part-{pruned_part_index:04d}.jsonl.gz"
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=path.name + f".pruned.part-{pruned_part_index:04d}.",
+                suffix=".tmp",
+                dir=str(archive_root),
             )
+            os.close(fd)
+            pruned_current_tmp = Path(tmp_name)
+            pruned_current_final = archive_root / final_name
+            pruned_gz = gzip.open(pruned_current_tmp, "wb")
+            pruned_part_raw_bytes = 0
+
+        try:
+            fd_keep, kept_tmp = tempfile.mkstemp(prefix=path.name + ".kept.", suffix=".tmp", dir=str(path.parent))
             with os.fdopen(fd_keep, "wb") as kept_fh:
-                pruned_gz = None
                 for line_no, row in _iter_jsonl(path):
                     encoded = (json.dumps(row, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n").encode("utf-8")
                     if keep_fn(line_no, row):
@@ -548,32 +625,25 @@ def _compact_jsonl(path: Path, keep_fn: KeepFn, *, archive_root: Path, snapshot:
                         kept_count += 1
                         kept_bytes += len(encoded)
                     else:
-                        if pruned_gz is None:
-                            pruned_fd, pruned_tmp = tempfile.mkstemp(
-                                prefix=path.name + ".pruned.", suffix=".tmp", dir=str(archive_root)
-                            )
-                            os.close(pruned_fd)
-                            pruned_gz = gzip.open(pruned_tmp, "wb")
+                        if pruned_gz is None or (pruned_part_raw_bytes and pruned_part_raw_bytes + len(encoded) > ARCHIVE_CHUNK_BYTES):
+                            open_pruned_part()
+                        assert pruned_gz is not None
                         pruned_gz.write(encoded)
+                        pruned_part_raw_bytes += len(encoded)
                         pruned_count += 1
-                if pruned_gz is not None:
-                    pruned_gz.flush()
-                    pruned_gz.close()
+                close_pruned_part()
                 kept_fh.flush()
                 os.fsync(kept_fh.fileno())
 
             archive = None
-            if pruned_count:
-                pruned_final.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(pruned_tmp, pruned_final)
-                pruned_tmp = None
-                archive = str(pruned_final)
+            if pruned_paths:
+                paths = [str(x) for x in pruned_paths]
+                archive = paths[0] if len(paths) == 1 else paths
 
             if pruned_count:
                 os.replace(kept_tmp, path)
                 kept_tmp = None
             else:
-                # Avoid changing bytes when there is nothing to compact.
                 os.unlink(kept_tmp)
                 kept_tmp = None
 
@@ -582,6 +652,7 @@ def _compact_jsonl(path: Path, keep_fn: KeepFn, *, archive_root: Path, snapshot:
                 raise RuntimeError(f"post-compaction size accounting mismatch: {path}")
             if not pruned_count and after["sha256"] != before["sha256"]:
                 raise RuntimeError(f"file changed despite zero pruning: {path}")
+
             return {
                 "path": str(path.relative_to(PROJECT_ROOT)),
                 "before": before["rows"],
@@ -600,15 +671,11 @@ def _compact_jsonl(path: Path, keep_fn: KeepFn, *, archive_root: Path, snapshot:
                     os.unlink(kept_tmp)
                 except FileNotFoundError:
                     pass
-            if pruned_tmp:
+            close_pruned_part()
+            if pruned_current_tmp:
                 try:
-                    os.unlink(pruned_tmp)
+                    os.unlink(pruned_current_tmp)
                 except FileNotFoundError:
-                    pass
-            if pruned_gz is not None:
-                try:
-                    pruned_gz.close()
-                except Exception:
                     pass
 
 
@@ -626,9 +693,29 @@ def _max_jsonl_timestamp(path: Path, field: str) -> datetime | None:
 def _pending_observations() -> list[dict[str, Any]]:
     obs_path = DATA_DIR / "zone_observations.jsonl"
     state_path = DATA_DIR / "research_outcome_state.json"
-    if not obs_path.exists() or not state_path.exists():
+    if not state_path.exists():
         return []
     state = _read_json(state_path)
+    pending_state = state.get("pending_observations_v1")
+    if isinstance(pending_state, dict):
+        out: list[dict[str, Any]] = []
+        for oid, meta in pending_state.items():
+            if not isinstance(meta, dict):
+                continue
+            ts = _parse_ts(meta.get("observation_ts"))
+            if ts is None:
+                continue
+            out.append({
+                "observation_id": str(oid),
+                "event_type": str(meta.get("event_type", "")),
+                "observation_ts": ts.isoformat(),
+                "symbol": str(meta.get("symbol", "")).upper(),
+                "replayable": all(meta.get(k) not in (None, "") for k in ("symbol", "direction", "observation_ts", "reference_price")),
+            })
+        if out:
+            return out
+    if not obs_path.exists():
+        return []
     processed = {str(x) for x in (state.get("processed_observation_ids") or []) if x}
     pending: list[dict[str, Any]] = []
     for _, row in _iter_jsonl(obs_path):
@@ -643,6 +730,7 @@ def _pending_observations() -> list[dict[str, Any]]:
             "event_type": str(row.get("event_type", "")),
             "observation_ts": ts.isoformat(),
             "symbol": str(row.get("symbol", "")).upper(),
+            "replayable": False,
         })
     return pending
 
