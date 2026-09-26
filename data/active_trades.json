@@ -57,7 +57,7 @@
     "peak_pnl_pct": 3.613511390416331,
     "mae_pct": -5.813040062843676,
     "max_drawdown_pct": -7.8030898140874605,
-    "current_pnl_pct": 2.8017805708300574,
+    "current_pnl_pct": 2.2518984027232296,
     "score": 70.0,
     "strategy_version": "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp3-tp6-be-on-tp1-zone-touch-test",
     "code_commit_sha": null,
@@ -875,10 +875,10 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790426439968,
+    "last_observation_ts": 1790426733491,
     "last_exchange_avg_price": 0.003819,
     "current_position_qty": 1303.4,
-    "protection_last_updated_ts": 1790426465654
+    "protection_last_updated_ts": 1790426757275
   },
   "ZONE_F2A939641AD43C820129731A": {
     "event_id": "ZONE_F2A939641AD43C820129731A",
@@ -945,7 +945,7 @@
     "peak_pnl_pct": 2.9874848607186073,
     "mae_pct": -5.7731126362535345,
     "max_drawdown_pct": -8.760597496972142,
-    "current_pnl_pct": -2.8461849010900284,
+    "current_pnl_pct": -3.2095276544206754,
     "score": 65.0,
     "strategy_version": "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp3-tp6-be-on-tp1-zone-touch-test",
     "code_commit_sha": null,
@@ -1755,10 +1755,10 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790426439968,
+    "last_observation_ts": 1790426733491,
     "last_exchange_avg_price": 0.4954,
     "current_position_qty": 20.153,
-    "protection_last_updated_ts": 1790426464050
+    "protection_last_updated_ts": 1790426755917
   },
   "ZONE_DB51CF3F4F23C0E7077F224A": {
     "event_id": "ZONE_DB51CF3F4F23C0E7077F224A",
@@ -1778,18 +1778,9 @@
     "signed_entry_slippage_pct": 0.052910052910050756,
     "adverse_entry_slippage_pct": 0.0,
     "initial_qty": 529.1,
-    "remaining_qty": 529.1,
+    "remaining_qty": 264.55,
     "entry_ts": 1790342332375,
     "tp_orders": [
-      {
-        "leg": "tp1",
-        "status": "already_exists",
-        "order_id": "2103474311469293568",
-        "client_order_id": "evt_65e8bc8f2df1fa20_tp1",
-        "price": 0.01834,
-        "qty": 264.55,
-        "pnl_pct": 2.9999999999999987
-      },
       {
         "leg": "tp2",
         "status": "already_exists",
@@ -1802,19 +1793,21 @@
     ],
     "sl_order": {
       "status": "already_exists",
-      "order_id": "2103474307216269312",
-      "client_order_id": "evt_65e8bc8f2df1fa20_sl",
-      "stop_price": 0.0208,
-      "qty": 529.1
+      "order_id": "2103827675277254656",
+      "client_order_id": "evt_be_zone_db51cf3f4f23c0e7077f224a",
+      "stop_price": 0.01891,
+      "qty": 264.55
     },
-    "hit_legs": [],
-    "be_activated": false,
-    "be_activation_ts": null,
-    "be_trigger_ts": null,
-    "be_trigger_rule": "after_tp1_filled",
-    "be_trigger_peak_r": null,
-    "be_order_id": null,
-    "be_trigger_price": null,
+    "hit_legs": [
+      "tp1"
+    ],
+    "be_activated": true,
+    "be_activation_ts": 1790426572944,
+    "be_trigger_ts": 1790426572944,
+    "be_trigger_rule": "tp1_filled",
+    "be_trigger_peak_r": 0.33315705975674176,
+    "be_order_id": "2103827675277254656",
+    "be_trigger_price": 0.01891,
     "be_fill_price": null,
     "be_execution_slippage_pct": null,
     "mfe_milestones_r": {
@@ -1822,10 +1815,10 @@
     },
     "be_required": false,
     "be_last_error": null,
-    "peak_pnl_pct": 2.961396086726589,
+    "peak_pnl_pct": 3.3315705975674175,
     "mae_pct": -5.6583818085669035,
     "max_drawdown_pct": -6.76890534108937,
-    "current_pnl_pct": 2.855631940772072,
+    "current_pnl_pct": 3.067160232681125,
     "score": 65.0,
     "strategy_version": "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp3-tp6-be-on-tp1-zone-touch-test",
     "code_commit_sha": null,
@@ -2112,7 +2105,19 @@
       "protection_seconds": 0.0,
       "protection_status": "PROTECTED"
     },
-    "tp_fill_events": [],
+    "tp_fill_events": [
+      {
+        "ts": 1790426572944,
+        "leg": "tp1",
+        "order_id": "2103474311469293568",
+        "order_status": "FILLED",
+        "executed_qty_total": 264.55,
+        "delta_qty": 264.55,
+        "avg_price": 0.01836,
+        "pnl_pct": 2.908514013749331,
+        "remaining_qty": 264.55
+      }
+    ],
     "event_type": "SUPPLY_ZONE_TOUCH_5M",
     "timeframe": "5m",
     "research": {
@@ -2609,24 +2614,20 @@
     ],
     "effective_tp_levels": [
       {
-        "leg": "tp1",
-        "pnl_pct": 2.9999999999999987,
-        "close_fraction": 0.5,
-        "qty": 264.55
-      },
-      {
         "leg": "tp2",
         "pnl_pct": 5.999999999999997,
-        "close_fraction": 0.5,
+        "close_fraction": 1.0,
         "qty": 264.55
       }
     ],
     "tp_mode": "multi_tp",
-    "effective_weighted_rr": 0.44999999999999984,
-    "tp_filled_qty": {},
-    "realized_pnl_qty": 0.0,
-    "realized_pnl_weighted_sum": 0.0,
-    "last_tp_exec_price": null,
+    "effective_weighted_rr": 0.5999999999999998,
+    "tp_filled_qty": {
+      "tp1": 264.55
+    },
+    "realized_pnl_qty": 264.55,
+    "realized_pnl_weighted_sum": 769.4473823373855,
+    "last_tp_exec_price": 0.01836,
     "last_close_exec_price": null,
     "realized_pnl_pct": null,
     "realized_rr": null,
@@ -2635,10 +2636,10 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790426439968,
+    "last_observation_ts": 1790426733491,
     "last_exchange_avg_price": 0.01891,
-    "current_position_qty": 529.1,
-    "protection_last_updated_ts": 1790426462435
+    "current_position_qty": 264.55,
+    "protection_last_updated_ts": 1790426754557
   },
   "ZONE_DD43531EB90FAE379A9FD84D": {
     "event_id": "ZONE_DD43531EB90FAE379A9FD84D",
@@ -2703,7 +2704,7 @@
     "peak_pnl_pct": 1.2626913363912693,
     "mae_pct": -8.843993196928315,
     "max_drawdown_pct": -10.106684533319584,
-    "current_pnl_pct": -3.571612637221058,
+    "current_pnl_pct": -3.6334587434932746,
     "score": 60.0,
     "strategy_version": "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp3-tp6-be-on-tp1-zone-touch-test",
     "code_commit_sha": null,
@@ -3513,10 +3514,10 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790426439968,
+    "last_observation_ts": 1790426733491,
     "last_exchange_avg_price": 0.19403,
     "current_position_qty": 51.51,
-    "protection_last_updated_ts": 1790426463605
+    "protection_last_updated_ts": 1790426755442
   },
   "ZONE_D4162DBE5655422D569F5C2A": {
     "event_id": "ZONE_D4162DBE5655422D569F5C2A",
@@ -3581,7 +3582,7 @@
     "peak_pnl_pct": 2.0129694677114363,
     "mae_pct": -7.146717103485549,
     "max_drawdown_pct": -9.159686571196985,
-    "current_pnl_pct": -4.850040529586592,
+    "current_pnl_pct": -4.471764388003233,
     "score": 60.0,
     "strategy_version": "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp3-tp6-be-on-tp1-zone-touch-test",
     "code_commit_sha": null,
@@ -4391,10 +4392,10 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790426439968,
+    "last_observation_ts": 1790426733491,
     "last_exchange_avg_price": 0.07402,
     "current_position_qty": 135.0,
-    "protection_last_updated_ts": 1790426461224
+    "protection_last_updated_ts": 1790426753628
   },
   "ZONE_16D39AC5CE65265838BC3390": {
     "event_id": "ZONE_16D39AC5CE65265838BC3390",
@@ -4459,7 +4460,7 @@
     "peak_pnl_pct": 1.9255251432208715,
     "mae_pct": -6.635900700190958,
     "max_drawdown_pct": -8.561425843411829,
-    "current_pnl_pct": -2.5620623806492757,
+    "current_pnl_pct": -2.2278803309993727,
     "score": 60.0,
     "strategy_version": "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp3-tp6-be-on-tp1-zone-touch-test",
     "code_commit_sha": null,
@@ -5269,10 +5270,10 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790426439968,
+    "last_observation_ts": 1790426733491,
     "last_exchange_avg_price": 6.284,
     "current_position_qty": 1.595,
-    "protection_last_updated_ts": 1790426460452
+    "protection_last_updated_ts": 1790426752754
   },
   "ZONE_A7302F5ADCD56713460ED6D1": {
     "event_id": "ZONE_A7302F5ADCD56713460ED6D1",
@@ -5337,7 +5338,7 @@
     "peak_pnl_pct": 1.3035767070647428,
     "mae_pct": -0.9902453443688928,
     "max_drawdown_pct": -2.063257463789548,
-    "current_pnl_pct": -0.4729530002955928,
+    "current_pnl_pct": -0.5379840378362366,
     "score": 65.0,
     "strategy_version": "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp3-tp6-be-on-tp1-zone-touch-test",
     "code_commit_sha": null,
@@ -6147,10 +6148,10 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790426439968,
+    "last_observation_ts": 1790426733491,
     "last_exchange_avg_price": 0.3383,
     "current_position_qty": 29.515,
-    "protection_last_updated_ts": 1790426466848
+    "protection_last_updated_ts": 1790426758142
   },
   "ZONE_14F3EB3D80D9C307CD012267": {
     "event_id": "ZONE_14F3EB3D80D9C307CD012267",
@@ -6215,7 +6216,7 @@
     "peak_pnl_pct": 1.685265315417895,
     "mae_pct": -6.854930539740392,
     "max_drawdown_pct": -8.540195855158288,
-    "current_pnl_pct": -6.126167160100216,
+    "current_pnl_pct": -5.966750170803927,
     "score": 65.0,
     "strategy_version": "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp3-tp6-be-on-tp1-zone-touch-test",
     "code_commit_sha": null,
@@ -7025,10 +7026,10 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790426439968,
+    "last_observation_ts": 1790426733491,
     "last_exchange_avg_price": 0.04391,
     "current_position_qty": 228.05,
-    "protection_last_updated_ts": 1790426464868
+    "protection_last_updated_ts": 1790426756795
   },
   "ZONE_DA84C9689237D6F90A3E058D": {
     "event_id": "ZONE_DA84C9689237D6F90A3E058D",
@@ -7090,10 +7091,10 @@
     "mfe_milestones_r": {},
     "be_required": false,
     "be_last_error": null,
-    "peak_pnl_pct": 0.8066064912617663,
+    "peak_pnl_pct": 1.0082581140772011,
     "mae_pct": -5.271749567889375,
     "max_drawdown_pct": -6.011138851545987,
-    "current_pnl_pct": -0.07681966583445198,
+    "current_pnl_pct": 0.5281352026118659,
     "score": 65.0,
     "strategy_version": "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp3-tp6-be-on-tp1-zone-touch-test",
     "code_commit_sha": null,
@@ -7903,10 +7904,10 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790426439968,
+    "last_observation_ts": 1790426733491,
     "last_exchange_avg_price": 104.14,
     "current_position_qty": 0.09,
-    "protection_last_updated_ts": 1790426467312
+    "protection_last_updated_ts": 1790426758990
   },
   "ZONE_7A100216F19E3013088D6E46": {
     "event_id": "ZONE_7A100216F19E3013088D6E46",
@@ -7971,7 +7972,7 @@
     "peak_pnl_pct": 0.9208103130755074,
     "mae_pct": -0.7980356046654533,
     "max_drawdown_pct": -1.2891344383057206,
-    "current_pnl_pct": 0.4297114794352231,
+    "current_pnl_pct": 0.5524861878452941,
     "score": 65.0,
     "strategy_version": "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp3-tp6-be-on-tp1-zone-touch-test",
     "code_commit_sha": null,
@@ -8781,10 +8782,10 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790426439968,
+    "last_observation_ts": 1790426733491,
     "last_exchange_avg_price": 0.1629,
     "current_position_qty": 61.5,
-    "protection_last_updated_ts": 1790426468143
+    "protection_last_updated_ts": 1790426759903
   },
   "ZONE_B9DF8023F4473C877021E741": {
     "event_id": "ZONE_B9DF8023F4473C877021E741",
@@ -8846,10 +8847,10 @@
     "mfe_milestones_r": {},
     "be_required": false,
     "be_last_error": null,
-    "peak_pnl_pct": 1.2919896640826682,
+    "peak_pnl_pct": 1.6980435585086724,
     "mae_pct": -0.03691399040237892,
-    "max_drawdown_pct": -1.107419712070876,
-    "current_pnl_pct": 0.9966777408637802,
+    "max_drawdown_pct": -1.439645625692143,
+    "current_pnl_pct": 1.5873015873015766,
     "score": 65.0,
     "strategy_version": "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp3-tp6-be-on-tp1-zone-touch-test",
     "code_commit_sha": null,
@@ -9659,9 +9660,9 @@
     "closed_ts": null,
     "duration_min": null,
     "closed": false,
-    "last_observation_ts": 1790426439968,
+    "last_observation_ts": 1790426733491,
     "last_exchange_avg_price": 0.2709,
     "current_position_qty": 36.968,
-    "protection_last_updated_ts": 1790426468573
+    "protection_last_updated_ts": 1790426760771
   }
 }
