@@ -42,6 +42,9 @@ jobs:
       FIXED_STOP_PCT: "10.00"
       MAX_ENTRY_SLIPPAGE_PCT: "1.00"
       EXECUTION_QUOTE_MAX_AGE_SEC: "2.0"
+      # VST currently may omit a venue quote timestamp; local age may be used only because this policy is explicit.
+      EXECUTION_REQUIRE_EXCHANGE_TIMESTAMP: "false"
+      EXECUTION_UNKNOWN_QUOTE_AGE_POLICY: "allow_with_local_age"
       MAX_SCAN_HISTORY_BYTES: "31457280"
       MIN_STRUCTURE_ROOM_R: "1.20"
       REQUIRE_DIRECTIONAL_CANDLE: "false"
@@ -106,7 +109,25 @@ jobs:
         run: python -m compileall -q event_engine run_once.py research_forward.py pine_r541_sr.py pine_sr_diagnostic.py test_all.py test_pine_sr_diagnostic.py test_research_layer.py
 
       - name: Run tests
+        env:
+          ZONE_ENGINE_TESTS_ISOLATED: "1"
         run: python -m pytest -q
+
+      - name: Verify tests did not mutate runtime data
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git diff --quiet -- data; then
+            echo "ERROR: pytest modified tracked runtime data/ files."
+            git diff -- data
+            exit 1
+          fi
+          ignored=$(git status --ignored --porcelain -- data | grep -E '^!!' || true)
+          if [ -n "$ignored" ]; then
+            echo "ERROR: pytest created ignored runtime artifacts inside production data/:"
+            echo "$ignored"
+            exit 1
+          fi
 
       - name: Run engine
         env:
