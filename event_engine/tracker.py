@@ -84,6 +84,7 @@ def _load_active_trades() -> dict[str, dict]:
                 t.setdefault("fill_position", {})
                 t.setdefault("execution_snapshot", {})
                 t.setdefault("tp_fill_events", [])
+                t.setdefault("tp_fill_classification", {})
                 t.setdefault("tp_mode", "single_tp" if len(t.get("tp_orders", [])) == 1 else "multi_tp")
                 t.setdefault("effective_tp_levels", t.get("tp_levels", []))
                 t.setdefault("effective_weighted_rr", t.get("planned_weighted_rr", 0.75))
@@ -241,6 +242,102 @@ def _display_symbol(symbol: str) -> str:
     return str(symbol or "").upper().replace("-", "")
 
 
+def _active_trade_conflicts(
+    trades: dict[str, dict], symbol: str, direction: str,
+    *, exclude_event_id: str | None = None,
+) -> list[tuple[str, dict]]:
+    """Return active local trades for one exchange position identity.
+
+    BingX position state is unique at the (symbol, direction) level for the
+    engine's configured position mode. Local state must therefore never silently
+    allow two live owners for that same exchange position.
+    """
+    want_bx = _normalized_symbol(symbol)
+    want_direction = str(direction).upper()
+    conflicts: list[tuple[str, dict]] = []
+    for event_id, trade in trades.items():
+        if str(event_id) == str(exclude_event_id or ""):
+            continue
+        if not isinstance(trade, dict) or trade.get("closed", False):
+            continue
+        trade_bx = _normalized_symbol(trade.get("symbol", ""))
+        if trade_bx == want_bx and str(trade.get("direction", "")).upper() == want_direction:
+            conflicts.append((str(event_id), trade))
+    return conflicts
+
+
+def has_active_trade_conflict(symbol: str, direction: str, *, exclude_event_id: str | None = None) -> bool:
+    return bool(_active_trade_conflicts(_load_active_trades(), symbol, direction, exclude_event_id=exclude_event_id))
+
+
+def _collect_order_ids(trade: dict) -> set[str]:
+    ids: set[str] = set()
+    entry_order = trade.get("entry_order") if isinstance(trade.get("entry_order"), dict) else {}
+    for key in ("order_id", "orderId"):
+        if entry_order.get(key):
+            ids.add(str(entry_order[key]))
+    sl = trade.get("sl_order") if isinstance(trade.get("sl_order"), dict) else {}
+    for key in ("order_id", "orderId"):
+        if sl.get(key):
+            ids.add(str(sl[key]))
+    for tp in trade.get("tp_orders", []) if isinstance(trade.get("tp_orders"), list) else []:
+        if not isinstance(tp, dict):
+            continue
+        for key in ("order_id", "orderId"):
+            if tp.get(key):
+                ids.add(str(tp[key]))
+    for key in ("be_order_id", "exit_order_id"):
+        if trade.get(key):
+            ids.add(str(trade[key]))
+    for event in trade.get("tp_fill_events", []) if isinstance(trade.get("tp_fill_events"), list) else []:
+        if isinstance(event, dict) and event.get("order_id"):
+            ids.add(str(event["order_id"]))
+    return ids
+
+
+def _protection_order_ids(tp_orders: list[dict] | None, sl_result: dict | None) -> list[str]:
+    ids: list[str] = []
+    for container in ([sl_result] if isinstance(sl_result, dict) else []):
+        for key in ("order_id", "orderId"):
+            if container.get(key):
+                ids.append(str(container[key]))
+    for tp in tp_orders if isinstance(tp_orders, list) else []:
+        if not isinstance(tp, dict):
+            continue
+        for key in ("order_id", "orderId"):
+            if tp.get(key):
+                ids.append(str(tp[key]))
+    return ids
+
+
+def _order_ids_owned_by_other_trades(trades: dict[str, dict], order_ids: set[str], *, exclude_event_id: str) -> dict[str, list[str]]:
+    owners: dict[str, list[str]] = {}
+    if not order_ids:
+        return owners
+    for other_event_id, other_trade in trades.items():
+        if str(other_event_id) == str(exclude_event_id) or not isinstance(other_trade, dict) or other_trade.get("closed", False):
+            continue
+        overlap = _collect_order_ids(other_trade) & order_ids
+        for order_id in overlap:
+            owners.setdefault(order_id, []).append(str(other_event_id))
+    return owners
+
+
+def _validate_protection_order_ownership(
+    trades: dict[str, dict], event_id: str, symbol: str, direction: str,
+    tp_orders: list[dict], sl_result: dict,
+) -> tuple[bool, str, list[str]]:
+    ids = _protection_order_ids(tp_orders, sl_result)
+    duplicate_ids = sorted({oid for oid in ids if ids.count(oid) > 1})
+    if duplicate_ids:
+        return False, "one protection payload references the same exchange order more than once", duplicate_ids
+    owners = _order_ids_owned_by_other_trades(trades, set(ids), exclude_event_id=event_id)
+    if owners:
+        conflicting = sorted(owners)
+        return False, f"exchange order id already belongs to another active event: {owners}", conflicting
+    return True, "", []
+
+
 def update_active_trade_protection(
     symbol: str,
     direction: str,
@@ -249,31 +346,68 @@ def update_active_trade_protection(
     effective_tp_levels: list[dict] | None = None,
     tp_mode: str | None = None,
     effective_weighted_rr: float | None = None,
+    *,
+    event_id: str | None = None,
 ) -> bool:
     trades = _load_active_trades()
-    want_bx = to_bx_symbol(symbol) or _normalized_symbol(symbol)
+    want_bx = _normalized_symbol(symbol)
     want_direction = str(direction).upper()
 
-    for trade in trades.values():
-        if trade.get("closed", False):
-            continue
-        trade_bx = to_bx_symbol(trade.get("symbol", "")) or _normalized_symbol(trade.get("symbol", ""))
-        trade_direction = str(trade.get("direction", "")).upper()
+    candidates: list[tuple[str, dict]] = []
+    if event_id:
+        trade = trades.get(str(event_id))
+        if isinstance(trade, dict) and not trade.get("closed", False):
+            candidates.append((str(event_id), trade))
+    else:
+        candidates = _active_trade_conflicts(trades, symbol, direction)
 
-        if trade_bx == want_bx and trade_direction == want_direction:
-            trade["tp_orders"] = tp_orders if isinstance(tp_orders, list) else []
-            trade["sl_order"] = sl_result if isinstance(sl_result, dict) else {}
-            if effective_tp_levels is not None:
-                trade["effective_tp_levels"] = effective_tp_levels
-            if tp_mode:
-                trade["tp_mode"] = tp_mode
-            if effective_weighted_rr is not None:
-                trade["effective_weighted_rr"] = _safe_float(effective_weighted_rr, 0.75)
-            trade["protection_last_updated_ts"] = int(time.time() * 1000)
-            _save_active_trades(trades)
-            return True
+    # Without an explicit event_id there must be exactly one unambiguous local owner.
+    if len(candidates) != 1:
+        owner_ids = [eid for eid, _ in candidates]
+        telemetry.record_state_conflict(
+            event_id=event_id, attempt_id=None, position_id=event_id, order_id=None,
+            symbol=symbol, direction=direction, conflict_type="PROTECTION_OWNER_AMBIGUOUS",
+            message=f"cannot update protection without exactly one local owner; candidates={owner_ids}",
+            owner_event_ids=owner_ids,
+        )
+        return False
 
-    return False
+    owner_event_id, trade = candidates[0]
+    trade_bx = _normalized_symbol(trade.get("symbol", ""))
+    trade_direction = str(trade.get("direction", "")).upper()
+    if trade_bx != want_bx or trade_direction != want_direction:
+        telemetry.record_state_conflict(
+            event_id=owner_event_id, attempt_id=trade.get("attempt_id"), position_id=trade.get("position_id") or owner_event_id, order_id=None,
+            symbol=symbol, direction=direction, conflict_type="PROTECTION_OWNER_MISMATCH",
+            message=f"requested={want_bx}:{want_direction} owner={trade_bx}:{trade_direction}",
+            owner_event_ids=[owner_event_id],
+        )
+        return False
+
+    ownership_ok, ownership_message, conflicting_order_ids = _validate_protection_order_ownership(
+        trades, owner_event_id, symbol, direction, tp_orders if isinstance(tp_orders, list) else [], sl_result if isinstance(sl_result, dict) else {}
+    )
+    if not ownership_ok:
+        telemetry.record_state_conflict(
+            event_id=owner_event_id, attempt_id=trade.get("attempt_id"), position_id=trade.get("position_id") or owner_event_id,
+            order_id=conflicting_order_ids[0] if conflicting_order_ids else None, symbol=symbol, direction=direction,
+            conflict_type="ORDER_OWNERSHIP_CONFLICT", message=ownership_message,
+            owner_event_ids=[owner_event_id], conflicting_order_ids=conflicting_order_ids,
+        )
+        log.error("[TRACKER_STATE_CONFLICT] refusing protection ownership update event=%s orders=%s", owner_event_id, conflicting_order_ids)
+        return False
+
+    trade["tp_orders"] = tp_orders if isinstance(tp_orders, list) else []
+    trade["sl_order"] = sl_result if isinstance(sl_result, dict) else {}
+    if effective_tp_levels is not None:
+        trade["effective_tp_levels"] = effective_tp_levels
+    if tp_mode:
+        trade["tp_mode"] = tp_mode
+    if effective_weighted_rr is not None:
+        trade["effective_weighted_rr"] = _safe_float(effective_weighted_rr, 0.75)
+    trade["protection_last_updated_ts"] = int(time.time() * 1000)
+    _save_active_trades(trades)
+    return True
 
 
 def _extract_setup_metrics(setup: dict | None) -> dict[str, Any]:
@@ -335,7 +469,7 @@ def register_active_trade(
     setup: dict | None = None,
     requested_entry_price: float | None = None,
     entry_ts_ms: int | None = None,
-) -> None:
+) -> bool:
     direction = _normalize_direction(direction)
     trades = _load_active_trades()
     now_ms = int(time.time() * 1000)
@@ -346,6 +480,31 @@ def register_active_trade(
 
     if actual_entry_price <= 0 or actual_qty <= 0:
         raise ValueError(f"Cannot register invalid position: entry_price={actual_entry_price} qty={actual_qty}")
+
+    existing_same_event = trades.get(str(event_id))
+    if isinstance(existing_same_event, dict) and not existing_same_event.get("closed", False):
+        telemetry.record_state_conflict(
+            event_id=event_id, attempt_id=(setup or {}).get("attempt_id") if isinstance(setup, dict) else None,
+            position_id=event_id, order_id=None, symbol=symbol, direction=direction,
+            conflict_type="LOCAL_EVENT_ID_DUPLICATE",
+            message="active local event_id already exists; refusing overwrite",
+            owner_event_ids=[str(event_id)],
+        )
+        log.error("[TRACKER_STATE_CONFLICT] refusing overwrite of active event=%s", event_id)
+        return False
+
+    conflicts = _active_trade_conflicts(trades, symbol, direction, exclude_event_id=event_id)
+    if conflicts:
+        conflict_ids = [eid for eid, _ in conflicts]
+        telemetry.record_state_conflict(
+            event_id=event_id, attempt_id=(setup or {}).get("attempt_id") if isinstance(setup, dict) else None,
+            position_id=event_id, order_id=None, symbol=symbol, direction=direction,
+            conflict_type="LOCAL_ACTIVE_TRADE_DUPLICATE",
+            message=f"active local trade already owns {symbol}:{direction}; conflicts={conflict_ids}",
+            owner_event_ids=conflict_ids,
+        )
+        log.error("[TRACKER_STATE_CONFLICT] refusing duplicate active owner event=%s conflicts=%s %s %s", event_id, conflict_ids, symbol, direction)
+        return False
 
     setup_metrics = _extract_setup_metrics(setup)
     research: dict[str, Any] = {"source": "BingX 1H demand_supply zone engine"}
@@ -457,7 +616,54 @@ def register_active_trade(
         "last_observation_ts": now_ms,
     }
 
+    new_order_ids = _collect_order_ids(trades[event_id])
+    raw_new_order_ids: list[str] = []
+    for container in (
+        trades[event_id].get("entry_order") if isinstance(trades[event_id].get("entry_order"), dict) else {},
+        trades[event_id].get("sl_order") if isinstance(trades[event_id].get("sl_order"), dict) else {},
+    ):
+        for key in ("order_id", "orderId"):
+            if container.get(key):
+                raw_new_order_ids.append(str(container[key]))
+    for tp in trades[event_id].get("tp_orders", []) if isinstance(trades[event_id].get("tp_orders"), list) else []:
+        if not isinstance(tp, dict):
+            continue
+        for key in ("order_id", "orderId"):
+            if tp.get(key):
+                raw_new_order_ids.append(str(tp[key]))
+    duplicate_new_ids = sorted({oid for oid in raw_new_order_ids if raw_new_order_ids.count(oid) > 1})
+    if duplicate_new_ids:
+        telemetry.record_state_conflict(
+            event_id=event_id, attempt_id=trades[event_id].get("attempt_id"), position_id=event_id,
+            order_id=duplicate_new_ids[0], symbol=symbol, direction=direction,
+            conflict_type="ORDER_OWNERSHIP_CONFLICT",
+            message=f"one local event references the same exchange order more than once: {duplicate_new_ids}",
+            owner_event_ids=[str(event_id)], conflicting_order_ids=duplicate_new_ids,
+        )
+        del trades[event_id]
+        log.error("[TRACKER_STATE_CONFLICT] duplicate order ids inside event=%s order_ids=%s", event_id, duplicate_new_ids)
+        return False
+
+    for existing_event_id, existing_trade in trades.items():
+        if existing_event_id == event_id or existing_trade.get("closed", False):
+            continue
+        existing_ids = _collect_order_ids(existing_trade)
+        overlap = sorted(new_order_ids & existing_ids)
+        if overlap:
+            telemetry.record_state_conflict(
+                event_id=event_id, attempt_id=trades[event_id].get("attempt_id"), position_id=event_id,
+                order_id=overlap[0], symbol=symbol, direction=direction,
+                conflict_type="ORDER_OWNERSHIP_CONFLICT",
+                message=f"exchange order id already belongs to another local event: {overlap}",
+                owner_event_ids=[str(existing_event_id), str(event_id)],
+                conflicting_order_ids=overlap,
+            )
+            del trades[event_id]
+            log.error("[TRACKER_STATE_CONFLICT] order ownership conflict event=%s other=%s order_ids=%s", event_id, existing_event_id, overlap)
+            return False
+
     _save_active_trades(trades)
+    return True
 
 
 def format_tp_hit_message(
@@ -762,7 +968,7 @@ def _emergency_close_after_be_failure(symbol: str, direction: str, qty: float, t
 
 def _move_sl_to_break_even(
     symbol: str, direction: str, entry_price: float, qty: float, old_sl_id: str | None, trade_id: str | None = None,
-    old_sl_price: float | None = None,
+    old_sl_price: float | None = None, owner_event_id: str | None = None,
 ) -> dict:
     """Move the stop-loss to break-even without ever holding two SL orders.
 
@@ -807,6 +1013,28 @@ def _move_sl_to_break_even(
 
             if be_client_id.upper() in cid or price_matches:
                 existing_id = str(order.get("orderId", ""))
+                if existing_id:
+                    current_trades = _load_active_trades()
+                    owners = _order_ids_owned_by_other_trades(
+                        current_trades, {existing_id}, exclude_event_id=str(owner_event_id or trade_id or "")
+                    )
+                    if owners:
+                        conflict_ids = sorted(owners)
+                        telemetry.record_state_conflict(
+                            event_id=owner_event_id or trade_id, attempt_id=None, position_id=owner_event_id or trade_id,
+                            order_id=existing_id, symbol=symbol, direction=direction, conflict_type="BE_ORDER_OWNERSHIP_CONFLICT",
+                            message=f"existing BE stop is already owned by another active event: {owners}; keeping current SL untouched",
+                            owner_event_ids=[str(owner_event_id or trade_id or "")] + sorted({eid for ids in owners.values() for eid in ids}),
+                            conflicting_order_ids=conflict_ids, leg="BE_SL",
+                        )
+                        return {
+                            "status": "error",
+                            "error": "existing BE order belongs to another active event",
+                            "order_id": existing_id,
+                            "client_order_id": cid or be_client_id,
+                            "stop_price": entry_price,
+                            "safety_action": "old_sl_kept",
+                        }
                 old_cancelled = True
                 cancel_note = ""
                 if old_sl_id and existing_id and str(old_sl_id) != existing_id:
@@ -978,6 +1206,31 @@ def _move_sl_to_break_even(
 
     if not found:
         return _fail("BE stop not visible on exchange")
+
+    # The BE stop is now proven to exist. Before touching the old SL, prove the
+    # new exchange order is not already attributed to another active local event.
+    # If ownership is ambiguous, keep the old SL and surface a state conflict.
+    current_trades = _load_active_trades()
+    owners = _order_ids_owned_by_other_trades(
+        current_trades, {new_order_id}, exclude_event_id=str(owner_event_id or trade_id or "")
+    )
+    if owners:
+        conflict_ids = sorted(owners)
+        telemetry.record_state_conflict(
+            event_id=owner_event_id or trade_id, attempt_id=None, position_id=owner_event_id or trade_id,
+            order_id=new_order_id, symbol=symbol, direction=direction, conflict_type="BE_ORDER_OWNERSHIP_CONFLICT",
+            message=f"new BE order id collides with another active event: {owners}; old SL will remain",
+            owner_event_ids=[str(owner_event_id or trade_id or "")] + sorted({eid for ids in owners.values() for eid in ids}),
+            conflicting_order_ids=conflict_ids, leg="BE_SL",
+        )
+        return {
+            "status": "error",
+            "error": "new BE order id collides with another active event",
+            "order_id": new_order_id,
+            "client_order_id": order.get("clientOrderId") or be_client_id,
+            "stop_price": entry_price,
+            "safety_action": "old_sl_kept",
+        }
 
     # The BE stop is now proven to exist, so the position never becomes naked.
     # Remove the obsolete engine SL afterwards. If cancellation cannot be
@@ -1189,6 +1442,29 @@ def _reconcile_historical_exit_order(
     return None, None, None, None
 
 
+def _classify_tp_fill(direction: str, entry_price: float, exec_price: float) -> tuple[bool, str]:
+    """Return whether an observed TP execution is economically favorable.
+
+    Trigger slippage may worsen the fill, but a TP fill for a LONG must not cross
+    through entry (and vice versa). Crossing entry is classified as an execution
+    anomaly and must never activate BE.
+    """
+    try:
+        tolerance_pct = max(0.0, float(os.environ.get("TP_FILL_ECONOMIC_TOLERANCE_PCT", "0.10")))
+    except (TypeError, ValueError):
+        tolerance_pct = 0.10
+    tol = tolerance_pct / 100.0
+    if direction == "LONG":
+        if exec_price < entry_price * (1.0 - tol):
+            return False, "ANOMALOUS_ADVERSE_TP_FILL"
+    elif direction == "SHORT":
+        if exec_price > entry_price * (1.0 + tol):
+            return False, "ANOMALOUS_ADVERSE_TP_FILL"
+    else:
+        return False, "INVALID_DIRECTION"
+    return True, "FAVORABLE_OR_TOLERATED_TP_FILL"
+
+
 def update_active_trades() -> None:
     trades = _load_active_trades()
     if not trades:
@@ -1350,7 +1626,7 @@ def update_active_trades() -> None:
                 delta_qty = max(0.0, executed_qty - previous_qty)
 
                 if delta_qty <= 0:
-                    if order_status == "FILLED":
+                    if order_status == "FILLED" and trade.get("tp_fill_classification", {}).get(leg) == "FAVORABLE_OR_TOLERATED_TP_FILL":
                         hit_legs.add(leg)
                     continue
 
@@ -1359,6 +1635,8 @@ def update_active_trades() -> None:
                     log.warning("[TRACKER_TP] %s %s %s has no actual avgPrice; deferring realized PnL", symbol, direction, leg)
                     continue
                 pnl_tp = _calc_trade_pnl_pct(entry_price, exec_price, direction)
+                tp_ok, tp_classification = _classify_tp_fill(direction, entry_price, exec_price)
+                trade.setdefault("tp_fill_classification", {})[leg] = tp_classification
 
                 # The position snapshot taken before this TP query is already exchange-authoritative.
                 # Do not subtract the TP delta from it again: the exchange position may already
@@ -1409,6 +1687,7 @@ def update_active_trades() -> None:
                     "avg_price": exec_price,
                     "pnl_pct": pnl_tp,
                     "remaining_qty": rem_qty,
+                    "classification": tp_classification,
                 })
                 telemetry.record_protection_event(
                     event_id=event_id,
@@ -1425,9 +1704,20 @@ def update_active_trades() -> None:
                     pnl_pct=pnl_tp,
                     remaining_qty=rem_qty,
                     order_update_time_ms=order_info.get("update_time_ms"),
+                    classification=tp_classification,
+                    economic_validation_passed=tp_ok,
                 )
 
-                if order_status == "FILLED" and leg not in hit_legs:
+                if not tp_ok:
+                    telemetry.record_state_conflict(
+                        event_id=event_id, attempt_id=trade.get("attempt_id"), position_id=trade.get("position_id") or event_id,
+                        order_id=str(order_id), symbol=symbol, direction=direction,
+                        conflict_type="ADVERSE_TP_FILL",
+                        message=f"TP {leg} fill crossed entry: entry={entry_price} fill={exec_price}",
+                        owner_event_ids=[event_id], leg=leg, entry_price=entry_price, fill_price=exec_price, pnl_pct=pnl_tp,
+                    )
+
+                if order_status == "FILLED" and leg not in hit_legs and tp_ok:
                     hit_legs.add(leg)
                     rem_pct = rem_qty / init_qty * 100.0 if init_qty > 0 else 0.0
 
@@ -1466,35 +1756,52 @@ def update_active_trades() -> None:
                             old_sl_id=old_sl_id,
                             trade_id=str(event_id).replace("EVT_", ""),
                             old_sl_price=old_sl_price,
+                            owner_event_id=str(event_id),
                         )
                         if new_sl.get("status") in {"created", "created_cleanup_pending"}:
-                            trade["sl_order"] = new_sl
-                            trade["be_activated"] = True
-                            trade["be_trigger_ts"] = trade.get("be_trigger_ts") or now_ms
-                            trade["be_trigger_peak_r"] = peak_r
-                            trade["be_trigger_rule"] = "tp1_filled"
-                            trade["be_activation_ts"] = now_ms
-                            trade["be_order_id"] = new_sl.get("order_id")
-                            trade["be_trigger_price"] = _safe_float(new_sl.get("stop_price"), entry_price)
-                            telemetry.record_protection_event(
-                                event_id=event_id,
-                                attempt_id=trade.get("attempt_id") or ((trade.get("setup") or {}).get("attempt_id") if isinstance(trade.get("setup"), dict) else None),
-                                position_id=trade.get("position_id") or event_id,
-                                order_id=new_sl.get("order_id"),
-                                symbol=symbol,
-                                direction=direction,
-                                leg="BE_SL",
-                                status="ACTIVATED",
-                                stop_price=_safe_float(new_sl.get("stop_price"), entry_price),
-                                qty=rem_qty,
-                                trigger_ts_ms=now_ms,
-                                trigger_rule="tp1_filled",
-                                trigger_peak_r=peak_r,
-                            )
-                            log.info(
-                                "[TRACKER_BE_ACTIVATED] %s (%s) TP1 taken. Stop-loss moved to Break-Even: %.8g (Risk: 0.00%%)",
-                                trade.get("name", symbol), symbol, entry_price
-                            )                             
+                            be_order_ids = _protection_order_ids([], new_sl)
+                            current_trades = _load_active_trades()
+                            owners = _order_ids_owned_by_other_trades(current_trades, set(be_order_ids), exclude_event_id=event_id)
+                            if owners:
+                                conflict_ids = sorted(owners)
+                                telemetry.record_state_conflict(
+                                    event_id=event_id, attempt_id=trade.get("attempt_id"), position_id=trade.get("position_id") or event_id,
+                                    order_id=conflict_ids[0] if conflict_ids else None, symbol=symbol, direction=direction,
+                                    conflict_type="BE_ORDER_OWNERSHIP_CONFLICT",
+                                    message=f"BE order already owned by another active event: {owners}",
+                                    owner_event_ids=[event_id] + sorted({eid for ids in owners.values() for eid in ids}),
+                                    conflicting_order_ids=conflict_ids, leg="BE_SL",
+                                )
+                                trade["be_required"] = True
+                                trade["be_last_error"] = "BE order ownership conflict"
+                            else:
+                                trade["sl_order"] = new_sl
+                                trade["be_activated"] = True
+                                trade["be_trigger_ts"] = trade.get("be_trigger_ts") or now_ms
+                                trade["be_trigger_peak_r"] = peak_r
+                                trade["be_trigger_rule"] = "tp1_filled"
+                                trade["be_activation_ts"] = now_ms
+                                trade["be_order_id"] = new_sl.get("order_id")
+                                trade["be_trigger_price"] = _safe_float(new_sl.get("stop_price"), entry_price)
+                                telemetry.record_protection_event(
+                                    event_id=event_id,
+                                    attempt_id=trade.get("attempt_id") or ((trade.get("setup") or {}).get("attempt_id") if isinstance(trade.get("setup"), dict) else None),
+                                    position_id=trade.get("position_id") or event_id,
+                                    order_id=new_sl.get("order_id"),
+                                    symbol=symbol,
+                                    direction=direction,
+                                    leg="BE_SL",
+                                    status="ACTIVATED",
+                                    stop_price=_safe_float(new_sl.get("stop_price"), entry_price),
+                                    qty=rem_qty,
+                                    trigger_ts_ms=now_ms,
+                                    trigger_rule="tp1_filled",
+                                    trigger_peak_r=peak_r,
+                                )
+                                log.info(
+                                    "[TRACKER_BE_ACTIVATED] %s (%s) TP1 taken. Stop-loss moved to Break-Even: %.8g (Risk: 0.00%%)",
+                                    trade.get("name", symbol), symbol, entry_price
+                                )
                         else:
                             trade["be_required"] = True
                             trade["be_last_error"] = new_sl.get("error")

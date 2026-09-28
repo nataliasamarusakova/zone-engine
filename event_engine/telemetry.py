@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from event_engine.version import ENGINE_VERSION
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA = PROJECT_ROOT / "data"
 SCHEMA_VERSION = 1
@@ -57,6 +59,7 @@ def emit(path: Path, record_type: str, *, event_id: str | None = None,
     now_ms = int(time.time() * 1000)
     record: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
+        "engine_version": ENGINE_VERSION,
         "record_type": record_type,
         "ts_ms": now_ms,
         "ts": datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc).isoformat(),
@@ -206,6 +209,33 @@ def parse_exchange_error(value: Any, *, default_code: Any = None) -> tuple[Any, 
         if match:
             code = match.group(1)
     return code, message
+
+
+def record_state_conflict(*, event_id: str | None, attempt_id: str | None,
+                         position_id: str | None, order_id: str | None,
+                         symbol: str, direction: str,
+                         conflict_type: str, message: str,
+                         owner_event_ids: list[str] | None = None, **payload: Any) -> None:
+    """Record an internal ownership/state-integrity conflict.
+
+    This is deliberately separate from exchange errors: the exchange may have
+    behaved correctly while the local state model linked the object incorrectly.
+    """
+    emit(
+        POSITION_RECONCILIATION_PATH,
+        "STATE_CONFLICT",
+        event_id=event_id,
+        attempt_id=attempt_id,
+        position_id=position_id,
+        order_id=order_id,
+        symbol=symbol,
+        direction=direction,
+        reconciliation_status="STATE_CONFLICT",
+        conflict_type=conflict_type,
+        message=message,
+        owner_event_ids=owner_event_ids or [],
+        **payload,
+    )
 
 
 def record_exchange_error(*, event_id: str | None, attempt_id: str | None,

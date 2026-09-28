@@ -841,6 +841,8 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str, *, exe
     except (TypeError, ValueError):
         max_quote_age = 2.0
     fresh, local_age, exchange_age, freshness_source = _quote_freshness(final_quote, max_quote_age)
+    if _require_exchange_quote_timestamp() and exchange_age is None:
+        return {"status": "skipped_stale_signal", "error": "execution_quote_missing_exchange_timestamp", "symbol": bx, "execution_quote": final_quote}
     final_quote["quote_local_age_sec"] = local_age
     final_quote["quote_exchange_age_sec"] = exchange_age
     final_quote["quote_freshness_source"] = freshness_source
@@ -893,6 +895,8 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str, *, exe
     # Last micro-check immediately before the network POST. This prevents a slow Python/network
     # path from turning a freshly-read quote into a stale order reference.
     fresh_now, local_age_now, exchange_age_now, freshness_source_now = _quote_freshness(execution_quote, max_quote_age)
+    if _require_exchange_quote_timestamp() and exchange_age_now is None:
+        return {"status": "skipped_stale_signal", "error": "execution_quote_missing_exchange_timestamp_at_post", "symbol": bx, "execution_quote": execution_quote}
     execution_quote["quote_local_age_sec_at_post"] = local_age_now
     execution_quote["quote_exchange_age_sec_at_post"] = exchange_age_now
     execution_quote["quote_freshness_source_at_post"] = freshness_source_now
@@ -1411,6 +1415,11 @@ def _normalize_market_timestamp_ms(value: Any) -> int | None:
     return None
 
 
+def _require_exchange_quote_timestamp() -> bool:
+    raw = str(os.environ.get("EXECUTION_REQUIRE_EXCHANGE_TIMESTAMP", "false")).strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
 def _quote_freshness(quote: dict[str, Any], max_age_sec: float) -> tuple[bool, float | None, float | None, str]:
     limit = max(0.0, float(max_age_sec))
     observed_ms = _normalize_market_timestamp_ms(quote.get("quote_observed_at_ms"))
@@ -1504,6 +1513,22 @@ def _quote_error(source: str, resp: Any, symbol: str) -> str:
     return f"{source} unavailable: code={code} msg={msg or 'invalid response'}"
 
 
+def _quote_provenance_fields(quote_time: Any) -> dict[str, Any]:
+    exchange_time_ms = _normalize_market_timestamp_ms(quote_time)
+    observed_ms = int(time.time() * 1000)
+    _ok, local_age, exchange_age, source = _quote_freshness(
+        {"quote_observed_at_ms": observed_ms, "quote_exchange_time_ms": exchange_time_ms},
+        max(0.0, float(os.environ.get("EXECUTION_QUOTE_MAX_AGE_SEC", "2.0"))),
+    )
+    return {
+        "quote_exchange_time_ms": exchange_time_ms,
+        "quote_observed_at_ms": observed_ms,
+        "quote_local_age_sec": local_age,
+        "quote_exchange_age_sec": exchange_age,
+        "quote_freshness_source": source,
+    }
+
+
 def get_execution_quote(symbol: str, *, min_interval_sec: float | None = None, reference_price: float | None = None) -> dict[str, Any]:
     """Return a valid BingX executable top-of-book quote immediately before entry.
 
@@ -1543,41 +1568,59 @@ def get_execution_quote(symbol: str, *, min_interval_sec: float | None = None, r
         parsed = _parse_top_of_book_payload(resp, bx, "bookTicker")
         if parsed is not None:
             bid, ask, quote_time = parsed
-            return {
-                "status": "ok", "symbol": bx, "bid": bid, "ask": ask,
-                "spread_pct": ((ask - bid) / bid * 100.0) if bid > 0 else None,
-                "time": quote_time, "quote_exchange_time_ms": _normalize_market_timestamp_ms(quote_time), "quote_observed_at_ms": int(time.time() * 1000), "last_price": None, "quote_source": "bookTicker",
-                "quote_sources_attempted": ["bookTicker"],
-                "quote_fallback_reason": None,
-            }
+            exchange_time_ms = _normalize_market_timestamp_ms(quote_time)
+            if _require_exchange_quote_timestamp() and exchange_time_ms is None:
+                log.warning("[EXEC_QUOTE_REJECT] %s | bookTicker returned no usable exchange timestamp", bx)
+            else:
+                provenance = _quote_provenance_fields(quote_time)
+                return {
+                    "status": "ok", "symbol": bx, "bid": bid, "ask": ask,
+                    "spread_pct": ((ask - bid) / bid * 100.0) if bid > 0 else None,
+                    "time": quote_time, "last_price": None, "quote_source": "bookTicker",
+                    "quote_sources_attempted": ["bookTicker"],
+                    "quote_fallback_reason": None,
+                    **provenance,
+                }
 
         ticker_resp = _call(TICKER_PATH)
         attempts.append(("ticker", ticker_resp))
         parsed = _parse_top_of_book_payload(ticker_resp, bx, "ticker")
         if parsed is not None:
             bid, ask, quote_time = parsed
-            log.warning("[EXEC_QUOTE_FALLBACK] %s | bookTicker invalid/unavailable -> ticker", bx)
-            return {
-                "status": "ok", "symbol": bx, "bid": bid, "ask": ask,
-                "spread_pct": ((ask - bid) / bid * 100.0) if bid > 0 else None,
-                "time": quote_time, "quote_exchange_time_ms": _normalize_market_timestamp_ms(quote_time), "quote_observed_at_ms": int(time.time() * 1000), "last_price": None, "quote_source": "ticker",
-                "quote_sources_attempted": [source for source, _ in attempts],
-                "quote_fallback_reason": _quote_error("bookTicker", attempts[0][1], bx) if attempts else "bookTicker_invalid",
-            }
+            exchange_time_ms = _normalize_market_timestamp_ms(quote_time)
+            if _require_exchange_quote_timestamp() and exchange_time_ms is None:
+                log.warning("[EXEC_QUOTE_REJECT] %s | ticker returned no usable exchange timestamp", bx)
+            else:
+                log.warning("[EXEC_QUOTE_FALLBACK] %s | bookTicker invalid/unavailable -> ticker", bx)
+                provenance = _quote_provenance_fields(quote_time)
+                return {
+                    "status": "ok", "symbol": bx, "bid": bid, "ask": ask,
+                    "spread_pct": ((ask - bid) / bid * 100.0) if bid > 0 else None,
+                    "time": quote_time, "last_price": None, "quote_source": "ticker",
+                    "quote_sources_attempted": [source for source, _ in attempts],
+                    "quote_fallback_reason": _quote_error("bookTicker", attempts[0][1], bx) if attempts else "bookTicker_invalid",
+                    **provenance,
+                }
 
         depth_resp = _call(DEPTH_PATH)
         attempts.append(("depth", depth_resp))
         parsed = _parse_depth_top(depth_resp)
         if parsed is not None:
             bid, ask, quote_time = parsed
-            log.warning("[EXEC_QUOTE_FALLBACK] %s | bookTicker/ticker invalid -> depth", bx)
-            return {
-                "status": "ok", "symbol": bx, "bid": bid, "ask": ask,
-                "spread_pct": ((ask - bid) / bid * 100.0) if bid > 0 else None,
-                "time": quote_time, "quote_exchange_time_ms": _normalize_market_timestamp_ms(quote_time), "quote_observed_at_ms": int(time.time() * 1000), "last_price": None, "quote_source": "depth",
-                "quote_sources_attempted": [source for source, _ in attempts],
-                "quote_fallback_reason": "; ".join(_quote_error(source, response, bx) for source, response in attempts[:-1]),
-            }
+            exchange_time_ms = _normalize_market_timestamp_ms(quote_time)
+            if _require_exchange_quote_timestamp() and exchange_time_ms is None:
+                log.warning("[EXEC_QUOTE_REJECT] %s | depth returned no usable exchange timestamp", bx)
+            else:
+                log.warning("[EXEC_QUOTE_FALLBACK] %s | bookTicker/ticker invalid -> depth", bx)
+                provenance = _quote_provenance_fields(quote_time)
+                return {
+                    "status": "ok", "symbol": bx, "bid": bid, "ask": ask,
+                    "spread_pct": ((ask - bid) / bid * 100.0) if bid > 0 else None,
+                    "time": quote_time, "last_price": None, "quote_source": "depth",
+                    "quote_sources_attempted": [source for source, _ in attempts],
+                    "quote_fallback_reason": "; ".join(_quote_error(source, response, bx) for source, response in attempts[:-1]),
+                    **provenance,
+                }
 
     details = "; ".join(_quote_error(source, response, bx) for source, response in attempts)
     return {
@@ -2552,6 +2595,8 @@ def ensure_directional_protection(
                         "price": float(existing_leg.get("stopPrice", 0) or existing_leg.get("price", 0) or 0),
                         "qty": existing_qty,
                         "pnl_pct": pnl_pct,
+                        "expected_tp_price": tp_price,
+                        "execution_verified": True,
                     }
                 )
                 continue
@@ -2681,6 +2726,7 @@ def ensure_directional_protection(
             "client_order_id": order.get("clientOrderId") or client_order_id,
             "price": float(order.get("stopPrice", 0) or order.get("price", 0) or tp_price),
             "qty": _order_qty(order), "pnl_pct": pnl_pct,
+            "expected_tp_price": tp_price, "execution_verified": True,
         })
 
     successful_tps = [t for t in tp_results if t.get("status") in {"created", "already_exists", "reconciled_after_post_error"}]
