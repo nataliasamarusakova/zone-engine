@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 import uuid
@@ -88,6 +89,8 @@ def _load_active_trades() -> dict[str, dict]:
                 t.setdefault("tp_mode", "single_tp" if len(t.get("tp_orders", [])) == 1 else "multi_tp")
                 t.setdefault("effective_tp_levels", t.get("tp_levels", []))
                 t.setdefault("effective_weighted_rr", t.get("planned_weighted_rr", 0.75))
+                t.setdefault("realized_weighted_rr", None)
+                t.setdefault("remaining_weighted_rr", None)
                 normalized[str(event_id)] = t
             return normalized
         log.error("[TRACKER] Invalid state: %s is not a JSON object", ACTIVE_TRADES_PATH)
@@ -112,6 +115,44 @@ def _save_active_trades(trades: dict[str, dict]) -> None:
         finally:
             if fcntl is not None:
                 fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
+
+
+def backfill_active_trade_provenance(trades: dict[str, dict] | None = None) -> int:
+    """Backfill missing code_commit_sha on open trades from their immutable TRADE_OPEN record."""
+    current = trades if trades is not None else _load_active_trades()
+    if not current or not TRADES_PATH.exists():
+        return 0
+    missing_ids = {str(eid) for eid, trade in current.items()
+                   if isinstance(trade, dict) and not trade.get("closed", False) and not trade.get("code_commit_sha")}
+    if not missing_ids:
+        return 0
+    found: dict[str, str] = {}
+    try:
+        with TRADES_PATH.open("r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if row.get("record_type") != "TRADE_OPEN":
+                    continue
+                eid = str(row.get("event_id") or "")
+                sha = str(row.get("code_commit_sha") or "")
+                if eid in missing_ids and sha:
+                    found[eid] = sha
+        changed = 0
+        for eid, sha in found.items():
+            current[eid]["code_commit_sha"] = sha
+            current[eid]["provenance_backfilled_ts"] = int(time.time() * 1000)
+            changed += 1
+        if changed:
+            _save_active_trades(current)
+        return changed
+    except OSError as exc:
+        log.warning("[TRACKER_PROVENANCE] backfill failed: %s", exc)
+        return 0
 
 
 def _close_record_exists(event_id: str) -> bool:
@@ -403,7 +444,15 @@ def update_active_trade_protection(
         trade["effective_tp_levels"] = effective_tp_levels
     if tp_mode:
         trade["tp_mode"] = tp_mode
-    if effective_weighted_rr is not None:
+    # Recompute weighted RR from the whole original position. The caller may provide
+    # a remaining-leg RR (for example 0.60 after TP1), but the persisted
+    # effective_weighted_rr must include the realized TP1 leg as well.
+    rr_effective, rr_realized, rr_remaining = _weighted_rr_snapshot(trade)
+    if rr_effective is not None:
+        trade["effective_weighted_rr"] = rr_effective
+        trade["realized_weighted_rr"] = rr_realized
+        trade["remaining_weighted_rr"] = rr_remaining
+    elif effective_weighted_rr is not None:
         trade["effective_weighted_rr"] = _safe_float(effective_weighted_rr, 0.75)
     trade["protection_last_updated_ts"] = int(time.time() * 1000)
     _save_active_trades(trades)
@@ -424,6 +473,7 @@ def _extract_setup_metrics(setup: dict | None) -> dict[str, Any]:
             "effective_weighted_rr": 0.75,
             "tp_mode": "multi_tp",
             "strategy_version": None,
+            "code_commit_sha": None,
             "signal_snapshot": {},
             "entry_bar": {},
             "previous_bar": {},
@@ -441,6 +491,7 @@ def _extract_setup_metrics(setup: dict | None) -> dict[str, Any]:
         "effective_weighted_rr": _safe_float(setup.get("effective_weighted_rr", setup.get("planned_weighted_rr", 0.75)), 0.75),
         "tp_mode": str(setup.get("tp_mode", "multi_tp")),
         "strategy_version": str(setup.get("strategy_version", "")) or None,
+        "code_commit_sha": str(setup.get("code_commit_sha", "")) or None,
         "signal_snapshot": setup.get("signal_snapshot") if isinstance(setup.get("signal_snapshot"), dict) else {},
         "entry_bar": setup.get("entry_bar") if isinstance(setup.get("entry_bar"), dict) else {},
         "previous_bar": setup.get("previous_bar") if isinstance(setup.get("previous_bar"), dict) else {},
@@ -1279,6 +1330,44 @@ def _calc_trade_pnl_pct(entry_price: float, exit_price: float, direction: str) -
     return (entry_price - exit_price) / entry_price * 100.0
 
 
+def _weighted_rr_snapshot(trade: dict) -> tuple[float | None, float | None, float | None]:
+    """Return (effective_total_rr, realized_rr_component, remaining_rr_component).
+
+    effective_total_rr is the projected RR for the whole original position: realized
+    legs use actual fills, while remaining legs use their planned target. This avoids
+    reporting only the remaining leg after a partial TP.
+    """
+    init_qty = max(_safe_float(trade.get("initial_qty"), 0.0), 0.0)
+    risk_pct = _derive_planned_risk_pct(trade)
+    if init_qty <= 0 or risk_pct is None or risk_pct <= 0:
+        return None, None, None
+    realized_qty = max(_safe_float(trade.get("realized_pnl_qty"), 0.0), 0.0)
+    realized_weighted = _safe_float(trade.get("realized_pnl_weighted_sum"), 0.0)
+    realized_rr_component = (realized_weighted / init_qty) / risk_pct if realized_qty > 0 else 0.0
+
+    hit_legs = {str(x) for x in (trade.get("hit_legs") or [])}
+    tp_levels = trade.get("tp_levels") if isinstance(trade.get("tp_levels"), list) else []
+    remaining_qty = max(_safe_float(trade.get("remaining_qty"), 0.0), 0.0)
+    remaining_rr_component = 0.0
+    if remaining_qty > 0 and tp_levels:
+        remaining = [x for x in tp_levels if str(x.get("leg", "")) not in hit_legs and _safe_float(x.get("pnl_pct"), 0.0) > 0]
+        if remaining:
+            raw_weights = [max(0.0, _safe_float(x.get("close_fraction"), 0.0)) for x in remaining]
+            weight_sum = sum(raw_weights)
+            if weight_sum <= 0:
+                raw_weights = [1.0] * len(remaining)
+                weight_sum = float(len(remaining))
+            for level, raw_weight in zip(remaining, raw_weights):
+                pnl_pct = _safe_float(level.get("pnl_pct"), 0.0)
+                qty = remaining_qty * raw_weight / weight_sum
+                remaining_rr_component += (qty / init_qty) * (pnl_pct / risk_pct)
+    effective = realized_rr_component + remaining_rr_component
+    remaining_rr = None
+    if remaining_qty > 0:
+        remaining_rr = remaining_rr_component / (remaining_qty / init_qty) if init_qty > 0 else None
+    return effective, realized_rr_component, remaining_rr
+
+
 def _derive_planned_risk_pct(trade: dict) -> float | None:
     direct = trade.get("planned_risk_pct")
     if direct is not None:
@@ -1465,6 +1554,23 @@ def _classify_tp_fill(direction: str, entry_price: float, exec_price: float) -> 
     return True, "FAVORABLE_OR_TOLERATED_TP_FILL"
 
 
+def _reconciliation_status(local_qty: float, exchange_qty: float, base_status: str) -> str:
+    """Return a truthful reconciliation status including quantity mismatches."""
+    if base_status != "FOUND":
+        return base_status
+    try:
+        local = abs(float(local_qty))
+        exchange = abs(float(exchange_qty))
+    except (TypeError, ValueError):
+        return "FOUND_QTY_MISMATCH"
+    try:
+        rel_tol = max(1e-12, float(os.environ.get("POSITION_QTY_RECON_REL_TOL", "1e-9")))
+        abs_tol = max(1e-12, float(os.environ.get("POSITION_QTY_RECON_ABS_TOL", "1e-8")))
+    except (TypeError, ValueError):
+        rel_tol, abs_tol = 1e-9, 1e-8
+    return "FOUND" if math.isclose(local, exchange, rel_tol=rel_tol, abs_tol=abs_tol) else "FOUND_QTY_MISMATCH"
+
+
 def update_active_trades() -> None:
     trades = _load_active_trades()
     if not trades:
@@ -1510,7 +1616,11 @@ def update_active_trades() -> None:
                 position_id=trade.get("position_id") or event_id,
                 symbol=symbol,
                 direction=direction,
-                status=("FOUND" if pos_status == "found" else "NOT_FOUND" if pos_status == "not_found" else "ERROR"),
+                status=_reconciliation_status(
+                    local_remaining_qty_before,
+                    pos_amt if pos_status in {"found", "not_found"} else 0.0,
+                    "FOUND" if pos_status == "found" else "NOT_FOUND" if pos_status == "not_found" else "ERROR",
+                ),
                 internal_remaining_qty=local_remaining_qty_before,
                 exchange_position_qty=pos_amt if pos_status in {"found", "not_found"} else None,
                 exchange_avg_price=pos.get("avgPrice") if pos_status == "found" else None,
@@ -1676,6 +1786,10 @@ def update_active_trades() -> None:
                 trade["remaining_qty"] = rem_qty
                 trade["realized_pnl_qty"] = realized_qty
                 trade["realized_pnl_weighted_sum"] = realized_weighted
+                rr_effective, rr_realized, rr_remaining = _weighted_rr_snapshot(trade)
+                trade["effective_weighted_rr"] = rr_effective
+                trade["realized_weighted_rr"] = rr_realized
+                trade["remaining_weighted_rr"] = rr_remaining
                 trade["last_tp_exec_price"] = exec_price
                 trade.setdefault("tp_fill_events", []).append({
                     "ts": now_ms,
@@ -1879,7 +1993,11 @@ def update_active_trades() -> None:
                 position_id=trade.get("position_id") or event_id,
                 symbol=symbol,
                 direction=direction,
-                status=("CLOSED" if final_pos_status == "not_found" else "FOUND" if final_pos_status == "found" else "ERROR"),
+                status=_reconciliation_status(
+                    residual_qty_before_position_disappeared,
+                    rem_qty if final_pos_status in {"found", "not_found"} else 0.0,
+                    "CLOSED" if final_pos_status == "not_found" else "FOUND" if final_pos_status == "found" else "ERROR",
+                ),
                 internal_remaining_qty=residual_qty_before_position_disappeared,
                 exchange_position_qty=rem_qty if final_pos_status in {"found", "not_found"} else None,
                 exchange_avg_price=final_pos.get("avgPrice") if final_pos_status == "found" else None,
@@ -1944,7 +2062,13 @@ def update_active_trades() -> None:
                 exit_price = entry_price * (1.0 + final_pnl / 100.0) if direction == "LONG" else entry_price * (1.0 - final_pnl / 100.0)
             planned_risk_pct = _derive_planned_risk_pct(trade)
             realized_rr = _calc_realized_rr(final_pnl, planned_risk_pct) if realized_pnl_source == "executed_tp_or_sl" else None
-            planned_rr = _safe_float(trade.get("effective_weighted_rr", trade.get("planned_weighted_rr", 1.05)), 1.05)
+            final_weighted_rr = _calc_realized_rr(final_pnl, planned_risk_pct) if planned_risk_pct and planned_risk_pct > 0 else None
+            projected_rr, realized_rr_component, remaining_rr_component = _weighted_rr_snapshot({**trade, "remaining_qty": 0.0, "realized_pnl_qty": init_qty, "realized_pnl_weighted_sum": final_pnl * init_qty, "hit_legs": hit_legs})
+            effective_rr_at_close = final_weighted_rr if final_weighted_rr is not None else projected_rr
+            trade["effective_weighted_rr"] = effective_rr_at_close
+            trade["realized_weighted_rr"] = final_weighted_rr
+            trade["remaining_weighted_rr"] = None
+            planned_rr = effective_rr_at_close
 
             # For BE/SL exits, retain exchange-confirmed trigger/fill telemetry
             # so the next audit can measure actual stop degradation rather than
@@ -2005,6 +2129,9 @@ def update_active_trades() -> None:
                 "realized_rr": realized_rr,
                 "realized_pnl_source": realized_pnl_source,
                 "effective_weighted_rr": planned_rr,
+                "planned_weighted_rr": _safe_float(trade.get("planned_weighted_rr"), planned_rr),
+                "realized_weighted_rr": final_weighted_rr,
+                "remaining_weighted_rr": None,
                 "tp_mode": trade.get("tp_mode", "multi_tp"),
                 "strategy_version": trade.get("strategy_version"),
                 "code_commit_sha": trade.get("code_commit_sha"),

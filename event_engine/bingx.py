@@ -273,9 +273,9 @@ def _request(
                     # endpoint can create a duplicate order. GET/DELETE remain
                     # eligible for the endpoint fallback.
                     if retryable and _is_network_error(exc) and method.upper() != "POST" and base_url != _base_urls()[-1]:
-                        log.warning("[BINGX] Network failure on %s; trying fallback domain: %s", base_url, exc)
+                        log.warning("[BINGX] Network failure on %s; trying fallback domain: %s", base_url, _safe_exception_message(exc))
                         break
-                    return {"code": -1, "msg": str(exc)}
+                    return {"code": -1, "msg": _safe_exception_message(exc)}
 
                 try:
                     code = int(payload.get("code"))
@@ -293,7 +293,7 @@ def _request(
         return {"code": -1, "msg": str(last_error) if last_error else "request failed"}
     except Exception as exc:
         log.exception("[BINGX] Request wrapper failure: %s %s", method, path)
-        return {"code": -1, "msg": str(exc)}
+        return {"code": -1, "msg": _safe_exception_message(exc)}
 
 def refresh_contracts() -> dict[str, Any]:
     resp = _request("GET", CONTRACTS_PATH, signed=False)
@@ -841,7 +841,7 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str, *, exe
     except (TypeError, ValueError):
         max_quote_age = 2.0
     fresh, local_age, exchange_age, freshness_source = _quote_freshness(final_quote, max_quote_age)
-    if _require_exchange_quote_timestamp() and exchange_age is None:
+    if exchange_age is None and (_require_exchange_quote_timestamp() or _unknown_exchange_quote_age_policy() == "block"):
         return {"status": "skipped_stale_signal", "error": "execution_quote_missing_exchange_timestamp", "symbol": bx, "execution_quote": final_quote}
     final_quote["quote_local_age_sec"] = local_age
     final_quote["quote_exchange_age_sec"] = exchange_age
@@ -895,7 +895,7 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str, *, exe
     # Last micro-check immediately before the network POST. This prevents a slow Python/network
     # path from turning a freshly-read quote into a stale order reference.
     fresh_now, local_age_now, exchange_age_now, freshness_source_now = _quote_freshness(execution_quote, max_quote_age)
-    if _require_exchange_quote_timestamp() and exchange_age_now is None:
+    if exchange_age_now is None and (_require_exchange_quote_timestamp() or _unknown_exchange_quote_age_policy() == "block"):
         return {"status": "skipped_stale_signal", "error": "execution_quote_missing_exchange_timestamp_at_post", "symbol": bx, "execution_quote": execution_quote}
     execution_quote["quote_local_age_sec_at_post"] = local_age_now
     execution_quote["quote_exchange_age_sec_at_post"] = exchange_age_now
@@ -1420,6 +1420,19 @@ def _require_exchange_quote_timestamp() -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
+def _unknown_exchange_quote_age_policy() -> str:
+    """Explicit policy when the venue response has no usable exchange timestamp."""
+    raw = str(os.environ.get("EXECUTION_UNKNOWN_QUOTE_AGE_POLICY", "allow_with_local_age")).strip().lower()
+    aliases = {
+        "allow": "allow_with_local_age",
+        "allow_with_local": "allow_with_local_age",
+        "allow_with_local_age": "allow_with_local_age",
+        "block": "block",
+        "reject": "block",
+    }
+    return aliases.get(raw, "allow_with_local_age")
+
+
 def _quote_freshness(quote: dict[str, Any], max_age_sec: float) -> tuple[bool, float | None, float | None, str]:
     limit = max(0.0, float(max_age_sec))
     observed_ms = _normalize_market_timestamp_ms(quote.get("quote_observed_at_ms"))
@@ -1507,6 +1520,14 @@ def _parse_depth_top(resp: Any) -> tuple[float, float, Any] | None:
     return bid, ask, data.get("T") or data.get("timestamp") or data.get("time")
 
 
+def _safe_exception_message(exc: Exception) -> str:
+    """Redact query strings/signatures from network exception text before telemetry."""
+    text = str(exc)
+    if "?" in text:
+        text = text.split("?", 1)[0] + "?[REDACTED]"
+    return text
+
+
 def _quote_error(source: str, resp: Any, symbol: str) -> str:
     code = resp.get("code") if isinstance(resp, dict) else None
     msg = resp.get("msg") if isinstance(resp, dict) else None
@@ -1577,6 +1598,8 @@ def get_execution_quote(symbol: str, *, min_interval_sec: float | None = None, r
                     "status": "ok", "symbol": bx, "bid": bid, "ask": ask,
                     "spread_pct": ((ask - bid) / bid * 100.0) if bid > 0 else None,
                     "time": quote_time, "last_price": None, "quote_source": "bookTicker",
+                    "quote_freshness_status": "EXCHANGE_TIME_VERIFIED" if exchange_time_ms is not None else "EXCHANGE_AGE_UNKNOWN_LOCAL_ALLOWED",
+                    "quote_unknown_age_policy": _unknown_exchange_quote_age_policy(),
                     "quote_sources_attempted": ["bookTicker"],
                     "quote_fallback_reason": None,
                     **provenance,
@@ -1597,6 +1620,8 @@ def get_execution_quote(symbol: str, *, min_interval_sec: float | None = None, r
                     "status": "ok", "symbol": bx, "bid": bid, "ask": ask,
                     "spread_pct": ((ask - bid) / bid * 100.0) if bid > 0 else None,
                     "time": quote_time, "last_price": None, "quote_source": "ticker",
+                    "quote_freshness_status": "EXCHANGE_TIME_VERIFIED" if exchange_time_ms is not None else "EXCHANGE_AGE_UNKNOWN_LOCAL_ALLOWED",
+                    "quote_unknown_age_policy": _unknown_exchange_quote_age_policy(),
                     "quote_sources_attempted": [source for source, _ in attempts],
                     "quote_fallback_reason": _quote_error("bookTicker", attempts[0][1], bx) if attempts else "bookTicker_invalid",
                     **provenance,
@@ -1617,6 +1642,8 @@ def get_execution_quote(symbol: str, *, min_interval_sec: float | None = None, r
                     "status": "ok", "symbol": bx, "bid": bid, "ask": ask,
                     "spread_pct": ((ask - bid) / bid * 100.0) if bid > 0 else None,
                     "time": quote_time, "last_price": None, "quote_source": "depth",
+                    "quote_freshness_status": "EXCHANGE_TIME_VERIFIED" if exchange_time_ms is not None else "EXCHANGE_AGE_UNKNOWN_LOCAL_ALLOWED",
+                    "quote_unknown_age_policy": _unknown_exchange_quote_age_policy(),
                     "quote_sources_attempted": [source for source, _ in attempts],
                     "quote_fallback_reason": "; ".join(_quote_error(source, response, bx) for source, response in attempts[:-1]),
                     **provenance,
@@ -1888,7 +1915,7 @@ def fetch_research_market_context(
             result["endpoint_latency_ms"][key] = round((time.monotonic() - started) * 1000.0, 3)
             result["endpoint_status"][key] = "error"
             result["errors"].append(f"{key}:{type(exc).__name__}:{exc}")
-            return {"code": -1, "msg": str(exc)}
+            return {"code": -1, "msg": _safe_exception_message(exc)}
 
     premium = call("premiumIndex", PREMIUM_INDEX_PATH, {"symbol": bx})
     prow = _research_symbol_row(premium.get("data"), bx) if isinstance(premium, dict) else None
@@ -1941,6 +1968,10 @@ def fetch_research_account_snapshot() -> dict[str, Any]:
         "captured_at": datetime.fromtimestamp(captured_ms / 1000.0, tz=timezone.utc).isoformat(),
         "status": "ok",
         "errors": [],
+        "account_realized_profit_source": "BALANCE_TOTAL",
+        "recent_realized_pnl_total": None,
+        "recent_realized_pnl_source": "UNAVAILABLE",
+        "recent_fill_source": "UNAVAILABLE",
     }
     api_key, secret_key = get_credentials()
     if not api_key or not secret_key:
@@ -2016,9 +2047,16 @@ def fetch_research_account_snapshot() -> dict[str, Any]:
             result["recent_fill_count"] = len(activity_rows)
             result["recent_fill_fee_total"] = fee_total
             result["recent_fill_realized_pnl_total"] = realized_total
+            result["recent_realized_pnl_total"] = realized_total
+            result["recent_realized_pnl_source"] = "ALL_FILL_ORDERS"
+            result["recent_fill_source"] = "ALL_FILL_ORDERS"
         else:
+            result["recent_fill_status"] = "error"
+            result["recent_fill_error"] = f"code={fills.get('code') if isinstance(fills, dict) else 'invalid'}"
             result.setdefault("errors", []).append(f"fills:code={fills.get('code') if isinstance(fills, dict) else 'invalid'}")
     except Exception as exc:
+        result["recent_fill_status"] = "error"
+        result["recent_fill_error"] = f"{type(exc).__name__}:{exc}"
         result.setdefault("errors", []).append(f"fills:{type(exc).__name__}:{exc}")
 
     try:
@@ -2056,6 +2094,15 @@ def fetch_research_account_snapshot() -> dict[str, Any]:
             result["recent_income"] = income_rows
             result["recent_income_count"] = len(income_rows)
             result["recent_income_totals"] = totals
+            if result.get("recent_realized_pnl_source") == "UNAVAILABLE":
+                realized_from_income = totals.get("REALIZED_PNL")
+                if isinstance(realized_from_income, (int, float)) and math.isfinite(float(realized_from_income)):
+                    result["recent_realized_pnl_total"] = float(realized_from_income)
+                    result["recent_realized_pnl_source"] = "INCOME_REALIZED_PNL_FALLBACK"
+            if result.get("recent_realized_pnl_source") == "ALL_FILL_ORDERS":
+                result["recent_fill_source"] = "ALL_FILL_ORDERS"
+            elif result.get("recent_realized_pnl_source") == "INCOME_REALIZED_PNL_FALLBACK":
+                result["recent_fill_source"] = "INCOME_FALLBACK"
         else:
             result.setdefault("errors", []).append(f"income:code={income.get('code') if isinstance(income, dict) else 'invalid'}")
     except Exception as exc:

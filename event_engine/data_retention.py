@@ -26,6 +26,7 @@ MARKET_5M_RETENTION_HOURS = max(24, int(os.environ.get("DATA_RETENTION_5M_HOURS"
 MARKET_1H_RETENTION_HOURS = max(72, int(os.environ.get("DATA_RETENTION_1H_HOURS", "168")))
 NEAREST_APPROACH_RETENTION_HOURS = max(24, int(os.environ.get("DATA_RETENTION_NEAREST_HOURS", "36")))
 RESEARCH_OUTCOME_RETENTION_HOURS = max(24, int(os.environ.get("DATA_RETENTION_OUTCOME_HOURS", "2160")))  # 90d
+COUNTERFACTUAL_RETENTION_HOURS = max(24, int(os.environ.get("DATA_RETENTION_COUNTERFACTUAL_HOURS", "2160")))  # 90d
 POSITION_RECONCILIATION_RETENTION_HOURS = max(24, int(os.environ.get("DATA_RETENTION_RECON_HOURS", "336")))  # 14d
 
 # GitHub rejects individual Git blobs >= 100,000,000 bytes. We do not delete
@@ -63,6 +64,7 @@ NEVER_REWRITE_STATE_FILES = {
     "event_execution_claims.json",
     "actions.jsonl",
     "signal_history.jsonl",
+    "runtime_version.json",
 }
 
 
@@ -396,6 +398,15 @@ def _size_guard_plan(path: Path, *, now: datetime, pending_ids: set[str], pendin
             ts = _parse_ts(row.get("observation_ts") or row.get("data_last_ts"))
             return ts is None or ts >= now - timedelta(hours=h)
         return [(f"keep_recent_outcome_{h}h_with_link_protection", lambda row, h=h: keep_outcome(row, h)) for h in hours]
+    if name == "counterfactual_experiments.jsonl":
+        hours = [2160, 720, 336, 168, 72, 24]
+        def keep_counterfactual(row: dict[str, Any], h: int) -> bool:
+            refs = {str(row.get(f, "")) for f in ("event_id", "attempt_id", "decision_id", "position_id", "signal_id", "observation_id") if row.get(f) not in (None, "")}
+            if refs & protected_refs or refs & protected_observation_ids:
+                return True
+            ts = _parse_ts(row.get("recorded_at") or row.get("source_event_ts"))
+            return ts is None or ts >= now - timedelta(hours=h)
+        return [(f"keep_recent_counterfactual_{h}h", lambda row, h=h: keep_counterfactual(row, h)) for h in hours]
     if name == "position_reconciliation.jsonl":
         # Size-based escalation for reconciliation is handled later by retaining
         # terminal/anomaly rows and the last healthy FOUND snapshot. The generic
@@ -519,6 +530,7 @@ def apply_size_guard(*, now: datetime | None = None, archive_root: Path | None =
         DATA_DIR / "market_bars_1h.jsonl",
         DATA_DIR / "zone_observations.jsonl",
         DATA_DIR / "research_outcomes.jsonl",
+        DATA_DIR / "counterfactual_experiments.jsonl",
         DATA_DIR / "position_reconciliation.jsonl",
     ]
     results = {"schema_version": 1, "mode": "size_guard", "started_at": now.isoformat(), "files": {}}
@@ -911,6 +923,7 @@ def _compact_data_locked(*, apply: bool, archive_root: Path, now: datetime) -> d
                 "market_1h": MARKET_1H_RETENTION_HOURS,
                 "nearest_approach": NEAREST_APPROACH_RETENTION_HOURS,
                 "research_outcomes": RESEARCH_OUTCOME_RETENTION_HOURS,
+                "counterfactual_experiments": COUNTERFACTUAL_RETENTION_HOURS,
                 "position_reconciliation": POSITION_RECONCILIATION_RETENTION_HOURS,
             },
             "protected_state": state_before,
@@ -953,6 +966,7 @@ def _compact_data_locked(*, apply: bool, archive_root: Path, now: datetime) -> d
             "market_1h": MARKET_1H_RETENTION_HOURS,
             "nearest_approach": NEAREST_APPROACH_RETENTION_HOURS,
             "research_outcomes": RESEARCH_OUTCOME_RETENTION_HOURS,
+            "counterfactual_experiments": COUNTERFACTUAL_RETENTION_HOURS,
             "position_reconciliation": POSITION_RECONCILIATION_RETENTION_HOURS,
         },
         "pending_observations": _pending_summary(pending),
@@ -992,6 +1006,13 @@ def _compact_data_locked(*, apply: bool, archive_root: Path, now: datetime) -> d
         ts = _parse_ts(row.get("observation_ts") or row.get("data_last_ts"))
         return ts is None or ts >= outcome_cutoff
 
+    def keep_counterfactual(_: int, row: dict[str, Any]) -> bool:
+        refs = {str(row.get(f, "")) for f in ("event_id", "attempt_id", "decision_id", "position_id", "signal_id", "observation_id") if row.get(f) not in (None, "")}
+        if refs & active_refs:
+            return True
+        ts = _parse_ts(row.get("recorded_at") or row.get("source_event_ts"))
+        return ts is None or ts >= now - timedelta(hours=COUNTERFACTUAL_RETENTION_HOURS)
+
     def keep_reconciliation(line_no: int, row: dict[str, Any]) -> bool:
         position_id = str(row.get("position_id") or row.get("event_id") or "")
         event_id = str(row.get("event_id") or "")
@@ -1024,6 +1045,9 @@ def _compact_data_locked(*, apply: bool, archive_root: Path, now: datetime) -> d
     )
     results["files"]["research_outcomes.jsonl"] = _compact_jsonl(
         DATA_DIR / "research_outcomes.jsonl", keep_outcome, archive_root=archive_root
+    )
+    results["files"]["counterfactual_experiments.jsonl"] = _compact_jsonl(
+        DATA_DIR / "counterfactual_experiments.jsonl", keep_counterfactual, archive_root=archive_root
     )
     results["files"]["position_reconciliation.jsonl"] = _compact_jsonl(
         DATA_DIR / "position_reconciliation.jsonl", keep_reconciliation, archive_root=archive_root

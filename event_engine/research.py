@@ -14,6 +14,8 @@ from typing import Any, Iterable
 
 import pandas as pd
 
+from event_engine import shadow
+
 log = logging.getLogger("event_engine.research")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -31,6 +33,7 @@ RESEARCH_MANIFEST_PATH = DATA_DIR / "research_manifest.json"
 RESEARCH_ERRORS_PATH = DATA_DIR / "research_persistence_errors.jsonl"
 RESEARCH_OUTCOMES_PATH = DATA_DIR / "research_outcomes.jsonl"
 RESEARCH_OUTCOME_STATE_PATH = DATA_DIR / "research_outcome_state.json"
+COUNTERFACTUAL_EXPERIMENTS_PATH = DATA_DIR / "counterfactual_experiments.jsonl"
 MARKET_CONTEXT_PATH = DATA_DIR / "market_context.jsonl"
 ACCOUNT_CONTEXT_PATH = DATA_DIR / "account_context.jsonl"
 
@@ -50,6 +53,8 @@ SHADOW_SHORT_BTC_EMA50_GT_050 = 0.50
 
 _OBSERVATION_SEEN_IDS: set[str] | None = None
 _OBSERVATION_SEEN_LOCK = threading.RLock()
+_COUNTERFACTUAL_SEEN_IDS: set[str] | None = None
+_COUNTERFACTUAL_SEEN_LOCK = threading.RLock()
 
 
 def _now_iso() -> str:
@@ -351,6 +356,95 @@ def record_entry_decision(row: dict[str, Any], *, path: Path | None = None) -> b
         _record_error("entry_decision_write", target, exc, symbol=str(payload.get("symbol", "")))
         if target == ENTRY_DECISIONS_PATH:
             _bump_manifest("persistence_errors", 1)
+        return False
+
+
+def record_counterfactual_snapshot(
+    *,
+    event_id: str,
+    symbol: str,
+    direction: str,
+    snapshot: dict[str, Any],
+    stage: str = "SIGNAL_CREATED",
+    scan_id: str | None = None,
+    strategy_version: str | None = None,
+    code_commit_sha: str | None = None,
+    ts: str | None = None,
+) -> bool:
+    global _COUNTERFACTUAL_SEEN_IDS
+    if not event_id:
+        return False
+    snapshot_id = stable_id("counterfactual-snapshot-v1", event_id, shadow.SHADOW_EXPERIMENT_VERSION, prefix="CF_")
+    with _COUNTERFACTUAL_SEEN_LOCK:
+        if _COUNTERFACTUAL_SEEN_IDS is None:
+            _COUNTERFACTUAL_SEEN_IDS = set()
+            if COUNTERFACTUAL_EXPERIMENTS_PATH.exists():
+                try:
+                    with COUNTERFACTUAL_EXPERIMENTS_PATH.open("r", encoding="utf-8") as fh:
+                        for line in fh:
+                            try:
+                                row = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if isinstance(row, dict) and row.get("record_type") == "COUNTERFACTUAL_SNAPSHOT":
+                                value = row.get("counterfactual_snapshot_id")
+                                if value:
+                                    _COUNTERFACTUAL_SEEN_IDS.add(str(value))
+                except OSError:
+                    pass
+        if snapshot_id in _COUNTERFACTUAL_SEEN_IDS:
+            return False
+        payload = {
+            "record_type": "COUNTERFACTUAL_SNAPSHOT",
+            "schema_version": shadow.SHADOW_SCHEMA_VERSION,
+            "experiment_version": shadow.SHADOW_EXPERIMENT_VERSION,
+            "counterfactual_snapshot_id": snapshot_id,
+            "recorded_at": ts or _now_iso(),
+            "event_id": str(event_id),
+            "symbol": str(symbol).upper(),
+            "direction": str(direction).upper(),
+            "stage": str(stage),
+            "scan_id": scan_id,
+            "strategy_version": strategy_version,
+            "code_commit_sha": code_commit_sha,
+            "applied": False,
+            "snapshot": sanitize(snapshot),
+        }
+        try:
+            ok = bool(_append_jsonl_locked(COUNTERFACTUAL_EXPERIMENTS_PATH, [payload]))
+            if ok:
+                _COUNTERFACTUAL_SEEN_IDS.add(snapshot_id)
+            return ok
+        except Exception as exc:
+            _record_error("counterfactual_snapshot_write", COUNTERFACTUAL_EXPERIMENTS_PATH, exc, symbol=symbol)
+            return False
+
+
+def record_counterfactual_outcome(
+    *,
+    observation: dict[str, Any],
+    outcomes: dict[str, Any],
+    outcome_id: str | None = None,
+) -> bool:
+    payload = {
+        "record_type": "COUNTERFACTUAL_OUTCOME",
+        "schema_version": shadow.SHADOW_SCHEMA_VERSION,
+        "experiment_version": shadow.SHADOW_EXPERIMENT_VERSION,
+        "counterfactual_outcome_id": stable_id("counterfactual-outcome-v1", outcome_id or observation.get("observation_id"), prefix="CFO_"),
+        "forward_outcome_id": outcome_id,
+        "recorded_at": _now_iso(),
+        "event_id": observation.get("event_id"),
+        "observation_id": observation.get("observation_id"),
+        "symbol": str(observation.get("symbol", "")).upper(),
+        "direction": str(observation.get("direction", "")).upper(),
+        "source_event_ts": observation.get("source_event_ts"),
+        "outcomes": sanitize(outcomes),
+        "applied": False,
+    }
+    try:
+        return bool(_append_jsonl_locked(COUNTERFACTUAL_EXPERIMENTS_PATH, [payload]))
+    except Exception as exc:
+        _record_error("counterfactual_outcome_write", COUNTERFACTUAL_EXPERIMENTS_PATH, exc, symbol=str(observation.get("symbol", "")))
         return False
 
 
@@ -953,7 +1047,7 @@ def build_research_features(
         context["account_context"] = account_context
     account = context.get("account_context") or {}
     if isinstance(account, dict):
-        for src, dst in (("account_context_id", "account_context_id"), ("equity", "account_equity"), ("available_margin", "account_available_margin"), ("used_margin", "account_used_margin"), ("unrealized_profit", "account_unrealized_profit"), ("realized_profit", "account_realized_profit"), ("freezed_margin", "account_freezed_margin"), ("open_positions_count", "account_open_positions_count"), ("long_positions_count", "account_long_positions_count"), ("short_positions_count", "account_short_positions_count"), ("open_positions_notional_usdt", "account_open_positions_notional_usdt"), ("open_positions_unrealized_profit", "account_open_positions_unrealized_profit"), ("recent_fill_count", "account_recent_fill_count"), ("recent_fill_fee_total", "account_recent_fill_fee_total"), ("recent_fill_realized_pnl_total", "account_recent_fill_realized_pnl_total"), ("recent_force_order_count", "account_recent_force_order_count"), ("recent_liquidation_count", "account_recent_liquidation_count"), ("recent_adl_count", "account_recent_adl_count")):
+        for src, dst in (("account_context_id", "account_context_id"), ("equity", "account_equity"), ("available_margin", "account_available_margin"), ("used_margin", "account_used_margin"), ("unrealized_profit", "account_unrealized_profit"), ("realized_profit", "account_realized_profit"), ("freezed_margin", "account_freezed_margin"), ("open_positions_count", "account_open_positions_count"), ("long_positions_count", "account_long_positions_count"), ("short_positions_count", "account_short_positions_count"), ("open_positions_notional_usdt", "account_open_positions_notional_usdt"), ("open_positions_unrealized_profit", "account_open_positions_unrealized_profit"), ("recent_fill_count", "account_recent_fill_count"), ("recent_fill_fee_total", "account_recent_fill_fee_total"), ("recent_fill_realized_pnl_total", "account_recent_fill_realized_pnl_total"), ("recent_realized_pnl_total", "account_recent_realized_pnl_total"), ("recent_realized_pnl_source", "account_recent_realized_pnl_source"), ("recent_fill_source", "account_recent_fill_source"), ("recent_force_order_count", "account_recent_force_order_count"), ("recent_liquidation_count", "account_recent_liquidation_count"), ("recent_adl_count", "account_recent_adl_count")):
             if src in account:
                 features[dst] = account.get(src)
         try:
@@ -1202,6 +1296,10 @@ def _observation_from_signal(
         "execution_age_semantics": "not_available_at_observation_generation",
         "trigger_to_observation_minutes": _elapsed_minutes_safe(ts, decision_ts),
     })
+    shadow_snapshot = signal.get("shadow_experiments")
+    if not isinstance(shadow_snapshot, dict):
+        shadow_snapshot = shadow.build_entry_snapshot(signal, df_5m=df_5m, df_1h=df_1h, account_context=account_context)
+    features["shadow_experiments"] = shadow_snapshot
     event_id = str(signal.get("event_id", ""))
     zid = str(zone.get("zone_id", ""))
     visit_id = str((signal.get("zone_visit") or {}).get("visit_id") or (signal.get("trigger") or {}).get("zone_visit_id") or "")
@@ -1440,6 +1538,26 @@ def record_scan_symbol(
             "research": {"source": "shadow_research_v1", "production_gate_applied": False, "outcome_class": "HYPOTHETICAL_FORWARD_OUTCOME"},
             "recorded_at": _now_iso(),
         })
+
+    # Persist one immutable counterfactual snapshot per production signal.
+    for signal in signals:
+        try:
+            snap = signal.get("shadow_experiments")
+            if not isinstance(snap, dict):
+                snap = shadow.build_entry_snapshot(signal, df_5m=closed_5m_df, df_1h=df_1h, account_context=account_context)
+                signal["shadow_experiments"] = snap
+            record_counterfactual_snapshot(
+                event_id=str(signal.get("event_id", "")),
+                symbol=str(symbol),
+                direction=str(signal.get("type", "")),
+                snapshot=snap,
+                scan_id=scan_id,
+                strategy_version=strategy_version,
+                code_commit_sha=code_commit_sha,
+                ts=decision_ts,
+            )
+        except Exception as exc:
+            _record_error("counterfactual_snapshot_build", COUNTERFACTUAL_EXPERIMENTS_PATH, exc, symbol=symbol)
 
     # Persist raw market bars only when this symbol produced at least one research observation.
     # This keeps the low-level API safe even when called directly, and prevents irrelevant
