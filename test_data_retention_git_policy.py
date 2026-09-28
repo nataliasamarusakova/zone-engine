@@ -1,10 +1,13 @@
 from pathlib import Path
 
 
-def test_data_directory_remains_tracked_by_policy():
-    text = Path(".gitignore").read_text(encoding="utf-8")
-    assert "data/*" not in text
-    assert "data/retention_archive" not in text
+def test_persistent_runtime_data_is_git_trackable_and_ephemeral_data_is_ignored():
+    lines = {line.strip() for line in Path(".gitignore").read_text(encoding="utf-8").splitlines()}
+    assert "data/" not in lines
+    assert "data/scan_history.jsonl" in lines
+    assert "data/scan_history.jsonl.*" in lines
+    assert "data/zone_engine_diagnostic.log" in lines
+    assert "data/retention_archive/" in lines
 
 
 def test_runbook_requires_history_rebuild_for_large_unpushed_blobs():
@@ -29,10 +32,10 @@ def test_size_guard_constants_have_headroom():
     assert data_retention.GITHUB_SIZE_TARGET_BYTES < data_retention.GITHUB_SIZE_GUARD_BYTES < data_retention.GITHUB_MAX_FILE_BYTES
 
 
-def test_git_policy_keeps_data_tracked():
-    text = Path(".gitignore").read_text(encoding="utf-8")
-    assert "data/*" not in text
-    assert "data/" not in [line.strip() for line in text.splitlines()]
+def test_git_policy_persists_engine_state_but_excludes_unbounded_runtime_artifacts():
+    lines = {line.strip() for line in Path(".gitignore").read_text(encoding="utf-8").splitlines()}
+    assert "data/" not in lines
+    assert "data/retention_archive/" in lines
 
 
 def test_size_guard_archives_before_compaction(monkeypatch, tmp_path):
@@ -144,3 +147,62 @@ def test_size_guard_zone_observations_can_archive_old_non_nearest_rows_without_t
                     restored_ids.add(json.loads(line)["observation_id"])
     assert "OBS_PROTECTED" in restored_ids
     assert "OBS_OLD_0" in restored_ids
+
+
+def test_clean_checkout_can_persist_and_restore_runtime_state(tmp_path):
+    """Prove the exact lifecycle used by GitHub Actions between two clean runs."""
+    import subprocess
+
+    remote = tmp_path / "remote.git"
+    work1 = tmp_path / "work1"
+    work2 = tmp_path / "work2"
+    source = Path.cwd()
+
+    subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+
+    # Use a disposable repo directory with only the source policy files required
+    # for this integration check; do not mutate the real project repository.
+    subprocess.run(["git", "clone", "-q", str(remote), str(work1)], check=True)
+    (work1 / ".gitignore").write_text((source / ".gitignore").read_text(encoding="utf-8"), encoding="utf-8")
+    (work1 / ".github").mkdir(parents=True, exist_ok=True)
+    (work1 / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
+    (work1 / ".github" / "workflows" / "event-engine.yml").write_text(
+        (source / ".github" / "workflows" / "event-engine.yml").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    subprocess.run(["git", "config", "user.name", "test"], cwd=work1, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=work1, check=True)
+    subprocess.run(["git", "add", ".gitignore", ".github/workflows/event-engine.yml"], cwd=work1, check=True)
+    subprocess.run(["git", "commit", "-qm", "seed"], cwd=work1, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "HEAD:main"], cwd=work1, check=True)
+    subprocess.run(["git", "--git-dir", str(remote), "symbolic-ref", "HEAD", "refs/heads/main"], check=True)
+
+    # Run #1 creates the persistent state plus ephemeral artifacts.
+    data = work1 / "data"
+    data.mkdir()
+    (data / "active_trades.json").write_text('{"version": 1, "events": {"E1": {"symbol": "TEST-USDT"}}}\n', encoding="utf-8")
+    (data / "research_outcome_state.json").write_text('{"version": 2, "processed_observation_ids": ["OBS1"]}\n', encoding="utf-8")
+    (data / "trades.jsonl").write_text('{"record_type":"TRADE_OPEN","event_id":"E1"}\n', encoding="utf-8")
+    (data / "scan_history.jsonl").write_text('{"ephemeral":true}\n', encoding="utf-8")
+    (data / "zone_engine_diagnostic.log").write_text("diagnostic\n", encoding="utf-8")
+    (data / "retention_archive").mkdir()
+    (data / "retention_archive" / "snapshot.jsonl.gz").write_bytes(b"archive")
+
+    subprocess.run(["git", "add", "data/"], cwd=work1, check=True)
+    staged = subprocess.check_output(["git", "diff", "--cached", "--name-only"], cwd=work1, text=True).splitlines()
+    assert "data/active_trades.json" in staged
+    assert "data/research_outcome_state.json" in staged
+    assert "data/trades.jsonl" in staged
+    assert "data/scan_history.jsonl" not in staged
+    assert "data/zone_engine_diagnostic.log" not in staged
+    assert not any(path.startswith("data/retention_archive/") for path in staged)
+    subprocess.run(["git", "commit", "-qm", "persist state"], cwd=work1, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "HEAD:main"], cwd=work1, check=True)
+
+    # Run #2 starts from a fresh checkout and must recover persistent state.
+    subprocess.run(["git", "clone", "-q", str(remote), str(work2)], check=True)
+    assert (work2 / "data" / "active_trades.json").exists()
+    assert (work2 / "data" / "research_outcome_state.json").exists()
+    assert (work2 / "data" / "trades.jsonl").exists()
+    assert not (work2 / "data" / "scan_history.jsonl").exists()
+    assert not (work2 / "data" / "zone_engine_diagnostic.log").exists()
+    assert not (work2 / "data" / "retention_archive").exists()

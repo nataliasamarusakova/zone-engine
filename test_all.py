@@ -53,6 +53,9 @@ def _isolate_runtime_state(monkeypatch, tmp_path):
             "bid": float(kwargs.get("reference_price", 100.0)),
             "ask": float(kwargs.get("reference_price", 100.0)),
             "spread_pct": 0.0,
+            "quote_observed_at_ms": int(time.time() * 1000),
+            "quote_exchange_time_ms": int(time.time() * 1000),
+            "quote_source": "bookTicker",
         },
     )
     monkeypatch.setattr(
@@ -167,6 +170,176 @@ def test_strategy_snapshot_contains_entry_context_and_exit_rules():
     assert setup["target"]["tp1_pct"] == 3.0
     assert setup["target"]["tp2_pct"] == 6.0
     assert setup["target"]["be_rule"] == "after_tp1_filled"
+
+
+def test_register_active_trade_blocks_second_local_owner(monkeypatch, tmp_path):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", tmp_path / "active_trades.json")
+    monkeypatch.setattr(tracker, "TRADES_PATH", tmp_path / "trades.jsonl")
+    monkeypatch.setattr(tracker, "ACTIONS_PATH", tmp_path / "actions.jsonl")
+    existing = {"EVT_A": {"event_id": "EVT_A", "symbol": "AAA-USDT", "direction": "LONG", "closed": False}}
+    (tmp_path / "active_trades.json").write_text(json.dumps(existing), encoding="utf-8")
+    ok = tracker.register_active_trade(
+        event_id="EVT_B", symbol="AAA-USDT", name="AAA", direction="LONG",
+        entry_price=100.0, qty=1.0,
+        tp_orders=[{"leg": "tp1", "order_id": "TP_B1"}],
+        sl_result={"order_id": "SL_B"}, event_type="TEST", setup={"risk_pct": 10.0},
+    )
+    assert ok is False
+    state = json.loads((tmp_path / "active_trades.json").read_text(encoding="utf-8"))
+    assert set(state) == {"EVT_A"}
+
+
+def test_update_active_trade_protection_requires_event_id_when_ambiguous(monkeypatch, tmp_path):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", tmp_path / "active_trades.json")
+    state = {
+        "EVT_A": {"event_id": "EVT_A", "symbol": "AAA-USDT", "direction": "LONG", "closed": False},
+        "EVT_B": {"event_id": "EVT_B", "symbol": "AAA-USDT", "direction": "LONG", "closed": False},
+    }
+    (tmp_path / "active_trades.json").write_text(json.dumps(state), encoding="utf-8")
+    assert tracker.update_active_trade_protection("AAA-USDT", "LONG", [], {}, event_id=None) is False
+
+
+def test_update_active_trade_protection_updates_exact_event_id(tmp_path, monkeypatch):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", tmp_path / "active_trades.json")
+    state = {
+        "EVT_A": {"event_id": "EVT_A", "symbol": "AAA-USDT", "direction": "LONG", "closed": False, "tp_orders": [], "sl_order": {}},
+        "EVT_B": {"event_id": "EVT_B", "symbol": "AAA-USDT", "direction": "LONG", "closed": False, "tp_orders": [], "sl_order": {}},
+    }
+    (tmp_path / "active_trades.json").write_text(json.dumps(state), encoding="utf-8")
+    assert tracker.update_active_trade_protection(
+        "AAA-USDT", "LONG", [{"leg": "tp1", "order_id": "TP_B"}], {"order_id": "SL_B"}, event_id="EVT_B"
+    ) is True
+    updated = json.loads((tmp_path / "active_trades.json").read_text(encoding="utf-8"))
+    assert updated["EVT_A"]["tp_orders"] == []
+    assert updated["EVT_B"]["tp_orders"][0]["order_id"] == "TP_B"
+
+
+def test_register_active_trade_rejects_duplicate_exchange_order_ownership(monkeypatch, tmp_path):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", tmp_path / "active_trades.json")
+    monkeypatch.setattr(tracker, "TRADES_PATH", tmp_path / "trades.jsonl")
+    state = {
+        "EVT_A": {"event_id": "EVT_A", "symbol": "AAA-USDT", "direction": "LONG", "closed": False,
+                  "tp_orders": [{"order_id": "DUP_1"}], "sl_order": {}, "entry_order": {}}
+    }
+    (tmp_path / "active_trades.json").write_text(json.dumps(state), encoding="utf-8")
+    ok = tracker.register_active_trade(
+        event_id="EVT_B", symbol="BBB-USDT", name="BBB", direction="LONG", entry_price=100.0, qty=1.0,
+        tp_orders=[{"leg": "tp1", "order_id": "DUP_1"}], sl_result={"order_id": "SL_B"},
+        event_type="TEST", setup={"risk_pct": 10.0},
+    )
+    assert ok is False
+    stored = json.loads((tmp_path / "active_trades.json").read_text(encoding="utf-8"))
+    assert set(stored) == {"EVT_A"}
+
+
+def test_register_active_trade_blocks_active_event_id_overwrite(monkeypatch, tmp_path):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", tmp_path / "active_trades.json")
+    existing = {"EVT_A": {"event_id": "EVT_A", "symbol": "AAA-USDT", "direction": "LONG", "closed": False}}
+    (tmp_path / "active_trades.json").write_text(json.dumps(existing), encoding="utf-8")
+    ok = tracker.register_active_trade(
+        event_id="EVT_A", symbol="BBB-USDT", name="BBB", direction="LONG", entry_price=100.0, qty=1.0,
+        tp_orders=[{"leg": "tp1", "order_id": "TP_A2"}], sl_result={"order_id": "SL_A2"}, event_type="TEST", setup={"risk_pct": 10.0},
+    )
+    assert ok is False
+    state = json.loads((tmp_path / "active_trades.json").read_text(encoding="utf-8"))
+    assert state["EVT_A"]["symbol"] == "AAA-USDT"
+
+
+def test_update_active_trade_protection_rejects_order_owned_by_other_event(monkeypatch, tmp_path):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", tmp_path / "active_trades.json")
+    state = {
+        "EVT_A": {"event_id": "EVT_A", "symbol": "AAA-USDT", "direction": "LONG", "closed": False,
+                  "tp_orders": [{"leg": "tp1", "order_id": "TP_A"}], "sl_order": {}},
+        "EVT_B": {"event_id": "EVT_B", "symbol": "BBB-USDT", "direction": "LONG", "closed": False,
+                  "tp_orders": [{"leg": "tp1", "order_id": "TP_B"}], "sl_order": {}},
+    }
+    (tmp_path / "active_trades.json").write_text(json.dumps(state), encoding="utf-8")
+    assert tracker.update_active_trade_protection(
+        "BBB-USDT", "LONG", [{"leg": "tp1", "order_id": "TP_A"}], {"order_id": "SL_B"}, event_id="EVT_B"
+    ) is False
+    updated = json.loads((tmp_path / "active_trades.json").read_text(encoding="utf-8"))
+    assert updated["EVT_B"]["tp_orders"][0]["order_id"] == "TP_B"
+
+
+def test_update_active_trade_protection_rejects_duplicate_order_inside_payload(monkeypatch, tmp_path):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", tmp_path / "active_trades.json")
+    state = {"EVT_A": {"event_id": "EVT_A", "symbol": "AAA-USDT", "direction": "LONG", "closed": False, "tp_orders": [], "sl_order": {}}}
+    (tmp_path / "active_trades.json").write_text(json.dumps(state), encoding="utf-8")
+    assert tracker.update_active_trade_protection(
+        "AAA-USDT", "LONG", [{"leg": "tp1", "order_id": "DUP"}, {"leg": "tp2", "order_id": "DUP"}], {"order_id": "SL_A"}, event_id="EVT_A"
+    ) is False
+
+
+def test_tp_adverse_fill_does_not_activate_be(monkeypatch):
+    from event_engine import tracker
+    ok, classification = tracker._classify_tp_fill("LONG", 100.0, 95.0)
+    assert ok is False
+    assert classification == "ANOMALOUS_ADVERSE_TP_FILL"
+    ok2, classification2 = tracker._classify_tp_fill("LONG", 100.0, 102.9)
+    assert ok2 is True
+    assert classification2 == "FAVORABLE_OR_TOLERATED_TP_FILL"
+
+
+def test_execution_quote_uses_local_observation_when_exchange_timestamp_missing(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.delenv("EXECUTION_REQUIRE_EXCHANGE_TIMESTAMP", raising=False)
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)
+    responses = [
+        {"code": 0, "data": {"symbol": "AAA-USDT", "bidPrice": "100", "askPrice": "101"}},
+    ]
+    monkeypatch.setattr(bingx, "_request", lambda *a, **k: responses.pop(0))
+    monkeypatch.setenv("BINGX_BOOK_TICKER_MIN_INTERVAL_SEC", "0")
+    out = bingx.get_execution_quote("AAA-USDT")
+    assert out["status"] == "ok"
+    assert out["quote_exchange_time_ms"] is None
+    assert out["quote_freshness_source"] == "local_observed_elapsed"
+
+
+def test_execution_quote_can_be_configured_to_require_exchange_timestamp(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setenv("EXECUTION_REQUIRE_EXCHANGE_TIMESTAMP", "true")
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)
+    responses = [
+        {"code": 0, "data": {"symbol": "AAA-USDT", "bidPrice": "100", "askPrice": "101"}},
+        {"code": 0, "data": [{"symbol": "AAA-USDT", "bidPrice": "100", "askPrice": "101"}]},
+        {"code": 0, "data": {"bids": [["100", "10"]], "asks": [["101", "10"]]}},
+    ]
+    monkeypatch.setattr(bingx, "_request", lambda *a, **k: responses.pop(0))
+    monkeypatch.setenv("BINGX_BOOK_TICKER_MIN_INTERVAL_SEC", "0")
+    out = bingx.get_execution_quote("AAA-USDT")
+    assert out["status"] == "error"
+
+
+def test_be_does_not_adopt_existing_stop_owned_by_other_event(monkeypatch, tmp_path):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", tmp_path / "active_trades.json")
+    state = {
+        "EVT_OTHER": {"event_id": "EVT_OTHER", "symbol": "AAA-USDT", "direction": "LONG", "closed": False,
+                       "sl_order": {"order_id": "SL_SHARED"}, "tp_orders": []},
+        "EVT_CURRENT": {"event_id": "EVT_CURRENT", "symbol": "AAA-USDT", "direction": "LONG", "closed": False,
+                         "sl_order": {"order_id": "SL_CURRENT"}, "tp_orders": []},
+    }
+    (tmp_path / "active_trades.json").write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(tracker, "to_bx_symbol", lambda symbol: symbol)
+    monkeypatch.setattr(tracker, "get_contract", lambda symbol: {"quantityPrecision": 2, "pricePrecision": 2})
+    monkeypatch.setattr(tracker, "get_open_protection_directional", lambda symbol, direction: {
+        "status": "ok", "sl_orders": [{"orderId": "SL_SHARED", "clientOrderId": "EVT_OTHER", "stopPrice": 100.0, "origQty": 1.0}],
+    })
+    cancelled = []
+    monkeypatch.setattr(tracker, "_cancel_old_sl_verified", lambda *args, **kwargs: cancelled.append(args[2]) or (True, "ok"))
+    result = tracker._move_sl_to_break_even(
+        "AAA-USDT", "LONG", 100.0, 1.0, "SL_CURRENT", trade_id="CURRENT", owner_event_id="EVT_CURRENT"
+    )
+    assert result["status"] == "error"
+    assert result["safety_action"] == "old_sl_kept"
+    assert cancelled == []
 
 
 def test_register_active_trade_persists_research_snapshots(tmp_path, monkeypatch):
@@ -343,7 +516,8 @@ def test_bingx_min_qty_is_nonfatal_skip(monkeypatch):
     monkeypatch.setattr(bingx, "has_open_position", lambda symbol, direction: False)
     monkeypatch.setattr(bingx, "_current_close_price", lambda symbol: 93.368)
     monkeypatch.setattr(bingx, "get_execution_quote", lambda symbol, **kwargs: {
-        "status": "ok", "symbol": symbol, "bid": 93.368, "ask": 93.368, "spread_pct": 0.0
+        "status": "ok", "symbol": symbol, "bid": 93.368, "ask": 93.368, "spread_pct": 0.0,
+        "quote_observed_at_ms": int(time.time() * 1000), "quote_exchange_time_ms": int(time.time() * 1000),
     })
     monkeypatch.setenv("BINGX_MARGIN_USDT", "1")
     monkeypatch.setenv("BINGX_LEVERAGE", "10")
@@ -493,7 +667,8 @@ def test_open_market_resolves_existing_client_order_before_post(monkeypatch):
         "quantityPrecision": 2, "tradeMinQuantity": 0.01, "multiplier": 1, "maxLeverage": 20,
     })
     monkeypatch.setattr(bingx, "has_open_position", lambda *a, **k: False)
-    monkeypatch.setattr(bingx, "get_execution_quote", lambda *a, **k: {"status": "ok", "bid": 99.9, "ask": 100.1, "mid": 100.0})
+    monkeypatch.setattr(bingx, "get_execution_quote", lambda *a, **k: {"status": "ok", "bid": 99.9, "ask": 100.1, "mid": 100.0,
+        "quote_observed_at_ms": int(time.time() * 1000), "quote_exchange_time_ms": int(time.time() * 1000)})
     monkeypatch.setattr(bingx, "_set_leverage", lambda *a, **k: True)
     monkeypatch.setattr(bingx, "position_side_param", lambda *a, **k: "LONG")
     monkeypatch.setattr(bingx, "get_order", lambda *a, **k: {
@@ -514,7 +689,8 @@ def test_open_market_transport_error_reconciles_client_order_without_repost(monk
         "quantityPrecision": 2, "tradeMinQuantity": 0.01, "multiplier": 1, "maxLeverage": 20,
     })
     monkeypatch.setattr(bingx, "has_open_position", lambda *a, **k: False)
-    monkeypatch.setattr(bingx, "get_execution_quote", lambda *a, **k: {"status": "ok", "bid": 99.9, "ask": 100.1, "mid": 100.0})
+    monkeypatch.setattr(bingx, "get_execution_quote", lambda *a, **k: {"status": "ok", "bid": 99.9, "ask": 100.1, "mid": 100.0,
+        "quote_observed_at_ms": int(time.time() * 1000), "quote_exchange_time_ms": int(time.time() * 1000)})
     monkeypatch.setattr(bingx, "_set_leverage", lambda *a, **k: True)
     monkeypatch.setattr(bingx, "position_side_param", lambda *a, **k: "LONG")
     lookup_calls = {"n": 0}
@@ -549,7 +725,8 @@ def test_open_market_refuses_reuse_of_terminal_client_order(monkeypatch):
         "quantityPrecision": 2, "tradeMinQuantity": 0.01, "multiplier": 1, "maxLeverage": 20,
     })
     monkeypatch.setattr(bingx, "has_open_position", lambda *a, **k: False)
-    monkeypatch.setattr(bingx, "get_execution_quote", lambda *a, **k: {"status": "ok", "bid": 99.9, "ask": 100.1, "mid": 100.0})
+    monkeypatch.setattr(bingx, "get_execution_quote", lambda *a, **k: {"status": "ok", "bid": 99.9, "ask": 100.1, "mid": 100.0,
+        "quote_observed_at_ms": int(time.time() * 1000), "quote_exchange_time_ms": int(time.time() * 1000)})
     monkeypatch.setattr(bingx, "_set_leverage", lambda *a, **k: True)
     monkeypatch.setattr(bingx, "position_side_param", lambda *a, **k: "LONG")
     monkeypatch.setattr(bingx, "get_order", lambda *a, **k: {
@@ -1561,9 +1738,11 @@ def test_open_market_blocks_two_tp_min_quantity_before_order(monkeypatch):
     monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
     monkeypatch.setattr(bingx, "_current_close_price", lambda symbol: 1000.0)
     monkeypatch.setattr(bingx, "get_execution_quote", lambda symbol, **kwargs: {
-        "status": "ok", "symbol": symbol, "bid": 1000.0, "ask": 1000.0, "spread_pct": 0.0
+        "status": "ok", "symbol": symbol, "bid": 1000.0, "ask": 1000.0, "spread_pct": 0.0,
+        "quote_observed_at_ms": int(time.time() * 1000), "quote_exchange_time_ms": int(time.time() * 1000),
     })
     monkeypatch.setattr(bingx, "has_open_position", lambda *args, **kwargs: False)
+    monkeypatch.setattr(bingx, "position_side_param", lambda *args, **kwargs: "LONG")
     out = bingx.open_market("BNB-USDT", "LONG", 1000.0, "EVT_TEST")
     assert out["status"] == "skipped_tp_min_qty"
 
@@ -1873,18 +2052,14 @@ def test_position_keys_normalizes_one_way_both_by_position_amount():
     }
 
 
-def test_reconcile_handles_one_way_both_position(monkeypatch, tmp_path):
+def test_reconcile_does_not_mutate_orphan_position(monkeypatch):
     import run_once
     monkeypatch.setattr(run_once, "_load_active_trades_file", lambda: {})
     monkeypatch.setattr(run_once, "get_positions", lambda **kwargs: [
         {"symbol": "AAA-USDT", "positionSide": "BOTH", "positionAmt": "-1.0", "avgPrice": "100.0"},
     ])
-    calls = {}
-    monkeypatch.setattr(run_once, "ensure_directional_protection", lambda *args, **kwargs: calls.update({
-        "symbol": args[0], "direction": args[1], "avg": args[2], "qty": args[3],
-    }) or {"status": "PROTECTED", "tp_orders": [], "sl_result": {}, "effective_tp_levels": []})
+    monkeypatch.setattr(run_once, "ensure_directional_protection", lambda *a, **k: (_ for _ in ()).throw(AssertionError("orphan position must not be auto-attributed")))
     run_once.reconcile_all_open_positions()
-    assert calls == {"symbol": "AAA-USDT", "direction": "SHORT", "avg": 100.0, "qty": 1.0}
 
 
 def test_tracker_uses_exchange_qty_as_remaining_qty(monkeypatch, tmp_path):
@@ -2639,7 +2814,7 @@ def test_get_execution_quote_falls_back_from_bookticker_to_ticker(monkeypatch):
     monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)
     responses = [
         {"code": 0, "data": {"symbol": "FLOKI-USDT", "bidPrice": "0", "askPrice": "0"}},
-        {"code": 0, "data": [{"symbol": "FLOKI-USDT", "bidPrice": "0.00002460", "askPrice": "0.00002461", "time": 123}]},
+        {"code": 0, "data": [{"symbol": "FLOKI-USDT", "bidPrice": "0.00002460", "askPrice": "0.00002461", "time": 1234567890000}]},
     ]
     def fake_request(method, path, params, signed=True, **kwargs):
         calls.append(path)
@@ -2661,7 +2836,7 @@ def test_get_execution_quote_falls_back_to_depth(monkeypatch):
     responses = [
         {"code": 0, "data": {"symbol": "S-USDT", "bidPrice": "0", "askPrice": "0"}},
         {"code": 0, "data": {"symbol": "S-USDT", "bidPrice": "0", "askPrice": "0"}},
-        {"code": 0, "data": {"bids": [["0.02690", "10"]], "asks": [["0.02691", "11"]], "T": 456}},
+        {"code": 0, "data": {"bids": [["0.02690", "10"]], "asks": [["0.02691", "11"]], "T": 1234567890000}},
     ]
     def fake_request(method, path, params, signed=True, **kwargs):
         calls.append(path)

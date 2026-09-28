@@ -140,23 +140,31 @@ This does not delete the older records: they remain in the timestamped external 
 
 ## 7. Git policy for runtime data
 
-The entire `data/` directory is runtime/research state and is intentionally **not tracked by Git**. Retention still compacts it locally and creates an external byte-faithful archive. This prevents GitHub's 100 MiB object limit from ever becoming a deployment blocker while preserving the full audit dataset outside Git. GitHub recommends storing programmatically generated files outside Git; files over 100 MiB are blocked in regular Git repositories.
+The engine uses a **split runtime-data policy**. Persistent engine/reconciliation state is intentionally tracked by Git so consecutive GitHub Actions VST cycles can restore state from the previous run. The unbounded or purely ephemeral artifacts stay ignored:
 
-The working `data/` directory must remain on the live machine. Do not run `git clean -fd` against it.
+- `data/scan_history.jsonl` and its rotated variants;
+- `data/zone_engine_diagnostic.log`;
+- `data/retention_archive/`;
+- Python caches, locks and temporary files via the repository-wide ignore rules.
 
-After retention has been applied, verify that no runtime data is staged:
+The persistent `data/` state remains subject to the 90 MB pre-commit guard. Retention creates byte-faithful external snapshots under `data/retention_archive/` before compaction, and that archive is deliberately **not committed**.
+
+This policy is required for the GitHub Actions workflow: every run starts from a fresh runner, so persistent state must survive through the repository between runs. A clean source release still contains no runtime `data/`; the directory is created on the first run.
+
+Verify the policy before pushing:
 
 ```bash
 git status --short
 git diff --cached --name-only
 git ls-files data/
+git check-ignore -v data/scan_history.jsonl data/zone_engine_diagnostic.log data/retention_archive/example.gz
 ```
 
-`git ls-files data/` should return only `data/.gitkeep` (or nothing if the directory is not needed in the repository).
+`git ls-files data/` should list persistent state files after a runtime cycle, while the explicitly ignored artifacts above should never be staged.
 
 ### Rebuild the unpushed local history safely
 
-Because rejected local commits may already contain >100 MiB blobs, merely adding a later cleanup commit is insufficient. Rebuild the local, not-yet-pushed history from `origin/main` while keeping the current working tree and live data intact:
+Because rejected local commits may already contain >100 MiB blobs, merely adding a later cleanup commit is insufficient for those oversized histories. Rebuild the local, not-yet-pushed history from `origin/main` while keeping the current working tree and live data intact:
 
 ```bash
 git fetch origin

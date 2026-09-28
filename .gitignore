@@ -4,5 +4,10 @@ __pycache__/
 *.tmp
 *.log
 
+# Runtime state is intentionally persisted by the GitHub Actions workflow so
+# consecutive VST cycles restore the engine/reconciliation state.  Only
+# unbounded or ephemeral runtime artifacts stay outside Git.
 data/scan_history.jsonl
+data/scan_history.jsonl.*
 data/zone_engine_diagnostic.log
+data/retention_archive/

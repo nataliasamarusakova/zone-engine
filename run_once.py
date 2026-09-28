@@ -41,9 +41,10 @@ from event_engine.bingx import (
     wait_for_position_fill_directional,
 )
 from event_engine.signals import STRATEGY_VERSION, SWING_LEN, TP1_PCT, TP2_PCT, generate_zone_signals, score_zone_signal, _nearest_opposing_level, _signal_forensics
+from event_engine.version import ENGINE_VERSION
 from event_engine.fundamental_assets import FUNDAMENTAL_ASSET_SYMBOLS
 from event_engine.telegram import format_signal, send as send_tg
-from event_engine.tracker import register_active_trade, update_active_trades, update_active_trade_protection
+from event_engine.tracker import register_active_trade, update_active_trades, update_active_trade_protection, has_active_trade_conflict
 from event_engine import research, telemetry
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -1428,7 +1429,6 @@ def reconcile_all_open_positions() -> None:
         log.error("[RECON] positions fetch failed: %s", exc)
         return
 
-    # Protection repair is driven from actual entry price and a stored setup when available.
     active = _load_active_trades_file()
     for p in positions:
         if time.time() - started >= RECONCILIATION_MAX_SECONDS:
@@ -1441,21 +1441,47 @@ def reconcile_all_open_positions() -> None:
         avg = float(p.get("avgPrice", 0) or p.get("entryPrice", 0) or 0)
         if qty <= 0 or avg <= 0:
             continue
-        key = f"{symbol}:{side}"
-        trade = active.get(key)
-        stop_loss_pct = float((trade or {}).get("planned_risk_pct") or 1.0)
-        setup = (trade or {}).get("setup", {}) if isinstance(trade, dict) else {}
+
+        candidates = [
+            (event_id, trade) for event_id, trade in active.items()
+            if isinstance(trade, dict) and not trade.get("closed")
+            and str(trade.get("symbol", "")).upper().replace("-USDT", "").replace("-", "") == symbol.replace("-USDT", "").replace("-", "")
+            and str(trade.get("direction", "")).upper() == side
+        ]
+        if len(candidates) != 1:
+            owner_ids = [str(event_id) for event_id, _ in candidates]
+            status = "ORPHAN_POSITION" if not candidates else "STATE_CONFLICT"
+            message = (
+                f"exchange position {symbol}:{side} has no unique local owner"
+                if not candidates else
+                f"exchange position {symbol}:{side} has multiple local owners: {owner_ids}"
+            )
+            log.critical("[RECON_%s] %s qty=%s avg=%s owners=%s", status, message, qty, avg, owner_ids)
+            telemetry.record_position_reconciliation(
+                event_id=owner_ids[0] if len(owner_ids) == 1 else None,
+                attempt_id=None, position_id=None, symbol=symbol, direction=side,
+                status=status, internal_remaining_qty=None, exchange_position_qty=qty,
+                exchange_avg_price=avg, local_owner_event_ids=owner_ids,
+            )
+            if candidates:
+                telemetry.record_state_conflict(
+                    event_id=None, attempt_id=None, position_id=None, order_id=None,
+                    symbol=symbol, direction=side, conflict_type="MULTIPLE_LOCAL_POSITION_OWNERS",
+                    message=message, owner_event_ids=owner_ids,
+                )
+            continue
+
+        event_id, trade = candidates[0]
+        stop_loss_pct = float(trade.get("planned_risk_pct") or 1.0)
+        setup = trade.get("setup", {}) if isinstance(trade.get("setup"), dict) else {}
         tp_levels = setup.get("tp_levels") if isinstance(setup.get("tp_levels"), list) else None
         if not tp_levels:
-            risk_pct = max(stop_loss_pct, 0.05)
             tp_levels = [
                 {"leg": "tp1", "pnl_pct": TP1_PCT, "close_fraction": 0.50},
                 {"leg": "tp2", "pnl_pct": TP2_PCT, "close_fraction": 0.50},
             ]
 
-        # Never recreate a TP leg already confirmed as executed. After TP1 the
-        # remaining TP2 becomes 100% of the remaining position.
-        hit_legs = set((trade or {}).get("hit_legs", []))
+        hit_legs = set(trade.get("hit_legs", []))
         remaining_levels = [x for x in tp_levels if str(x.get("leg", "")) not in hit_legs]
         if remaining_levels:
             share = 1.0 / len(remaining_levels)
@@ -1467,12 +1493,25 @@ def reconcile_all_open_positions() -> None:
             tp_levels = []
 
         try:
-            result = ensure_directional_protection(symbol, side, avg, qty, stop_loss_pct, tp_levels, trade_id=(trade or {}).get("event_id") or key)
+            result = ensure_directional_protection(
+                symbol, side, avg, qty, stop_loss_pct, tp_levels, trade_id=str(event_id)
+            )
             if result.get("status") in {"PROTECTED", "SL_ONLY"}:
-                if trade:
-                    update_active_trade_protection(symbol, side, result.get("tp_orders", []), result.get("sl_result", {}), result.get("effective_tp_levels", []), result.get("tp_mode"), result.get("effective_weighted_rr"))
+                updated = update_active_trade_protection(
+                    symbol, side, result.get("tp_orders", []), result.get("sl_result", {}),
+                    result.get("effective_tp_levels", []), result.get("tp_mode"),
+                    result.get("effective_weighted_rr"), event_id=str(event_id),
+                )
+                if not updated:
+                    telemetry.record_state_conflict(
+                        event_id=str(event_id), attempt_id=trade.get("attempt_id"),
+                        position_id=trade.get("position_id") or str(event_id), order_id=None,
+                        symbol=symbol, direction=side, conflict_type="PROTECTION_UPDATE_OWNER_LOST",
+                        message="unique owner disappeared or no longer matched before protection state update",
+                        owner_event_ids=[str(event_id)],
+                    )
         except Exception as exc:
-            log.exception("[RECON] protection repair failed for %s %s: %s", symbol, side, exc)
+            log.exception("[RECON] protection repair failed for %s %s event=%s: %s", symbol, side, event_id, exc)
 
 
 def _load_active_trades_file() -> dict[str, dict]:
@@ -1483,21 +1522,23 @@ def _load_active_trades_file() -> dict[str, dict]:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
-    out = {}
+    out: dict[str, dict] = {}
     if isinstance(raw, dict):
-        for trade in raw.values():
+        for raw_event_id, trade in raw.items():
             if not isinstance(trade, dict) or trade.get("closed"):
                 continue
+            event_id = str(trade.get("event_id") or raw_event_id)
             sym = str(trade.get("symbol", "")).upper()
             side = str(trade.get("direction", "")).upper()
-            if sym and side:
-                out[f"{sym}:{side}"] = trade
+            if event_id and sym and side:
+                out[event_id] = trade
     return out
 
 
 def _build_setup(signal: dict[str, Any]) -> dict[str, Any]:
     risk_pct = float(signal["risk_pct"])
     return {
+        "engine_version": ENGINE_VERSION,
         "strategy": str(signal.get("strategy", "Demand/Supply Zone First")),
         "strategy_version": str(signal.get("strategy_version", STRATEGY_VERSION)),
         "entry_rule": str((signal.get("trigger") or {}).get("zone_entry_rule", "fresh_midpoint_touch")),
@@ -1850,6 +1891,20 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         log.warning("[EXEC_SKIPPED] %s %s | invalid_setup | %s", symbol, direction, reason)
         _append_execution_ledger(event_id, signal.get("attempt_id"), "SETUP_REJECTED", {"status": "skipped_invalid_setup", "error": reason})
         return {"status": "skipped_invalid_setup", "error": reason, "symbol": symbol, "direction": direction}
+
+    # Local ownership invariant: the engine must never create a second active
+    # local owner for the same exchange position identity, even when exchange
+    # position polling temporarily reports flat/stale state.
+    if has_active_trade_conflict(symbol, direction, exclude_event_id=event_id):
+        conflict = "local_active_trade_conflict"
+        log.error("[EXEC_BLOCKED_LOCAL_OWNER] %s %s | event=%s | %s", symbol, direction, event_id, conflict)
+        _append_execution_ledger(event_id, signal.get("attempt_id"), "LOCAL_OWNER_CONFLICT", {"status": "blocked_local_owner_conflict", "error": conflict})
+        telemetry.record_state_conflict(
+            event_id=event_id, attempt_id=signal.get("attempt_id"), position_id=None, order_id=None,
+            symbol=symbol, direction=direction, conflict_type="LOCAL_ACTIVE_TRADE_DUPLICATE",
+            message=conflict,
+        )
+        return {"status": "blocked_local_owner_conflict", "symbol": symbol, "direction": direction, "error": conflict}
 
     # Do not open first and discover that the trigger-order endpoint is unavailable.
     # BingX can temporarily disable this endpoint under its trigger-frequency rule;
@@ -2383,7 +2438,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
 
     _append_execution_ledger(event_id, signal.get("attempt_id"), "PROTECTED_POSITION", {"fill_price": avg_price, "sl_price": sl_price, "tp1_price": tp1_price, "tp2_price": tp2_price, "risk_pct": actual_risk_pct, "planned_weighted_rr": setup["planned_weighted_rr"]})
 
-    register_active_trade(
+    registered = register_active_trade(
         event_id=event_id,
         symbol=symbol,
         name=symbol,
@@ -2398,6 +2453,20 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         setup={**setup, "protection_status": protection.get("status"), "protection_result": protection},
         requested_entry_price=entry_price,
     )
+    if registered is False:
+        log.critical("[SAFETY_CLOSE] %s %s | active-trade ownership registration failed after protected entry; rolling back", symbol, direction)
+        cleanup = _cancel_engine_protection_before_emergency_close(symbol, direction)
+        close_result = _emergency_close_and_verify(symbol, direction, qty, event_id)
+        return {
+            "status": "opened_then_emergency_closed",
+            "error": "active_trade_registration_failed",
+            "order": order,
+            "position": position,
+            "protection": protection,
+            "protection_cleanup": cleanup,
+            "close": close_result,
+            "executed_signal": actual_signal,
+        }
 
     return {
         "status": "opened_protected",

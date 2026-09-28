@@ -84,7 +84,7 @@ Run once before the commit/push. The command does not connect to BingX and does 
 - Pending research observations, active-trade references, and trade/decision-linked audit records are preserved.
 - Position reconciliation compaction preserves active positions, anomalies, terminal records, and the latest healthy FOUND snapshot for old closed positions.
 - After staging, `--check-staged` fails closed if any `data/` file is still at or above 90 MB; the commit step is skipped in that case.
-- `data/` remains tracked in Git; only scan-history and diagnostic log files remain ignored.
+- Persistent runtime state under `data/` is tracked in Git so consecutive GitHub Actions cycles restore state; only unbounded scan history, diagnostic logs and `data/retention_archive/` remain ignored.
 
 ## Step 7 — Research forward performance hardening
 - Optimized `research_forward.py` to avoid per-observation DataFrame copies, boolean rescans and `iterrows()` loops.
@@ -121,3 +121,39 @@ Run once before the commit/push. The command does not connect to BingX and does 
 - `data_retention.py` may archive old `zone_observations.jsonl` rows across all event types; the raw source remains recoverable from a verified pre-compaction snapshot.
 - Large pruned deltas are chunked using the same 50 MB raw-byte safety boundary as source snapshots.
 - Retention remains fail-safe if the remaining working window itself cannot fit under the 90 MB guard.
+
+# v5.48 — state ownership, protection correctness and quote provenance hardening
+
+## Step 10 — Local state ownership
+- `active_trades.json` is keyed by `event_id`; an active `event_id` cannot be silently overwritten.
+- A second live local owner for the same `(symbol, direction)` is rejected and produces `LOCAL_ACTIVE_TRADE_DUPLICATE` / `STATE_CONFLICT` telemetry.
+- Protection updates require an unambiguous `event_id` owner and verify symbol/direction consistency.
+- Exchange order IDs are checked for duplicate ownership both within a protection payload and across active events, including TP/SL/BE/exit lifecycle IDs.
+
+## Step 11 — Protection correctness
+- `FILLED` TP status no longer implies `TP_HIT` by itself.
+- TP fills are checked against entry direction; materially adverse-side fills are classified as `ANOMALOUS_ADVERSE_TP_FILL` and cannot activate BE.
+- BE adoption now refuses an existing stop already owned by another active event before cancelling the current trade's old SL.
+- A newly created BE order is checked for cross-event order-id ownership before the old SL is cancelled.
+
+## Step 12 — Quote provenance
+- Execution quote telemetry records exchange timestamp, local observation timestamp, local age, exchange age and freshness source.
+- Current BingX `bookTicker` documentation exposes bid/ask but does not guarantee a quote timestamp; therefore `EXECUTION_REQUIRE_EXCHANGE_TIMESTAMP=true` is an explicit hardening mode rather than the default.
+- Default execution remains protected by local observation age and preserves exchange age whenever BingX supplies it; no silent cross-venue or candle-close quote fallback was introduced.
+
+## Final validation
+- `test_all.py`: 189 passed.
+- `test_data_retention_git_policy.py`: 8 passed.
+- `test_pine_sr_diagnostic.py`: 4 passed.
+- `test_research_layer.py`: 60 passed.
+- Total: **261 passed**.
+- `python -m compileall`: passed.
+- Release archive contains no runtime `data/`, Python caches, pytest cache, logs or prior audit artifacts.
+
+
+# v5.48.1 — VST state persistence policy
+
+- Fixed the GitHub Actions persistence policy: persistent engine/reconciliation state under `data/` is now Git-trackable between VST runs.
+- Kept `data/scan_history.jsonl`, rotated scan-history files, `data/zone_engine_diagnostic.log`, and `data/retention_archive/` ignored so unbounded/ephemeral artifacts are never committed.
+- Added an integration regression test covering clean checkout → first run state creation → commit/push staging → second clean checkout → state restoration.
+- No trading, signal, sizing, SL, TP, BE, protection ownership or quote-provenance logic changed in this step.
