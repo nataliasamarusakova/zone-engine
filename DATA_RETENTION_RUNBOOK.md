@@ -206,3 +206,7 @@ Do not delete `active_trades.json`, research cursors, research outcome state, tr
 ## 8. Production logging fix included in this release
 
 `TRACKER_TRADE_CLOSED` had a placeholder/argument mismatch that produced `TypeError: must be real number, not str` during otherwise successful trade-close logging. The format string now has the correct number and ordering of placeholders. This affects logging only; it does not change trade state or execution logic.
+
+### Counterfactual experiment journal
+
+`data/counterfactual_experiments.jsonl` is persistent audit telemetry. It contains observational experiment snapshots and matured counterfactual outcomes and is compacted with a 90-day working window while references linked to active/trade state are protected.

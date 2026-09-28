@@ -22,7 +22,7 @@ import pytest
 @pytest.fixture(autouse=True)
 def _isolate_runtime_state(monkeypatch, tmp_path):
     """Tests must never read/write the repository's production data/ files."""
-    from event_engine import analytics, tracker, telemetry
+    from event_engine import analytics, tracker, telemetry, research, data_retention
     import run_once
 
     runtime_data = tmp_path / "data"
@@ -94,6 +94,27 @@ def _isolate_runtime_state(monkeypatch, tmp_path):
     monkeypatch.setattr(analytics, "SIGNALS_JSONL", runtime_data / "signal_history.jsonl")
     monkeypatch.setattr(analytics, "LATEST_SCAN_JSON", runtime_data / "latest_scan.json")
     monkeypatch.setattr(analytics, "LATEST_SCAN_TXT", runtime_data / "latest_scan.txt")
+
+    # Research and retention tests must also be isolated from repository data/.
+    research_paths = {
+        "DATA_DIR": runtime_data,
+        "ZONE_OBSERVATIONS_PATH": runtime_data / "zone_observations.jsonl",
+        "ENTRY_DECISIONS_PATH": runtime_data / "entry_decisions.jsonl",
+        "MARKET_BARS_1H_PATH": runtime_data / "market_bars_1h.jsonl",
+        "MARKET_BARS_5M_PATH": runtime_data / "market_bars_5m.jsonl",
+        "RESEARCH_BAR_CURSORS_PATH": runtime_data / "research_bar_cursors.json",
+        "RESEARCH_MANIFEST_PATH": runtime_data / "research_manifest.json",
+        "RESEARCH_ERRORS_PATH": runtime_data / "research_persistence_errors.jsonl",
+        "RESEARCH_OUTCOMES_PATH": runtime_data / "research_outcomes.jsonl",
+        "RESEARCH_OUTCOME_STATE_PATH": runtime_data / "research_outcome_state.json",
+        "COUNTERFACTUAL_EXPERIMENTS_PATH": runtime_data / "counterfactual_experiments.jsonl",
+        "MARKET_CONTEXT_PATH": runtime_data / "market_context.jsonl",
+        "ACCOUNT_CONTEXT_PATH": runtime_data / "account_context.jsonl",
+    }
+    for name, value in research_paths.items():
+        monkeypatch.setattr(research, name, value)
+    monkeypatch.setattr(data_retention, "DATA_DIR", runtime_data)
+    monkeypatch.setattr(data_retention, "REPO_RETENTION_ARCHIVE_ROOT", runtime_data / "retention_archive")
 
 
 def _candles(n: int = 100) -> pd.DataFrame:
@@ -340,6 +361,65 @@ def test_be_does_not_adopt_existing_stop_owned_by_other_event(monkeypatch, tmp_p
     assert result["status"] == "error"
     assert result["safety_action"] == "old_sl_kept"
     assert cancelled == []
+
+
+def test_register_active_trade_persists_code_commit_sha(tmp_path, monkeypatch):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", tmp_path / "active_trades.json")
+    setup = {"strategy_version": "v1", "code_commit_sha": "abc123", "attempt_id": "ATT_1"}
+    assert tracker.register_active_trade(
+        event_id="EVT_COMMIT", symbol="TEST-USDT", name="TEST-USDT", direction="LONG",
+        entry_price=100.0, qty=1.0, tp_orders=[], sl_result={"order_id": "SL1"},
+        event_type="TEST", setup=setup, requested_entry_price=100.0,
+    ) is True
+    state = tracker._load_active_trades()["EVT_COMMIT"]
+    assert state["code_commit_sha"] == "abc123"
+
+
+def test_backfill_active_trade_provenance_from_trade_open(tmp_path, monkeypatch):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", tmp_path / "active_trades.json")
+    monkeypatch.setattr(tracker, "TRADES_PATH", tmp_path / "trades.jsonl")
+    state = {"EVT_ACTIVE": {"event_id": "EVT_ACTIVE", "symbol": "AAA-USDT", "direction": "LONG", "closed": False}}
+    (tmp_path / "active_trades.json").write_text(json.dumps(state), encoding="utf-8")
+    (tmp_path / "trades.jsonl").write_text(json.dumps({"record_type":"TRADE_OPEN", "event_id":"EVT_ACTIVE", "code_commit_sha":"deadbeef"}) + "\n", encoding="utf-8")
+    loaded = tracker._load_active_trades()
+    assert tracker.backfill_active_trade_provenance(loaded) == 1
+    updated = json.loads((tmp_path / "active_trades.json").read_text(encoding="utf-8"))
+    assert updated["EVT_ACTIVE"]["code_commit_sha"] == "deadbeef"
+
+
+def test_reconciliation_status_distinguishes_quantity_mismatch():
+    from event_engine import tracker
+    assert tracker._reconciliation_status(10.0, 10.0, "FOUND") == "FOUND"
+    assert tracker._reconciliation_status(10.0, 9.0, "FOUND") == "FOUND_QTY_MISMATCH"
+    assert tracker._reconciliation_status(10.0, 9.0, "NOT_FOUND") == "NOT_FOUND"
+
+
+def test_weighted_rr_includes_realized_and_remaining_tp_legs():
+    from event_engine import tracker
+    trade = {
+        "initial_qty": 1828.0,
+        "remaining_qty": 914.0,
+        "planned_risk_pct": 10.0,
+        "realized_pnl_qty": 914.0,
+        "realized_pnl_weighted_sum": 914.0 * 3.2505478451424437,
+        "hit_legs": ["tp1"],
+        "tp_levels": [
+            {"leg": "tp1", "pnl_pct": 3.0, "close_fraction": 0.5},
+            {"leg": "tp2", "pnl_pct": 6.0, "close_fraction": 0.5},
+        ],
+    }
+    effective, realized, remaining = tracker._weighted_rr_snapshot(trade)
+    assert effective == pytest.approx((0.5 * (3.2505478451424437 / 10.0)) + (0.5 * (6.0 / 10.0)))
+    assert realized == pytest.approx(0.5 * (3.2505478451424437 / 10.0))
+    assert remaining == pytest.approx(0.6)
+
+
+def test_elapsed_unknown_and_invalid_are_not_encoded_as_zero():
+    import run_once
+    assert run_once._elapsed_seconds(None, None) is None
+    assert run_once._elapsed_seconds("bad", "2026-01-01T00:00:00Z") is None
 
 
 def test_register_active_trade_persists_research_snapshots(tmp_path, monkeypatch):
@@ -2050,6 +2130,22 @@ def test_position_keys_normalizes_one_way_both_by_position_amount():
         ("BBB-USDT", "SHORT"),
         ("DDD-USDT", "LONG"),
     }
+
+
+def test_reconcile_classifies_side_mismatch_and_orphan_local(monkeypatch):
+    import run_once
+    statuses = []
+    monkeypatch.setattr(run_once, "get_positions", lambda **kwargs: [
+        {"symbol": "AAA-USDT", "positionSide": "SHORT", "positionAmt": "1.0", "avgPrice": "100.0"},
+    ])
+    monkeypatch.setattr(run_once, "_load_active_trades_file", lambda: {
+        "EVT_LONG": {"event_id": "EVT_LONG", "symbol": "AAA-USDT", "direction": "LONG", "closed": False, "remaining_qty": 1.0},
+        "EVT_LOCAL": {"event_id": "EVT_LOCAL", "symbol": "BBB-USDT", "direction": "LONG", "closed": False, "remaining_qty": 2.0},
+    })
+    monkeypatch.setattr(run_once.telemetry, "record_position_reconciliation", lambda **kwargs: statuses.append(kwargs["status"]))
+    run_once.reconcile_all_open_positions()
+    assert "FOUND_SIDE_MISMATCH" in statuses
+    assert "ORPHAN_LOCAL_POSITION" in statuses
 
 
 def test_reconcile_does_not_mutate_orphan_position(monkeypatch):
@@ -3778,3 +3874,27 @@ def test_data_retention_archives_research_outcomes_and_reconciliation_without_lo
     with gzip.open(recon_snapshot, "rt", encoding="utf-8") as fh:
         restored_recon = [json.loads(line) for line in fh if line.strip()]
     assert len(restored_recon) == len(recon)
+
+
+def test_runtime_version_metadata_writes_current_provenance(tmp_path, monkeypatch):
+    import json
+    import run_once
+    monkeypatch.setattr(run_once, "DATA", tmp_path)
+    monkeypatch.setattr(run_once, "ENGINE_VERSION", "5.48.5")
+    monkeypatch.setattr(run_once, "STRATEGY_VERSION", "test-strategy")
+    monkeypatch.setattr(run_once, "CODE_COMMIT_SHA", "deadbeef")
+    run_once._write_runtime_version_metadata()
+    row = json.loads((tmp_path / "runtime_version.json").read_text(encoding="utf-8"))
+    assert row["engine_version"] == "5.48.5"
+    assert row["strategy_version"] == "test-strategy"
+    assert row["code_commit_sha"] == "deadbeef"
+
+
+def test_unknown_quote_age_policy_is_explicit(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.delenv("EXECUTION_UNKNOWN_QUOTE_AGE_POLICY", raising=False)
+    assert bingx._unknown_exchange_quote_age_policy() == "allow_with_local_age"
+    monkeypatch.setenv("EXECUTION_UNKNOWN_QUOTE_AGE_POLICY", "block")
+    assert bingx._unknown_exchange_quote_age_policy() == "block"
+    monkeypatch.setenv("EXECUTION_UNKNOWN_QUOTE_AGE_POLICY", "nonsense")
+    assert bingx._unknown_exchange_quote_age_policy() == "allow_with_local_age"

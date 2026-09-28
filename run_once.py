@@ -44,8 +44,8 @@ from event_engine.signals import STRATEGY_VERSION, SWING_LEN, TP1_PCT, TP2_PCT, 
 from event_engine.version import ENGINE_VERSION
 from event_engine.fundamental_assets import FUNDAMENTAL_ASSET_SYMBOLS
 from event_engine.telegram import format_signal, send as send_tg
-from event_engine.tracker import register_active_trade, update_active_trades, update_active_trade_protection, has_active_trade_conflict
-from event_engine import research, telemetry
+from event_engine.tracker import register_active_trade, update_active_trades, update_active_trade_protection, has_active_trade_conflict, backfill_active_trade_provenance
+from event_engine import research, telemetry, shadow
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("zone_engine")
@@ -319,6 +319,9 @@ def _record_entry_decision(
         "shadow_short_geometry_bad": shadow_geometry_bad,
         "shadow_short_body_to_range_gt": research.SHADOW_SHORT_BODY_TO_RANGE_GT,
         "shadow_short_lower_wick_lt": research.SHADOW_SHORT_LOWER_WICK_LT,
+        "counterfactual_experiment_version": shadow.SHADOW_EXPERIMENT_VERSION,
+        "counterfactual_applied": False,
+        "counterfactual_experiment_ids": sorted(list((signal.get("shadow_experiments") or {}).get("experiments", {}).keys())),
     }
     try:
         ok = research.record_entry_decision(payload, path=ENTRY_DECISIONS_PATH)
@@ -1450,12 +1453,23 @@ def reconcile_all_open_positions() -> None:
         ]
         if len(candidates) != 1:
             owner_ids = [str(event_id) for event_id, _ in candidates]
-            status = "ORPHAN_POSITION" if not candidates else "STATE_CONFLICT"
-            message = (
-                f"exchange position {symbol}:{side} has no unique local owner"
-                if not candidates else
-                f"exchange position {symbol}:{side} has multiple local owners: {owner_ids}"
-            )
+            same_symbol_other_side = [
+                (str(event_id), str(trade.get("direction", "")).upper())
+                for event_id, trade in active.items()
+                if isinstance(trade, dict) and not trade.get("closed")
+                and str(trade.get("symbol", "")).upper().replace("-USDT", "").replace("-", "") == symbol.replace("-USDT", "").replace("-", "")
+                and str(trade.get("direction", "")).upper() != side
+            ]
+            if not candidates and same_symbol_other_side:
+                status = "FOUND_SIDE_MISMATCH"
+                message = f"exchange position {symbol}:{side} conflicts with local owner direction(s): {same_symbol_other_side}"
+            else:
+                status = "ORPHAN_EXCHANGE_POSITION" if not candidates else "STATE_CONFLICT"
+                message = (
+                    f"exchange position {symbol}:{side} has no unique local owner"
+                    if not candidates else
+                    f"exchange position {symbol}:{side} has multiple local owners: {owner_ids}"
+                )
             log.critical("[RECON_%s] %s qty=%s avg=%s owners=%s", status, message, qty, avg, owner_ids)
             telemetry.record_position_reconciliation(
                 event_id=owner_ids[0] if len(owner_ids) == 1 else None,
@@ -1512,6 +1526,32 @@ def reconcile_all_open_positions() -> None:
                     )
         except Exception as exc:
             log.exception("[RECON] protection repair failed for %s %s event=%s: %s", symbol, side, event_id, exc)
+
+    # Second pass: local active trades missing from the exchange position snapshot.
+    exchange_keys = _position_keys(positions)
+    normalized_exchange_keys = {
+        (str(symbol).upper().replace("-USDT", "").replace("-", ""), str(direction).upper())
+        for symbol, direction in exchange_keys
+    }
+    for event_id, trade in active.items():
+        if not isinstance(trade, dict) or trade.get("closed"):
+            continue
+        symbol = str(trade.get("symbol", "")).upper()
+        direction = str(trade.get("direction", "")).upper()
+        norm_symbol = symbol.replace("-USDT", "").replace("-", "")
+        if not symbol or direction not in {"LONG", "SHORT"}:
+            continue
+        if (norm_symbol, direction) not in normalized_exchange_keys:
+            telemetry.record_position_reconciliation(
+                event_id=event_id, attempt_id=trade.get("attempt_id"), position_id=trade.get("position_id") or event_id,
+                symbol=symbol, direction=direction, status="ORPHAN_LOCAL_POSITION",
+                internal_remaining_qty=float(trade.get("remaining_qty", 0.0) or 0.0),
+                exchange_position_qty=0.0, exchange_avg_price=None,
+                local_tp_filled_qty=trade.get("tp_filled_qty") or {},
+                local_be_activated=bool(trade.get("be_activated")),
+                local_sl_order_id=(trade.get("sl_order") or {}).get("order_id") if isinstance(trade.get("sl_order"), dict) else None,
+                exchange_error=None, position_gone=True,
+            )
 
 
 def _load_active_trades_file() -> dict[str, dict]:
@@ -1862,11 +1902,26 @@ def _is_terminal_execution_failure(execution: dict[str, Any]) -> bool:
 
 
 def _elapsed_seconds(start_ts: Any, end_ts: Any) -> float | None:
+    """Return elapsed seconds only when both timestamps are valid and ordered.
+
+    Unknown timestamps remain unknown (None); negative durations are data-order
+    anomalies and are never silently coerced to zero.
+    """
     try:
-        a = pd.Timestamp(start_ts); b = pd.Timestamp(end_ts)
-        if a.tzinfo is None: a = a.tz_localize("UTC")
-        if b.tzinfo is None: b = b.tz_localize("UTC")
-        return max(0.0, (b - a).total_seconds())
+        if start_ts in (None, "") or end_ts in (None, ""):
+            return None
+        a = pd.Timestamp(start_ts)
+        b = pd.Timestamp(end_ts)
+        if pd.isna(a) or pd.isna(b):
+            return None
+        if a.tzinfo is None:
+            a = a.tz_localize("UTC")
+        if b.tzinfo is None:
+            b = b.tz_localize("UTC")
+        seconds = (b - a).total_seconds()
+        if not math.isfinite(float(seconds)) or seconds < 0:
+            return None
+        return float(seconds)
     except Exception:
         return None
 
@@ -2512,6 +2567,26 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         "executed_signal": actual_signal,
     }
 
+def _write_runtime_version_metadata() -> None:
+    """Persist current runtime/code provenance without rewriting historical records."""
+    path = DATA / "runtime_version.json"
+    payload = {
+        "schema_version": 1,
+        "record_type": "RUNTIME_VERSION",
+        "engine_version": ENGINE_VERSION,
+        "strategy_version": STRATEGY_VERSION,
+        "code_commit_sha": CODE_COMMIT_SHA,
+        "written_ts": int(time.time() * 1000),
+    }
+    try:
+        DATA.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception as exc:
+        log.warning("[VERSION_METADATA] write failed: %s", type(exc).__name__)
+
+
 def _send_signal(signal: dict[str, Any], execution: dict[str, Any] | None = None) -> None:
     # Entry notifications are sent only after a position is actually opened
     # and mandatory SL/TP protection has been verified.
@@ -2531,6 +2606,7 @@ def _send_signal(signal: dict[str, Any], execution: dict[str, Any] | None = None
 def main() -> None:
     started = time.time()
     DATA.mkdir(parents=True, exist_ok=True)
+    _write_runtime_version_metadata()
     scan_id = f"SCAN_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8].upper()}"
     _init_diagnostic_log()
     log.info(
@@ -2547,6 +2623,8 @@ def main() -> None:
             "require_directional_candle": REQUIRE_DIRECTIONAL_CANDLE, "require_structure_obstacle": REQUIRE_STRUCTURE_OBSTACLE,
             "max_trades_per_cycle": MAX_TRADES_PER_CYCLE, "max_open_positions": MAX_OPEN_POSITIONS, "max_entry_slippage_pct": MAX_ENTRY_SLIPPAGE_PCT,
             "execution_quote_max_age_sec": EXECUTION_QUOTE_MAX_AGE_SEC,
+            "execution_require_exchange_timestamp": os.environ.get("EXECUTION_REQUIRE_EXCHANGE_TIMESTAMP", "false"),
+            "execution_unknown_quote_age_policy": os.environ.get("EXECUTION_UNKNOWN_QUOTE_AGE_POLICY", "allow_with_local_age"),
             "research_rich_context_enabled": RESEARCH_RICH_CONTEXT_ENABLED,
             "research_defer_until_after_execution": RESEARCH_DEFER_UNTIL_AFTER_EXECUTION,
             "max_market_spread_pct": MAX_MARKET_SPREAD_PCT, "max_5m_trigger_age_minutes": MAX_5M_TRIGGER_AGE_MINUTES,
@@ -2569,6 +2647,12 @@ def main() -> None:
             log.error("[AUTH] BingX private preflight failed: %s; execution/reconciliation disabled for this run", exc)
             private_ready = False
         if private_ready:
+            try:
+                backfilled = backfill_active_trade_provenance()
+                if backfilled:
+                    log.info("[TRACKER_PROVENANCE] backfilled code_commit_sha for %d active trade(s)", backfilled)
+            except Exception as exc:
+                log.warning("[TRACKER_PROVENANCE] backfill failed: %s", exc)
             try:
                 update_active_trades()
             except Exception as exc:
@@ -2863,6 +2947,13 @@ def main() -> None:
                 bingx_price,
             ) if provider == "binance" else None
             for sig in recent:
+                try:
+                    # Immutable research-only snapshot. This never gates execution.
+                    sig["shadow_experiments"] = shadow.build_entry_snapshot(
+                        sig, df_5m=pd.DataFrame(trigger_bars_raw), df_1h=df, account_context=research_account_context
+                    )
+                except Exception as shadow_exc:
+                    log.warning("[SHADOW_TELEMETRY] %s | snapshot build failed: %s", _display_symbol(symbol), shadow_exc)
                 market_snapshot = sig.setdefault("market_snapshot", {})
                 trigger_ts = pd.Timestamp(sig.get("trigger_bar_time")) if sig.get("trigger_bar_time") else pd.Timestamp.now(tz="UTC")
                 market_snapshot.update({

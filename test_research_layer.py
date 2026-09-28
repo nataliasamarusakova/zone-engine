@@ -610,6 +610,37 @@ def test_fetch_research_account_snapshot_collects_read_only_fields_without_loggi
     assert "TEST_SECRET_SENTINEL" not in rendered
 
 
+def test_fetch_research_account_snapshot_falls_back_to_realized_pnl_income(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "get_credentials", lambda: ("TEST_PUBLIC_KEY", "TEST_SECRET"))
+
+    def fake_request(method, path, params=None, signed=True, **kwargs):
+        if path == bingx.BALANCE_PATH:
+            return {"code": 0, "data": [{"asset": "USDT", "balance": "100", "equity": "100", "realisedProfit": "0", "availableMargin": "90", "usedMargin": "10", "freezedMargin": "0"}]}
+        if path == bingx.ALL_FILL_ORDERS_PATH:
+            return {"code": 109500, "msg": "fills unavailable"}
+        if path == bingx.INCOME_PATH:
+            return {"code": 0, "data": [
+                {"symbol": "PUMP-USDT", "incomeType": "REALIZED_PNL", "income": "3.25", "asset": "USDT", "time": 1767225502000, "tranId": "I1", "tradeId": "T1"},
+                {"symbol": "PUMP-USDT", "incomeType": "TRADING_FEE", "income": "-0.02", "asset": "USDT", "time": 1767225503000, "tranId": "I2", "tradeId": "T1"},
+            ]}
+        if path == bingx.FORCE_ORDERS_PATH:
+            return {"code": 0, "data": []}
+        if path == bingx.POSITION_PATH:
+            return {"code": 0, "data": []}
+        if path == bingx.COMMISSION_RATE_PATH:
+            return {"code": 0, "data": {"commission": {"takerCommissionRate": "0.0005", "makerCommissionRate": "0.0002"}}}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(bingx, "_request", fake_request)
+    snap = bingx.fetch_research_account_snapshot()
+    assert snap["recent_fill_source"] == "INCOME_FALLBACK"
+    assert snap["recent_realized_pnl_source"] == "INCOME_REALIZED_PNL_FALLBACK"
+    assert snap["recent_realized_pnl_total"] == pytest.approx(3.25)
+    assert snap["recent_income_totals"]["REALIZED_PNL"] == pytest.approx(3.25)
+    assert any("fills:code=109500" in e for e in snap["errors"])
+
+
 def test_record_scan_symbol_persists_account_context_once_and_links_observation(tmp_path: Path, monkeypatch):
     for name in [
         "ZONE_OBSERVATIONS_PATH", "MARKET_BARS_1H_PATH", "MARKET_BARS_5M_PATH",
@@ -800,6 +831,8 @@ def test_elapsed_minutes_is_monotonic_and_utc_safe():
     import run_once
     assert run_once._elapsed_minutes("2026-01-01T00:00:00Z", "2026-01-01T00:05:30Z") == pytest.approx(5.5)
     assert run_once._elapsed_seconds("2026-01-01T00:00:00Z", "2026-01-01T00:00:01Z") == pytest.approx(1.0)
+    assert run_once._elapsed_seconds(None, "2026-01-01T00:00:01Z") is None
+    assert run_once._elapsed_seconds("2026-01-01T00:00:02Z", "2026-01-01T00:00:01Z") is None
 
 
 def test_shadow_context_exposes_buyer_maker_coverage():

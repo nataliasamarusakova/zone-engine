@@ -45,7 +45,7 @@ class _BarIndex:
 
 
 
-from event_engine import research
+from event_engine import research, shadow
 
 log = logging.getLogger("zone_engine.research_forward")
 
@@ -366,6 +366,12 @@ def _calculate_forward_outcome_indexed(observation: dict[str, Any], index: _BarI
     horizon_24_ns = obs_ns + int(24 * 60 * 60 * 1_000_000_000)
     result["forward_gap_count_24h"] = _path_gap_count_indexed(index, obs_ns, horizon_24_ns)
     result["forward_path_complete_24h"] = result["forward_gap_count_24h"] == 0 and last_close_ns >= horizon_24_ns
+    # Counterfactual experiments use only the persisted pre-entry snapshot plus
+    # future market bars. They never modify production trade outcomes.
+    try:
+        result["counterfactual_experiments"] = shadow.calculate_counterfactual_outcomes(observation, index.df)
+    except Exception as exc:
+        result["counterfactual_experiments"] = {"schema_version": shadow.SHADOW_SCHEMA_VERSION, "status": "ERROR", "error": f"{type(exc).__name__}: {exc}"}
 
     threshold_end = index.start_at_timestamp(horizon_24_ns)
     threshold_end = min(threshold_end, index.n)
@@ -382,6 +388,12 @@ def _calculate_forward_outcome_indexed(observation: dict[str, Any], index: _BarI
             result[f"time_to_plus_{threshold}pct_min"] = max(0.0, (hit_ts - obs_ns) / 60_000_000_000.0)
         else:
             result[f"time_to_plus_{threshold}pct_min"] = None
+    cf = result.get("counterfactual_experiments")
+    if isinstance(cf, dict):
+        for cf_id in ("CF_VOLUME_5M", "CF_VOLUME_1H"):
+            if isinstance(cf.get("experiments", {}).get(cf_id), dict):
+                cf["experiments"][cf_id]["forward_return_24h_pct"] = result.get("forward_return_1440m_pct")
+
     for threshold in ADVERSE_THRESHOLDS:
         target = reference * (1.0 - threshold / 100.0) if direction == "LONG" else reference * (1.0 + threshold / 100.0)
         arr = index.low if direction == "LONG" else index.high
@@ -703,6 +715,13 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
             unique_ready.append(row)
         if unique_ready:
             research._append_jsonl_locked(research.RESEARCH_OUTCOMES_PATH, unique_ready)
+            for outcome_row in unique_ready:
+                try:
+                    obs = next((o for o in observations if str(o.get("observation_id", "")) == str(outcome_row.get("observation_id", ""))), None)
+                    if obs is not None:
+                        research.record_counterfactual_outcome(observation=obs, outcomes=outcome_row.get("counterfactual_experiments") or {}, outcome_id=str(outcome_row.get("outcome_id") or ""))
+                except Exception as cf_exc:
+                    log.warning("[COUNTERFACTUAL_OUTCOME] event_id=%s error=%s", outcome_row.get("event_id"), cf_exc)
             processed.update(str(x["observation_id"]) for x in unique_ready if x.get("observation_id"))
             for x in unique_ready:
                 pending_now.pop(str(x.get("observation_id", "")), None)

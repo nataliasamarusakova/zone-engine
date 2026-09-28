@@ -1,3 +1,12 @@
+# v5.48.5 — Forensic correctness hardening
+
+- Isolate pytest runtime writes from production data/.
+- Preserve unknown quote age explicitly with a configurable VST-safe policy.
+- Return None for unknown/invalid elapsed durations instead of 0.0.
+- Correct weighted RR to include realized and remaining legs.
+- Add reconciliation statuses for side mismatch and orphan local/exchange positions.
+- Persist runtime version metadata without rewriting historical records.
+
 # Stepwise changes applied
 
 ## Step 1 — Execution telemetry (observational only)
@@ -157,3 +166,42 @@ Run once before the commit/push. The command does not connect to BingX and does 
 - Kept `data/scan_history.jsonl`, rotated scan-history files, `data/zone_engine_diagnostic.log`, and `data/retention_archive/` ignored so unbounded/ephemeral artifacts are never committed.
 - Added an integration regression test covering clean checkout → first run state creation → commit/push staging → second clean checkout → state restoration.
 - No trading, signal, sizing, SL, TP, BE, protection ownership or quote-provenance logic changed in this step.
+
+# v5.48.2 — telemetry/accounting correctness
+
+## Step 13 — Trade provenance persistence
+- Persisted `code_commit_sha` into `active_trades.json` from the immutable setup/TRADE_OPEN payload.
+- Added startup-only backfill for existing open trades with missing commit provenance, keyed by `event_id` and sourced only from `TRADE_OPEN` records.
+- No exchange/API mutation is performed by this migration.
+
+## Step 14 — Recent realized PnL fallback
+- `allFillOrders` remains the primary recent-fill source when available.
+- When the fill-history endpoint fails, recent realized PnL is explicitly recovered from BingX `REALIZED_PNL` income records.
+- Added explicit `recent_realized_pnl_source` and `recent_fill_source` telemetry so fallback values cannot be confused with fill-level data.
+- The original fill-endpoint error remains recorded for auditability.
+
+## Step 15 — Quantity reconciliation truthfulness
+- Position reconciliation now emits `FOUND_QTY_MISMATCH` when local and exchange quantities differ beyond configurable tolerance.
+- Default tolerances: relative `1e-9`, absolute `1e-8`.
+- The existing `FOUND` status remains reserved for quantity-consistent snapshots.
+
+## Validation
+- Full regression suite: 266 passed.
+- `python -m compileall`: passed.
+
+
+# v5.48.3 — Step 16: Shadow / Counterfactual Telemetry
+
+- Added `event_engine/shadow.py` with frozen experiment specifications and deterministic observational calculations.
+- Added persistent `COUNTERFACTUAL_SNAPSHOT` / `COUNTERFACTUAL_OUTCOME` records.
+- Added correct 5m/5m and 1h/1h volume baselines; the trigger bar is excluded from its own volume denominator.
+- Added structural-stop, 1.5R/3R target, delta, EMA200, ATR, session, zone-invalidation, cost, delayed-BE and ATR-trail shadow measurements.
+- Reused the existing market-bar research journal for future counterfactual path simulation.
+- Added retention handling for `counterfactual_experiments.jsonl` with a 90-day working window and active/trade-reference protection.
+- No shadow field can gate production execution; `applied=false` is written explicitly.
+
+## Validation
+- `test_shadow_telemetry.py`: 7 passed.
+- Existing suites: 266 passed.
+- Combined regression suite: **273 passed**.
+- `python -m compileall`: passed.
