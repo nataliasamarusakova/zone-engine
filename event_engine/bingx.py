@@ -607,7 +607,7 @@ def get_order(
 
     return {
         "status": "ok",
-        "order_id": str(order.get("orderId", order_id or "")),
+        "order_id": str(order.get("orderID") or order.get("orderId") or order_id or ""),
         "order_status": str(order.get("status", "")).upper(),
         "symbol": str(order.get("symbol", bx)).upper(),
         "side": str(order.get("side", "")).upper(),
@@ -621,6 +621,98 @@ def get_order(
         "time_ms": int(_num("time")) if _num("time") > 0 else None,
         "update_time_ms": int(_num("updateTime")) if _num("updateTime") > 0 else None,
     }
+
+
+def get_fill_orders(
+    symbol: str,
+    start_time_ms: int,
+    end_time_ms: int,
+    *,
+    order_id: str | int | None = None,
+    limit: int = 1000,
+) -> list[dict]:
+    """Return exchange-confirmed perpetual-swap fills in a time window.
+
+    Unlike an order-status response, fill history is actual execution evidence and
+    contains per-fill quantity/price/realized-PnL/fee fields.  The tracker uses this
+    endpoint only as a reconciliation path, never as an entry gate.
+    """
+    # Unit tests and offline tooling must not accidentally perform private I/O.
+    # Check credentials before contract resolution because to_bx_symbol() may itself
+    # refresh the contracts cache over the network.
+    if not credentials_available():
+        return []
+    bx = to_bx_symbol(symbol)
+    if not bx:
+        return []
+    start_ms = max(0, int(start_time_ms))
+    end_ms = max(start_ms, int(end_time_ms))
+    params: dict[str, Any] = {
+        "tradingUnit": "CONT",
+        "startTs": start_ms,
+        "endTs": end_ms,
+        "currency": "USDT",
+    }
+    if order_id not in (None, ""):
+        params["orderId"] = str(order_id)
+    resp = _request(
+        "GET",
+        ALL_FILL_ORDERS_PATH,
+        params,
+        signed=True,
+        timeout_sec=min(5.0, float(os.environ.get("FILL_HISTORY_TIMEOUT_SEC", "5"))),
+        retryable=False,
+    )
+    if not isinstance(resp, dict):
+        raise RuntimeError("allFillOrders returned invalid response")
+    try:
+        response_code = int(resp.get("code", -1))
+    except (TypeError, ValueError):
+        response_code = -1
+    if response_code != 0:
+        raise RuntimeError(f"allFillOrders failed: code={response_code} msg={resp.get('msg')}")
+    raw = resp.get("data")
+    if isinstance(raw, dict):
+        for key in ("rows", "list", "items", "data"):
+            if isinstance(raw.get(key), list):
+                raw = raw[key]
+                break
+    if not isinstance(raw, list):
+        return []
+
+    out: list[dict] = []
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        item: dict[str, Any] = {}
+        for src, dst in (
+            ("tradeId", "trade_id"),
+            ("orderId", "order_id"),
+            ("orderID", "order_id"),
+            ("symbol", "symbol"),
+            ("side", "side"),
+            ("positionSide", "position_side"),
+        ):
+            if row.get(src) not in (None, "") and dst not in item:
+                item[dst] = str(row.get(src))
+        for src, dst in (
+            ("price", "price"),
+            ("qty", "qty"),
+            ("realizedPnl", "realized_pnl"),
+            ("fee", "fee"),
+            ("time", "time_ms"),
+        ):
+            if row.get(src) in (None, ""):
+                continue
+            try:
+                val = float(row.get(src))
+                if dst == "time_ms":
+                    val = int(val)
+                item[dst] = val if math.isfinite(float(val)) else None
+            except (TypeError, ValueError):
+                item[dst] = None
+        out.append(item)
+    return out
 
 
 def cancel_order(symbol: str, order_id: str | int) -> dict:

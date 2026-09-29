@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import copy
 import json
+from contextlib import contextmanager
 import logging
 import math
 import os
+import shutil
 import time
 import uuid
 try:
@@ -19,6 +22,7 @@ from event_engine.bingx import (
     get_positions,
     get_order,
     get_all_orders,
+    get_fill_orders,
     get_open_protection_directional,
     cancel_order,
     fetch_klines,
@@ -47,6 +51,52 @@ DATA = PROJECT_ROOT / "data"
 ACTIVE_TRADES_PATH = DATA / "active_trades.json"
 TRADES_PATH = DATA / "trades.jsonl"
 ACTIONS_PATH = DATA / "actions.jsonl"
+DEFAULT_PLANNED_WEIGHTED_RR = 0.45
+
+_ACTIVE_TRADES_THREAD_LOCK = threading.RLock()
+
+
+@contextmanager
+def _active_trades_lock():
+    """Serialize active-state read/validate/mutate/write transactions across threads/processes."""
+    _ACTIVE_TRADES_THREAD_LOCK.acquire()
+    lockf = None
+    try:
+        ACTIVE_TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = ACTIVE_TRADES_PATH.with_suffix(ACTIVE_TRADES_PATH.suffix + ".lock")
+        lockf = lock_path.open("a+")
+        if fcntl is not None:
+            fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        if lockf is not None:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
+            finally:
+                lockf.close()
+        _ACTIVE_TRADES_THREAD_LOCK.release()
+
+
+class ActiveTradeStateCorrupt(RuntimeError):
+    """The persisted active-trade state cannot be trusted for trading decisions."""
+
+
+def _quarantine_state_copy(path: Path, reason: str) -> None:
+    """Copy, but never remove, a corrupt state file for forensic recovery."""
+    if not path.exists():
+        return
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    quarantine = path.with_name(f"{path.name}.quarantine.{stamp}")
+    suffix = 1
+    while quarantine.exists():
+        quarantine = path.with_name(f"{path.name}.quarantine.{stamp}.{suffix}")
+        suffix += 1
+    try:
+        shutil.copy2(path, quarantine)
+        log.critical("[TRACKER_STATE_CORRUPT] quarantined copy=%s reason=%s", quarantine, reason)
+    except Exception as exc:
+        log.critical("[TRACKER_STATE_CORRUPT] could not quarantine %s: %s", path, exc)
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -61,6 +111,43 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _optional_float(value: Any) -> float | None:
+    """Parse an exchange numeric field without converting unavailable data to zero."""
+    if value in (None, ""):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _all_present_numeric(rows: list[dict], key: str) -> bool:
+    return bool(rows) and all(_optional_float(row.get(key)) is not None for row in rows)
+
+
+def _adverse_exit_slippage_pct(direction: str, actual_fill: float, trigger_price: float) -> float | None:
+    """Return positive adverse stop/BE slippage; favorable fills are zero."""
+    actual = _safe_float(actual_fill, 0.0)
+    trigger = _safe_float(trigger_price, 0.0)
+    if actual <= 0 or trigger <= 0:
+        return None
+    raw = (actual - trigger) / trigger * 100.0
+    return max(0.0, -raw) if str(direction).upper() == "LONG" else max(0.0, raw)
+
+
+def _is_full_tp_close(position_gone: bool, realized_qty: float, initial_qty: float, hit_legs: set[str]) -> bool:
+    """A full TP close requires the whole initial quantity to be confirmed as realized."""
+    if not position_gone or not hit_legs:
+        return False
+    init = max(0.0, _safe_float(initial_qty, 0.0))
+    realized = max(0.0, _safe_float(realized_qty, 0.0))
+    if init <= 0:
+        return False
+    tolerance = max(1e-12, init * 1e-8)
+    return realized >= init - tolerance and realized <= init + tolerance
+
+
 def _load_active_trades() -> dict[str, dict]:
     if not ACTIVE_TRADES_PATH.exists():
         return {}
@@ -70,7 +157,9 @@ def _load_active_trades() -> dict[str, dict]:
             normalized = {}
             for event_id, trade in data.items():
                 if not isinstance(trade, dict):
-                    continue
+                    reason = f"event_id={event_id!r} has non-object trade state"
+                    _quarantine_state_copy(ACTIVE_TRADES_PATH, reason)
+                    raise ActiveTradeStateCorrupt(reason)
                 t = dict(trade)
                 t.setdefault("mae_pct", 0.0)
                 t.setdefault("max_drawdown_pct", 0.0)
@@ -88,33 +177,77 @@ def _load_active_trades() -> dict[str, dict]:
                 t.setdefault("tp_fill_classification", {})
                 t.setdefault("tp_mode", "single_tp" if len(t.get("tp_orders", [])) == 1 else "multi_tp")
                 t.setdefault("effective_tp_levels", t.get("tp_levels", []))
-                t.setdefault("effective_weighted_rr", t.get("planned_weighted_rr", 0.75))
+                t.setdefault("effective_weighted_rr", t.get("planned_weighted_rr", DEFAULT_PLANNED_WEIGHTED_RR))
                 t.setdefault("realized_weighted_rr", None)
                 t.setdefault("remaining_weighted_rr", None)
                 normalized[str(event_id)] = t
             return normalized
-        log.error("[TRACKER] Invalid state: %s is not a JSON object", ACTIVE_TRADES_PATH)
-        return {}
+        reason = f"state root is {type(data).__name__}, expected object"
+        _quarantine_state_copy(ACTIVE_TRADES_PATH, reason)
+        raise ActiveTradeStateCorrupt(reason)
     except Exception as exc:
         log.error("[TRACKER] Corrupt state in %s: %s", ACTIVE_TRADES_PATH, exc)
-        return {}
+        if isinstance(exc, ActiveTradeStateCorrupt):
+            raise
+        reason = f"{type(exc).__name__}: {exc}"
+        _quarantine_state_copy(ACTIVE_TRADES_PATH, reason)
+        raise ActiveTradeStateCorrupt(reason) from exc
+
+
+def _write_active_trades_unlocked(trades: dict[str, dict]) -> None:
+    """Atomically replace active state; caller must hold _active_trades_lock()."""
+    ACTIVE_TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = ACTIVE_TRADES_PATH.with_name(ACTIVE_TRADES_PATH.name + ".tmp")
+    payload = json.dumps(trades, ensure_ascii=False, indent=2, allow_nan=False)
+    with tmp_path.open("w", encoding="utf-8") as tf:
+        tf.write(payload)
+        tf.flush()
+        os.fsync(tf.fileno())
+    os.replace(tmp_path, ACTIVE_TRADES_PATH)
+    if hasattr(os, "O_DIRECTORY"):
+        try:
+            dir_fd = os.open(str(ACTIVE_TRADES_PATH.parent), os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
 
 
 def _save_active_trades(trades: dict[str, dict]) -> None:
     """Atomically persist active-trade state and serialize concurrent writers."""
-    ACTIVE_TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = ACTIVE_TRADES_PATH.with_name(ACTIVE_TRADES_PATH.name + ".tmp")
-    lock_path = ACTIVE_TRADES_PATH.with_suffix(ACTIVE_TRADES_PATH.suffix + ".lock")
-    payload = json.dumps(trades, ensure_ascii=False, indent=2)
-    with lock_path.open("a+") as lockf:
-        if fcntl is not None:
-            fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
-        try:
-            tmp_path.write_text(payload, encoding="utf-8")
-            os.replace(tmp_path, ACTIVE_TRADES_PATH)
-        finally:
-            if fcntl is not None:
-                fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
+    with _active_trades_lock():
+        _write_active_trades_unlocked(trades)
+
+
+def _save_active_trades_after_reconciliation(
+    original_trades: dict[str, dict],
+    updated_trades: dict[str, dict],
+) -> None:
+    """Apply reconciliation changes only when an event was not concurrently modified.
+
+    Reconciliation can take seconds.  Before persisting its snapshot, compare each
+    event with the exact state that reconciliation started from.  A concurrent run
+    that changed or closed the same event wins; the next cycle can reconcile it again.
+    This prevents both new-event loss and same-event stale-state clobbering.
+    """
+    with _active_trades_lock():
+        latest = _load_active_trades()
+        for raw_event_id, original in original_trades.items():
+            key = str(raw_event_id)
+            if key not in latest:
+                # Another process already removed/closed it. Never resurrect stale state.
+                continue
+            if latest[key] != original:
+                log.warning("[TRACKER_STATE_RACE] skip stale reconciliation write event=%s", key)
+                continue
+            if key in updated_trades:
+                latest[key] = updated_trades[key]
+            else:
+                # This event was closed successfully by this reconciliation cycle.
+                latest.pop(key, None)
+        _write_active_trades_unlocked(latest)
 
 
 def backfill_active_trade_provenance(trades: dict[str, dict] | None = None) -> int:
@@ -390,6 +523,24 @@ def update_active_trade_protection(
     *,
     event_id: str | None = None,
 ) -> bool:
+    with _active_trades_lock():
+        return _update_active_trade_protection_locked(
+            symbol, direction, tp_orders, sl_result, effective_tp_levels,
+            tp_mode, effective_weighted_rr, event_id=event_id,
+        )
+
+
+def _update_active_trade_protection_locked(
+    symbol: str,
+    direction: str,
+    tp_orders: list[dict],
+    sl_result: dict,
+    effective_tp_levels: list[dict] | None = None,
+    tp_mode: str | None = None,
+    effective_weighted_rr: float | None = None,
+    *,
+    event_id: str | None = None,
+) -> bool:
     trades = _load_active_trades()
     want_bx = _normalized_symbol(symbol)
     want_direction = str(direction).upper()
@@ -453,9 +604,9 @@ def update_active_trade_protection(
         trade["realized_weighted_rr"] = rr_realized
         trade["remaining_weighted_rr"] = rr_remaining
     elif effective_weighted_rr is not None:
-        trade["effective_weighted_rr"] = _safe_float(effective_weighted_rr, 0.75)
+        trade["effective_weighted_rr"] = _safe_float(effective_weighted_rr, DEFAULT_PLANNED_WEIGHTED_RR)
     trade["protection_last_updated_ts"] = int(time.time() * 1000)
-    _save_active_trades(trades)
+    _write_active_trades_unlocked(trades)
     return True
 
 
@@ -464,13 +615,13 @@ def _extract_setup_metrics(setup: dict | None) -> dict[str, Any]:
         return {
             "planned_risk_pct": None,
             "planned_target_rr": None,
-            "planned_weighted_rr": 0.75,
+            "planned_weighted_rr": DEFAULT_PLANNED_WEIGHTED_RR,
             "entry_reference": None,
             "invalidation_price": None,
             "target_price": None,
             "tp_levels": [],
             "effective_tp_levels": [],
-            "effective_weighted_rr": 0.75,
+            "effective_weighted_rr": DEFAULT_PLANNED_WEIGHTED_RR,
             "tp_mode": "multi_tp",
             "strategy_version": None,
             "code_commit_sha": None,
@@ -486,9 +637,9 @@ def _extract_setup_metrics(setup: dict | None) -> dict[str, Any]:
     return {
         "planned_risk_pct": _safe_float(setup.get("risk_pct"), 0.0) if setup.get("risk_pct") is not None else None,
         "planned_target_rr": _safe_float(setup.get("target_rr"), 0.0) if setup.get("target_rr") is not None else None,
-        "planned_weighted_rr": _safe_float(setup.get("planned_weighted_rr", 0.75), 0.75),
+        "planned_weighted_rr": _safe_float(setup.get("planned_weighted_rr", DEFAULT_PLANNED_WEIGHTED_RR), DEFAULT_PLANNED_WEIGHTED_RR),
         "effective_tp_levels": setup.get("effective_tp_levels") if isinstance(setup.get("effective_tp_levels"), list) else [],
-        "effective_weighted_rr": _safe_float(setup.get("effective_weighted_rr", setup.get("planned_weighted_rr", 0.75)), 0.75),
+        "effective_weighted_rr": _safe_float(setup.get("effective_weighted_rr", setup.get("planned_weighted_rr", DEFAULT_PLANNED_WEIGHTED_RR)), DEFAULT_PLANNED_WEIGHTED_RR),
         "tp_mode": str(setup.get("tp_mode", "multi_tp")),
         "strategy_version": str(setup.get("strategy_version", "")) or None,
         "code_commit_sha": str(setup.get("code_commit_sha", "")) or None,
@@ -506,6 +657,29 @@ def _extract_setup_metrics(setup: dict | None) -> dict[str, Any]:
 
 
 def register_active_trade(
+    event_id: str,
+    symbol: str,
+    name: str,
+    direction: str,
+    entry_price: float,
+    qty: float,
+    tp_orders: list[dict],
+    sl_result: dict,
+    event_type: str,
+    timeframe: str | None = None,
+    score: float = 50.0,
+    setup: dict | None = None,
+    requested_entry_price: float | None = None,
+    entry_ts_ms: int | None = None,
+) -> bool:
+    with _active_trades_lock():
+        return _register_active_trade_locked(
+            event_id, symbol, name, direction, entry_price, qty, tp_orders, sl_result,
+            event_type, timeframe, score, setup, requested_entry_price, entry_ts_ms,
+        )
+
+
+def _register_active_trade_locked(
     event_id: str,
     symbol: str,
     name: str,
@@ -558,7 +732,15 @@ def register_active_trade(
         return False
 
     setup_metrics = _extract_setup_metrics(setup)
-    research: dict[str, Any] = {"source": "BingX 1H demand_supply zone engine"}
+    signal_snapshot = setup_metrics.get("signal_snapshot") if isinstance(setup_metrics.get("signal_snapshot"), dict) else {}
+    signal_source = signal_snapshot.get("market_snapshot", {}) if isinstance(signal_snapshot.get("market_snapshot"), dict) else {}
+    setup_source = (setup or {}) if isinstance(setup, dict) else {}
+    research_source = setup_source.get("analysis_source") or signal_source.get("analysis_source") or setup_source.get("market_source")
+    research: dict[str, Any] = {
+        "source": str(research_source or "runtime_market_data"),
+        "analysis_provider": signal_source.get("analysis_provider"),
+        "analysis_source": signal_source.get("analysis_source"),
+    }
     if isinstance(setup, dict) and isinstance(setup.get("signal_forensics"), dict):
         research["signal_forensics"] = dict(setup.get("signal_forensics") or {})
 
@@ -713,7 +895,7 @@ def register_active_trade(
             log.error("[TRACKER_STATE_CONFLICT] order ownership conflict event=%s other=%s order_ids=%s", event_id, existing_event_id, overlap)
             return False
 
-    _save_active_trades(trades)
+    _write_active_trades_unlocked(trades)
     return True
 
 
@@ -1435,16 +1617,235 @@ def _update_mfe_mae(trade: dict, candles: list[dict]) -> None:
     trade["max_drawdown_pct"] = drawdown
 
 def _get_filled_order(symbol: str, order_id: str | None) -> dict | None:
+    info = _get_order_execution_evidence(symbol, order_id)
+    if not info:
+        return None
+    if info.get("status") != "ok" or str(info.get("order_status", "")).upper() != "FILLED":
+        return None
+    if _safe_float(info.get("executed_qty"), 0.0) <= 0 or _safe_float(info.get("avg_price"), 0.0) <= 0:
+        return None
+    return info
+
+
+def _get_order_execution_evidence(symbol: str, order_id: str | None, *, entry_ts: int | None = None) -> dict | None:
+    """Return order status enriched with actual fill-history evidence when needed.
+
+    A FILLED status with executedQty=0 is not enough evidence of execution.  In that
+    inconsistent case, query the exchange fill ledger by orderId and use actual fill
+    quantity/weighted price.  origQty is deliberately never treated as a fill.
+
+    Exchange financial fields are kept tri-state: a real zero is valid, while a missing
+    or unparseable fee/realizedPnl remains ``None`` and is never manufactured as zero.
+    """
     if not order_id:
         return None
     try:
         info = get_order(symbol, order_id)
     except Exception as exc:
         log.warning("[TRACKER] order query error for %s/%s: %s", symbol, order_id, exc)
-        return None
-    if info.get("status") != "ok" or str(info.get("order_status", "")).upper() != "FILLED":
-        return None
-    return info
+        info = {"status": "error", "error": str(exc)}
+
+    if not isinstance(info, dict):
+        info = {"status": "error", "error": "invalid order response"}
+
+    status = str(info.get("order_status", "")).upper()
+    executed_qty = max(0.0, _safe_float(info.get("executed_qty"), 0.0))
+    avg_price = max(0.0, _safe_float(info.get("avg_price"), 0.0))
+    if info.get("status") == "ok" and executed_qty > 0 and avg_price > 0:
+        info["execution_evidence_source"] = "ORDER_STATUS"
+        return info
+
+    if info.get("status") == "error":
+        # Preserve exchange/API errors for the caller's telemetry path.
+        return info
+    if status not in {"FILLED", "PARTIALLY_FILLED"}:
+        return info
+
+    now_ms = int(time.time() * 1000)
+    start_ms = max(0, int(entry_ts or info.get("time_ms") or now_ms) - 60_000)
+    end_ms = max(start_ms, now_ms + 60_000)
+    try:
+        fills = get_fill_orders(symbol, start_ms, end_ms, order_id=str(order_id), limit=1000)
+    except Exception as exc:
+        log.warning("[TRACKER] fill-history query error for %s/%s: %s", symbol, order_id, exc)
+        fills = []
+
+    fills = [f for f in fills if str(f.get("order_id", "")) == str(order_id)]
+    info["fill_history"] = fills
+    qty_complete = _all_present_numeric(fills, "qty")
+    price_complete = _all_present_numeric(fills, "price")
+    priced_fills = [(float(_optional_float(f.get("qty"))), float(_optional_float(f.get("price")))) for f in fills if _optional_float(f.get("qty")) is not None and _optional_float(f.get("price")) is not None]
+    total_qty = sum(q for q, _ in priced_fills)
+    priced_qty = sum(q * p for q, p in priced_fills)
+    weighted_price = priced_qty / total_qty if total_qty > 0 and qty_complete and price_complete else 0.0
+
+    if total_qty > 0 and weighted_price > 0:
+        info["executed_qty"] = total_qty
+        info["avg_price"] = weighted_price
+        info["execution_evidence_source"] = "ALL_FILL_ORDERS" if qty_complete and price_complete else "ALL_FILL_ORDERS_PARTIAL"
+        if _all_present_numeric(fills, "realized_pnl"):
+            info["fill_realized_pnl_abs"] = sum(float(_optional_float(f.get("realized_pnl"))) for f in fills)
+            info["fill_realized_pnl_status"] = "CONFIRMED"
+        else:
+            info["fill_realized_pnl_abs"] = None
+            info["fill_realized_pnl_status"] = "UNAVAILABLE_MISSING_FIELD"
+        if _all_present_numeric(fills, "fee"):
+            info["fill_fee_raw"] = sum(float(_optional_float(f.get("fee"))) for f in fills)
+            info["fill_fee_status"] = "CONFIRMED"
+        else:
+            info["fill_fee_raw"] = None
+            info["fill_fee_status"] = "UNAVAILABLE_MISSING_FIELD"
+        info["fill_trade_ids"] = [str(f.get("trade_id")) for f in fills if f.get("trade_id")]
+        return info
+
+    # Keep the order response intact, but do not manufacture execution from origQty.
+    info["execution_evidence_source"] = "UNVERIFIED"
+    info["fill_realized_pnl_abs"] = None
+    info["fill_fee_raw"] = None
+    info["fill_realized_pnl_status"] = "UNAVAILABLE"
+    info["fill_fee_status"] = "UNAVAILABLE"
+    return info if info.get("status") == "ok" else None
+
+
+def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
+    """Collect exchange fill/fee evidence for one logical trade at close time.
+
+    The result intentionally separates:
+    * gross price PnL derived from confirmed entry/exit fills;
+    * exchange-reported realized PnL;
+    * signed fee total and fee cost;
+    * net PnL derived from gross price PnL + signed fees.
+
+    Missing exchange fields stay ``None``. They are never converted to zero.
+    """
+    symbol = str(trade.get("symbol", ""))
+    direction = _normalize_direction(trade.get("direction", ""))
+    entry_ts = int(_safe_float(trade.get("entry_ts"), 0.0))
+    order_roles: dict[str, str] = {}
+
+    entry_order = trade.get("entry_order") if isinstance(trade.get("entry_order"), dict) else {}
+    for key in ("order_id", "orderId", "orderID"):
+        if entry_order.get(key):
+            order_roles[str(entry_order[key])] = "ENTRY"
+
+    for tp in trade.get("tp_orders", []) if isinstance(trade.get("tp_orders"), list) else []:
+        if not isinstance(tp, dict):
+            continue
+        for key in ("order_id", "orderId", "orderID"):
+            if tp.get(key):
+                order_roles[str(tp[key])] = str(tp.get("leg") or "TP").upper()
+
+    sl_order = trade.get("sl_order") if isinstance(trade.get("sl_order"), dict) else {}
+    for key in ("order_id", "orderId", "orderID"):
+        if sl_order.get(key):
+            order_roles[str(sl_order[key])] = "SL"
+
+    if trade.get("be_order_id"):
+        order_roles[str(trade["be_order_id"])] = "BE_SL"
+    if trade.get("exit_order_id"):
+        order_roles[str(trade["exit_order_id"])] = order_roles.get(str(trade["exit_order_id"]), "EXIT")
+
+    base = {"fills": [], "order_ids": sorted(order_roles), "source": "ALL_FILL_ORDERS"}
+    if not symbol or not order_roles:
+        return {**base, "status": "NO_ORDER_IDS"}
+
+    try:
+        fills = get_fill_orders(
+            symbol,
+            max(0, entry_ts - 60_000),
+            max(entry_ts, now_ms) + 60_000,
+            limit=1000,
+        )
+    except Exception as exc:
+        return {**base, "status": "UNAVAILABLE", "error": f"{type(exc).__name__}:{exc}"}
+
+    relevant = [f for f in fills if str(f.get("order_id", "")) in order_roles]
+    if not relevant:
+        return {**base, "status": "NO_MATCHING_FILLS"}
+
+    for fill in relevant:
+        fill["role"] = order_roles.get(str(fill.get("order_id", "")), "UNKNOWN")
+
+    entry_fills = [f for f in relevant if f.get("role") == "ENTRY"]
+    exit_fills = [f for f in relevant if f.get("role") != "ENTRY"]
+    qty_complete = _all_present_numeric(relevant, "qty")
+    price_complete = _all_present_numeric(relevant, "price")
+    fee_complete = _all_present_numeric(relevant, "fee")
+    realized_complete = _all_present_numeric(relevant, "realized_pnl")
+    entry_qty_complete = _all_present_numeric(entry_fills, "qty")
+    entry_price_complete = _all_present_numeric(entry_fills, "price")
+    exit_qty_complete = _all_present_numeric(exit_fills, "qty")
+    exit_price_complete = _all_present_numeric(exit_fills, "price")
+
+    entry_qty = sum(float(_optional_float(f.get("qty"))) for f in entry_fills if _optional_float(f.get("qty")) is not None)
+    exit_qty = sum(float(_optional_float(f.get("qty"))) for f in exit_fills if _optional_float(f.get("qty")) is not None)
+    entry_vwap = None
+    if entry_qty_complete and entry_price_complete and entry_qty > 0:
+        entry_vwap = sum(float(_optional_float(f.get("qty"))) * float(_optional_float(f.get("price"))) for f in entry_fills) / entry_qty
+
+    gross_realized_pnl_abs = None
+    if entry_vwap is not None and exit_qty_complete and exit_price_complete and direction in {"LONG", "SHORT"}:
+        gross_realized_pnl_abs = 0.0
+        for fill in exit_fills:
+            q = float(_optional_float(fill.get("qty")))
+            px = float(_optional_float(fill.get("price")))
+            gross_realized_pnl_abs += (px - entry_vwap) * q if direction == "LONG" else (entry_vwap - px) * q
+
+    exchange_realized_pnl_abs = None
+    if realized_complete:
+        exchange_realized_pnl_abs = sum(float(_optional_float(f.get("realized_pnl"))) for f in relevant)
+
+    entry_fee_raw = None
+    exit_fee_raw = None
+    fee_raw_total = None
+    fees_paid_abs = None
+    if fee_complete:
+        entry_fee_raw = sum(float(_optional_float(f.get("fee"))) for f in entry_fills)
+        exit_fee_raw = sum(float(_optional_float(f.get("fee"))) for f in exit_fills)
+        fee_raw_total = entry_fee_raw + exit_fee_raw
+        fees_paid_abs = max(0.0, -fee_raw_total)
+
+    net_realized_pnl_abs = None
+    if gross_realized_pnl_abs is not None and fee_raw_total is not None:
+        net_realized_pnl_abs = gross_realized_pnl_abs + fee_raw_total
+
+    close_candidates = [
+        int(_optional_float(f.get("time_ms")))
+        for f in exit_fills
+        if _optional_float(f.get("time_ms")) is not None and int(_optional_float(f.get("time_ms"))) > 0
+    ]
+    status = "VERIFIED" if (exit_qty_complete and exit_price_complete) else "PARTIAL_ACCOUNTING"
+    quantity_tolerance = max(1e-12, abs(entry_qty) * 1e-8) if entry_qty > 0 else 1e-12
+    quantity_reconciliation = {
+        "status": "VERIFIED" if entry_qty > 0 and exit_qty >= entry_qty - quantity_tolerance else "PARTIAL_OR_UNVERIFIED",
+        "entry_qty": entry_qty if entry_qty_complete else None,
+        "confirmed_exit_qty": exit_qty if exit_qty_complete else None,
+        "difference_qty": (exit_qty - entry_qty) if entry_qty_complete and exit_qty_complete else None,
+        "tolerance": quantity_tolerance,
+    }
+    return {
+        "status": status,
+        "fills": relevant,
+        "order_ids": sorted(order_roles),
+        "entry_qty_confirmed": entry_qty if entry_qty_complete else None,
+        "confirmed_exit_qty": exit_qty if exit_qty_complete else None,
+        "entry_vwap_confirmed": entry_vwap,
+        "entry_fee_raw": entry_fee_raw,
+        "exit_fee_raw": exit_fee_raw,
+        "gross_realized_pnl_abs": gross_realized_pnl_abs,
+        "gross_realized_pnl_source": "CONFIRMED_FILL_PRICES" if gross_realized_pnl_abs is not None else "UNAVAILABLE",
+        "exchange_realized_pnl_abs": exchange_realized_pnl_abs,
+        "exchange_realized_pnl_source": "ALL_FILL_ORDERS" if exchange_realized_pnl_abs is not None else "UNAVAILABLE_MISSING_FIELD",
+        "fee_raw_total": fee_raw_total,
+        "fees_paid_abs": fees_paid_abs,
+        "fee_source": "ALL_FILL_ORDERS" if fee_raw_total is not None else "UNAVAILABLE_MISSING_FIELD",
+        "fees_status": "CONFIRMED" if fee_raw_total is not None else "UNAVAILABLE",
+        "net_realized_pnl_abs": net_realized_pnl_abs,
+        "net_realized_pnl_source": "CONFIRMED_FILL_PRICES_PLUS_SIGNED_FEES" if net_realized_pnl_abs is not None else "UNAVAILABLE",
+        "last_exit_fill_ts_ms": max(close_candidates) if close_candidates else None,
+        "quantity_reconciliation": quantity_reconciliation,
+        "source": "ALL_FILL_ORDERS",
+    }
 
 
 def _get_exit_from_sl(symbol: str, sl_order_id: str | None) -> tuple[float | None, str | None]:
@@ -1500,7 +1901,7 @@ def _reconcile_historical_exit_order(
             continue
         try:
             created = int(float(order.get("updateTime") or order.get("time") or order.get("createTime") or 0))
-            qty = abs(float(order.get("executedQty") or order.get("cumQty") or order.get("origQty") or order.get("quantity") or 0))
+            qty = abs(float(order.get("executedQty") or order.get("cumQty") or 0))
             px = float(order.get("avgPrice") or order.get("price") or order.get("stopPrice") or 0)
         except (TypeError, ValueError):
             continue
@@ -1576,6 +1977,7 @@ def update_active_trades() -> None:
     if not trades:
         return
 
+    original_trades = copy.deepcopy(trades)
     now_ms = int(time.time() * 1000)
     updated_trades: dict[str, dict] = {}
 
@@ -1689,7 +2091,7 @@ def update_active_trades() -> None:
                     continue
 
                 try:
-                    order_info = get_order(symbol, order_id)
+                    order_info = _get_order_execution_evidence(symbol, str(order_id), entry_ts=entry_ts)
                 except Exception as exc:
                     telemetry.record_exchange_error(
                         event_id=event_id,
@@ -1706,6 +2108,9 @@ def update_active_trades() -> None:
                         business_impact="TP_STATE_UNKNOWN",
                         leg=leg.upper(),
                     )
+                    continue
+
+                if order_info is None:
                     continue
 
                 if order_info.get("status") == "error":
@@ -1736,8 +2141,10 @@ def update_active_trades() -> None:
                 delta_qty = max(0.0, executed_qty - previous_qty)
 
                 if delta_qty <= 0:
-                    if order_status == "FILLED" and trade.get("tp_fill_classification", {}).get(leg) == "FAVORABLE_OR_TOLERATED_TP_FILL":
-                        hit_legs.add(leg)
+                    # A status=FILLED response with zero execution remains
+                    # unverified.  Do not infer a fill from origQty or from the
+                    # disappearance of the position; the fill-history fallback
+                    # above must provide real execution evidence first.
                     continue
 
                 exec_price = _safe_float(order_info.get("avg_price"), 0.0)
@@ -1802,6 +2209,10 @@ def update_active_trades() -> None:
                     "pnl_pct": pnl_tp,
                     "remaining_qty": rem_qty,
                     "classification": tp_classification,
+                    "execution_evidence_source": order_info.get("execution_evidence_source"),
+                    "fill_realized_pnl_abs": order_info.get("fill_realized_pnl_abs"),
+                    "fill_fee_raw": order_info.get("fill_fee_raw"),
+                    "fill_trade_ids": order_info.get("fill_trade_ids", []),
                 })
                 telemetry.record_protection_event(
                     event_id=event_id,
@@ -2009,14 +2420,15 @@ def update_active_trades() -> None:
                 position_gone=position_gone,
             )
 
-            closed_by_tp = rem_qty <= 1e-12 and realized_qty > 0 and position_gone
+            qty_tolerance = max(1e-12, init_qty * 1e-8)
+            closed_by_tp = _is_full_tp_close(position_gone, realized_qty, init_qty, hit_legs)
 
             if not position_gone and not closed_by_tp:
                 updated_trades[event_id] = trade
                 continue
 
             # Фиксация выхода и закрытие
-            duration_min = (now_ms - entry_ts) / 60000.0
+            duration_min = max(0.0, (now_ms - entry_ts) / 60000.0)
             exit_price = _safe_float(trade.get("last_tp_exec_price"), cur_price)
             sl_order = trade.get("sl_order", {}) if isinstance(trade.get("sl_order"), dict) else {}
             sl_order_id = sl_order.get("order_id")
@@ -2039,6 +2451,10 @@ def update_active_trades() -> None:
                 if hist_px is not None:
                     exit_price = hist_px
                     exit_reason = hist_reason or "MANUAL_CLOSE_RECONCILED"
+                    if historical_order:
+                        historical_order_id = historical_order.get("orderId") or historical_order.get("orderID")
+                        if historical_order_id:
+                            trade["exit_order_id"] = str(historical_order_id)
                 else:
                     exit_reason = "POSITION_CLOSED_UNVERIFIED"
             else:
@@ -2047,11 +2463,60 @@ def update_active_trades() -> None:
             if exit_price <= 0:
                 exit_price = cur_price
 
+            residual_exit_verified = not position_gone or residual_qty_before_position_disappeared <= 0
+            if sl_exit_price is not None or closed_by_tp:
+                residual_exit_verified = True
             if position_gone and residual_qty_before_position_disappeared > 0 and init_qty > 0:
-                residual_pnl = _calc_trade_pnl_pct(entry_price, exit_price, direction)
-                realized_weighted += residual_qty_before_position_disappeared * residual_pnl
-                realized_qty += residual_qty_before_position_disappeared
-                trade["remaining_qty"] = 0.0
+                if historical_order is not None or sl_exit_price is not None or closed_by_tp:
+                    residual_pnl = _calc_trade_pnl_pct(entry_price, exit_price, direction)
+                    realized_weighted += residual_qty_before_position_disappeared * residual_pnl
+                    realized_qty += residual_qty_before_position_disappeared
+                    trade["remaining_qty"] = 0.0
+                    residual_exit_verified = True
+                else:
+                    # Position disappearance is evidence that the position is no longer
+                    # open, but it is NOT evidence of which exit leg executed or at
+                    # which fill price. Keep the local accounting unmodified and mark
+                    # the close as unverified rather than manufacturing realized PnL.
+                    residual_exit_verified = False
+
+            # Reconcile actual exchange fills once more at close time.  This is
+            # diagnostic/accounting I/O only; it does not affect live entry logic.
+            fill_accounting = _collect_trade_fill_accounting(trade, now_ms)
+            trade["fill_accounting"] = fill_accounting
+            trade["entry_fee_raw"] = fill_accounting.get("entry_fee_raw")
+            trade["exit_fee_raw"] = fill_accounting.get("exit_fee_raw")
+            trade["fee_raw_total"] = fill_accounting.get("fee_raw_total")
+            trade["fees_paid_abs"] = fill_accounting.get("fees_paid_abs")
+            trade["exchange_realized_pnl_abs"] = fill_accounting.get("exchange_realized_pnl_abs")
+            trade["fee_source"] = fill_accounting.get("fee_source")
+            if fill_accounting.get("last_exit_fill_ts_ms"):
+                trade["exchange_close_ts"] = int(fill_accounting["last_exit_fill_ts_ms"])
+
+            accounting_diff_qty = realized_qty - init_qty
+            confirmed_exit_fill_qty = fill_accounting.get("confirmed_exit_qty")
+            close_fill_qty_verified = (
+                confirmed_exit_fill_qty is not None
+                and abs(float(confirmed_exit_fill_qty) - init_qty) <= qty_tolerance
+            )
+            if not residual_exit_verified:
+                accounting_status = "UNVERIFIED_RESIDUAL_EXIT"
+            elif close_fill_qty_verified and abs(accounting_diff_qty) <= qty_tolerance:
+                accounting_status = "VERIFIED"
+            elif realized_qty > 0:
+                accounting_status = "PARTIAL_REALIZED_QTY"
+            else:
+                accounting_status = "NO_CONFIRMED_REALIZED_QTY"
+            trade["realized_pnl_reconciliation"] = {
+                "status": accounting_status,
+                "initial_qty": init_qty,
+                "confirmed_realized_qty": realized_qty,
+                "confirmed_exit_fill_qty": confirmed_exit_fill_qty,
+                "difference_qty": accounting_diff_qty,
+                "exit_fill_difference_qty": (float(confirmed_exit_fill_qty) - init_qty) if confirmed_exit_fill_qty is not None else None,
+                "quantity_tolerance": qty_tolerance,
+                "weighted_pnl_pct": (realized_weighted / realized_qty) if realized_qty > 0 else None,
+            }
 
             final_pnl = (realized_weighted / init_qty) if (init_qty > 0 and realized_qty > 0) else current_pnl
             realized_pnl_source = (
@@ -2076,15 +2541,20 @@ def update_active_trades() -> None:
             exit_order_info = _get_filled_order(symbol, sl_order_id) if sl_order_id else None
             if exit_order_info:
                 actual_exit_fill = _safe_float(exit_order_info.get("avg_price"), 0.0)
-                trigger_px = _safe_float(exit_order_info.get("stop_price") or sl_order.get("stop_price"), 0.0)
+                trigger_px = _safe_float(
+                    exit_order_info.get("trigger_price")
+                    or exit_order_info.get("stop_price")
+                    or sl_order.get("trigger_price")
+                    or sl_order.get("stop_price"),
+                    0.0,
+                )
                 if actual_exit_fill > 0:
                     trade["exit_order_id"] = exit_order_info.get("order_id") or sl_order_id
                     trade["exit_order_avg_price"] = actual_exit_fill
                     trade["exit_order_trigger_price"] = trigger_px if trigger_px > 0 else None
                     if trigger_px > 0:
-                        raw_stop_slippage = (actual_exit_fill - trigger_px) / trigger_px * 100.0
-                        trade["exit_order_adverse_slippage_pct"] = (
-                            max(0.0, raw_stop_slippage) if direction == "LONG" else max(0.0, -raw_stop_slippage)
+                        trade["exit_order_adverse_slippage_pct"] = _adverse_exit_slippage_pct(
+                            direction, actual_exit_fill, trigger_px
                         )
                     if trade.get("be_activated"):
                         trade["be_order_id"] = trade.get("be_order_id") or sl_order_id
@@ -2092,9 +2562,8 @@ def update_active_trades() -> None:
                         trade["be_fill_price"] = actual_exit_fill
                         be_trigger_px = _safe_float(trade.get("be_trigger_price"), entry_price)
                         if be_trigger_px > 0:
-                            raw_be_slippage = (actual_exit_fill - be_trigger_px) / be_trigger_px * 100.0
-                            trade["be_execution_slippage_pct"] = (
-                                max(0.0, raw_be_slippage) if direction == "LONG" else max(0.0, -raw_be_slippage)
+                            trade["be_execution_slippage_pct"] = _adverse_exit_slippage_pct(
+                                direction, actual_exit_fill, be_trigger_px
                             )
 
             if trade.get("be_trigger_ts") and entry_ts:
@@ -2110,17 +2579,94 @@ def update_active_trades() -> None:
             trade["realized_pnl_source"] = realized_pnl_source
             trade["exit_price"] = exit_price
             trade["exit_reason"] = exit_reason
-            trade["closed_ts"] = now_ms
-            trade["duration_min"] = duration_min
-            trade["closed"] = True
+
+            # Canonical absolute accounting is fill-evidence based only.  An exchange
+            # position disappearing without an identified exit fill can still close
+            # the tracker state, but it cannot produce a canonical account PnL number.
+            canonical_net = (
+                fill_accounting.get("net_realized_pnl_abs")
+                if close_fill_qty_verified and residual_exit_verified
+                else None
+            )
+            trade["gross_realized_pnl_abs"] = (
+                fill_accounting.get("gross_realized_pnl_abs")
+                if close_fill_qty_verified and residual_exit_verified
+                else None
+            )
+            trade["gross_realized_pnl_source"] = (
+                fill_accounting.get("gross_realized_pnl_source")
+                if trade["gross_realized_pnl_abs"] is not None
+                else "UNAVAILABLE"
+            )
+            trade["exchange_realized_pnl_abs"] = (
+                fill_accounting.get("exchange_realized_pnl_abs")
+                if close_fill_qty_verified and residual_exit_verified
+                else None
+            )
+            trade["exchange_realized_pnl_source"] = (
+                fill_accounting.get("exchange_realized_pnl_source")
+                if trade["exchange_realized_pnl_abs"] is not None
+                else "UNAVAILABLE"
+            )
+            trade["fees_abs"] = (
+                fill_accounting.get("fees_paid_abs")
+                if fill_accounting.get("fee_raw_total") is not None and close_fill_qty_verified and residual_exit_verified
+                else None
+            )
+            trade["fees_source"] = fill_accounting.get("fee_source") if trade["fees_abs"] is not None else "UNAVAILABLE"
+            trade["net_realized_pnl_abs"] = canonical_net
+            trade["net_realized_pnl_source"] = (
+                fill_accounting.get("net_realized_pnl_source")
+                if canonical_net is not None
+                else "UNAVAILABLE"
+            )
+            trade["realized_pnl_abs"] = canonical_net
+            trade["realized_pnl_abs_source"] = "NET_CONFIRMED_FILL_ACCOUNTING" if canonical_net is not None else "UNAVAILABLE"
+            trade["realized_pnl_abs_status"] = "CONFIRMED" if canonical_net is not None else "UNAVAILABLE"
+
+            observed_closed_ts = now_ms
+            execution_close_candidates = []
+            if fill_accounting.get("last_exit_fill_ts_ms"):
+                execution_close_candidates.append(int(fill_accounting["last_exit_fill_ts_ms"]))
+            if exit_order_info and exit_order_info.get("update_time_ms"):
+                execution_close_candidates.append(int(exit_order_info["update_time_ms"]))
+            if historical_order:
+                hist_ts = historical_order.get("updateTime") or historical_order.get("time") or historical_order.get("createTime")
+                if _optional_float(hist_ts) is not None and int(_optional_float(hist_ts)) > 0:
+                    execution_close_candidates.append(int(_optional_float(hist_ts)))
+            execution_closed_ts = max(execution_close_candidates) if execution_close_candidates else None
+            trade["execution_close_ts"] = execution_closed_ts
+            trade["observed_closed_ts"] = observed_closed_ts
+            trade["close_timestamp_source"] = (
+                "EXCHANGE_FILL_TIME" if fill_accounting.get("last_exit_fill_ts_ms") else
+                "EXCHANGE_ORDER_UPDATE_TIME" if exit_order_info and exit_order_info.get("update_time_ms") else
+                "EXCHANGE_HISTORICAL_ORDER_TIME" if historical_order and execution_closed_ts else
+                "UNAVAILABLE"
+            )
+            # Keep the legacy field only when execution-time evidence exists. Never
+            # substitute local observation time into canonical close time.
+            trade["closed_ts"] = execution_closed_ts
+            trade["duration_min"] = (
+                max(0.0, (execution_closed_ts - entry_ts) / 60000.0)
+                if execution_closed_ts is not None else None
+            )
+            closed_ts = execution_closed_ts
+            trade["observed_duration_min"] = max(0.0, (observed_closed_ts - entry_ts) / 60000.0)
+            trade["observed_pnl_pct_estimate"] = (
+                _calc_trade_pnl_pct(entry_price, cur_price, direction)
+                if not residual_exit_verified else None
+            )
             emoji = "💚" if final_pnl >= 0.0 else "💔"
-            _append_trade_close_once({
+            close_record = {
                 "record_type": "TRADE_CLOSE",
                 "event_id": event_id,
                 "symbol": symbol,
                 "direction": direction,
                 "event_type": trade.get("event_type"),
-                "closed_ts": now_ms,
+                "closed_ts": closed_ts,
+                "execution_close_ts": trade.get("execution_close_ts"),
+                "observed_closed_ts": observed_closed_ts,
+                "close_timestamp_source": trade.get("close_timestamp_source"),
                 "exit_reason": exit_reason,
                 "outcome_category": _exit_outcome_category(exit_reason),
                 "entry_price": entry_price,
@@ -2147,7 +2693,9 @@ def update_active_trades() -> None:
                 "peak_pnl_pct": _safe_float(trade.get("peak_pnl_pct")),
                 "mae_pct": _safe_float(trade.get("mae_pct")),
                 "max_drawdown_pct": _safe_float(trade.get("max_drawdown_pct")),
-                "duration_min": duration_min,
+                "duration_min": trade.get("duration_min"),
+                "observed_duration_min": trade.get("observed_duration_min"),
+                "observed_pnl_pct_estimate": trade.get("observed_pnl_pct_estimate"),
                 "hit_legs": sorted(hit_legs),
                 "tp_filled_qty": filled_by_leg,
                 "be_activated": bool(trade.get("be_activated")),
@@ -2164,10 +2712,34 @@ def update_active_trades() -> None:
                 "exit_order_avg_price": trade.get("exit_order_avg_price"),
                 "exit_order_trigger_price": trade.get("exit_order_trigger_price"),
                 "exit_order_adverse_slippage_pct": trade.get("exit_order_adverse_slippage_pct"),
+                "fill_accounting": fill_accounting,
+                "realized_pnl_reconciliation": trade.get("realized_pnl_reconciliation"),
+                "entry_fee_raw": trade.get("entry_fee_raw"),
+                "exit_fee_raw": trade.get("exit_fee_raw"),
+                "fee_raw_total": trade.get("fee_raw_total"),
+                "fees_paid_abs": trade.get("fees_paid_abs"),
+                "fees_abs": trade.get("fees_abs"),
+                "fees_source": trade.get("fees_source"),
+                "gross_realized_pnl_abs": trade.get("gross_realized_pnl_abs"),
+                "gross_realized_pnl_source": trade.get("gross_realized_pnl_source"),
+                "exchange_realized_pnl_abs": trade.get("exchange_realized_pnl_abs"),
+                "exchange_realized_pnl_source": trade.get("exchange_realized_pnl_source"),
+                "net_realized_pnl_abs": trade.get("net_realized_pnl_abs"),
+                "net_realized_pnl_source": trade.get("net_realized_pnl_source"),
+                "realized_pnl_abs": trade.get("realized_pnl_abs"),
+                "realized_pnl_abs_source": trade.get("realized_pnl_abs_source"),
+                "realized_pnl_abs_status": trade.get("realized_pnl_abs_status"),
                 "research": trade.get("research", {}),
                 "setup": trade.get("setup", {}),
-                })
+            }
+            # Journal first.  If serialization or disk I/O fails, the trade remains
+            # open in local state and the next cycle can retry without losing the
+            # close event.  If another process already wrote the close, treating the
+            # idempotent duplicate as success is safe.
+            _append_trade_close_once(close_record)
+            trade["closed"] = True
 
+            duration_min = trade["duration_min"] if trade["duration_min"] is not None else trade["observed_duration_min"]
             log.info(_TRACKER_TRADE_CLOSED_LOG_FORMAT, emoji, trade.get("name", symbol), symbol, final_pnl, (f"{realized_rr:.3f}" if realized_rr is not None else "—"), planned_rr, exit_price, exit_reason, duration_min)
 
             _send_tracker_notification(
@@ -2209,4 +2781,4 @@ def update_active_trades() -> None:
             log.exception("[TRACKER] Fatal trade error for event %s: %s", event_id, exc)
             updated_trades[event_id] = trade
 
-    _save_active_trades(updated_trades)
+    _save_active_trades_after_reconciliation(original_trades, updated_trades)

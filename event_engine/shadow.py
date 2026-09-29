@@ -36,14 +36,38 @@ def _finite(value: Any) -> float | None:
 
 
 def _parse_ts(value: Any) -> pd.Timestamp | None:
+    """Parse ISO timestamps and numeric epoch values deterministically.
+
+    Numeric values in this project are epoch milliseconds (for example
+    ``origin_ts_ms``), while ISO strings may contain an explicit timezone.
+    ``pd.Timestamp(numeric)`` defaults to nanoseconds and silently produces
+    dates near 1970, so numeric input must use ``unit="ms"`` explicitly.
+    """
     if value is None:
         return None
     try:
-        ts = pd.Timestamp(value)
-        if ts.tzinfo is None:
-            ts = ts.tz_localize("UTC")
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            if not math.isfinite(float(value)):
+                return None
+            ts = pd.to_datetime(value, unit="ms", utc=True)
+        elif isinstance(value, str):
+            raw = value.strip()
+            if raw and raw.lstrip("+-").isdigit():
+                ts = pd.to_datetime(int(raw), unit="ms", utc=True)
+            else:
+                ts = pd.Timestamp(raw)
+                if ts.tzinfo is None:
+                    ts = ts.tz_localize("UTC")
+                else:
+                    ts = ts.tz_convert("UTC")
         else:
-            ts = ts.tz_convert("UTC")
+            ts = pd.Timestamp(value)
+            if ts.tzinfo is None:
+                ts = ts.tz_localize("UTC")
+            else:
+                ts = ts.tz_convert("UTC")
         return ts
     except Exception:
         return None
@@ -145,10 +169,16 @@ def build_entry_snapshot(
     df_5m: pd.DataFrame | None,
     df_1h: pd.DataFrame | None,
     account_context: dict[str, Any] | None = None,
+    decision_ts: Any | None = None,
 ) -> dict[str, Any]:
     direction = str(signal.get("type", "")).upper()
     entry = _finite(signal.get("entry"))
     entry_ts = _parse_ts(signal.get("trigger_bar_time") or signal.get("time"))
+    decision_ts_parsed = _parse_ts(decision_ts or signal.get("decision_ts") or signal.get("observation_ts"))
+    if decision_ts_parsed is None:
+        # Standalone/unit-test snapshots have no separate decision boundary;
+        # retain trigger-time semantics unless the caller supplies one explicitly.
+        decision_ts_parsed = entry_ts or pd.Timestamp.now(tz="UTC")
     zone = signal.get("zone") if isinstance(signal.get("zone"), dict) else {}
     top = _finite(zone.get("top"))
     bottom = _finite(zone.get("btm"))
@@ -205,7 +235,9 @@ def build_entry_snapshot(
     tp1_rr = entry + structural_risk_abs * TP1_R_MULT if direction == "LONG" and structural_risk_abs is not None else entry - structural_risk_abs * TP1_R_MULT if direction == "SHORT" and structural_risk_abs is not None else None
     tp2_rr = entry + structural_risk_abs * TP2_R_MULT if direction == "LONG" and structural_risk_abs is not None else entry - structural_risk_abs * TP2_R_MULT if direction == "SHORT" and structural_risk_abs is not None else None
 
-    session_hour = int(entry_ts.hour)
+    trigger_session_hour = int(entry_ts.hour)
+    decision_session_hour = int(decision_ts_parsed.hour)
+    session_hour = decision_session_hour
     asia_block_window = 0 <= session_hour < 6
     if asia_block_window:
         session = "ASIA_OFF_HOURS"
@@ -240,10 +272,11 @@ def build_entry_snapshot(
         for pos in account_context.get("positions") or []:
             if isinstance(pos, dict) and pos.get("symbol"):
                 open_symbols.append(str(pos["symbol"]).upper())
+    account_context_available = isinstance(account_context, dict)
     open_symbols = sorted(set(open_symbols))
 
-    taker_fee_rate = _finite((account_context or {}).get("taker_commission_rate")) if isinstance(account_context, dict) else None
-    maker_fee_rate = _finite((account_context or {}).get("maker_commission_rate")) if isinstance(account_context, dict) else None
+    taker_fee_rate = _finite((account_context or {}).get("taker_commission_rate")) if account_context_available else None
+    maker_fee_rate = _finite((account_context or {}).get("maker_commission_rate")) if account_context_available else None
     roundtrip_taker_fee_pct = taker_fee_rate * 2.0 * 100.0 if taker_fee_rate is not None else None
 
     production_sl = _finite(signal.get("sl"))
@@ -269,6 +302,8 @@ def build_entry_snapshot(
             "direction": direction,
             "entry": entry,
             "trigger_bar_time": entry_ts.isoformat(),
+            "decision_ts": decision_ts_parsed.isoformat(),
+            "counterfactual_path_start_ts": decision_ts_parsed.isoformat(),
             "source": "closed_5m_signal_bar",
         },
         "experiments": {
@@ -331,6 +366,15 @@ def build_entry_snapshot(
                 "version": 1,
                 "session_utc": session,
                 "utc_hour": session_hour,
+                "trigger_session_utc": (
+                    "ASIA_OFF_HOURS" if 0 <= trigger_session_hour < 6 else
+                    "LONDON" if 6 <= trigger_session_hour < 13 else
+                    "LONDON_NY_OVERLAP" if 13 <= trigger_session_hour < 16 else
+                    "NEW_YORK" if 16 <= trigger_session_hour < 24 else "UNKNOWN"
+                ),
+                "trigger_utc_hour": trigger_session_hour,
+                "decision_session_utc": session,
+                "decision_utc_hour": decision_session_hour,
                 "asia_block_window": "00:00<=UTC<06:00",
                 "asia_off_hours": asia_block_window,
                 "would_pass_if_asia_blocked": not asia_block_window,
@@ -349,7 +393,12 @@ def build_entry_snapshot(
                 "open_position_symbols": open_symbols,
                 "max_open_position_correlation": None,
                 "would_pass": None,
-                "status": "DEFERRED_TO_AUDIT_WITH_STORED_MARKET_BARS" if open_symbols else "NO_OPEN_PEERS",
+                "status": (
+                    "CONTEXT_UNAVAILABLE"
+                    if not account_context_available
+                    else "DEFERRED_TO_AUDIT_WITH_STORED_MARKET_BARS" if open_symbols
+                    else "NO_OPEN_PEERS"
+                ),
             },
             "CF_PRODUCTION_MANAGEMENT": {
                 "version": 1,
@@ -631,7 +680,11 @@ def calculate_counterfactual_outcomes(observation: dict[str, Any], bars: pd.Data
     shadow = ((observation.get("features") or {}).get("shadow_experiments") or {})
     direction = str(observation.get("direction", "")).upper()
     entry = _finite(observation.get("reference_price"))
-    source_ts = _parse_ts(observation.get("source_event_ts") or observation.get("observation_ts"))
+    source_ts = _parse_ts(
+        observation.get("counterfactual_path_start_ts")
+        or observation.get("observation_ts")
+        or observation.get("source_event_ts")
+    )
     if direction not in {"LONG", "SHORT"} or entry is None or entry <= 0 or source_ts is None or bars is None or bars.empty:
         return {"schema_version": SHADOW_SCHEMA_VERSION, "status": "INSUFFICIENT_INPUT"}
     x = bars.copy()
@@ -643,7 +696,7 @@ def calculate_counterfactual_outcomes(observation: dict[str, Any], bars: pd.Data
     for col in ("open", "high", "low", "close"):
         x[col] = pd.to_numeric(x[col], errors="coerce")
     x = x.dropna(subset=["timestamp", "close_time", "open", "high", "low", "close"]).sort_values("timestamp")
-    future = x.loc[x["close_time"] > source_ts].copy().reset_index(drop=True)
+    future = x.loc[(x["timestamp"] >= source_ts) & (x["close_time"] > source_ts)].copy().reset_index(drop=True)
     if future.empty:
         return {"schema_version": SHADOW_SCHEMA_VERSION, "status": "NO_FUTURE_PATH"}
 
@@ -662,21 +715,24 @@ def calculate_counterfactual_outcomes(observation: dict[str, Any], bars: pd.Data
                 "target_tp1": _simulate_single_exit(future, direction=direction, entry=entry, stop=structural_sl, target=tp1),
                 "target_tp2": _simulate_single_exit(future, direction=direction, entry=entry, stop=structural_sl, target=tp2),
             }
-        production = shadow.get("CF_PRODUCTION_MANAGEMENT") if isinstance(shadow, dict) else None
-        production_stop = _finite((production or {}).get("stop")) if isinstance(production, dict) else None
-        production_tp1 = _finite((production or {}).get("tp1")) if isinstance(production, dict) else None
-        production_tp2 = _finite((production or {}).get("tp2")) if isinstance(production, dict) else None
-        if production_stop is not None and production_tp1 is not None and production_tp2 is not None:
-            for bars_delay in DELAYED_BE_BARS:
-                out["experiments"][f"CF_DELAYED_BE_CURRENT_{bars_delay}BAR"] = _simulate_management_only(
-                    x, future, direction=direction, entry=entry, production_stop=production_stop,
-                    production_tp1=production_tp1, production_tp2=production_tp2, mode="DELAYED_BE", parameter=bars_delay,
-                )
-            for atr_mult in TRAIL_ATR_MULTIPLIERS:
-                out["experiments"][f"CF_TRAIL_CURRENT_{str(atr_mult).replace('.', '_')}ATR"] = _simulate_management_only(
-                    x, future, direction=direction, entry=entry, production_stop=production_stop,
-                    production_tp1=production_tp1, production_tp2=production_tp2, mode="TRAIL_ATR", parameter=atr_mult,
-                )
+
+    # These experiments intentionally model the production management baseline
+    # independently of structural-stop availability.
+    production = shadow.get("CF_PRODUCTION_MANAGEMENT") if isinstance(shadow, dict) else None
+    production_stop = _finite((production or {}).get("stop")) if isinstance(production, dict) else None
+    production_tp1 = _finite((production or {}).get("tp1")) if isinstance(production, dict) else None
+    production_tp2 = _finite((production or {}).get("tp2")) if isinstance(production, dict) else None
+    if production_stop is not None and production_tp1 is not None and production_tp2 is not None:
+        for bars_delay in DELAYED_BE_BARS:
+            out["experiments"][f"CF_DELAYED_BE_CURRENT_{bars_delay}BAR"] = _simulate_management_only(
+                x, future, direction=direction, entry=entry, production_stop=production_stop,
+                production_tp1=production_tp1, production_tp2=production_tp2, mode="DELAYED_BE", parameter=bars_delay,
+            )
+        for atr_mult in TRAIL_ATR_MULTIPLIERS:
+            out["experiments"][f"CF_TRAIL_CURRENT_{str(atr_mult).replace('.', '_')}ATR"] = _simulate_management_only(
+                x, future, direction=direction, entry=entry, production_stop=production_stop,
+                production_tp1=production_tp1, production_tp2=production_tp2, mode="TRAIL_ATR", parameter=atr_mult,
+            )
 
     filter_specs = {
         "CF_VOLUME_5M": "1.5",

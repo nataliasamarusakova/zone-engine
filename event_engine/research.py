@@ -1196,6 +1196,7 @@ def build_observation_from_touch_event(
         "direction": str(direction).upper(),
         "observation_ts": decision_ts or _now_iso(),
         "source_event_ts": ts,
+        "counterfactual_path_start_ts": decision_ts or _now_iso(),
         "reference_price": reference_price,
         "zone_id": zone_id_value,
         "zone_visit_id": zone_visit_id or event.get("zone_visit_id"),
@@ -1298,7 +1299,9 @@ def _observation_from_signal(
     })
     shadow_snapshot = signal.get("shadow_experiments")
     if not isinstance(shadow_snapshot, dict):
-        shadow_snapshot = shadow.build_entry_snapshot(signal, df_5m=df_5m, df_1h=df_1h, account_context=account_context)
+        shadow_snapshot = shadow.build_entry_snapshot(
+            signal, df_5m=df_5m, df_1h=df_1h, account_context=account_context, decision_ts=decision_ts
+        )
     features["shadow_experiments"] = shadow_snapshot
     event_id = str(signal.get("event_id", ""))
     zid = str(zone.get("zone_id", ""))
@@ -1320,6 +1323,7 @@ def _observation_from_signal(
         "direction": direction,
         "observation_ts": decision_ts or _now_iso(),
         "source_event_ts": ts,
+        "counterfactual_path_start_ts": decision_ts or _now_iso(),
         "reference_price": signal.get("entry"),
         "event_id": event_id,
         "zone_id": zid,
@@ -1502,7 +1506,7 @@ def record_scan_symbol(
             "source_event_reason": "zone_rearmed",
             "scan_id": scan_id, "strategy_version": strategy_version, "code_commit_sha": code_commit_sha,
             "provider": provider, "source": source, "market_context_id": (market_context or {}).get("context_id"), "account_context_id": (account_context or {}).get("account_context_id"),
-            "symbol": symbol.upper(), "direction": direction, "observation_ts": decision_ts, "source_event_ts": event.get("timestamp"),
+            "symbol": symbol.upper(), "direction": direction, "observation_ts": decision_ts, "source_event_ts": event.get("timestamp"), "counterfactual_path_start_ts": decision_ts,
             "reference_price": event.get("close"), "zone_id": zone.get("zone_id") or zone_key,
             "zone_visit_id": event.get("visit_id"), "zone": sanitize(zone), "entry_bar": sanitize(bar),
             "features": build_research_features(symbol=symbol, direction=direction, zone=zone, bar=bar, df_1h=df_1h, df_5m=closed_5m_df, decision_ts=decision_ts, market_context=market_context, btc_df_5m=btc_df_5m, btc_df_1h=btc_df_1h),
@@ -1530,7 +1534,7 @@ def record_scan_symbol(
             "source_event_reason": "closest_midpoint_without_touch",
             "scan_id": scan_id, "strategy_version": strategy_version, "code_commit_sha": code_commit_sha,
             "provider": provider, "source": source, "market_context_id": (market_context or {}).get("context_id"), "account_context_id": (account_context or {}).get("account_context_id"),
-            "symbol": symbol.upper(), "direction": direction, "observation_ts": decision_ts, "source_event_ts": ts,
+            "symbol": symbol.upper(), "direction": direction, "observation_ts": decision_ts, "source_event_ts": ts, "counterfactual_path_start_ts": decision_ts,
             "reference_price": bar.get("close"), "zone_id": zid,
             "zone_visit_id": (symbol_state.get("zones", {}).get(zone_key) or {}).get("visit_id"),
             "zone": sanitize(zone), "entry_bar": sanitize(bar),
@@ -1544,7 +1548,10 @@ def record_scan_symbol(
         try:
             snap = signal.get("shadow_experiments")
             if not isinstance(snap, dict):
-                snap = shadow.build_entry_snapshot(signal, df_5m=closed_5m_df, df_1h=df_1h, account_context=account_context)
+                snap = shadow.build_entry_snapshot(
+                    signal, df_5m=closed_5m_df, df_1h=df_1h,
+                    account_context=account_context, decision_ts=decision_ts
+                )
                 signal["shadow_experiments"] = snap
             record_counterfactual_snapshot(
                 event_id=str(signal.get("event_id", "")),
