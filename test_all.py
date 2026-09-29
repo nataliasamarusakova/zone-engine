@@ -27,6 +27,7 @@ def _isolate_runtime_state(monkeypatch, tmp_path):
 
     runtime_data = tmp_path / "data"
     runtime_data.mkdir(parents=True, exist_ok=True)
+    (runtime_data / "active_trades.json").write_text("{}", encoding="utf-8")
     # All telemetry files must be isolated from the repository's production data.
     telemetry_paths = {
         "DATA": runtime_data,
@@ -2354,6 +2355,48 @@ def test_exit_outcome_categories_separate_strategy_and_unverified_closes():
     assert tracker._exit_outcome_category("POSITION_CLOSED_UNVERIFIED") == "UNVERIFIED_CLOSE"
 
 
+def test_register_active_trade_serializes_read_validate_write_transaction(monkeypatch, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from event_engine import tracker
+    import time as _time
+
+    active = tmp_path / "active_trades.json"
+    active.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", active)
+
+    original_load = tracker._load_active_trades
+    active_loaders = {"current": 0, "max": 0}
+    guard = tracker.threading.Lock()
+
+    def instrumented_load():
+        with guard:
+            active_loaders["current"] += 1
+            active_loaders["max"] = max(active_loaders["max"], active_loaders["current"])
+        try:
+            _time.sleep(0.02)
+            return original_load()
+        finally:
+            with guard:
+                active_loaders["current"] -= 1
+
+    monkeypatch.setattr(tracker, "_load_active_trades", instrumented_load)
+
+    def register(event_id):
+        return tracker.register_active_trade(
+            event_id=event_id, symbol="AAA-USDT", name="AAA", direction="LONG",
+            entry_price=100.0, qty=1.0, tp_orders=[{"leg": "tp1", "order_id": f"TP_{event_id}"}],
+            sl_result={"order_id": f"SL_{event_id}"}, event_type="TEST", setup={"risk_pct": 10.0},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(register, ["EVT_RACE_A", "EVT_RACE_B"]))
+
+    assert sorted(results) == [False, True]
+    assert active_loaders["max"] == 1
+    state = json.loads(active.read_text(encoding="utf-8"))
+    assert len(state) == 1
+
+
 def test_active_trade_state_save_uses_lock_and_atomic_replace(tmp_path, monkeypatch):
     from event_engine import tracker
     target = tmp_path / "active_trades.json"
@@ -3898,3 +3941,432 @@ def test_unknown_quote_age_policy_is_explicit(monkeypatch):
     assert bingx._unknown_exchange_quote_age_policy() == "block"
     monkeypatch.setenv("EXECUTION_UNKNOWN_QUOTE_AGE_POLICY", "nonsense")
     assert bingx._unknown_exchange_quote_age_policy() == "allow_with_local_age"
+
+
+def test_adverse_exit_slippage_sign_is_correct_for_both_directions():
+    from event_engine import tracker
+    assert tracker._adverse_exit_slippage_pct("LONG", 99.0, 100.0) == 1.0
+    assert tracker._adverse_exit_slippage_pct("LONG", 101.0, 100.0) == 0.0
+    assert tracker._adverse_exit_slippage_pct("SHORT", 101.0, 100.0) == 1.0
+    assert tracker._adverse_exit_slippage_pct("SHORT", 99.0, 100.0) == 0.0
+    assert tracker._adverse_exit_slippage_pct("LONG", 0.0, 100.0) is None
+
+
+def test_full_tp_requires_full_confirmed_quantity():
+    from event_engine import tracker
+    assert tracker._is_full_tp_close(True, 0.5, 1.0, {"tp1"}) is False
+    assert tracker._is_full_tp_close(True, 1.0, 1.0, {"tp1", "tp2"}) is True
+    assert tracker._is_full_tp_close(False, 1.0, 1.0, {"tp1", "tp2"}) is False
+    assert tracker._is_full_tp_close(True, 1.0, 0.0, {"tp1"}) is False
+
+
+def test_order_execution_evidence_uses_real_fill_history_not_orig_qty(monkeypatch):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "get_order", lambda *a, **k: {
+        "status": "ok", "order_status": "FILLED", "executed_qty": 0.0,
+        "avg_price": 0.0, "orig_qty": 1.0, "order_id": "TP1",
+    })
+    monkeypatch.setattr(tracker, "get_fill_orders", lambda *a, **k: [{
+        "order_id": "TP1", "trade_id": "F1", "qty": 0.5, "price": 102.0,
+        "realized_pnl": 1.0, "fee": -0.01, "time_ms": 2000,
+    }])
+    out = tracker._get_order_execution_evidence("AAA-USDT", "TP1", entry_ts=1000)
+    assert out["execution_evidence_source"] == "ALL_FILL_ORDERS"
+    assert out["executed_qty"] == 0.5
+    assert out["avg_price"] == 102.0
+    assert out["fill_realized_pnl_abs"] == 1.0
+    assert out["fill_fee_raw"] == -0.01
+
+
+def test_order_execution_evidence_does_not_infer_fill_from_orig_qty(monkeypatch):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "get_order", lambda *a, **k: {
+        "status": "ok", "order_status": "FILLED", "executed_qty": 0.0,
+        "avg_price": 0.0, "orig_qty": 1.0, "order_id": "TP1",
+    })
+    monkeypatch.setattr(tracker, "get_fill_orders", lambda *a, **k: [])
+    out = tracker._get_order_execution_evidence("AAA-USDT", "TP1", entry_ts=1000)
+    assert out["execution_evidence_source"] == "UNVERIFIED"
+    assert out["executed_qty"] == 0.0
+
+
+def test_historical_exit_reconciliation_does_not_infer_execution_from_orig_qty(monkeypatch):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "_get_filled_order", lambda *a, **k: None)
+    monkeypatch.setattr(tracker, "get_all_orders", lambda *a, **k: [{
+        "orderId": "MANUAL1", "status": "FILLED", "side": "SELL", "type": "MARKET",
+        "origQty": "1", "executedQty": "0", "avgPrice": "102", "updateTime": 300,
+    }])
+    out = tracker._reconcile_historical_exit_order("AAA-USDT", "LONG", 100, 1, [], {})
+    assert out[0] is None
+    assert out[1] is None
+
+
+def test_tracker_corrupt_state_is_quarantined_and_not_treated_as_empty(tmp_path, monkeypatch):
+    from event_engine import tracker
+    path = tmp_path / "active_trades.json"
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", path)
+    path.write_text('{"broken":', encoding="utf-8")
+    try:
+        tracker._load_active_trades()
+    except tracker.ActiveTradeStateCorrupt:
+        pass
+    else:
+        raise AssertionError("corrupt state must block trading")
+    assert list(tmp_path.glob("active_trades.json.quarantine.*"))
+    assert path.read_text(encoding="utf-8") == '{"broken":'
+
+
+def test_run_once_corrupt_state_is_quarantined_for_all_invalid_shapes(tmp_path, monkeypatch):
+    import run_once
+    path = tmp_path / "active_trades.json"
+    monkeypatch.setattr(run_once, "DATA", tmp_path)
+    path.write_text(json.dumps([]), encoding="utf-8")
+    try:
+        run_once._load_active_trades_file()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("invalid root must block reconciliation")
+    assert list(tmp_path.glob("active_trades.json.quarantine.*"))
+
+
+def test_reconciliation_final_save_preserves_concurrent_new_trade(tmp_path, monkeypatch):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", tmp_path / "active_trades.json")
+    original = {"event_id": "OLD", "symbol": "AAA-USDT", "direction": "LONG", "closed": False}
+    tracker._save_active_trades({"OLD": original})
+    original_snapshot = tracker._load_active_trades()
+    # Simulate a new execution registration occurring while reconciliation is running.
+    tracker._save_active_trades({
+        "OLD": original,
+        "NEW": {"event_id": "NEW", "symbol": "BBB-USDT", "direction": "SHORT", "closed": False},
+    })
+    tracker._save_active_trades_after_reconciliation(
+        original_snapshot,
+        {"OLD": {**original, "tick": 2}},
+    )
+    out = json.loads((tmp_path / "active_trades.json").read_text(encoding="utf-8"))
+    assert set(out) == {"OLD", "NEW"}
+    assert out["OLD"]["tick"] == 2
+
+
+def test_reconciliation_final_save_skips_concurrent_same_event_modification(tmp_path, monkeypatch):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", tmp_path / "active_trades.json")
+    original = {"event_id": "OLD", "symbol": "AAA-USDT", "direction": "LONG", "closed": False}
+    tracker._save_active_trades(original.copy() | {"OLD": original})
+    # Another process modifies the same event while reconciliation is in progress.
+    tracker._save_active_trades({
+        "OLD": {**original, "tick": 99},
+    })
+    tracker._save_active_trades_after_reconciliation(
+        {"OLD": original},
+        {"OLD": {**original, "tick": 2}},
+    )
+    out = json.loads((tmp_path / "active_trades.json").read_text(encoding="utf-8"))
+    assert out["OLD"]["tick"] == 99
+
+
+def test_trade_close_journal_is_attempted_before_state_is_removed(tmp_path, monkeypatch):
+    from event_engine import tracker
+    active = tmp_path / "active_trades.json"
+    trades_path = tmp_path / "trades.jsonl"
+    actions = tmp_path / "actions.jsonl"
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", active)
+    monkeypatch.setattr(tracker, "TRADES_PATH", trades_path)
+    monkeypatch.setattr(tracker, "ACTIONS_PATH", actions)
+    trade = {
+        "event_id": "EVT_ORDER_CLOSE",
+        "symbol": "AAA-USDT", "direction": "LONG", "name": "AAA",
+        "entry_price": 100.0, "initial_qty": 1.0, "remaining_qty": 1.0,
+        "entry_ts": 1, "closed": False, "tp_orders": [], "sl_order": {},
+        "hit_legs": [], "tp_filled_qty": {}, "realized_pnl_qty": 0.0,
+        "realized_pnl_weighted_sum": 0.0, "peak_pnl_pct": 0.0, "mae_pct": 0.0,
+        "max_drawdown_pct": 0.0, "planned_risk_pct": 1.0,
+        "planned_weighted_rr": 0.45, "effective_weighted_rr": 0.45,
+        "setup": {}, "tp_levels": [], "effective_tp_levels": [],
+    }
+    active.write_text(json.dumps({"EVT_ORDER_CLOSE": trade}), encoding="utf-8")
+    monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: {"status": "not_found"})
+    monkeypatch.setattr(tracker, "fetch_klines", lambda *a, **k: [])
+    monkeypatch.setattr(tracker, "get_all_orders", lambda *a, **k: [{
+        "orderId": "CLOSE1", "status": "FILLED", "side": "SELL", "type": "MARKET",
+        "executedQty": "1", "avgPrice": "102", "updateTime": 200,
+    }])
+    monkeypatch.setattr(tracker, "get_order", lambda *a, **k: {"status": "error", "error": "not found"})
+    observed = {}
+    def fake_append(record):
+        state = json.loads(active.read_text(encoding="utf-8"))
+        observed["closed_before_journal"] = state["EVT_ORDER_CLOSE"]["closed"]
+        return True
+    monkeypatch.setattr(tracker, "_append_trade_close_once", fake_append)
+    monkeypatch.setattr(tracker, "send_tg", lambda *a, **k: True)
+    tracker.update_active_trades()
+    assert observed["closed_before_journal"] is False
+    final_state = json.loads(active.read_text(encoding="utf-8"))
+    assert "EVT_ORDER_CLOSE" not in final_state
+
+
+def test_execute_new_position_persists_protection_timings_in_registered_snapshot(monkeypatch):
+    import run_once
+    signal = {
+        "event_id": "ZONE_TEST_PROTECTION_TIMING",
+        "symbol": "TEST-USDT", "type": "LONG", "entry": 100.0,
+        "sl": 99.0, "tp1": 101.0, "tp2": 102.0, "risk_pct": 1.0,
+        "score": 80.0, "atr": 2.0,
+        "zone": {"kind": "DEMAND", "btm": 98.0, "top": 100.0},
+        "target": {"obstacle_price": 104.0},
+    }
+    monkeypatch.setattr(run_once, "_validate_trade_geometry", lambda s: (True, "ok"))
+    monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
+    monkeypatch.setattr(run_once, "_build_setup", lambda s: {"zone": {"kind": "DEMAND"}})
+    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: {"status": "opened", "symbol": "TEST-USDT", "order_id": "ENTRY1"})
+    monkeypatch.setattr(run_once, "wait_for_position_fill_directional", lambda *a, **k: {"status": "found", "avgPrice": 100.0, "positionAmt": 1.0})
+    monkeypatch.setattr(run_once, "_rebase_protection_after_fill", lambda s, avg: {
+        "sl": 90.0, "tp1": 103.0, "tp2": 106.0, "risk_abs": 10.0, "risk_pct": 10.0,
+        "tp1_rr": 0.3, "tp2_rr": 0.6, "target_source": "test", "obstacle_price": 110.0,
+    })
+    monkeypatch.setattr(run_once, "ensure_directional_protection", lambda *a, **k: {
+        "status": "PROTECTED", "tp_orders": [{"leg": "tp1", "order_id": "TP1"}, {"leg": "tp2", "order_id": "TP2"}],
+        "sl_result": {"status": "created", "order_id": "SL1", "stop_price": 90.0},
+    })
+    registered = {}
+    monkeypatch.setattr(run_once, "register_active_trade", lambda *a, **k: registered.update(k) or True)
+    monkeypatch.setattr(run_once, "_append_execution_ledger", lambda *a, **k: None)
+    monkeypatch.setattr(run_once.telemetry, "record_protection_event", lambda *a, **k: None)
+    monkeypatch.setattr(run_once.telemetry, "record_exchange_error", lambda *a, **k: None)
+    out = run_once.execute_new_position(signal)
+    assert out["status"] == "opened_protected"
+    snapshot = registered["setup"]["execution_snapshot"]
+    assert snapshot["protection_started_ts"]
+    assert snapshot["protection_finished_ts"]
+    assert snapshot["protection_seconds"] is not None
+
+
+def test_get_fill_orders_raises_on_exchange_error(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda s: s)
+    monkeypatch.setattr(bingx, "credentials_available", lambda: True)
+    monkeypatch.setattr(bingx, "_request", lambda *a, **k: {"code": 109500, "msg": "Internal server error"})
+    try:
+        bingx.get_fill_orders("AAA-USDT", 100, 200)
+    except RuntimeError as exc:
+        assert "109500" in str(exc)
+    else:
+        raise AssertionError("allFillOrders exchange errors must be distinguishable from no fills")
+
+
+def test_execute_new_position_blocks_missing_active_state_before_exchange_write(monkeypatch, tmp_path):
+    import run_once
+    missing_data = tmp_path / "runtime"
+    monkeypatch.setattr(run_once, "DATA", missing_data)
+    signal = {
+        "event_id": "EVT_MISSING_STATE", "symbol": "TEST-USDT", "type": "LONG",
+        "entry": 100.0, "sl": 90.0, "tp1": 103.0, "tp2": 106.0, "risk_pct": 10.0,
+        "score": 80.0, "zone": {"kind": "DEMAND", "btm": 98.0, "top": 100.0},
+    }
+    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: (_ for _ in ()).throw(AssertionError("missing active state must block exchange entry")))
+    out = run_once.execute_new_position(signal)
+    assert out["status"] == "blocked_state_untrusted"
+
+
+def test_execute_new_position_blocks_untrusted_active_state_before_exchange_write(monkeypatch):
+    import run_once
+
+    signal = {
+        "event_id": "EVT_STATE_BLOCK",
+        "symbol": "TEST-USDT",
+        "type": "LONG",
+        "entry": 100.0,
+    }
+
+    def corrupt_state():
+        raise run_once.ActiveTradeStateCorrupt("checksum/shape invalid")
+
+    writes = []
+    monkeypatch.setattr(run_once, "_load_active_trades_file", corrupt_state)
+    monkeypatch.setattr(run_once, "_append_execution_ledger", lambda *a, **k: writes.append((a, k)))
+    monkeypatch.setattr(run_once.telemetry, "record_state_conflict", lambda *a, **k: None)
+    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: (_ for _ in ()).throw(AssertionError("exchange entry must be blocked")))
+
+    out = run_once.execute_new_position(signal)
+    assert out["status"] == "blocked_state_untrusted"
+    assert any(args[2] == "EXECUTION_BLOCKED_STATE" for args, _ in writes)
+
+
+def test_registration_failure_after_protected_entry_rolls_back_and_verifies_close(monkeypatch):
+    import run_once
+
+    signal = {
+        "event_id": "EVT_REG_ROLLBACK",
+        "symbol": "TEST-USDT",
+        "type": "LONG",
+        "entry": 100.0,
+        "sl": 90.0,
+        "tp1": 103.0,
+        "tp2": 106.0,
+        "risk_pct": 10.0,
+        "score": 80.0,
+        "atr": 2.0,
+        "zone": {"kind": "DEMAND", "btm": 98.0, "top": 100.0},
+        "target": {"obstacle_price": 110.0},
+    }
+    monkeypatch.setattr(run_once, "_load_active_trades_file", lambda: {})
+    monkeypatch.setattr(run_once, "has_active_trade_conflict", lambda *a, **k: False)
+    monkeypatch.setattr(run_once, "_validate_trade_geometry", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(run_once, "prepare_protection_capacity", lambda *a, **k: {"status": "ready"})
+    monkeypatch.setattr(run_once, "get_execution_quote", lambda *a, **k: {
+        "status": "ok", "bid": 100.0, "ask": 100.0, "spread_pct": 0.0,
+        "quote_source": "test", "quote_sources_attempted": ["test"],
+        "quote_time": "2026-09-29T12:00:00+00:00",
+        "quote_exchange_time_ms": 1000, "quote_observed_at_ms": int(time.time() * 1000),
+    })
+    monkeypatch.setattr(run_once, "_build_setup", lambda *a, **k: {
+        "zone": {"kind": "DEMAND"}, "tp_levels": [], "planned_weighted_rr": 0.45,
+    })
+    monkeypatch.setattr(run_once, "_rebase_protection_after_fill", lambda *a, **k: {
+        "entry": 100.0, "sl": 90.0, "tp1": 103.0, "tp2": 106.0,
+        "risk_abs": 10.0, "risk_pct": 10.0, "tp1_rr": 0.3, "tp2_rr": 0.6,
+        "target_source": "test", "obstacle_price": 110.0,
+    })
+    monkeypatch.setattr(run_once, "_build_actual_signal_from_rebase", lambda signal, rebased: {
+        **signal, "entry": 100.0, "sl": 90.0, "tp1": 103.0, "tp2": 106.0,
+        "risk_pct": 10.0, "tp1_rr": 0.3, "tp2_rr": 0.6,
+    })
+    monkeypatch.setattr(run_once, "_validate_exchange_price_distinctness", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: {
+        "status": "opened", "symbol": "TEST-USDT", "order_id": "ENTRY1",
+        "client_order_id": "EVT_REG_ROLLBACK", "qty": 1.0,
+        "execution_quote": signal and {"status": "ok", "bid": 100.0, "ask": 100.0},
+    })
+    monkeypatch.setattr(run_once, "wait_for_position_fill_directional", lambda *a, **k: {
+        "status": "found", "avgPrice": 100.0, "positionAmt": 1.0,
+    })
+    protection = {
+        "status": "PROTECTED",
+        "sl_result": {"status": "created", "order_id": "SL1"},
+        "tp_orders": [{"leg": "tp1", "order_id": "TP1"}, {"leg": "tp2", "order_id": "TP2"}],
+    }
+    monkeypatch.setattr(run_once, "ensure_directional_protection", lambda *a, **k: protection)
+    monkeypatch.setattr(run_once, "register_active_trade", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("state save failed")))
+    monkeypatch.setattr(run_once, "_append_execution_ledger", lambda *a, **k: None)
+    monkeypatch.setattr(run_once, "_append_jsonl", lambda *a, **k: None)
+    for name in ("record_state_conflict", "record_position_reconciliation", "record_order_event", "record_exchange_error", "record_protection_event"):
+        if hasattr(run_once.telemetry, name):
+            monkeypatch.setattr(run_once.telemetry, name, lambda *a, **k: None)
+
+    calls = []
+    def fake_cleanup(symbol, direction, known_order_ids=None):
+        calls.append(("cleanup", set(known_order_ids or [])))
+        return {"status": "ok", "cancelled": ["SL1", "TP1", "TP2"], "errors": []}
+    def fake_close(symbol, direction, qty, trade_id):
+        calls.append(("close", qty, trade_id))
+        return {"status": "closed_verified"}
+    monkeypatch.setattr(run_once, "_cancel_engine_protection_before_emergency_close", fake_cleanup)
+    monkeypatch.setattr(run_once, "_emergency_close_and_verify", fake_close)
+
+    out = run_once.execute_new_position(signal)
+    assert out["status"] == "opened_then_emergency_closed"
+    assert calls[0] == ("cleanup", {"SL1", "TP1", "TP2"})
+    assert calls[1] == ("close", 1.0, "EVT_REG_ROLLBACK")
+    assert out["rollback_verified"] is True
+
+
+def test_fill_accounting_never_turns_missing_fee_or_realized_pnl_into_zero(monkeypatch):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "get_fill_orders", lambda *a, **k: [
+        {"order_id": "ENTRY1", "qty": 1.0, "price": 100.0, "fee": None, "realized_pnl": None, "time_ms": 100},
+        {"order_id": "EXIT1", "qty": 1.0, "price": 102.0, "fee": -0.2, "realized_pnl": None, "time_ms": 200},
+    ])
+    trade = {
+        "symbol": "AAA-USDT", "direction": "LONG", "entry_ts": 1,
+        "entry_order": {"order_id": "ENTRY1"}, "exit_order_id": "EXIT1",
+    }
+    out = tracker._collect_trade_fill_accounting(trade, 1000)
+    assert out["status"] == "VERIFIED"
+    assert out["gross_realized_pnl_abs"] == 2.0
+    assert out["fee_raw_total"] is None
+    assert out["fees_paid_abs"] is None
+    assert out["exchange_realized_pnl_abs"] is None
+    assert out["net_realized_pnl_abs"] is None
+
+
+def test_trade_close_uses_exchange_execution_timestamp_and_canonical_absolute_accounting(monkeypatch, tmp_path):
+    from event_engine import tracker
+    active = tmp_path / "active_trades.json"
+    trades_path = tmp_path / "trades.jsonl"
+    actions = tmp_path / "actions.jsonl"
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", active)
+    monkeypatch.setattr(tracker, "TRADES_PATH", trades_path)
+    monkeypatch.setattr(tracker, "ACTIONS_PATH", actions)
+    monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: {"status": "not_found"})
+    monkeypatch.setattr(tracker, "fetch_klines", lambda *a, **k: [])
+    monkeypatch.setattr(tracker, "_get_filled_order", lambda *a, **k: None)
+    monkeypatch.setattr(tracker, "get_all_orders", lambda *a, **k: [{
+        "orderId": "CLOSE1", "status": "FILLED", "side": "SELL", "type": "MARKET",
+        "executedQty": "1", "avgPrice": "102", "updateTime": 200,
+    }])
+    monkeypatch.setattr(tracker, "get_fill_orders", lambda *a, **k: [
+        {"order_id": "ENTRY1", "qty": 1.0, "price": 100.0, "fee": -0.1, "realized_pnl": 0.0, "time_ms": 100},
+        {"order_id": "CLOSE1", "qty": 1.0, "price": 102.0, "fee": -0.2, "realized_pnl": 2.0, "time_ms": 210},
+    ])
+    monkeypatch.setattr(tracker, "send_tg", lambda *a, **k: True)
+    trade = {
+        "event_id": "EVT_ACCOUNTING_TS", "symbol": "AAA-USDT", "direction": "LONG", "name": "AAA",
+        "entry_price": 100.0, "initial_qty": 1.0, "remaining_qty": 1.0, "entry_ts": 1, "closed": False,
+        "entry_order": {"order_id": "ENTRY1"}, "tp_orders": [], "sl_order": {},
+        "hit_legs": [], "tp_filled_qty": {}, "realized_pnl_qty": 0.0, "realized_pnl_weighted_sum": 0.0,
+        "peak_pnl_pct": 2.0, "mae_pct": -1.0, "max_drawdown_pct": -1.0,
+        "planned_risk_pct": 10.0, "planned_weighted_rr": 0.45, "effective_weighted_rr": 0.45,
+        "setup": {}, "tp_levels": [], "effective_tp_levels": [],
+    }
+    active.write_text(json.dumps({trade["event_id"]: trade}), encoding="utf-8")
+
+    tracker.update_active_trades()
+    record = json.loads(trades_path.read_text(encoding="utf-8").strip())
+    assert record["execution_close_ts"] == 210
+    assert record["closed_ts"] == 210
+    assert record["observed_closed_ts"] >= 210
+    assert record["close_timestamp_source"] == "EXCHANGE_FILL_TIME"
+    assert record["gross_realized_pnl_abs"] == 2.0
+    assert record["exchange_realized_pnl_abs"] == 2.0
+    assert record["fees_abs"] == pytest.approx(0.3)
+    assert record["net_realized_pnl_abs"] == pytest.approx(1.7)
+    assert record["realized_pnl_abs"] == pytest.approx(1.7)
+    assert record["realized_pnl_abs_status"] == "CONFIRMED"
+
+
+def test_position_disappearance_without_exit_evidence_never_creates_canonical_pnl(monkeypatch, tmp_path):
+    from event_engine import tracker
+    active = tmp_path / "active_trades.json"
+    trades_path = tmp_path / "trades.jsonl"
+    actions = tmp_path / "actions.jsonl"
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", active)
+    monkeypatch.setattr(tracker, "TRADES_PATH", trades_path)
+    monkeypatch.setattr(tracker, "ACTIONS_PATH", actions)
+    monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: {"status": "not_found"})
+    monkeypatch.setattr(tracker, "fetch_klines", lambda *a, **k: [])
+    monkeypatch.setattr(tracker, "get_all_orders", lambda *a, **k: [])
+    monkeypatch.setattr(tracker, "get_fill_orders", lambda *a, **k: [])
+    monkeypatch.setattr(tracker, "send_tg", lambda *a, **k: True)
+    trade = {
+        "event_id": "EVT_UNVERIFIED_DISAPPEAR", "symbol": "AAA-USDT", "direction": "LONG", "name": "AAA",
+        "entry_price": 100.0, "initial_qty": 1.0, "remaining_qty": 1.0, "entry_ts": 1, "closed": False,
+        "tp_orders": [], "sl_order": {}, "hit_legs": [], "tp_filled_qty": {},
+        "realized_pnl_qty": 0.0, "realized_pnl_weighted_sum": 0.0,
+        "peak_pnl_pct": 0.0, "mae_pct": 0.0, "max_drawdown_pct": 0.0,
+        "planned_risk_pct": 10.0, "planned_weighted_rr": 0.45, "effective_weighted_rr": 0.45,
+        "setup": {}, "tp_levels": [], "effective_tp_levels": [],
+    }
+    active.write_text(json.dumps({trade["event_id"]: trade}), encoding="utf-8")
+
+    tracker.update_active_trades()
+    record = json.loads(trades_path.read_text(encoding="utf-8").strip())
+    assert record["exit_reason"] == "POSITION_CLOSED_UNVERIFIED"
+    assert record["realized_pnl_abs"] is None
+    assert record["net_realized_pnl_abs"] is None
+    assert record["execution_close_ts"] is None
+    assert record["closed_ts"] is None
+    assert record["realized_pnl_abs_status"] == "UNAVAILABLE"
+    assert record["observed_pnl_pct_estimate"] is not None

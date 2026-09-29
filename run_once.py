@@ -9,6 +9,7 @@ import uuid
 import fcntl
 import hashlib
 import re
+import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -44,7 +45,7 @@ from event_engine.signals import STRATEGY_VERSION, SWING_LEN, TP1_PCT, TP2_PCT, 
 from event_engine.version import ENGINE_VERSION
 from event_engine.fundamental_assets import FUNDAMENTAL_ASSET_SYMBOLS
 from event_engine.telegram import format_signal, send as send_tg
-from event_engine.tracker import register_active_trade, update_active_trades, update_active_trade_protection, has_active_trade_conflict, backfill_active_trade_provenance
+from event_engine.tracker import ActiveTradeStateCorrupt, register_active_trade, update_active_trades, update_active_trade_protection, has_active_trade_conflict, backfill_active_trade_provenance
 from event_engine import research, telemetry, shadow
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -242,6 +243,7 @@ def _append_execution_ledger(event_id: str, attempt_id: str | None, stage: str, 
         "attempt_id": attempt_id,
         "stage": str(stage),
         "strategy_version": _effective_strategy_version(),
+        "engine_version": ENGINE_VERSION,
         "code_commit_sha": CODE_COMMIT_SHA,
     }
     if isinstance(payload, dict):
@@ -1556,23 +1558,139 @@ def reconcile_all_open_positions() -> None:
 
 def _load_active_trades_file() -> dict[str, dict]:
     path = DATA / "active_trades.json"
+
+    def quarantine(reason: str) -> None:
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        quarantine_path = path.with_name(f"{path.name}.quarantine.{stamp}")
+        suffix = 1
+        while quarantine_path.exists():
+            quarantine_path = path.with_name(f"{path.name}.quarantine.{stamp}.{suffix}")
+            suffix += 1
+        try:
+            shutil.copy2(path, quarantine_path)
+            log.critical("[STATE_CORRUPT] active_trades quarantined copy=%s reason=%s", quarantine_path, reason)
+        except Exception as exc:
+            log.critical("[STATE_CORRUPT] active_trades quarantine failed: %s", exc)
+
+    def fail(reason: str) -> None:
+        quarantine(reason)
+        raise RuntimeError(f"active_trades.json is untrusted: {reason}")
+
     if not path.exists():
-        return {}
+        fail("active_trades.json is missing")
+
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    except Exception as exc:
+        fail(f"invalid JSON: {type(exc).__name__}: {exc}")
+
+    if not isinstance(raw, dict):
+        fail(f"root={type(raw).__name__}; expected object")
+
     out: dict[str, dict] = {}
-    if isinstance(raw, dict):
-        for raw_event_id, trade in raw.items():
-            if not isinstance(trade, dict) or trade.get("closed"):
-                continue
-            event_id = str(trade.get("event_id") or raw_event_id)
-            sym = str(trade.get("symbol", "")).upper()
-            side = str(trade.get("direction", "")).upper()
-            if event_id and sym and side:
-                out[event_id] = trade
+    symbol_direction_owners: dict[tuple[str, str], str] = {}
+    order_owners: dict[str, str] = {}
+    for raw_event_id, trade in raw.items():
+        if not isinstance(trade, dict):
+            fail(f"event_id={raw_event_id!r} is not an object")
+        if trade.get("closed"):
+            continue
+        event_id = str(trade.get("event_id") or raw_event_id)
+        sym = str(trade.get("symbol", "")).upper()
+        side = str(trade.get("direction", "")).upper()
+        if not event_id or not sym or side not in {"LONG", "SHORT"}:
+            fail(f"invalid active trade state for {raw_event_id!r}")
+        if event_id in out:
+            fail(f"duplicate active event_id={event_id!r}")
+        if str(raw_event_id) != event_id:
+            fail(f"state key/event_id mismatch key={raw_event_id!r} event_id={event_id!r}")
+        try:
+            initial_qty = float(trade.get("initial_qty", 0) or 0)
+            remaining_qty = float(trade.get("remaining_qty", 0) or 0)
+        except (TypeError, ValueError):
+            fail(f"non-numeric quantities for event_id={event_id!r}")
+        if not math.isfinite(initial_qty) or initial_qty <= 0 or not math.isfinite(remaining_qty) or remaining_qty < 0:
+            fail(f"invalid quantities for event_id={event_id!r}: initial={initial_qty!r} remaining={remaining_qty!r}")
+
+        identity = (sym.replace("-USDT", "").replace("-", ""), side)
+        previous_owner = symbol_direction_owners.get(identity)
+        if previous_owner is not None and previous_owner != event_id:
+            fail(f"cross-event position ownership collision {identity}: {previous_owner} vs {event_id}")
+        symbol_direction_owners[identity] = event_id
+
+        ids: set[str] = set()
+        containers = [
+            trade.get("entry_order") if isinstance(trade.get("entry_order"), dict) else {},
+            trade.get("sl_order") if isinstance(trade.get("sl_order"), dict) else {},
+        ]
+        containers += [x for x in (trade.get("tp_orders") if isinstance(trade.get("tp_orders"), list) else []) if isinstance(x, dict)]
+        for key in ("be_order_id", "exit_order_id"):
+            if trade.get(key):
+                ids.add(str(trade[key]))
+        for container in containers:
+            for key in ("order_id", "orderId", "orderID"):
+                if container.get(key):
+                    ids.add(str(container[key]))
+        for oid in ids:
+            previous_order_owner = order_owners.get(oid)
+            if previous_order_owner is not None and previous_order_owner != event_id:
+                fail(f"cross-event exchange order ownership collision order_id={oid}: {previous_order_owner} vs {event_id}")
+            order_owners[oid] = event_id
+
+        out[event_id] = trade
     return out
+
+
+def _live_state_preflight(signal: dict[str, Any]) -> tuple[bool, str]:
+    """Return whether local active state is trusted enough to allow a live order.
+
+    State integrity is an execution safety prerequisite.  A corrupt/unreadable or
+    internally conflicting active-trade file must block the order before any exchange
+    write.  This check is repeated inside execute_new_position so callers cannot bypass
+    the main-loop preflight.
+    """
+    try:
+        _load_active_trades_file()
+        return True, "ok"
+    except Exception as exc:
+        reason = f"{type(exc).__name__}: {exc}"
+        event_id = str(signal.get("event_id") or "")
+        symbol = str(signal.get("symbol") or "")
+        direction = str(signal.get("type") or "").upper()
+        try:
+            telemetry.record_state_conflict(
+                event_id=event_id or None,
+                attempt_id=signal.get("attempt_id"),
+                position_id=event_id or None,
+                order_id=None,
+                symbol=symbol,
+                direction=direction or "UNKNOWN",
+                conflict_type="LIVE_EXECUTION_BLOCKED_STATE_UNTRUSTED",
+                message=reason,
+                owner_event_ids=[],
+            )
+        except Exception:
+            pass
+        _append_execution_ledger(event_id, signal.get("attempt_id"), "EXECUTION_BLOCKED_STATE", {
+            "status": "BLOCKED_STATE_UNTRUSTED",
+            "error": reason,
+        })
+        try:
+            _append_jsonl(ACTIONS_PATH, {
+                "ts": int(time.time() * 1000),
+                "action": "LIVE_EXECUTION_BLOCKED_STATE_UNTRUSTED",
+                "event_id": event_id,
+                "symbol": symbol,
+                "direction": direction,
+                "error": reason,
+            })
+        except Exception as exc:
+            log.error("[STATE_BLOCK_TELEMETRY_WRITE_FAILED] event_id=%s error=%s", event_id, exc)
+        log.critical(
+            "[LIVE_BLOCKED_STATE] %s %s event=%s | active-trade state is untrusted: %s",
+            symbol, direction, event_id, reason,
+        )
+        return False, reason
 
 
 def _build_setup(signal: dict[str, Any]) -> dict[str, Any]:
@@ -1761,8 +1879,16 @@ def _rebase_protection_after_fill(signal: dict[str, Any], avg_price: float) -> d
     }
 
 
-def _cancel_engine_protection_before_emergency_close(symbol: str, direction: str) -> dict[str, Any]:
-    """Best-effort cleanup of this engine's SL/TP orders before a MARKET rollback."""
+def _cancel_engine_protection_before_emergency_close(
+    symbol: str,
+    direction: str,
+    known_order_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    """Best-effort cleanup of engine-owned SL/TP orders before a MARKET rollback.
+
+    When exact protection order ids are known, restrict cancellation to those ids so
+    a failed registration cannot accidentally cancel a different event's protection.
+    """
     result = {"status": "ok", "cancelled": [], "errors": []}
     try:
         existing = get_open_protection_directional(symbol, direction)
@@ -1774,6 +1900,8 @@ def _cancel_engine_protection_before_emergency_close(symbol: str, direction: str
         oid = str(order.get("orderId", ""))
         cid = str(order.get("clientOrderId", "")).upper()
         if not oid or not cid.startswith("EVT_"):
+            continue
+        if known_order_ids is not None and oid not in {str(x) for x in known_order_ids}:
             continue
         try:
             resp = cancel_order(symbol, oid)
@@ -1836,6 +1964,144 @@ def _emergency_close_and_verify(symbol: str, direction: str, qty: float, trade_i
         time.sleep(0.35)
 
     return {"status": "close_unverified", "attempts": attempts, "verification": verification, "remaining_qty": last_qty}
+
+
+def _rollback_after_registration_failure(
+    *,
+    event_id: str,
+    symbol: str,
+    direction: str,
+    qty: float,
+    reason: str,
+    order: dict[str, Any] | None,
+    position: dict[str, Any] | None,
+    protection: dict[str, Any] | None,
+    executed_signal: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Safety rollback when a real protected entry cannot acquire a local owner.
+
+    This is intentionally exception-safe: state persistence failures, duplicate-owner
+    rejection, and unexpected registration exceptions all converge to the same explicit
+    rollback path.  The result is deterministic: either the exchange position is
+    verified closed, or the result is explicitly marked unverified.
+    """
+    try:
+        telemetry.record_state_conflict(
+            event_id=event_id,
+            attempt_id=None,
+            position_id=event_id,
+            order_id=(order or {}).get("order_id") if isinstance(order, dict) else None,
+            symbol=symbol,
+            direction=direction,
+            conflict_type="ACTIVE_TRADE_REGISTRATION_FAILED_AFTER_PROTECTED_ENTRY",
+            message=str(reason),
+            owner_event_ids=[event_id],
+        )
+    except Exception:
+        pass
+
+    _append_execution_ledger(
+        event_id,
+        None,
+        "ACTIVE_TRADE_REGISTRATION_FAILED",
+        {
+            "status": "ROLLBACK_REQUIRED",
+            "error": str(reason),
+            "entry_order_id": (order or {}).get("order_id") if isinstance(order, dict) else None,
+            "fill_price": (position or {}).get("avgPrice") if isinstance(position, dict) else None,
+            "fill_qty": (position or {}).get("positionAmt") if isinstance(position, dict) else qty,
+        },
+    )
+
+    known_ids: set[str] = set()
+    if isinstance(protection, dict):
+        sl_result = protection.get("sl_result") if isinstance(protection.get("sl_result"), dict) else {}
+        for container in [sl_result]:
+            for key in ("order_id", "orderId", "orderID"):
+                if container.get(key):
+                    known_ids.add(str(container[key]))
+        for tp in protection.get("tp_orders", []) if isinstance(protection.get("tp_orders"), list) else []:
+            if not isinstance(tp, dict):
+                continue
+            for key in ("order_id", "orderId", "orderID"):
+                if tp.get(key):
+                    known_ids.add(str(tp[key]))
+
+    try:
+        cleanup = _cancel_engine_protection_before_emergency_close(
+            symbol,
+            direction,
+            known_order_ids=known_ids or None,
+        )
+    except Exception as exc:
+        cleanup = {"status": "error", "cancelled": [], "errors": [str(exc)]}
+
+    try:
+        close_result = _emergency_close_and_verify(symbol, direction, qty, event_id)
+    except Exception as exc:
+        close_result = {"status": "close_unverified", "attempts": [], "error": str(exc)}
+
+    rollback_verified = str(close_result.get("status")) == "closed_verified"
+    final_status = "opened_then_emergency_closed" if rollback_verified else "opened_registration_failed_close_unverified"
+    _append_execution_ledger(
+        event_id,
+        None,
+        "REGISTRATION_ROLLBACK_RESULT",
+        {
+            "status": final_status,
+            "rollback_verified": rollback_verified,
+            "protection_cleanup": cleanup,
+            "close": close_result,
+        },
+    )
+    try:
+        telemetry.record_position_reconciliation(
+            event_id=event_id,
+            attempt_id=None,
+            position_id=event_id,
+            symbol=symbol,
+            direction=direction,
+            status="ROLLBACK_CLOSED" if rollback_verified else "ROLLBACK_CLOSE_UNVERIFIED",
+            internal_remaining_qty=qty,
+            exchange_position_qty=0.0 if rollback_verified else close_result.get("remaining_qty"),
+            exchange_avg_price=None,
+            local_owner_event_id=None,
+            rollback_reason=str(reason),
+            protection_cleanup_status=cleanup.get("status"),
+        )
+    except Exception as exc:
+        _append_execution_ledger(event_id, None, "REGISTRATION_ROLLBACK_TELEMETRY_FAILED", {"error": f"{type(exc).__name__}: {exc}"})
+    try:
+        _append_jsonl(
+            TRADES_PATH,
+            {
+                "record_type": "TRADE_ROLLBACK",
+                "event_id": event_id,
+                "symbol": symbol,
+                "direction": direction,
+                "entry_order": order or {},
+                "fill_position": position or {},
+                "protection": protection or {},
+                "rollback_reason": str(reason),
+                "protection_cleanup": cleanup,
+                "close": close_result,
+                "status": final_status,
+                "ts_ms": int(time.time() * 1000),
+            },
+        )
+    except Exception as exc:
+        _append_execution_ledger(event_id, None, "REGISTRATION_ROLLBACK_JOURNAL_FAILED", {"error": f"{type(exc).__name__}: {exc}"})
+    return {
+        "status": final_status,
+        "error": str(reason),
+        "order": order,
+        "position": position,
+        "protection": protection,
+        "protection_cleanup": cleanup,
+        "close": close_result,
+        "executed_signal": executed_signal,
+        "rollback_verified": rollback_verified,
+    }
 
 def _adverse_signal_drift_pct(signal_entry: float, executable_price: float, direction: str) -> float:
     """Distance the current executable price has moved against the original signal."""
@@ -1936,6 +2202,15 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     direction = str(signal["type"]).upper()
     event_id = str(signal["event_id"])
     entry_price = float(signal["entry"])
+
+    state_ready, state_reason = _live_state_preflight(signal)
+    if not state_ready:
+        return {
+            "status": "blocked_state_untrusted",
+            "error": state_reason,
+            "order": None,
+            "position": None,
+        }
     execution_started_ts = pd.Timestamp.now(tz="UTC")
     signal["execution_started_ts"] = execution_started_ts.isoformat()
     _append_execution_ledger(event_id, signal.get("attempt_id"), "EXECUTION_START", {"symbol": symbol, "direction": direction, "signal_price": entry_price, "trigger_bar_time": signal.get("trigger_bar_time") or signal.get("time")})
@@ -2399,6 +2674,16 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     )
     protection_finished_ts = pd.Timestamp.now(tz="UTC")
     signal["protection_finished_ts"] = protection_finished_ts.isoformat()
+    # The snapshot is persisted with the active trade after protection is complete.
+    # Update it here so protection timings cannot be lost because the snapshot was
+    # initially assembled before the protection orders were submitted.
+    execution_snapshot = setup.setdefault("execution_snapshot", {})
+    execution_snapshot.update({
+        "protection_started_ts": signal.get("protection_started_ts"),
+        "protection_finished_ts": signal.get("protection_finished_ts"),
+        "fill_to_protection_seconds": _elapsed_seconds(signal.get("fill_observed_ts"), signal.get("protection_started_ts")),
+        "protection_seconds": _elapsed_seconds(signal.get("protection_started_ts"), signal.get("protection_finished_ts")),
+    })
     setup["execution_snapshot"]["protection_status"] = protection.get("status")
     _append_execution_ledger(event_id, signal.get("attempt_id"), "PROTECTION_RESULT", {"status": protection.get("status"), "error": protection.get("error"), "sl_order": protection.get("sl_result"), "tp_orders": protection.get("tp_orders", [])})
     sl_result = protection.get("sl_result") if isinstance(protection.get("sl_result"), dict) else {}
@@ -2493,35 +2778,46 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
 
     _append_execution_ledger(event_id, signal.get("attempt_id"), "PROTECTED_POSITION", {"fill_price": avg_price, "sl_price": sl_price, "tp1_price": tp1_price, "tp2_price": tp2_price, "risk_pct": actual_risk_pct, "planned_weighted_rr": setup["planned_weighted_rr"]})
 
-    registered = register_active_trade(
-        event_id=event_id,
-        symbol=symbol,
-        name=symbol,
-        direction=direction,
-        entry_price=avg_price,
-        qty=qty,
-        tp_orders=protection.get("tp_orders", []),
-        sl_result=protection.get("sl_result", {}),
-        event_type=f"{setup['zone'].get('kind', 'ZONE')}_{'MIDPOINT_TOUCH_5M' if ZONE_TRIGGER_MODE == 'midpoint' else 'ZONE_TOUCH_5M'}",
-        timeframe="5m",
-        score=float(signal.get("score", 0.0)),
-        setup={**setup, "protection_status": protection.get("status"), "protection_result": protection},
-        requested_entry_price=entry_price,
-    )
+    registration_reason = "active_trade_registration_failed"
+    try:
+        registered = register_active_trade(
+            event_id=event_id,
+            symbol=symbol,
+            name=symbol,
+            direction=direction,
+            entry_price=avg_price,
+            qty=qty,
+            tp_orders=protection.get("tp_orders", []),
+            sl_result=protection.get("sl_result", {}),
+            event_type=f"{setup['zone'].get('kind', 'ZONE')}_{'MIDPOINT_TOUCH_5M' if ZONE_TRIGGER_MODE == 'midpoint' else 'ZONE_TOUCH_5M'}",
+            timeframe="5m",
+            score=float(signal.get("score", 0.0)),
+            setup={**setup, "protection_status": protection.get("status"), "protection_result": protection},
+            requested_entry_price=entry_price,
+        )
+    except ActiveTradeStateCorrupt as exc:
+        registered = False
+        registration_reason = f"active_trade_state_untrusted_after_entry: {exc}"
+    except Exception as exc:
+        registered = False
+        registration_reason = f"active_trade_registration_exception: {type(exc).__name__}: {exc}"
+
     if registered is False:
-        log.critical("[SAFETY_CLOSE] %s %s | active-trade ownership registration failed after protected entry; rolling back", symbol, direction)
-        cleanup = _cancel_engine_protection_before_emergency_close(symbol, direction)
-        close_result = _emergency_close_and_verify(symbol, direction, qty, event_id)
-        return {
-            "status": "opened_then_emergency_closed",
-            "error": "active_trade_registration_failed",
-            "order": order,
-            "position": position,
-            "protection": protection,
-            "protection_cleanup": cleanup,
-            "close": close_result,
-            "executed_signal": actual_signal,
-        }
+        log.critical(
+            "[SAFETY_CLOSE] %s %s | active-trade registration failed after protected entry; rolling back: %s",
+            symbol, direction, registration_reason,
+        )
+        return _rollback_after_registration_failure(
+            event_id=event_id,
+            symbol=symbol,
+            direction=direction,
+            qty=qty,
+            reason=registration_reason,
+            order=order,
+            position=position,
+            protection=protection,
+            executed_signal=actual_signal,
+        )
 
     return {
         "status": "opened_protected",
@@ -2641,6 +2937,28 @@ def main() -> None:
     private_ready = _private_layer_ready()
     if private_ready:
         try:
+            _load_active_trades_file()
+            log.info("[STATE_PREFLIGHT] active-trade state integrity OK")
+        except Exception as exc:
+            private_ready = False
+            log.critical(
+                "[LIVE_BLOCKED_STATE] active-trade state preflight failed; execution/reconciliation disabled for this run: %s",
+                exc,
+            )
+            try:
+                _append_jsonl(ACTIONS_PATH, {
+                    "ts": int(time.time() * 1000),
+                    "action": "LIVE_EXECUTION_BLOCKED_STATE_UNTRUSTED",
+                    "event_id": None,
+                    "symbol": None,
+                    "direction": None,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "scope": "cycle_preflight",
+                })
+            except Exception:
+                pass
+    if private_ready:
+        try:
             mode = get_position_mode(timeout_sec=float(os.environ.get("PRIVATE_PREFLIGHT_TIMEOUT_SEC", "5")))
             log.info("[AUTH] BingX private preflight OK | position_mode=%s", mode)
         except Exception as exc:
@@ -2651,16 +2969,27 @@ def main() -> None:
                 backfilled = backfill_active_trade_provenance()
                 if backfilled:
                     log.info("[TRACKER_PROVENANCE] backfilled code_commit_sha for %d active trade(s)", backfilled)
+            except ActiveTradeStateCorrupt as exc:
+                private_ready = False
+                log.critical("[LIVE_BLOCKED_STATE] tracker provenance found untrusted active state: %s", exc)
             except Exception as exc:
-                log.warning("[TRACKER_PROVENANCE] backfill failed: %s", exc)
-            try:
-                update_active_trades()
-            except Exception as exc:
-                log.exception("[TRACKER] active trade update failed: %s", exc)
-            try:
-                reconcile_all_open_positions()
-            except Exception as exc:
-                log.exception("[RECON] reconciliation failed: %s", exc)
+                private_ready = False
+                log.critical("[LIVE_BLOCKED_STATE] tracker provenance/backfill failed; execution disabled for this run: %s", exc)
+            if private_ready:
+                try:
+                    update_active_trades()
+                except ActiveTradeStateCorrupt as exc:
+                    private_ready = False
+                    log.critical("[LIVE_BLOCKED_STATE] tracker update found untrusted active state: %s", exc)
+                except Exception as exc:
+                    private_ready = False
+                    log.exception("[LIVE_BLOCKED_STATE] active trade update failed; execution disabled for this run: %s", exc)
+            if private_ready:
+                try:
+                    reconcile_all_open_positions()
+                except Exception as exc:
+                    private_ready = False
+                    log.exception("[LIVE_BLOCKED_RECON] reconciliation failed; execution disabled for this run: %s", exc)
     else:
         log.info("[PRIVATE] BingX private layer unavailable | reconciliation/execution disabled")
 
@@ -2806,7 +3135,11 @@ def main() -> None:
             latest_price = float(df["close"].iloc[-1])
             bingx_price = _bingx_last_price(contract)
             latest_closed_idx = len(df) - 1
-            latest_closed_time = pd.Timestamp(df["timestamp"].iloc[-1])
+            latest_bar_open_time = pd.Timestamp(df["timestamp"].iloc[-1])
+            if "close_time" in df.columns:
+                latest_closed_time = pd.Timestamp(df["close_time"].iloc[-1])
+            else:
+                latest_closed_time = latest_bar_open_time + pd.Timedelta(hours=1)
             now_utc = pd.Timestamp.now(tz="UTC")
             data_age_hours = max(0.0, (now_utc - latest_closed_time).total_seconds() / 3600.0)
 
@@ -2834,7 +3167,11 @@ def main() -> None:
                     "zones": {"demand": demand, "supply": supply},
                     "last_signal_count": 0,
                     "latest_closed_idx": int(latest_closed_idx),
+                    "latest_bar_open_time": latest_bar_open_time.isoformat(),
+                    "latest_bar_close_time": latest_closed_time.isoformat(),
                     "latest_closed_time": latest_closed_time.isoformat(),
+                    "trigger_status": "DATA_STALE_REJECT",
+                    "data_stale_reject": True,
                     "signals": [],
                     "error": f"stale_1h_data:{data_age_hours:.2f}h>{MAX_DATA_STALENESS_HOURS:.2f}h",
                 }
@@ -2946,11 +3283,14 @@ def main() -> None:
                 binance_live_price if binance_live_price is not None else latest_price,
                 bingx_price,
             ) if provider == "binance" else None
+            decision_boundary_ts = pd.Timestamp.now(tz="UTC")
+            shadow_decision_ts = decision_boundary_ts.isoformat()
             for sig in recent:
                 try:
                     # Immutable research-only snapshot. This never gates execution.
                     sig["shadow_experiments"] = shadow.build_entry_snapshot(
-                        sig, df_5m=pd.DataFrame(trigger_bars_raw), df_1h=df, account_context=research_account_context
+                        sig, df_5m=pd.DataFrame(trigger_bars_raw), df_1h=df,
+                        account_context=research_account_context, decision_ts=shadow_decision_ts
                     )
                 except Exception as shadow_exc:
                     log.warning("[SHADOW_TELEMETRY] %s | snapshot build failed: %s", _display_symbol(symbol), shadow_exc)
@@ -3044,7 +3384,7 @@ def main() -> None:
             # When live execution is enabled, keep the production critical path free of
             # research persistence/I/O. Capture the exact decision-time inputs in memory
             # and flush them after all selected live attempts are finished.
-            research_decision_ts = pd.Timestamp.now(tz="UTC").isoformat()
+            research_decision_ts = decision_boundary_ts.isoformat()
             if research.RESEARCH_ENABLED and RESEARCH_DEFER_UNTIL_AFTER_EXECUTION:
                 with deferred_research_lock:
                     deferred_research_rows.append({
@@ -3106,6 +3446,8 @@ def main() -> None:
                 "zones": {"demand": demand, "supply": supply},
                 "last_signal_count": len(recent),
                 "latest_closed_idx": int(latest_closed_idx),
+                "latest_bar_open_time": latest_bar_open_time.isoformat(),
+                "latest_bar_close_time": latest_closed_time.isoformat(),
                 "latest_closed_time": latest_closed_time.isoformat(),
                 "trigger_status": str((five_min_diag.get("decision") or {}).get("status") or "NO_ZONE_CHECK"),
                 "trigger_reason": str((five_min_diag.get("decision") or {}).get("reason") or ""),
@@ -3139,9 +3481,10 @@ def main() -> None:
                 try:
                     result = future.result()
                 except Exception as exc:  # defensive: scan_one already catches errors
+                    fallback_source_name = str((analysis_meta.get(symbol) or {}).get("source") or "unknown")
                     result = {
                         "symbol": symbol, "current_price": None, "binance_price": None, "bingx_price": None, "market_spread_pct": None,
-                "market_source": source_name, "binance_symbol": analysis_meta.get(symbol, {}).get("binance_symbol"),
+                        "market_source": fallback_source_name, "binance_symbol": analysis_meta.get(symbol, {}).get("binance_symbol"),
                 "asset_class": analysis_meta.get(symbol, {}).get("asset_class", "UNKNOWN"), "price_position": "ERROR",
                         "fresh_signal": "—", "active_demand": 0, "active_supply": 0,
                         "zones": {"demand": [], "supply": []}, "last_signal_count": 0,
@@ -3167,7 +3510,8 @@ def main() -> None:
     scan_contract_not_found = sum(1 for row in scan_rows if row.get("price_position") == "CONTRACT_NOT_FOUND")
     scan_stale_rejects = sum(
         1 for row in scan_rows
-        if str(row.get("trigger_status", "")) in {"BLOCKED_STALE_TOUCH", "DATA_STALE_REJECT"}
+        if row.get("data_stale_reject") is True
+        or str(row.get("trigger_status", "")) in {"BLOCKED_STALE_TOUCH", "DATA_STALE_REJECT"}
         or "DATA_STALE_REJECT" in str(row.get("fresh_signal", ""))
     )
     scan_skips = scan_insufficient_data + scan_contract_not_found + scan_stale_rejects

@@ -195,3 +195,56 @@ def test_trailing_does_not_use_current_bar_high_for_same_bar_stop():
     cf = out["experiments"]["CF_TRAIL_CURRENT_1_0ATR"]
     # The 120 high on the current bar must not retroactively raise the stop before its low is checked.
     assert cf["exit_ts"] in {"2026-09-28T10:20:00+00:00", None}
+
+
+def test_parse_ts_numeric_epoch_is_milliseconds():
+    ts = shadow._parse_ts(1790648100000)
+    assert ts is not None
+    assert ts.isoformat() == "2026-09-29T02:15:00+00:00"
+
+
+def test_missing_account_context_is_not_reported_as_no_open_peers():
+    snap = shadow.build_entry_snapshot(
+        _signal(), df_5m=_bars_5m([10] * 21), df_1h=_bars_1h(), account_context=None
+    )
+    corr = snap["experiments"]["CF_CORRELATION"]
+    assert corr["status"] == "CONTEXT_UNAVAILABLE"
+    assert corr["open_position_symbols"] == []
+    assert corr["would_pass"] is None
+
+
+def test_session_experiment_uses_decision_time_and_preserves_trigger_session():
+    sig = _signal()
+    sig["trigger_bar_time"] = "2026-09-28T05:55:00Z"
+    snap = shadow.build_entry_snapshot(
+        sig,
+        df_5m=_bars_5m([10] * 21),
+        df_1h=_bars_1h(),
+        decision_ts="2026-09-28T06:03:52Z",
+    )
+    exp = snap["experiments"]["CF_SESSION"]
+    assert exp["trigger_session_utc"] == "ASIA_OFF_HOURS"
+    assert exp["decision_session_utc"] == "LONDON"
+    assert exp["asia_off_hours"] is False
+
+
+def test_counterfactual_excludes_bar_that_started_before_decision_boundary():
+    snap = shadow.build_entry_snapshot(_signal("LONG"), df_5m=_bars_5m([10] * 21), df_1h=_bars_1h())
+    obs = {
+        "event_id": "EVT_BOUNDARY",
+        "symbol": "TEST-USDT",
+        "direction": "LONG",
+        "reference_price": 100.0,
+        "source_event_ts": "2026-09-28T10:00:00Z",
+        "observation_ts": "2026-09-28T10:07:00Z",
+        "counterfactual_path_start_ts": "2026-09-28T10:07:00Z",
+        "features": {"shadow_experiments": snap["experiments"]},
+    }
+    future = pd.DataFrame([
+        {"timestamp": "2026-09-28T10:05:00Z", "close_time": "2026-09-28T10:10:00Z", "open": 100, "high": 105, "low": 99, "close": 104},
+        {"timestamp": "2026-09-28T10:10:00Z", "close_time": "2026-09-28T10:15:00Z", "open": 100.1, "high": 100.5, "low": 99.8, "close": 100.0},
+    ])
+    out = shadow.calculate_counterfactual_outcomes(obs, future)
+    cf = out["experiments"]["CF_STRUCTURAL_SL"]
+    assert cf["exit"] in {None, "PATH_NOT_EXITED"}
+    assert cf.get("bars_to_exit") is None
