@@ -655,6 +655,58 @@ def _make_5m_event_id(symbol: str, direction: str, trigger_ts_ms: int, zone: dic
     return "ZONE_" + hashlib.sha256(raw.encode("utf-8")).hexdigest().upper()[:24]
 
 
+def _coerce_utc_timestamp(value: Any) -> pd.Timestamp | None:
+    """Normalize a scalar provider timestamp to timezone-aware UTC.
+
+    BingX/Binance kline payloads expose epoch milliseconds, while tests and
+    persisted telemetry may also provide ISO strings or datetime objects.
+    Never call ``pd.Timestamp(raw_epoch_ms)`` directly: pandas interprets an
+    integer without a unit as nanoseconds and returns a tz-naive timestamp.
+    """
+    if value is None:
+        return None
+    try:
+        if isinstance(value, pd.Timestamp):
+            ts = value
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            numeric = float(value)
+            if not math.isfinite(numeric):
+                return None
+            magnitude = abs(numeric)
+            unit = ("ns" if magnitude >= 1e17 else
+                    "us" if magnitude >= 1e14 else
+                    "ms" if magnitude >= 1e11 else
+                    "s" if magnitude >= 1e8 else None)
+            if unit is None:
+                ts = pd.to_datetime(value, utc=True)
+            else:
+                ts = pd.to_datetime(value, unit=unit, utc=True)
+        else:
+            text = str(value).strip()
+            if not text:
+                return None
+            numeric = pd.to_numeric(text, errors="coerce")
+            if pd.notna(numeric):
+                numeric = float(numeric)
+                magnitude = abs(numeric)
+                unit = ("ns" if magnitude >= 1e17 else
+                        "us" if magnitude >= 1e14 else
+                        "ms" if magnitude >= 1e11 else
+                        "s" if magnitude >= 1e8 else None)
+                ts = pd.to_datetime(numeric, unit=unit, utc=True) if unit else pd.to_datetime(text, utc=True)
+            else:
+                ts = pd.to_datetime(text, utc=True)
+        if pd.isna(ts):
+            return None
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        return ts
+    except Exception:
+        return None
+
+
 def _normalize_closed_5m(bars: list[dict[str, Any]]) -> pd.DataFrame:
     """Normalize provider 5m bars and retain only fully closed candles."""
     if not bars:
@@ -1556,7 +1608,7 @@ def reconcile_all_open_positions() -> None:
             )
 
 
-def _load_active_trades_file() -> dict[str, dict]:
+def _load_active_trades_file(*, fresh_runtime_start: bool = False) -> dict[str, dict]:
     path = DATA / "active_trades.json"
 
     def quarantine(reason: str) -> None:
@@ -1577,6 +1629,13 @@ def _load_active_trades_file() -> dict[str, dict]:
         raise RuntimeError(f"active_trades.json is untrusted: {reason}")
 
     if not path.exists():
+        if fresh_runtime_start:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_name(path.name + ".tmp")
+            tmp_path.write_text("{}\n", encoding="utf-8")
+            os.replace(tmp_path, path)
+            log.warning("[STATE_BOOTSTRAP] fresh runtime start detected; initialized empty active_trades.json")
+            return {}
         fail("active_trades.json is missing")
 
     try:
@@ -2901,6 +2960,7 @@ def _send_signal(signal: dict[str, Any], execution: dict[str, Any] | None = None
 
 def main() -> None:
     started = time.time()
+    fresh_runtime_start = not DATA.exists()
     DATA.mkdir(parents=True, exist_ok=True)
     _write_runtime_version_metadata()
     scan_id = f"SCAN_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8].upper()}"
@@ -2937,7 +2997,7 @@ def main() -> None:
     private_ready = _private_layer_ready()
     if private_ready:
         try:
-            _load_active_trades_file()
+            _load_active_trades_file(fresh_runtime_start=fresh_runtime_start)
             log.info("[STATE_PREFLIGHT] active-trade state integrity OK")
         except Exception as exc:
             private_ready = False
@@ -3135,10 +3195,14 @@ def main() -> None:
             latest_price = float(df["close"].iloc[-1])
             bingx_price = _bingx_last_price(contract)
             latest_closed_idx = len(df) - 1
-            latest_bar_open_time = pd.Timestamp(df["timestamp"].iloc[-1])
+            latest_bar_open_time = _coerce_utc_timestamp(df["timestamp"].iloc[-1])
+            if latest_bar_open_time is None:
+                raise ValueError("latest 1H bar timestamp is invalid")
             if "close_time" in df.columns:
-                latest_closed_time = pd.Timestamp(df["close_time"].iloc[-1])
+                latest_closed_time = _coerce_utc_timestamp(df["close_time"].iloc[-1])
             else:
+                latest_closed_time = latest_bar_open_time + pd.Timedelta(hours=1)
+            if latest_closed_time is None:
                 latest_closed_time = latest_bar_open_time + pd.Timedelta(hours=1)
             now_utc = pd.Timestamp.now(tz="UTC")
             data_age_hours = max(0.0, (now_utc - latest_closed_time).total_seconds() / 3600.0)
