@@ -882,6 +882,13 @@ def build_research_features(
         "shadow_age_le_48h": None,
         "shadow_age_le_72h": None,
     }
+    if features.get("zone_age_bars") is None and df_1h is not None and not df_1h.empty:
+        try:
+            current_idx = len(df_1h) - 1
+            zone_start = int(zone.get("start", current_idx))
+            features["zone_age_bars"] = max(0, int(current_idx - zone_start))
+        except (TypeError, ValueError):
+            pass
     if width is not None and width > 0 and high is not None and low is not None:
         penetration = ((top - low) / width) if direction == "LONG" and top is not None else ((high - bottom) / width if direction == "SHORT" and bottom is not None else None)
         features["zone_penetration_ratio"] = penetration
@@ -1129,6 +1136,10 @@ def build_observation_from_touch_event(
     ts = event.get("timestamp")
     if not ts:
         return None
+    # The outer event timestamp is the authoritative 5m event boundary. Keep it
+    # inside entry_bar as well so downstream feature calculations never fall back
+    # to an unbounded tail of bars (which would permit lookahead).
+    bar.setdefault("timestamp", ts)
     zone_id_value = str(zone.get("zone_id") or event.get("zone_key") or "")
     if not zone_id_value:
         zone_id_value = stable_id(symbol, direction, zone.get("origin_ts_ms"), zone.get("top"), zone.get("btm"), prefix="ZONE_")
@@ -1164,6 +1175,13 @@ def build_observation_from_touch_event(
             event["structural_distance_price"] = structural_distance
     except Exception:
         structure_room = None
+    if zone.get("age_bars") is None and df_1h is not None and not df_1h.empty:
+        try:
+            current_idx = len(df_1h) - 1
+            zone_start = int(zone.get("start", current_idx))
+            zone["age_bars"] = max(0, int(current_idx - zone_start))
+        except (TypeError, ValueError):
+            pass
     features = build_research_features(
         symbol=symbol,
         direction=direction,
@@ -1204,7 +1222,7 @@ def build_observation_from_touch_event(
         "entry_bar": sanitize(bar),
         "previous_bar": sanitize(event.get("previous_bar") or {}),
         "trigger": {
-            "touch_mode": event.get("touch_mode"),
+            "touch_mode": event.get("touch_mode") or event.get("zone_trigger_mode") or os.environ.get("ZONE_TRIGGER_MODE"),
             "midpoint": event.get("midpoint"),
             "event_id": event.get("event_id"),
             "age_min": event.get("age_min"),
