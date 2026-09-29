@@ -3343,6 +3343,7 @@ def test_5m_zone_diagnostics_capture_window_and_processed_reasons(monkeypatch):
     from run_once import _process_5m_zone_visits
     monkeypatch.setattr(run_once, "INITIAL_5M_TRIGGER_LOOKBACK_MINUTES", 60.0)
     monkeypatch.setattr(run_once, "MAX_5M_TRIGGER_AGE_MINUTES", 60.0)
+    monkeypatch.setattr(run_once, "ZONE_TRIGGER_MODE", "zone")
     now = pd.Timestamp.now(tz="UTC").floor("5min")
     zone = {"start": 0, "top": 110.0, "btm": 100.0, "poi": 105.0}
     t0 = now - pd.Timedelta(minutes=15)
@@ -3363,6 +3364,13 @@ def test_5m_zone_diagnostics_capture_window_and_processed_reasons(monkeypatch):
     assert diagnostics["zones"][key]["signals_created"] >= 1
     assert sigs
     assert state["zones"][key]["state"] == "LOCKED"
+    touch_events = diagnostics["touch_events"]
+    assert touch_events
+    assert all(event.get("touch_mode") == "zone" for event in touch_events)
+    assert all(event.get("bar", {}).get("timestamp") for event in touch_events)
+    assert all(isinstance(event.get("bar", {}).get("volume"), (int, float)) for event in touch_events)
+    assert diagnostics["zones"][key]["closest_midpoint_bar"].get("timestamp")
+    assert isinstance(diagnostics["zones"][key]["closest_midpoint_bar"].get("volume"), (int, float))
 
 
 def test_build_zone_rejects_non_finite_atr_and_anchor():

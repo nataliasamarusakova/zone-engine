@@ -46,6 +46,37 @@ def test_build_features_shadow_filters_do_not_depend_on_runtime_gate(monkeypatch
     assert f["shadow_age_le_24h"] in {True, False}
 
 
+def test_touch_observation_anchors_entry_bar_timestamp_and_prevents_volume_lookahead():
+    ts = pd.date_range("2026-01-01T00:00:00Z", periods=30, freq="5min")
+    volumes = [100.0] * 25 + [100000.0] * 5
+    df5 = pd.DataFrame({
+        "timestamp": ts,
+        "open": [100.0] * len(ts),
+        "high": [101.0] * len(ts),
+        "low": [99.0] * len(ts),
+        "close": [100.0] * len(ts),
+        "volume": volumes,
+    })
+    event_ts = ts[24].isoformat()
+    event = {
+        "timestamp": event_ts,
+        "reason": "directional_candle_required",
+        "entry_ref": 100.0,
+        "touch_mode": "zone",
+        "bar": {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 200.0},
+    }
+    zone = {"zone_id": "Z_TOUCH", "top": 101.0, "btm": 99.0, "poi": 100.0, "origin_ts_ms": int(ts[0].timestamp() * 1000), "start": 10}
+    out = research.build_observation_from_touch_event(
+        event=event, symbol="TEST-USDT", zone=zone, direction="LONG", df_1h=_df_1h(), df_5m=df5,
+        zone_visit_id="V1", scan_id="S1", decision_ts=event_ts, strategy_version="v1",
+        code_commit_sha="abc", provider="binance", source="binance_spot",
+    )
+    assert out["entry_bar"]["timestamp"] == event_ts
+    assert out["trigger"]["touch_mode"] == "zone"
+    assert out["zone"]["age_bars"] == 49
+    assert out["features"]["volume_ratio_5m20"] == pytest.approx(2.0)
+
+
 def test_record_entry_decision_uses_requested_path(tmp_path: Path):
     path = tmp_path / "entry_decisions.jsonl"
     row = {"scan_id": "S1", "event_id": "E1", "stage": "CYCLE_CAP", "reason": "cap", "symbol": "TEST-USDT", "direction": "SHORT"}

@@ -1014,7 +1014,7 @@ def _process_5m_zone_visits(
                 distance_pct = 0.0 if touched else ((midpoint - high) if high < midpoint else (low - midpoint)) / midpoint * 100.0 if midpoint else None
                 if distance_pct is not None and (zdiag["window_closest_midpoint_distance_pct"] is None or distance_pct < zdiag["window_closest_midpoint_distance_pct"]):
                     zdiag["window_closest_midpoint_distance_pct"] = distance_pct
-                    zdiag["window_closest_midpoint_bar"] = {"timestamp": ts.isoformat(), "open": float(wbar["open"]), "high": high, "low": low, "close": float(wbar["close"]), "distance_pct": distance_pct}
+                    zdiag["window_closest_midpoint_bar"] = {"timestamp": ts.isoformat(), "open": float(wbar["open"]), "high": high, "low": low, "close": float(wbar["close"]), "volume": float(wbar["volume"]), "distance_pct": distance_pct}
                 if touched:
                     zdiag["window_midpoint_touches"] += 1
                     zdiag["window_last_midpoint_touch"] = ts.isoformat()
@@ -1080,9 +1080,9 @@ def _process_5m_zone_visits(
                         diagnostics["touch_events"].append({
                             "timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction,
                             "midpoint": float((float(zone["top"]) + float(zone["btm"])) / 2.0),
-                            "state_before": zs.get("state", "ARMED"), "reason": "zone_not_active",
+                            "state_before": zs.get("state", "ARMED"), "reason": "zone_not_active", "touch_mode": ZONE_TRIGGER_MODE,
                             "visit_id": zs.get("visit_id"),
-                            "bar": {"open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"]), "volume": float(bar["volume"])}
+                            "bar": {"timestamp": bar_ts.isoformat(), "open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"]), "volume": float(bar["volume"])}
                         })
                     _set_decision("BLOCKED_ZONE_NOT_ACTIVE", zone_key=zone_key, direction=direction, reason="zone_not_active", timestamp=bar_ts.isoformat())
                     continue
@@ -1096,7 +1096,7 @@ def _process_5m_zone_visits(
                 zdiag = diagnostics["zones"][zone_key]
                 if zdiag["closest_midpoint_distance_pct"] is None or distance_pct < zdiag["closest_midpoint_distance_pct"]:
                     zdiag["closest_midpoint_distance_pct"] = distance_pct
-                    zdiag["closest_midpoint_bar"] = {"timestamp": bar_ts.isoformat(), "open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"]), "distance_pct": distance_pct}
+                    zdiag["closest_midpoint_bar"] = {"timestamp": bar_ts.isoformat(), "open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"]), "volume": float(bar["volume"]), "distance_pct": distance_pct}
             touch = midpoint_touch if ZONE_TRIGGER_MODE == "midpoint" else zone_overlap
             if not touch:
                 continue
@@ -1116,7 +1116,7 @@ def _process_5m_zone_visits(
                 zs.update({"state": "LOCKED", "first_touch_ts": bar_ts.isoformat(), "last_touch_ts": bar_ts.isoformat(), "touch_count": int(zs.get("touch_count", 0)) + 1, "lock_reason": "ambiguous_overlap", "visit_id": f"{symbol}:{zone_key}:{int(bar_ts.timestamp()*1000)}"})
                 if diagnostics is not None:
                     diagnostics["zones"][zone_key]["ambiguous_blocks"] += 1
-                    diagnostics["touch_events"].append({"timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction, "midpoint": midpoint, "state_before": "ARMED", "reason": "ambiguous_overlap", "visit_id": zs.get("visit_id"), "bar": {"open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"]), "volume": float(bar["volume"])}})
+                    diagnostics["touch_events"].append({"timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction, "midpoint": midpoint, "state_before": "ARMED", "reason": "ambiguous_overlap", "touch_mode": ZONE_TRIGGER_MODE, "visit_id": zs.get("visit_id"), "bar": {"timestamp": bar_ts.isoformat(), "open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"]), "volume": float(bar["volume"])}})
                     diagnostics["zones"][zone_key]["state_after"] = "LOCKED"
                 _set_decision("BLOCKED_AMBIGUOUS", zone_key=zone_key, direction=direction, reason="ambiguous_overlap", timestamp=bar_ts.isoformat())
                 continue
@@ -1151,7 +1151,7 @@ def _process_5m_zone_visits(
                 zs.update({"state": "LOCKED", "last_touch_ts": bar_ts.isoformat(), "touch_count": int(zs.get("touch_count", 0)) + 1})
                 if diagnostics is not None:
                     diagnostics["zones"][zone_key]["same_visit_blocks"] += 1
-                    diagnostics["touch_events"].append({"timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction, "midpoint": midpoint, "state_before": "LOCKED_OR_CONTINUOUS", "reason": ("previous_5m_midpoint_touch" if ZONE_TRIGGER_MODE == "midpoint" else "previous_5m_zone_touch"), "visit_id": zs.get("visit_id"), "touch_count_before_trigger": int(zs.get("touch_count", 0)), "bar": {"open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"]), "volume": float(bar["volume"])}})
+                    diagnostics["touch_events"].append({"timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction, "midpoint": midpoint, "state_before": "LOCKED_OR_CONTINUOUS", "reason": ("previous_5m_midpoint_touch" if ZONE_TRIGGER_MODE == "midpoint" else "previous_5m_zone_touch"), "touch_mode": ZONE_TRIGGER_MODE, "visit_id": zs.get("visit_id"), "touch_count_before_trigger": int(zs.get("touch_count", 0)), "bar": {"timestamp": bar_ts.isoformat(), "open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"]), "volume": float(bar["volume"])}})
                 _set_decision("BLOCKED_SAME_VISIT", zone_key=zone_key, direction=direction, reason=("previous_5m_midpoint_touch" if ZONE_TRIGGER_MODE == "midpoint" else "previous_5m_zone_touch"), timestamp=bar_ts.isoformat())
                 continue
             if not zs.get("first_touch_ts"):
@@ -1168,8 +1168,9 @@ def _process_5m_zone_visits(
                     "timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction,
                     "midpoint": midpoint, "visit_id": zs.get("visit_id"),
                     "touch_count_before_trigger": int(zs.get("touch_count", 0)),
+                    "touch_mode": ZONE_TRIGGER_MODE,
                     "entry_ref": research_entry_ref,
-                    "bar": {"open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"]), "volume": float(bar["volume"])},
+                    "bar": {"timestamp": bar_ts.isoformat(), "open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"]), "volume": float(bar["volume"])},
                 }
                 if research_obstacle is not None:
                     obstacle_price = float(research_obstacle.get("price"))
@@ -1217,7 +1218,7 @@ def _process_5m_zone_visits(
                 })
                 if diagnostics is not None:
                     diagnostics["zones"][zone_key]["stale_touches"] += 1
-                    diagnostics["touch_events"].append({"timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction, "midpoint": midpoint, "state_before": "ARMED", "reason": ("stale_midpoint_touch_ignored" if ZONE_TRIGGER_MODE == "midpoint" else "stale_zone_touch_ignored"), "age_min": age_min, "visit_id": zs.get("visit_id"), "touch_count_before_trigger": int(zs.get("touch_count", 0)), "bar": {"open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"]), "volume": float(bar["volume"])}})
+                    diagnostics["touch_events"].append({"timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction, "midpoint": midpoint, "state_before": "ARMED", "reason": ("stale_midpoint_touch_ignored" if ZONE_TRIGGER_MODE == "midpoint" else "stale_zone_touch_ignored"), "touch_mode": ZONE_TRIGGER_MODE, "age_min": age_min, "visit_id": zs.get("visit_id"), "touch_count_before_trigger": int(zs.get("touch_count", 0)), "bar": {"timestamp": bar_ts.isoformat(), "open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"]), "volume": float(bar["volume"])}})
                 _set_decision("BLOCKED_STALE_TOUCH", zone_key=zone_key, direction=direction, reason=("stale_midpoint_touch_ignored" if ZONE_TRIGGER_MODE == "midpoint" else "stale_zone_touch_ignored"), timestamp=bar_ts.isoformat())
                 continue
             zs["trigger_event_id"] = event_id
@@ -1240,7 +1241,7 @@ def _process_5m_zone_visits(
                         "tp2": float(signal.get("tp2", 0.0) or 0.0),
                         "obstacle_price": (signal.get("target") or {}).get("obstacle_price"),
                         "zone_age_bars": (signal.get("confirmation") or {}).get("zone_age_bars"),
-                        "bar": {"open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"]), "volume": float(bar["volume"])},
+                        "bar": {"timestamp": bar_ts.isoformat(), "open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"]), "volume": float(bar["volume"])},
                         "previous_bar": ({"timestamp": pd.Timestamp(prev["timestamp"]).isoformat(), "open": float(prev["open"]), "high": float(prev["high"]), "low": float(prev["low"]), "close": float(prev["close"]), "volume": float(prev["volume"])} if prev is not None else {}),
                     })
                 _set_decision("SIGNAL_CREATED", zone_key=zone_key, direction=direction, reason="signal_created", timestamp=bar_ts.isoformat())
