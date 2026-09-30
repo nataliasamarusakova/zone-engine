@@ -904,13 +904,16 @@ def build_research_features(
             x5["timestamp"] = x5["timestamp"].map(_parse_timestamp)
             x5["volume"] = pd.to_numeric(x5["volume"], errors="coerce")
             x5 = x5.dropna(subset=["timestamp", "volume"]).sort_values("timestamp")
-            prior = x5.loc[x5["timestamp"] < trigger_ts, "volume"].tail(20) if trigger_ts is not None else x5["volume"].tail(20)
-            avg = float(prior.mean()) if len(prior) >= 20 else float("nan")
+            prior = x5.loc[x5["timestamp"] < trigger_ts, "volume"].tail(20) if trigger_ts is not None else x5["volume"].iloc[0:0]
+            avg = float(prior.mean()) if len(prior) == 20 else float("nan")
             if math.isfinite(avg) and avg > 0:
                 vr = volume / avg
         except Exception:
             vr = None
     features["volume_ratio_5m20"] = vr
+    features["volume_ratio_5m20_source"] = (
+        "5M_PREVIOUS_20_CLOSED_BARS" if vr is not None else "UNAVAILABLE_TRIGGER_TIMESTAMP_OR_20_BAR_BASELINE"
+    )
     # Explicit approach-to-zone metrics are computed from bars strictly before the trigger bar.
     if df_5m is not None and not df_5m.empty and bar.get("timestamp") is not None:
         try:

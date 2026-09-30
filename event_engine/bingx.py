@@ -1639,6 +1639,9 @@ def _quote_provenance_fields(quote_time: Any) -> dict[str, Any]:
         "quote_local_age_sec": local_age,
         "quote_exchange_age_sec": exchange_age,
         "quote_freshness_source": source,
+        "execution_reference_quality": (
+            "EXCHANGE_TIME_VERIFIED" if exchange_time_ms is not None else "LOCAL_OBSERVED_ONLY"
+        ),
     }
 
 
@@ -2110,7 +2113,8 @@ def fetch_research_account_snapshot() -> dict[str, Any]:
         if isinstance(fills, dict) and int(fills.get("code", -1)) == 0:
             raw_rows = fills.get("data") if isinstance(fills.get("data"), list) else []
             activity_rows = []
-            fee_total = realized_total = 0.0
+            fee_values: list[float] = []
+            realized_values: list[float] = []
             for row in raw_rows:
                 if not isinstance(row, dict):
                     continue
@@ -2129,19 +2133,44 @@ def fetch_research_account_snapshot() -> dict[str, Any]:
                     except (TypeError, ValueError):
                         item[dst] = None
                 if item.get("fee") is not None:
-                    fee_total += float(item["fee"])
+                    fee_values.append(float(item["fee"]))
                 if item.get("realized_pnl") is not None:
-                    realized_total += float(item["realized_pnl"])
+                    realized_values.append(float(item["realized_pnl"]))
                 activity_rows.append(item)
+            fill_count = len(activity_rows)
+            fees_complete = len(fee_values) == fill_count
+            realized_complete = len(realized_values) == fill_count
             result["recent_fill_window_start_ms"] = activity_start_ms
             result["recent_fill_window_end_ms"] = activity_end_ms
             result["recent_fills"] = activity_rows
-            result["recent_fill_count"] = len(activity_rows)
-            result["recent_fill_fee_total"] = fee_total
-            result["recent_fill_realized_pnl_total"] = realized_total
-            result["recent_realized_pnl_total"] = realized_total
-            result["recent_realized_pnl_source"] = "ALL_FILL_ORDERS"
-            result["recent_fill_source"] = "ALL_FILL_ORDERS"
+            result["recent_fill_count"] = fill_count
+            result["recent_fill_status"] = "EMPTY" if fill_count == 0 else "OK"
+            if fill_count == 0:
+                result["recent_fill_financial_status"] = "NO_FILLS"
+                result["recent_fill_fee_status"] = "NO_FILLS"
+                result["recent_fill_realized_pnl_status"] = "NO_FILLS"
+                result["recent_fill_fee_total"] = 0.0
+                result["recent_fill_realized_pnl_total"] = 0.0
+                result["recent_realized_pnl_total"] = 0.0
+                result["recent_realized_pnl_source"] = "ALL_FILL_ORDERS_EMPTY"
+                result["recent_fill_source"] = "ALL_FILL_ORDERS_EMPTY"
+            else:
+                result["recent_fill_fee_status"] = "CONFIRMED" if fees_complete else "PARTIAL_MISSING_FIELD"
+                result["recent_fill_realized_pnl_status"] = "CONFIRMED" if realized_complete else "PARTIAL_MISSING_FIELD"
+                result["recent_fill_fee_total"] = sum(fee_values) if fees_complete else None
+                result["recent_fill_realized_pnl_total"] = sum(realized_values) if realized_complete else None
+                if fees_complete and realized_complete:
+                    result["recent_fill_financial_status"] = "CONFIRMED"
+                    result["recent_realized_pnl_total"] = sum(realized_values)
+                    result["recent_realized_pnl_source"] = "ALL_FILL_ORDERS"
+                else:
+                    result["recent_fill_financial_status"] = "PARTIAL_MISSING_FIELDS"
+                    # A complete realized-PnL field remains authoritative even when
+                    # fee fields are incomplete. Do not replace it with a different
+                    # source merely because the combined financial row is partial.
+                    result["recent_realized_pnl_total"] = sum(realized_values) if realized_complete else None
+                    result["recent_realized_pnl_source"] = "ALL_FILL_ORDERS_PARTIAL_MISSING"
+                result["recent_fill_source"] = "ALL_FILL_ORDERS"
         else:
             result["recent_fill_status"] = "error"
             result["recent_fill_error"] = f"code={fills.get('code') if isinstance(fills, dict) else 'invalid'}"
@@ -2186,7 +2215,7 @@ def fetch_research_account_snapshot() -> dict[str, Any]:
             result["recent_income"] = income_rows
             result["recent_income_count"] = len(income_rows)
             result["recent_income_totals"] = totals
-            if result.get("recent_realized_pnl_source") == "UNAVAILABLE":
+            if result.get("recent_realized_pnl_total") is None and result.get("recent_realized_pnl_source") in {"UNAVAILABLE", "ALL_FILL_ORDERS_EMPTY", "ALL_FILL_ORDERS_PARTIAL_MISSING"}:
                 realized_from_income = totals.get("REALIZED_PNL")
                 if isinstance(realized_from_income, (int, float)) and math.isfinite(float(realized_from_income)):
                     result["recent_realized_pnl_total"] = float(realized_from_income)
@@ -2578,6 +2607,8 @@ def ensure_directional_protection(
             "client_order_id": str(sl.get("clientOrderId", "")),
             "stop_price": float(sl.get("stopPrice", 0) or sl.get("price", 0) or 0),
             "qty": float(sl.get("origQty", 0) or sl.get("quantity", 0) or position_qty),
+            "protection_order_verified": True,
+            "execution_verified": None,
         }
     else:
         sl_price = avg_price * (1.0 - stop_loss_pct / 100.0) if direction == "LONG" else avg_price * (1.0 + stop_loss_pct / 100.0)
@@ -2627,6 +2658,8 @@ def ensure_directional_protection(
                 "client_order_id": order.get("clientOrderId") or client_order_id,
                 "stop_price": float(order.get("stopPrice", 0) or order.get("price", 0) or sl_price),
                 "qty": _order_qty(order),
+                "protection_order_verified": True,
+                "execution_verified": None,
             }
         else:
             sl_result = {
@@ -2635,6 +2668,8 @@ def ensure_directional_protection(
                 "client_order_id": order.get("clientOrderId") or client_order_id,
                 "stop_price": sl_price,
                 "qty": position_qty,
+                "protection_order_verified": True,
+                "execution_verified": None,
             }
 
     verified = get_open_protection_directional(symbol, direction)
@@ -2735,7 +2770,8 @@ def ensure_directional_protection(
                         "qty": existing_qty,
                         "pnl_pct": pnl_pct,
                         "expected_tp_price": tp_price,
-                        "execution_verified": True,
+                        "protection_order_verified": True,
+                        "execution_verified": None,
                     }
                 )
                 continue
@@ -2811,7 +2847,9 @@ def ensure_directional_protection(
                     "price": current_price,
                     "qty": float(verification.get("reduced_qty") or verification.get("executed_qty") or tp_qty),
                     "pnl_pct": pnl_pct,
+                    "protection_order_verified": None,
                     "execution_verified": True,
+                    "fill_evidence_status": "CONFIRMED",
                     "executed_qty": float(verification.get("executed_qty", 0.0) or 0.0),
                     "remaining_qty": float(verification.get("remaining_qty", 0.0) or 0.0),
                 })
@@ -2846,6 +2884,8 @@ def ensure_directional_protection(
                 "client_order_id": order.get("clientOrderId") or client_order_id,
                 "price": float(order.get("stopPrice", 0) or order.get("price", 0) or tp_price),
                 "qty": _order_qty(order), "pnl_pct": pnl_pct,
+                "protection_order_verified": True,
+                "execution_verified": None,
             })
             continue
 
@@ -2865,7 +2905,7 @@ def ensure_directional_protection(
             "client_order_id": order.get("clientOrderId") or client_order_id,
             "price": float(order.get("stopPrice", 0) or order.get("price", 0) or tp_price),
             "qty": _order_qty(order), "pnl_pct": pnl_pct,
-            "expected_tp_price": tp_price, "execution_verified": True,
+            "expected_tp_price": tp_price, "protection_order_verified": True, "execution_verified": None,
         })
 
     successful_tps = [t for t in tp_results if t.get("status") in {"created", "already_exists", "reconciled_after_post_error"}]

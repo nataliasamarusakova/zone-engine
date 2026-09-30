@@ -819,6 +819,11 @@ def _register_active_trade_locked(
         "entry_order": setup_metrics.get("entry_order", {}),
         "fill_position": setup_metrics.get("fill_position", {}),
         "execution_snapshot": setup_metrics.get("execution_snapshot", {}),
+        "protection_status": (
+            ((setup or {}).get("execution_snapshot") or {}).get("protection_status")
+            if isinstance((setup or {}).get("execution_snapshot"), dict)
+            else None
+        ),
         "tp_fill_events": [],
         "event_type": event_type,
         "timeframe": str(timeframe or (setup or {}).get("event_timeframe") or (setup or {}).get("timeframe") or "1h").lower(),
@@ -1708,15 +1713,19 @@ def _get_order_execution_evidence(symbol: str, order_id: str | None, *, entry_ts
 
 
 def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
-    """Collect exchange fill/fee evidence for one logical trade at close time.
+    """Collect exchange execution/fee/PnL evidence for one logical trade.
 
-    The result intentionally separates:
-    * gross price PnL derived from confirmed entry/exit fills;
-    * exchange-reported realized PnL;
-    * signed fee total and fee cost;
-    * net PnL derived from gross price PnL + signed fees.
+    Priority is strict and explicit:
+    1. exchange fill-history rows are the authoritative fill ledger;
+    2. when the aggregate fill query does not return a known order, retry that
+       order by ``orderId``;
+    3. when fill history is still unavailable, an exchange order response with
+       ``executedQty > 0`` and ``avgPrice > 0`` is retained as *execution
+       evidence*, but it is never treated as fill-level fee/realized-PnL evidence.
 
-    Missing exchange fields stay ``None``. They are never converted to zero.
+    This lets us reconstruct gross price PnL and execution timestamps without
+    manufacturing account fees or exchange realized PnL. Missing financial fields
+    remain ``None``.
     """
     symbol = str(trade.get("symbol", ""))
     direction = _normalize_direction(trade.get("direction", ""))
@@ -1745,60 +1754,156 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
     if trade.get("exit_order_id"):
         order_roles[str(trade["exit_order_id"])] = order_roles.get(str(trade["exit_order_id"]), "EXIT")
 
-    base = {"fills": [], "order_ids": sorted(order_roles), "source": "ALL_FILL_ORDERS"}
+    base = {
+        "fills": [],
+        "order_execution_evidence": [],
+        "order_ids": sorted(order_roles),
+        "source": "ALL_FILL_ORDERS",
+        "fill_query_mode": "AGGREGATE",
+        "exact_order_queries_attempted": [],
+        "exact_order_query_errors": {},
+    }
     if not symbol or not order_roles:
         return {**base, "status": "NO_ORDER_IDS"}
 
+    start_ms = max(0, entry_ts - 60_000)
+    end_ms = max(entry_ts, now_ms) + 60_000
+    aggregate_error = None
     try:
-        fills = get_fill_orders(
-            symbol,
-            max(0, entry_ts - 60_000),
-            max(entry_ts, now_ms) + 60_000,
-            limit=1000,
-        )
+        fills = get_fill_orders(symbol, start_ms, end_ms, limit=1000)
     except Exception as exc:
-        return {**base, "status": "UNAVAILABLE", "error": f"{type(exc).__name__}:{exc}"}
+        fills = []
+        aggregate_error = f"{type(exc).__name__}:{exc}"
 
-    relevant = [f for f in fills if str(f.get("order_id", "")) in order_roles]
-    if not relevant:
-        return {**base, "status": "NO_MATCHING_FILLS"}
+    def _fill_key(fill: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            str(fill.get("order_id", "")),
+            str(fill.get("trade_id", "")),
+            int(_optional_float(fill.get("time_ms")) or 0),
+            float(_optional_float(fill.get("qty")) or 0.0),
+            float(_optional_float(fill.get("price")) or 0.0),
+        )
 
-    for fill in relevant:
-        fill["role"] = order_roles.get(str(fill.get("order_id", "")), "UNKNOWN")
+    relevant_map: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for fill in fills if isinstance(fills, list) else []:
+        if str(fill.get("order_id", "")) not in order_roles:
+            continue
+        row = dict(fill)
+        row["role"] = order_roles.get(str(row.get("order_id", "")), "UNKNOWN")
+        relevant_map[_fill_key(row)] = row
+
+    # The aggregate endpoint is not guaranteed to surface every order for a
+    # busy account. Retry each known order that is absent from the aggregate set.
+    aggregate_order_ids = {str(row.get("order_id", "")) for row in relevant_map.values()}
+    exact_attempts: list[str] = []
+    exact_errors: dict[str, str] = {}
+    for order_id in sorted(order_roles):
+        if order_id in aggregate_order_ids:
+            continue
+        exact_attempts.append(order_id)
+        try:
+            exact_rows = get_fill_orders(symbol, start_ms, end_ms, order_id=order_id, limit=1000)
+        except Exception as exc:
+            exact_rows = []
+            exact_errors[order_id] = f"{type(exc).__name__}:{exc}"
+        for fill in exact_rows if isinstance(exact_rows, list) else []:
+            if str(fill.get("order_id", "")) != order_id:
+                continue
+            row = dict(fill)
+            row["role"] = order_roles.get(order_id, "UNKNOWN")
+            relevant_map[_fill_key(row)] = row
+
+    relevant = list(relevant_map.values())
+
+    # If fill history still lacks a known order, retain exchange order-level
+    # execution evidence. This is actual executedQty/avgPrice evidence, not an
+    # invented fill and never supplies fee/realizedPnl values.
+    fill_order_ids = {str(row.get("order_id", "")) for row in relevant}
+    order_execution_evidence: list[dict[str, Any]] = []
+    for order_id in sorted(order_roles):
+        if order_id in fill_order_ids:
+            continue
+        try:
+            info = _get_order_execution_evidence(symbol, order_id, entry_ts=entry_ts)
+        except Exception as exc:
+            info = {"status": "error", "error": f"{type(exc).__name__}:{exc}"}
+        if not isinstance(info, dict) or info.get("status") != "ok":
+            continue
+        executed_qty = _safe_float(info.get("executed_qty"), 0.0)
+        avg_price = _safe_float(info.get("avg_price"), 0.0)
+        if executed_qty <= 0 or avg_price <= 0:
+            continue
+        order_execution_evidence.append({
+            "order_id": str(info.get("order_id") or order_id),
+            "role": order_roles.get(order_id, "UNKNOWN"),
+            "order_status": str(info.get("order_status") or "").upper(),
+            "executed_qty": executed_qty,
+            "avg_price": avg_price,
+            "trigger_price": _safe_float(info.get("trigger_price"), 0.0) or None,
+            "time_ms": info.get("time_ms"),
+            "update_time_ms": info.get("update_time_ms"),
+            "execution_evidence_source": "ORDER_STATUS_EXECUTION_EVIDENCE",
+            "fill_realized_pnl_abs": None,
+            "fill_fee_raw": None,
+            "fill_realized_pnl_status": "UNAVAILABLE_ORDER_LEVEL_ONLY",
+            "fill_fee_status": "UNAVAILABLE_ORDER_LEVEL_ONLY",
+        })
+
+    relevant = sorted(relevant, key=lambda row: (
+        int(_optional_float(row.get("time_ms")) or 0),
+        str(row.get("order_id", "")),
+        str(row.get("trade_id", "")),
+    ))
+    for row in relevant:
+        row.setdefault("execution_evidence_source", "ALL_FILL_ORDERS")
 
     entry_fills = [f for f in relevant if f.get("role") == "ENTRY"]
     exit_fills = [f for f in relevant if f.get("role") != "ENTRY"]
-    qty_complete = _all_present_numeric(relevant, "qty")
-    price_complete = _all_present_numeric(relevant, "price")
-    fee_complete = _all_present_numeric(relevant, "fee")
-    realized_complete = _all_present_numeric(relevant, "realized_pnl")
-    entry_qty_complete = _all_present_numeric(entry_fills, "qty")
-    entry_price_complete = _all_present_numeric(entry_fills, "price")
-    exit_qty_complete = _all_present_numeric(exit_fills, "qty")
-    exit_price_complete = _all_present_numeric(exit_fills, "price")
+    entry_exec = [
+        {"qty": _optional_float(f.get("qty")), "price": _optional_float(f.get("price")), "source": "FILL"}
+        for f in entry_fills
+    ] + [
+        {"qty": x["executed_qty"], "price": x["avg_price"], "source": "ORDER"}
+        for x in order_execution_evidence if x.get("role") == "ENTRY"
+    ]
+    exit_exec = [
+        {"qty": _optional_float(f.get("qty")), "price": _optional_float(f.get("price")), "source": "FILL", "time_ms": f.get("time_ms")}
+        for f in exit_fills
+    ] + [
+        {"qty": x["executed_qty"], "price": x["avg_price"], "source": "ORDER", "time_ms": x.get("update_time_ms") or x.get("time_ms")}
+        for x in order_execution_evidence if x.get("role") != "ENTRY"
+    ]
 
-    entry_qty = sum(float(_optional_float(f.get("qty"))) for f in entry_fills if _optional_float(f.get("qty")) is not None)
-    exit_qty = sum(float(_optional_float(f.get("qty"))) for f in exit_fills if _optional_float(f.get("qty")) is not None)
-    entry_vwap = None
-    if entry_qty_complete and entry_price_complete and entry_qty > 0:
-        entry_vwap = sum(float(_optional_float(f.get("qty"))) * float(_optional_float(f.get("price"))) for f in entry_fills) / entry_qty
+    def _complete_exec(rows: list[dict[str, Any]]) -> bool:
+        return bool(rows) and all(
+            isinstance(row.get("qty"), (int, float)) and math.isfinite(float(row["qty"])) and float(row["qty"]) > 0
+            and isinstance(row.get("price"), (int, float)) and math.isfinite(float(row["price"])) and float(row["price"]) > 0
+            for row in rows
+        )
+
+    entry_execution_complete = _complete_exec(entry_exec)
+    exit_execution_complete = _complete_exec(exit_exec)
+    entry_qty = sum(float(row["qty"]) for row in entry_exec if row.get("qty") is not None)
+    exit_qty = sum(float(row["qty"]) for row in exit_exec if row.get("qty") is not None)
+    entry_vwap = (
+        sum(float(row["qty"]) * float(row["price"]) for row in entry_exec) / entry_qty
+        if entry_execution_complete and entry_qty > 0 else None
+    )
 
     gross_realized_pnl_abs = None
-    if entry_vwap is not None and exit_qty_complete and exit_price_complete and direction in {"LONG", "SHORT"}:
+    if entry_vwap is not None and exit_execution_complete and direction in {"LONG", "SHORT"}:
         gross_realized_pnl_abs = 0.0
-        for fill in exit_fills:
-            q = float(_optional_float(fill.get("qty")))
-            px = float(_optional_float(fill.get("price")))
+        for row in exit_exec:
+            q = float(row["qty"])
+            px = float(row["price"])
             gross_realized_pnl_abs += (px - entry_vwap) * q if direction == "LONG" else (entry_vwap - px) * q
 
-    exchange_realized_pnl_abs = None
-    if realized_complete:
-        exchange_realized_pnl_abs = sum(float(_optional_float(f.get("realized_pnl"))) for f in relevant)
-
-    entry_fee_raw = None
-    exit_fee_raw = None
-    fee_raw_total = None
-    fees_paid_abs = None
+    # Financial totals remain fill-ledger-only. An order-level execution response
+    # has no authoritative fee/realizedPnl fields and must not be treated as one.
+    fee_complete = bool(relevant) and _all_present_numeric(relevant, "fee") and not order_execution_evidence
+    realized_complete = bool(relevant) and _all_present_numeric(relevant, "realized_pnl") and not order_execution_evidence
+    exchange_realized_pnl_abs = sum(float(_optional_float(f.get("realized_pnl"))) for f in relevant) if realized_complete else None
+    entry_fee_raw = exit_fee_raw = fee_raw_total = fees_paid_abs = None
     if fee_complete:
         entry_fee_raw = sum(float(_optional_float(f.get("fee"))) for f in entry_fills)
         exit_fee_raw = sum(float(_optional_float(f.get("fee"))) for f in exit_fills)
@@ -1809,42 +1914,233 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
     if gross_realized_pnl_abs is not None and fee_raw_total is not None:
         net_realized_pnl_abs = gross_realized_pnl_abs + fee_raw_total
 
-    close_candidates = [
+    fill_exit_ts = [
         int(_optional_float(f.get("time_ms")))
         for f in exit_fills
         if _optional_float(f.get("time_ms")) is not None and int(_optional_float(f.get("time_ms"))) > 0
     ]
-    status = "VERIFIED" if (exit_qty_complete and exit_price_complete) else "PARTIAL_ACCOUNTING"
-    quantity_tolerance = max(1e-12, abs(entry_qty) * 1e-8) if entry_qty > 0 else 1e-12
-    quantity_reconciliation = {
-        "status": "VERIFIED" if entry_qty > 0 and exit_qty >= entry_qty - quantity_tolerance else "PARTIAL_OR_UNVERIFIED",
-        "entry_qty": entry_qty if entry_qty_complete else None,
-        "confirmed_exit_qty": exit_qty if exit_qty_complete else None,
-        "difference_qty": (exit_qty - entry_qty) if entry_qty_complete and exit_qty_complete else None,
-        "tolerance": quantity_tolerance,
-    }
+    order_exit_ts = [
+        int(_optional_float(x.get("update_time_ms") or x.get("time_ms")))
+        for x in order_execution_evidence
+        if x.get("role") != "ENTRY" and _optional_float(x.get("update_time_ms") or x.get("time_ms")) is not None
+        and int(_optional_float(x.get("update_time_ms") or x.get("time_ms"))) > 0
+    ]
+    if fill_exit_ts:
+        last_exit_fill_ts_ms = max(fill_exit_ts)
+        last_exit_execution_timestamp_source = "FILL_TIME"
+    elif order_exit_ts:
+        last_exit_fill_ts_ms = max(order_exit_ts)
+        last_exit_execution_timestamp_source = "ORDER_UPDATE_OR_TIME"
+    else:
+        last_exit_fill_ts_ms = None
+        last_exit_execution_timestamp_source = "UNAVAILABLE"
+
+    qty_tolerance = max(1e-12, abs(entry_qty) * 1e-8) if entry_qty > 0 else 1e-12
+    execution_source = "ALL_FILL_ORDERS"
+    if order_execution_evidence and relevant:
+        execution_source = "ALL_FILL_ORDERS+ORDER_STATUS"
+    elif order_execution_evidence:
+        execution_source = "ORDER_STATUS_EXECUTION_EVIDENCE"
+    elif aggregate_error:
+        execution_source = "ALL_FILL_ORDERS_ERROR"
+
+    exit_vwap_confirmed = (
+        sum(float(row["qty"]) * float(row["price"]) for row in exit_exec) / exit_qty
+        if exit_execution_complete and exit_qty > 0 else None
+    )
+    exit_sources = {str(row.get("source") or "").upper() for row in exit_exec}
+    if exit_vwap_confirmed is None:
+        exit_vwap_source = "UNAVAILABLE"
+    elif exit_sources == {"FILL"}:
+        exit_vwap_source = "CONFIRMED_FILL_HISTORY"
+    elif exit_sources and exit_sources.issubset({"FILL", "ORDER"}):
+        exit_vwap_source = "CONFIRMED_EXECUTION_EVIDENCE"
+    elif exit_sources == {"ORDER"}:
+        exit_vwap_source = "CONFIRMED_ORDER_EXECUTION_EVIDENCE"
+    else:
+        exit_vwap_source = "UNAVAILABLE"
+    execution_qty_status = (
+        "VERIFIED" if entry_execution_complete and exit_execution_complete and exit_qty >= entry_qty - qty_tolerance
+        else "PARTIAL_OR_UNVERIFIED"
+    )
+    status = (
+        "VERIFIED" if entry_execution_complete and exit_execution_complete and not order_execution_evidence
+        else "VERIFIED_ORDER_EXECUTION" if entry_execution_complete and exit_execution_complete
+        else "PARTIAL_ACCOUNTING"
+    )
     return {
         "status": status,
         "fills": relevant,
+        "order_execution_evidence": order_execution_evidence,
         "order_ids": sorted(order_roles),
-        "entry_qty_confirmed": entry_qty if entry_qty_complete else None,
-        "confirmed_exit_qty": exit_qty if exit_qty_complete else None,
+        "entry_qty_confirmed": entry_qty if entry_execution_complete else None,
+        "confirmed_exit_qty": exit_qty if exit_execution_complete else None,
+        "confirmed_exit_qty_source": "FILL_HISTORY" if exit_fills and not order_execution_evidence else "ORDER_STATUS_EXECUTION_EVIDENCE" if order_execution_evidence else "UNAVAILABLE",
+        "exit_vwap_confirmed": exit_vwap_confirmed,
+        "exit_vwap_source": exit_vwap_source,
         "entry_vwap_confirmed": entry_vwap,
         "entry_fee_raw": entry_fee_raw,
         "exit_fee_raw": exit_fee_raw,
         "gross_realized_pnl_abs": gross_realized_pnl_abs,
-        "gross_realized_pnl_source": "CONFIRMED_FILL_PRICES" if gross_realized_pnl_abs is not None else "UNAVAILABLE",
+        "gross_realized_pnl_source": "CONFIRMED_EXECUTION_EVIDENCE" if gross_realized_pnl_abs is not None else "UNAVAILABLE",
         "exchange_realized_pnl_abs": exchange_realized_pnl_abs,
-        "exchange_realized_pnl_source": "ALL_FILL_ORDERS" if exchange_realized_pnl_abs is not None else "UNAVAILABLE_MISSING_FIELD",
+        "exchange_realized_pnl_source": "ALL_FILL_ORDERS" if exchange_realized_pnl_abs is not None else "UNAVAILABLE_FILL_LEVEL_EVIDENCE",
         "fee_raw_total": fee_raw_total,
         "fees_paid_abs": fees_paid_abs,
-        "fee_source": "ALL_FILL_ORDERS" if fee_raw_total is not None else "UNAVAILABLE_MISSING_FIELD",
+        "fee_source": "ALL_FILL_ORDERS" if fee_raw_total is not None else "UNAVAILABLE_FILL_LEVEL_EVIDENCE",
         "fees_status": "CONFIRMED" if fee_raw_total is not None else "UNAVAILABLE",
         "net_realized_pnl_abs": net_realized_pnl_abs,
-        "net_realized_pnl_source": "CONFIRMED_FILL_PRICES_PLUS_SIGNED_FEES" if net_realized_pnl_abs is not None else "UNAVAILABLE",
-        "last_exit_fill_ts_ms": max(close_candidates) if close_candidates else None,
-        "quantity_reconciliation": quantity_reconciliation,
-        "source": "ALL_FILL_ORDERS",
+        "net_realized_pnl_source": "CONFIRMED_EXECUTION_EVIDENCE_PLUS_SIGNED_FEES" if net_realized_pnl_abs is not None else "UNAVAILABLE",
+        "last_exit_fill_ts_ms": last_exit_fill_ts_ms,
+        "last_exit_execution_timestamp_source": last_exit_execution_timestamp_source,
+        "quantity_reconciliation": {
+            "status": execution_qty_status,
+            "initial_qty": entry_qty if entry_execution_complete else None,
+            "confirmed_exit_qty": exit_qty if exit_execution_complete else None,
+            "difference_qty": (exit_qty - entry_qty) if entry_execution_complete and exit_execution_complete else None,
+            "tolerance": qty_tolerance,
+        },
+        "source": execution_source,
+        "aggregate_query_error": aggregate_error,
+        "exact_order_queries_attempted": exact_attempts,
+        "exact_order_query_errors": exact_errors,
+    }
+
+
+def _close_execution_evidence(trade: dict, fill_accounting: dict[str, Any]) -> dict[str, Any]:
+    """Return the strongest confirmed exit-leg evidence available for a close.
+
+    Fill-ledger rows are preferred.  When the exchange fill ledger is unavailable,
+    confirmed order execution evidence is used.  As a final tracker-local fallback
+    for TP closes, previously recorded ``tp_fill_events`` are retained as evidence
+    but are clearly labelled as TP-event evidence.
+    """
+    reason = str(trade.get("exit_reason") or "").upper()
+    def _include_leg(leg: str) -> bool:
+        role = str(leg or "").upper()
+        if role == "ENTRY":
+            return False
+        if reason == "TAKE_PROFIT_FULL":
+            return role.startswith("TP")
+        if reason in {"STOP_LOSS", "BREAK_EVEN"}:
+            return role in {"SL", "BE_SL", "EXIT"} or role.startswith("BE")
+        return True
+
+    rows: list[dict[str, Any]] = []
+    tp_event_by_order: dict[str, dict[str, Any]] = {}
+    for event in trade.get("tp_fill_events", []) if isinstance(trade.get("tp_fill_events"), list) else []:
+        oid = str(event.get("order_id") or "")
+        if oid:
+            tp_event_by_order[oid] = event
+
+    for fill in fill_accounting.get("fills", []) if isinstance(fill_accounting.get("fills"), list) else []:
+        role = str(fill.get("role") or "EXIT").upper()
+        if not _include_leg(role):
+            continue
+        qty = _optional_float(fill.get("qty"))
+        px = _optional_float(fill.get("price"))
+        if qty is None or px is None or qty <= 0 or px <= 0:
+            continue
+        event = tp_event_by_order.get(str(fill.get("order_id") or "")) or {}
+        rows.append({
+            "order_id": str(fill.get("order_id") or ""),
+            "leg": role,
+            "status": "FILLED",
+            "executed_qty": float(qty),
+            "avg_price": float(px),
+            "trigger_price": event.get("trigger_price"),
+            "fill_time_ms": _optional_float(fill.get("time_ms")),
+            "order_update_time_ms": event.get("order_update_time_ms"),
+            "evidence_source": "ALL_FILL_ORDERS",
+            "trade_id": fill.get("trade_id"),
+        })
+    for row in fill_accounting.get("order_execution_evidence", []) if isinstance(fill_accounting.get("order_execution_evidence"), list) else []:
+        role = str(row.get("role") or "EXIT").upper()
+        if not _include_leg(role):
+            continue
+        qty = _optional_float(row.get("executed_qty"))
+        px = _optional_float(row.get("avg_price"))
+        if qty is None or px is None or qty <= 0 or px <= 0:
+            continue
+        rows.append({
+            "order_id": str(row.get("order_id") or ""),
+            "leg": role,
+            "status": str(row.get("order_status") or "FILLED").upper(),
+            "executed_qty": float(qty),
+            "avg_price": float(px),
+            "trigger_price": row.get("trigger_price"),
+            "fill_time_ms": None,
+            "order_update_time_ms": row.get("update_time_ms"),
+            "evidence_source": row.get("execution_evidence_source") or "ORDER_STATUS_EXECUTION_EVIDENCE",
+            "trade_id": None,
+        })
+
+    if not rows and reason == "TAKE_PROFIT_FULL":
+        for event in trade.get("tp_fill_events", []) if isinstance(trade.get("tp_fill_events"), list) else []:
+            qty = _optional_float(event.get("delta_qty"))
+            px = _optional_float(event.get("avg_price"))
+            if qty is None or px is None or qty <= 0 or px <= 0:
+                continue
+            rows.append({
+                "order_id": str(event.get("order_id") or ""),
+                "leg": str(event.get("leg") or "TP").upper(),
+                "status": str(event.get("order_status") or "FILLED").upper(),
+                "executed_qty": float(qty),
+                "avg_price": float(px),
+                "trigger_price": event.get("trigger_price"),
+                "fill_time_ms": event.get("fill_time_ms"),
+                "order_update_time_ms": event.get("order_update_time_ms"),
+                "evidence_source": "TP_FILL_EVENT",
+                "trade_id": (event.get("fill_trade_ids") or [None])[0],
+            })
+
+    if not rows:
+        return {
+            "status": "UNAVAILABLE",
+            "authority": "UNAVAILABLE",
+            "rows": [],
+            "confirmed_exit_qty": None,
+            "exit_vwap_confirmed": None,
+            "exit_vwap_source": "UNAVAILABLE",
+            "latest": None,
+        }
+
+    total_qty = sum(float(r["executed_qty"]) for r in rows)
+    exit_vwap = sum(float(r["executed_qty"]) * float(r["avg_price"]) for r in rows) / total_qty if total_qty > 0 else None
+
+    def _ts(row: dict[str, Any]) -> int:
+        value = row.get("fill_time_ms") or row.get("order_update_time_ms")
+        parsed = _optional_float(value)
+        return int(parsed) if parsed is not None and parsed > 0 else 0
+
+    latest = max(rows, key=_ts)
+    evidence_sources = {str(row.get("evidence_source") or "").upper() for row in rows}
+    if evidence_sources and evidence_sources.issubset({"ALL_FILL_ORDERS"}):
+        authority = "EXCHANGE_FILL_HISTORY"
+        exit_vwap_source = "CONFIRMED_FILL_HISTORY"
+    elif evidence_sources and evidence_sources.issubset({"ALL_FILL_ORDERS", "ORDER_STATUS_EXECUTION_EVIDENCE"}):
+        authority = "EXCHANGE_EXECUTION_EVIDENCE"
+        exit_vwap_source = "CONFIRMED_EXECUTION_EVIDENCE"
+    elif evidence_sources == {"ORDER_STATUS_EXECUTION_EVIDENCE"}:
+        authority = "EXCHANGE_ORDER_EXECUTION"
+        exit_vwap_source = "CONFIRMED_ORDER_EXECUTION_EVIDENCE"
+    else:
+        authority = "TRACKER_LOCAL_EVENT"
+        exit_vwap_source = "TRACKER_RECORDED_TP_EVENT"
+    return {
+        "status": "CONFIRMED",
+        "authority": authority,
+        "rows": rows,
+        "confirmed_exit_qty": total_qty,
+        "exit_vwap_confirmed": exit_vwap,
+        "exit_vwap_source": exit_vwap_source,
+        "latest": latest,
+        "latest_execution_ts_ms": _ts(latest) or None,
+        "latest_execution_timestamp_source": (
+            "FILL_TIME" if _optional_float(latest.get("fill_time_ms")) is not None and _optional_float(latest.get("fill_time_ms")) > 0
+            else "ORDER_UPDATE_TIME" if _optional_float(latest.get("order_update_time_ms")) is not None and _optional_float(latest.get("order_update_time_ms")) > 0
+            else "UNAVAILABLE"
+        ),
     }
 
 
@@ -2210,6 +2506,11 @@ def update_active_trades() -> None:
                     "remaining_qty": rem_qty,
                     "classification": tp_classification,
                     "execution_evidence_source": order_info.get("execution_evidence_source"),
+                    "fill_evidence_status": "CONFIRMED",
+                    "fill_time_ms": max((int(_optional_float(f.get("time_ms"))) for f in (order_info.get("fill_history") or []) if _optional_float(f.get("time_ms")) is not None), default=None),
+                    "order_update_time_ms": order_info.get("update_time_ms"),
+                    "order_time_ms": order_info.get("time_ms"),
+                    "trigger_price": _safe_float(order_info.get("trigger_price"), 0.0) or None,
                     "fill_realized_pnl_abs": order_info.get("fill_realized_pnl_abs"),
                     "fill_fee_raw": order_info.get("fill_fee_raw"),
                     "fill_trade_ids": order_info.get("fill_trade_ids", []),
@@ -2230,6 +2531,7 @@ def update_active_trades() -> None:
                     remaining_qty=rem_qty,
                     order_update_time_ms=order_info.get("update_time_ms"),
                     classification=tp_classification,
+                    fill_evidence_status="CONFIRMED",
                     economic_validation_passed=tp_ok,
                 )
 
@@ -2484,11 +2786,17 @@ def update_active_trades() -> None:
             # diagnostic/accounting I/O only; it does not affect live entry logic.
             fill_accounting = _collect_trade_fill_accounting(trade, now_ms)
             trade["fill_accounting"] = fill_accounting
+            close_execution_evidence = _close_execution_evidence(trade, fill_accounting)
+            trade["close_execution_evidence"] = close_execution_evidence
             trade["entry_fee_raw"] = fill_accounting.get("entry_fee_raw")
             trade["exit_fee_raw"] = fill_accounting.get("exit_fee_raw")
             trade["fee_raw_total"] = fill_accounting.get("fee_raw_total")
             trade["fees_paid_abs"] = fill_accounting.get("fees_paid_abs")
             trade["exchange_realized_pnl_abs"] = fill_accounting.get("exchange_realized_pnl_abs")
+            trade["exit_vwap_confirmed"] = fill_accounting.get("exit_vwap_confirmed")
+            trade["exit_vwap_source"] = fill_accounting.get("exit_vwap_source")
+            trade["exit_leg_vwap_confirmed"] = close_execution_evidence.get("exit_vwap_confirmed")
+            trade["exit_leg_vwap_source"] = close_execution_evidence.get("exit_vwap_source")
             trade["fee_source"] = fill_accounting.get("fee_source")
             if fill_accounting.get("last_exit_fill_ts_ms"):
                 trade["exchange_close_ts"] = int(fill_accounting["last_exit_fill_ts_ms"])
@@ -2503,6 +2811,8 @@ def update_active_trades() -> None:
                 accounting_status = "UNVERIFIED_RESIDUAL_EXIT"
             elif close_fill_qty_verified and abs(accounting_diff_qty) <= qty_tolerance:
                 accounting_status = "VERIFIED"
+            elif close_fill_qty_verified and abs(accounting_diff_qty) > qty_tolerance:
+                accounting_status = "LOCAL_VS_EXCHANGE_QTY_MISMATCH"
             elif realized_qty > 0:
                 accounting_status = "PARTIAL_REALIZED_QTY"
             else:
@@ -2523,8 +2833,27 @@ def update_active_trades() -> None:
                 "executed_tp_or_sl" if (closed_by_tp or sl_exit_price is not None)
                 else (hist_source or "observation_price_estimate")
             )
+            exit_price_semantics = "UNAVAILABLE"
             if closed_by_tp and realized_qty > 0 and sl_exit_price is None:
-                exit_price = entry_price * (1.0 + final_pnl / 100.0) if direction == "LONG" else entry_price * (1.0 - final_pnl / 100.0)
+                confirmed_vwap = close_execution_evidence.get("exit_vwap_confirmed")
+                if confirmed_vwap is not None and close_execution_evidence.get("confirmed_exit_qty") is not None:
+                    exit_price = float(confirmed_vwap)
+                    exit_price_semantics = (
+                        "CONFIRMED_EXIT_VWAP"
+                        if str(close_execution_evidence.get("authority")) != "TRACKER_LOCAL_EVENT"
+                        else "TRACKER_RECORDED_TP_EVENT_VWAP"
+                    )
+                else:
+                    # Backward-compatible price for consumers that still expect a scalar
+                    # exit_price, but explicitly mark it as a tracker-weighted estimate.
+                    exit_price = entry_price * (1.0 + final_pnl / 100.0) if direction == "LONG" else entry_price * (1.0 - final_pnl / 100.0)
+                    exit_price_semantics = "TRACKER_WEIGHTED_EXIT_ESTIMATE"
+            elif sl_exit_price is not None:
+                exit_price_semantics = "SINGLE_CONFIRMED_EXIT_FILL"
+            elif historical_order is not None:
+                exit_price_semantics = "SINGLE_CONFIRMED_HISTORICAL_ORDER"
+            else:
+                exit_price_semantics = "OBSERVED_PRICE_ESTIMATE"
             planned_risk_pct = _derive_planned_risk_pct(trade)
             realized_rr = _calc_realized_rr(final_pnl, planned_risk_pct) if realized_pnl_source == "executed_tp_or_sl" else None
             final_weighted_rr = _calc_realized_rr(final_pnl, planned_risk_pct) if planned_risk_pct and planned_risk_pct > 0 else None
@@ -2565,6 +2894,58 @@ def update_active_trades() -> None:
                             trade["be_execution_slippage_pct"] = _adverse_exit_slippage_pct(
                                 direction, actual_exit_fill, be_trigger_px
                             )
+
+            # For TP closes, surface the latest confirmed TP leg as the canonical exit-order
+            # evidence while keeping all legs in tp_fill_events.  For historical closes,
+            # surface the normalized exchange order used to reconcile the residual.
+            if close_execution_evidence.get("latest"):
+                latest_exit = close_execution_evidence["latest"]
+                trade["exit_order_id"] = latest_exit.get("order_id") or trade.get("exit_order_id")
+                trade["exit_order_avg_price"] = _safe_float(latest_exit.get("avg_price"), 0.0) or None
+                trade["exit_order_trigger_price"] = _safe_float(latest_exit.get("trigger_price"), 0.0) or None
+                if trade.get("exit_order_trigger_price") is not None and trade.get("exit_order_avg_price") is not None:
+                    trade["exit_order_adverse_slippage_pct"] = _adverse_exit_slippage_pct(
+                        direction, float(trade["exit_order_avg_price"]), float(trade["exit_order_trigger_price"])
+                    )
+            elif historical_order is not None:
+                trade["exit_order_evidence"] = {
+                    "order_id": str(historical_order.get("orderId") or historical_order.get("orderID") or "") or None,
+                    "status": str(historical_order.get("status") or historical_order.get("orderStatus") or "FILLED").upper(),
+                    "type": str(historical_order.get("type") or "").upper() or None,
+                    "side": str(historical_order.get("side") or "").upper() or None,
+                    "position_side": str(historical_order.get("positionSide") or "").upper() or None,
+                    "executed_qty": _optional_float(historical_order.get("executedQty") or historical_order.get("cumQty") or historical_order.get("_qty")),
+                    "avg_price": _optional_float(historical_order.get("avgPrice") or historical_order.get("_px")),
+                    "trigger_price": _optional_float(historical_order.get("stopPrice")),
+                    "update_time_ms": _optional_float(historical_order.get("updateTime") or historical_order.get("time") or historical_order.get("createTime") or historical_order.get("_ts")),
+                    "source": "HISTORICAL_ALL_ORDERS",
+                    "fill_evidence_status": "ORDER_EXECUTION_CONFIRMED",
+                }
+
+            tp_actual_close_fractions: dict[str, float] = {}
+            if init_qty > 0:
+                for tp_event in trade.get("tp_fill_events", []) if isinstance(trade.get("tp_fill_events"), list) else []:
+                    leg = str(tp_event.get("leg") or "").lower()
+                    delta = _optional_float(tp_event.get("delta_qty"))
+                    if leg and delta is not None and delta > 0:
+                        tp_actual_close_fractions[leg] = tp_actual_close_fractions.get(leg, 0.0) + float(delta) / init_qty
+            trade["tp_actual_close_fractions"] = tp_actual_close_fractions
+            if trade.get("exit_order_evidence") is None and close_execution_evidence.get("latest"):
+                latest_exit = close_execution_evidence["latest"]
+                trade["exit_order_evidence"] = {
+                    "order_id": latest_exit.get("order_id"),
+                    "status": latest_exit.get("status"),
+                    "leg": latest_exit.get("leg"),
+                    "executed_qty": latest_exit.get("executed_qty"),
+                    "avg_price": latest_exit.get("avg_price"),
+                    "trigger_price": latest_exit.get("trigger_price"),
+                    "fill_time_ms": latest_exit.get("fill_time_ms"),
+                    "order_update_time_ms": latest_exit.get("order_update_time_ms"),
+                    "source": latest_exit.get("evidence_source"),
+                    "fill_evidence_status": "CONFIRMED",
+                }
+            elif trade.get("exit_order_evidence") is None:
+                trade["exit_order_evidence"] = None
 
             if trade.get("be_trigger_ts") and entry_ts:
                 trade["time_to_be_trigger_min"] = max(0.0, (int(trade["be_trigger_ts"]) - entry_ts) / 60000.0)
@@ -2625,24 +3006,33 @@ def update_active_trades() -> None:
             trade["realized_pnl_abs_status"] = "CONFIRMED" if canonical_net is not None else "UNAVAILABLE"
 
             observed_closed_ts = now_ms
-            execution_close_candidates = []
-            if fill_accounting.get("last_exit_fill_ts_ms"):
-                execution_close_candidates.append(int(fill_accounting["last_exit_fill_ts_ms"]))
+            execution_close_candidates: list[tuple[int, str]] = []
+            fill_ts = _optional_float(fill_accounting.get("last_exit_fill_ts_ms"))
+            if fill_ts is not None and int(fill_ts) > 0:
+                execution_close_candidates.append((int(fill_ts), "EXCHANGE_FILL_TIME"))
+            elif close_execution_evidence.get("latest_execution_ts_ms"):
+                evidence_ts = int(close_execution_evidence["latest_execution_ts_ms"])
+                evidence_source = str(close_execution_evidence.get("latest_execution_timestamp_source") or "UNAVAILABLE")
+                execution_close_candidates.append((
+                    evidence_ts,
+                    "EXCHANGE_FILL_TIME" if evidence_source == "FILL_TIME"
+                    else "EXCHANGE_ORDER_UPDATE_TIME" if evidence_source == "ORDER_UPDATE_TIME"
+                    else "TP_FILL_EVENT_EXCHANGE_TIME",
+                ))
             if exit_order_info and exit_order_info.get("update_time_ms"):
-                execution_close_candidates.append(int(exit_order_info["update_time_ms"]))
+                execution_close_candidates.append((int(exit_order_info["update_time_ms"]), "EXCHANGE_ORDER_UPDATE_TIME"))
             if historical_order:
                 hist_ts = historical_order.get("updateTime") or historical_order.get("time") or historical_order.get("createTime")
-                if _optional_float(hist_ts) is not None and int(_optional_float(hist_ts)) > 0:
-                    execution_close_candidates.append(int(_optional_float(hist_ts)))
-            execution_closed_ts = max(execution_close_candidates) if execution_close_candidates else None
+                hist_ts_num = _optional_float(hist_ts)
+                if hist_ts_num is not None and int(hist_ts_num) > 0:
+                    execution_close_candidates.append((int(hist_ts_num), "EXCHANGE_HISTORICAL_ORDER_TIME"))
+            execution_closed_ts, execution_closed_ts_source = (
+                max(execution_close_candidates, key=lambda item: item[0])
+                if execution_close_candidates else (None, "UNAVAILABLE")
+            )
             trade["execution_close_ts"] = execution_closed_ts
             trade["observed_closed_ts"] = observed_closed_ts
-            trade["close_timestamp_source"] = (
-                "EXCHANGE_FILL_TIME" if fill_accounting.get("last_exit_fill_ts_ms") else
-                "EXCHANGE_ORDER_UPDATE_TIME" if exit_order_info and exit_order_info.get("update_time_ms") else
-                "EXCHANGE_HISTORICAL_ORDER_TIME" if historical_order and execution_closed_ts else
-                "UNAVAILABLE"
-            )
+            trade["close_timestamp_source"] = execution_closed_ts_source
             # Keep the legacy field only when execution-time evidence exists. Never
             # substitute local observation time into canonical close time.
             trade["closed_ts"] = execution_closed_ts
@@ -2671,6 +3061,11 @@ def update_active_trades() -> None:
                 "outcome_category": _exit_outcome_category(exit_reason),
                 "entry_price": entry_price,
                 "exit_price": exit_price,
+                "exit_price_semantics": exit_price_semantics,
+                "exit_vwap_confirmed": fill_accounting.get("exit_vwap_confirmed"),
+                "exit_vwap_source": fill_accounting.get("exit_vwap_source"),
+                "exit_leg_vwap_confirmed": close_execution_evidence.get("exit_vwap_confirmed"),
+                "exit_leg_vwap_source": close_execution_evidence.get("exit_vwap_source"),
                 "realized_pnl_pct": final_pnl,
                 "realized_rr": realized_rr,
                 "realized_pnl_source": realized_pnl_source,
@@ -2712,6 +3107,9 @@ def update_active_trades() -> None:
                 "exit_order_avg_price": trade.get("exit_order_avg_price"),
                 "exit_order_trigger_price": trade.get("exit_order_trigger_price"),
                 "exit_order_adverse_slippage_pct": trade.get("exit_order_adverse_slippage_pct"),
+                "exit_order_evidence": trade.get("exit_order_evidence"),
+                "tp_actual_close_fractions": trade.get("tp_actual_close_fractions", {}),
+                "close_execution_evidence": close_execution_evidence,
                 "fill_accounting": fill_accounting,
                 "realized_pnl_reconciliation": trade.get("realized_pnl_reconciliation"),
                 "entry_fee_raw": trade.get("entry_fee_raw"),
