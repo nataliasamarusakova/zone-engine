@@ -87,8 +87,6 @@ EVENT_CLAIM_LEASE_SEC = max(60, int(os.environ.get("EVENT_CLAIM_LEASE_SEC", "900
 
 EXECUTION_ENABLED = os.environ.get("EXECUTION_ENABLED", "true").lower() == "true"
 MARGIN_USDT = float(os.environ.get("BINGX_MARGIN_USDT", "1"))
-MAX_TRADES_PER_CYCLE = int(os.environ.get("MAX_TRADES_PER_CYCLE", "5"))
-MAX_OPEN_POSITIONS = max(1, int(os.environ.get("MAX_OPEN_POSITIONS", "20")))
 MAX_SCAN_SYMBOLS = int(os.environ.get("MAX_SCAN_SYMBOLS", "0"))
 WATCHLIST_ONLY = os.environ.get("WATCHLIST_ONLY", "false").lower() == "true"
 # Temporary test switches. Normal mode keeps the curated 150-asset whitelist and
@@ -3007,7 +3005,7 @@ def main() -> None:
             "zone_trigger_mode": ZONE_TRIGGER_MODE, "fixed_stop_pct": FIXED_STOP_PCT,
             "tp1_pct": TP1_PCT, "tp2_pct": TP2_PCT, "min_structure_room_r": MIN_STRUCTURE_ROOM_R,
             "require_directional_candle": REQUIRE_DIRECTIONAL_CANDLE, "require_structure_obstacle": REQUIRE_STRUCTURE_OBSTACLE,
-            "max_trades_per_cycle": MAX_TRADES_PER_CYCLE, "max_open_positions": MAX_OPEN_POSITIONS, "max_entry_slippage_pct": MAX_ENTRY_SLIPPAGE_PCT,
+            "open_position_cap_enabled": False, "trades_per_cycle_cap_enabled": False, "max_entry_slippage_pct": MAX_ENTRY_SLIPPAGE_PCT,
             "execution_quote_max_age_sec": EXECUTION_QUOTE_MAX_AGE_SEC,
             "execution_require_exchange_timestamp": os.environ.get("EXECUTION_REQUIRE_EXCHANGE_TIMESTAMP", "false"),
             "execution_unknown_quote_age_policy": os.environ.get("EXECUTION_UNKNOWN_QUOTE_AGE_POLICY", "allow_with_local_age"),
@@ -3737,40 +3735,12 @@ def main() -> None:
     log.info("[EXEC_GATE_SUMMARY] input_signals=%d executable=%d rejected=%d reasons=%s", len(latest_by_symbol), len(executable), sum(exec_gate_stats.values()), json.dumps(exec_gate_stats, ensure_ascii=False, sort_keys=True))
 
     executed = 0
-    # Hard account-level admission control. ``open_keys`` is an exchange-authoritative
-    # snapshot captured immediately before selection and includes external positions.
-    # It prevents the engine from creating a portfolio whose protection orders can
-    # exhaust the exchange account/order budget before the three required protections
-    # (SL + TP1 + TP2) are installed.
-    open_position_count = len(open_keys)
-    available_position_slots = max(0, MAX_OPEN_POSITIONS - open_position_count)
-    selection_limit = min(MAX_TRADES_PER_CYCLE, available_position_slots)
-    selected_signals = executable[:selection_limit]
-    deferred_signals = executable[selection_limit:]
-    for rank, signal in enumerate(deferred_signals, start=selection_limit + 1):
-        if rank <= MAX_TRADES_PER_CYCLE:
-            stage = "ACCOUNT_POSITION_CAP"
-            reason = "max_open_positions_reached"
-            log.warning(
-                "[EXEC_ACCOUNT_CAP] symbol=%s direction=%s event_id=%s rank=%d open=%d cap=%d score=%.2f trigger=%s",
-                signal.get("symbol"), signal.get("type"), signal.get("event_id"), rank,
-                open_position_count, MAX_OPEN_POSITIONS, signal.get("score", 0.0), signal.get("trigger_bar_time") or signal.get("time"),
-            )
-        else:
-            stage = "CYCLE_CAP"
-            reason = "max_trades_per_cycle_reached"
-            log.warning(
-                "[EXEC_CYCLE_CAP] symbol=%s direction=%s event_id=%s rank=%d cap=%d score=%.2f trigger=%s",
-                signal.get("symbol"), signal.get("type"), signal.get("event_id"), rank,
-                MAX_TRADES_PER_CYCLE, signal.get("score", 0.0), signal.get("trigger_bar_time") or signal.get("time"),
-            )
-        _record_entry_decision(scan_id, signal, stage, reason, selection_rank=rank)
-
+    # No engine-imposed portfolio-size or per-cycle admission cap. Every signal that
+    # survives the normal execution gates below is submitted in deterministic order.
+    # Exchange-native/account-native limits, protection readiness, duplicate event
+    # claims, and existing symbol ownership checks remain enforced.
+    selected_signals = executable
     for rank, signal in enumerate(selected_signals, start=1):
-        if EXECUTION_ENABLED and len(open_keys) >= MAX_OPEN_POSITIONS:
-            _record_entry_decision(scan_id, signal, "ACCOUNT_POSITION_CAP", "max_open_positions_reached_before_execution", selection_rank=rank)
-            log.warning("[EXEC_ACCOUNT_CAP] blocking before execution | symbol=%s direction=%s open=%d cap=%d", signal.get("symbol"), signal.get("type"), len(open_keys), MAX_OPEN_POSITIONS)
-            continue
         execution_gate_ts = pd.Timestamp.now(tz="UTC")
         signal["execution_gate_ts"] = execution_gate_ts.isoformat()
         trigger_raw = signal.get("trigger_bar_time") or signal.get("time")
@@ -3785,7 +3755,7 @@ def main() -> None:
             scan_id,
             signal,
             "EXECUTION_SELECTED",
-            "selected_within_cycle_cap",
+            "selected_for_execution",
             selection_rank=rank,
         )
         if not EXECUTION_ENABLED:

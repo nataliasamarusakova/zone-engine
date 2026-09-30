@@ -3414,19 +3414,26 @@ def test_validate_trade_geometry_uses_module_structure_obstacle_default(monkeypa
     assert not ok and reason == "missing_structural_obstacle"
 
 
-def test_entry_decision_journal_records_cycle_cap_and_has_stable_decision_id(tmp_path, monkeypatch):
+def test_entry_decision_journal_records_repeated_stage_and_has_stable_decision_id(tmp_path, monkeypatch):
     import run_once
 
     path = tmp_path / "entry_decisions.jsonl"
     monkeypatch.setattr(run_once, "ENTRY_DECISIONS_PATH", path)
     signal = {"event_id": "ZONE_TEST", "symbol": "TEST-USDT", "type": "SHORT", "time": "2026-01-01T00:00:00+00:00"}
-    run_once._record_entry_decision("SCAN_TEST", signal, "CYCLE_CAP", "max_trades_per_cycle_reached", selection_rank=6)
-    run_once._record_entry_decision("SCAN_TEST", signal, "CYCLE_CAP", "max_trades_per_cycle_reached", selection_rank=6)
+    run_once._record_entry_decision("SCAN_TEST", signal, "EXECUTION_CLAIM", "claimed", selection_rank=6)
+    run_once._record_entry_decision("SCAN_TEST", signal, "EXECUTION_CLAIM", "claimed", selection_rank=6)
     rows = [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines()]
     assert len(rows) == 2
-    assert rows[0]["stage"] == "CYCLE_CAP"
+    assert rows[0]["stage"] == "EXECUTION_CLAIM"
     assert rows[0]["selection_rank"] == 6
     assert rows[0]["decision_id"] == rows[1]["decision_id"]
+
+
+def test_no_engine_imposed_position_or_cycle_caps():
+    import run_once
+
+    assert not hasattr(run_once, "MAX_OPEN_POSITIONS")
+    assert not hasattr(run_once, "MAX_TRADES_PER_CYCLE")
 
 
 def test_prepare_protection_capacity_cleans_stale_engine_orders(monkeypatch):

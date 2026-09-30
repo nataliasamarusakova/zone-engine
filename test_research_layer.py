@@ -79,7 +79,7 @@ def test_touch_observation_anchors_entry_bar_timestamp_and_prevents_volume_looka
 
 def test_record_entry_decision_uses_requested_path(tmp_path: Path):
     path = tmp_path / "entry_decisions.jsonl"
-    row = {"scan_id": "S1", "event_id": "E1", "stage": "CYCLE_CAP", "reason": "cap", "symbol": "TEST-USDT", "direction": "SHORT"}
+    row = {"scan_id": "S1", "event_id": "E1", "stage": "EXECUTION_CLAIM", "reason": "claimed", "symbol": "TEST-USDT", "direction": "SHORT"}
     assert research.record_entry_decision(row, path=path) is True
     stored = json.loads(path.read_text(encoding="utf-8").strip())
     assert stored["decision_id"].startswith("DEC_")
