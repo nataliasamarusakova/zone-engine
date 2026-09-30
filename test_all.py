@@ -4378,3 +4378,266 @@ def test_position_disappearance_without_exit_evidence_never_creates_canonical_pn
     assert record["closed_ts"] is None
     assert record["realized_pnl_abs_status"] == "UNAVAILABLE"
     assert record["observed_pnl_pct_estimate"] is not None
+
+
+def test_build_5m_zone_signal_volume_ratio_uses_prior_5m_bars_not_1h(monkeypatch):
+    import run_once
+    now = pd.Timestamp("2026-09-30T12:00:00Z")
+    monkeypatch.setattr(run_once, "ZONE_TRIGGER_MODE", "zone")
+    monkeypatch.setattr(run_once, "REQUIRE_DIRECTIONAL_CANDLE", False)
+    monkeypatch.setattr(run_once, "REQUIRE_STRUCTURE_OBSTACLE", False)
+    monkeypatch.setattr(run_once, "_nearest_opposing_level", lambda *args, **kwargs: None)
+    df_1h = pd.DataFrame([
+        {"timestamp": now - pd.Timedelta(hours=4-i), "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 100000.0, "atr50": 2.0}
+        for i in range(4)
+    ])
+    df_5m = pd.DataFrame([
+        {"timestamp": now - pd.Timedelta(minutes=5*(21-i)), "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 10.0}
+        for i in range(22)
+    ])
+    # Deliberately make the 1H volume scale completely different so a mixed-timeframe
+    # ratio cannot accidentally pass the test.
+    bar = pd.Series({"timestamp": now - pd.Timedelta(minutes=5), "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 20.0})
+    prev = pd.Series({"timestamp": now - pd.Timedelta(minutes=10), "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0, "volume": 10.0})
+    zone = {"start": 0, "top": 101.0, "btm": 99.0, "poi": 100.0, "zone_id": "Z_VOL"}
+    signal = run_once._build_5m_zone_signal(
+        "TEST-USDT", "LONG", zone, bar, prev, df_1h, [zone], [], {"visit_id": "V"}, df_5m=df_5m
+    )
+    assert signal["confirmation"]["volume_ratio"] == pytest.approx(2.0)
+    assert signal["confirmation"]["volume_ratio_5m20"] == pytest.approx(2.0)
+    assert signal["confirmation"]["volume_ratio_semantics"] == "trigger_5m_volume_divided_by_mean_previous_20_closed_5m_volumes"
+    assert signal["confirmation"]["volume_ratio_source"] == "5M_PREVIOUS_20_CLOSED_BARS"
+    assert signal["confirmation"]["volume_ratio_baseline"] == pytest.approx(10.0)
+    assert signal["confirmation"]["volume_ratio_baseline_count"] == 20
+
+
+def test_build_5m_zone_signal_without_5m_baseline_does_not_fabricate_volume_ratio(monkeypatch):
+    import run_once
+    now = pd.Timestamp("2026-09-30T12:00:00Z")
+    monkeypatch.setattr(run_once, "ZONE_TRIGGER_MODE", "zone")
+    monkeypatch.setattr(run_once, "REQUIRE_DIRECTIONAL_CANDLE", False)
+    monkeypatch.setattr(run_once, "REQUIRE_STRUCTURE_OBSTACLE", False)
+    monkeypatch.setattr(run_once, "_nearest_opposing_level", lambda *args, **kwargs: None)
+    df_1h = pd.DataFrame([
+        {"timestamp": now - pd.Timedelta(hours=3-i), "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 100.0, "atr50": 2.0}
+        for i in range(3)
+    ])
+    bar = pd.Series({"timestamp": now - pd.Timedelta(minutes=5), "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 20.0})
+    prev = pd.Series({"timestamp": now - pd.Timedelta(minutes=10), "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0, "volume": 10.0})
+    zone = {"start": 0, "top": 101.0, "btm": 99.0, "poi": 100.0, "zone_id": "Z_VOL_NONE"}
+    signal = run_once._build_5m_zone_signal(
+        "TEST-USDT", "LONG", zone, bar, prev, df_1h, [zone], [], {"visit_id": "V"}
+    )
+    assert signal["confirmation"]["volume_ratio"] is None
+    assert signal["confirmation"]["volume_ratio_source"] == "UNAVAILABLE_TRIGGER_TIMESTAMP_OR_20_BAR_BASELINE"
+
+
+def test_tracker_exact_order_fill_fallback_and_order_execution_evidence(monkeypatch):
+    from event_engine import tracker
+    calls = []
+
+    def fake_fill(symbol, start, end, *, order_id=None, limit=1000):
+        calls.append(order_id)
+        if order_id is None:
+            return []
+        return []
+
+    monkeypatch.setattr(tracker, "get_fill_orders", fake_fill)
+    order_data = {
+        "ENTRY1": {"status": "ok", "order_status": "FILLED", "executed_qty": 1.0, "avg_price": 100.0, "order_id": "ENTRY1", "time_ms": 100, "update_time_ms": 110},
+        "EXIT1": {"status": "ok", "order_status": "FILLED", "executed_qty": 1.0, "avg_price": 102.0, "order_id": "EXIT1", "time_ms": 200, "update_time_ms": 210, "trigger_price": 102.0},
+    }
+    monkeypatch.setattr(tracker, "get_order", lambda symbol, oid: order_data[str(oid)])
+    trade = {"symbol": "AAA-USDT", "direction": "LONG", "entry_ts": 1, "entry_order": {"order_id": "ENTRY1"}, "exit_order_id": "EXIT1"}
+    out = tracker._collect_trade_fill_accounting(trade, 1000)
+    assert calls[0] is None
+    assert set(calls[1:]) == {"ENTRY1", "EXIT1"}
+    assert out["status"] == "VERIFIED_ORDER_EXECUTION"
+    assert out["entry_qty_confirmed"] == pytest.approx(1.0)
+    assert out["confirmed_exit_qty"] == pytest.approx(1.0)
+    assert out["gross_realized_pnl_abs"] == pytest.approx(2.0)
+    assert out["gross_realized_pnl_source"] == "CONFIRMED_EXECUTION_EVIDENCE"
+    assert out["exchange_realized_pnl_abs"] is None
+    assert out["fee_raw_total"] is None
+    assert out["last_exit_fill_ts_ms"] == 210
+    assert out["last_exit_execution_timestamp_source"] == "ORDER_UPDATE_OR_TIME"
+    assert len(out["order_execution_evidence"]) == 2
+
+
+def test_tp_full_close_exposes_confirmed_vwap_and_latest_exit_order(monkeypatch):
+    from event_engine import tracker
+    trade = {
+        "event_id": "EVT_TP_VWAP", "direction": "LONG", "exit_reason": "TAKE_PROFIT_FULL",
+        "tp_fill_events": [
+            {"leg": "tp1", "order_id": "TP1", "order_status": "FILLED", "delta_qty": 0.5, "avg_price": 103.0, "fill_time_ms": 1000, "order_update_time_ms": 1010, "trigger_price": 103.0},
+            {"leg": "tp2", "order_id": "TP2", "order_status": "FILLED", "delta_qty": 0.5, "avg_price": 106.0, "fill_time_ms": 2000, "order_update_time_ms": 2010, "trigger_price": 106.0},
+        ],
+    }
+    evidence = tracker._close_execution_evidence(trade, {"fills": [], "order_execution_evidence": []})
+    assert evidence["status"] == "CONFIRMED"
+    assert evidence["confirmed_exit_qty"] == pytest.approx(1.0)
+    assert evidence["exit_vwap_confirmed"] == pytest.approx(104.5)
+    assert evidence["latest"]["order_id"] == "TP2"
+    assert evidence["latest_execution_ts_ms"] == 2000
+    assert evidence["latest_execution_timestamp_source"] == "FILL_TIME"
+    assert evidence["authority"] == "TRACKER_LOCAL_EVENT"
+    assert evidence["exit_vwap_source"] == "TRACKER_RECORDED_TP_EVENT"
+
+
+def test_protection_creation_does_not_mark_open_order_as_execution_fill(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)
+    monkeypatch.setattr(bingx, "get_contract", lambda symbol: {"quantityPrecision": 3, "pricePrecision": 4, "tradeMinQuantity": 0.001})
+    protection_states = iter([
+        {"status": "ok", "sl_orders": [], "tp_orders": [
+            {"orderId": "OLD_TP", "clientOrderId": "EVT_OLD", "origQty": "0.5", "stopPrice": "110"},
+        ]},
+        {"status": "ok", "sl_orders": [
+            {"orderId": "SL_NEW", "clientOrderId": "EVT_TEST_SL", "origQty": "1.0", "stopPrice": "90.0", "type": "STOP_MARKET"},
+        ], "tp_orders": []},
+    ])
+    monkeypatch.setattr(bingx, "get_open_protection_directional", lambda *args, **kwargs: next(protection_states))
+    monkeypatch.setattr(bingx, "get_position_mode", lambda *args, **kwargs: "HEDGE")
+    monkeypatch.setattr(bingx, "cancel_order", lambda *args, **kwargs: {"code": 0})
+    monkeypatch.setattr(bingx, "_current_close_price", lambda symbol: 100.0)
+    post_calls = []
+    def fake_request(method, path, params=None, **kwargs):
+        post_calls.append(params)
+        return {"code": 0, "data": {"order": {"orderId": params.get("clientOrderId"), "clientOrderId": params.get("clientOrderId"), "type": params.get("type"), "stopPrice": params.get("stopPrice"), "origQty": params.get("quantity")}}}
+    monkeypatch.setattr(bingx, "_request", fake_request)
+    def fake_verify_open_order(symbol, direction, *, client_order_id, order_kind, expected_price, expected_qty, price_precision, max_attempts=3):
+        return {"status": "verified", "order": {
+            "orderId": "ORDER_" + str(order_kind), "clientOrderId": client_order_id, "type": order_kind,
+            "stopPrice": str(expected_price), "origQty": str(expected_qty),
+        }}
+    monkeypatch.setattr(bingx, "_verify_open_order", fake_verify_open_order)
+    result = bingx.ensure_directional_protection("AAA-USDT", "LONG", 100.0, 1.0, 10.0, [{"leg": "tp1", "pnl_pct": 3.0, "close_fraction": 0.5}, {"leg": "tp2", "pnl_pct": 6.0, "close_fraction": 0.5}], trade_id="EVT_TEST")
+    assert result["status"] in {"PROTECTED", "SL_ONLY"}
+    successful = [x for x in result.get("tp_orders", []) if x.get("status") in {"created", "already_exists", "reconciled_after_post_error"}]
+    assert successful
+    assert all(x.get("protection_order_verified") is True for x in successful)
+    assert all(x.get("execution_verified") is None for x in successful if x.get("fill_evidence_status") != "CONFIRMED")
+
+
+def test_quote_provenance_distinguishes_exchange_timestamp_from_local_observation(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "_quote_freshness", lambda quote, max_age_sec: (True, 0.0, None if quote.get("quote_exchange_time_ms") is None else 0.0, "local_observed_elapsed"))
+    local_only = bingx._quote_provenance_fields(None)
+    assert local_only["execution_reference_quality"] == "LOCAL_OBSERVED_ONLY"
+    verified = bingx._quote_provenance_fields(1767225500000)
+    assert verified["execution_reference_quality"] == "EXCHANGE_TIME_VERIFIED"
+
+
+def test_historical_exit_order_is_preserved_as_normalized_evidence_and_timestamp(monkeypatch, tmp_path):
+    from event_engine import tracker
+    active = tmp_path / "active_trades.json"
+    trades_path = tmp_path / "trades.jsonl"
+    actions = tmp_path / "actions.jsonl"
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", active)
+    monkeypatch.setattr(tracker, "TRADES_PATH", trades_path)
+    monkeypatch.setattr(tracker, "ACTIONS_PATH", actions)
+    monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: {"status": "not_found"})
+    monkeypatch.setattr(tracker, "fetch_klines", lambda *a, **k: [])
+    monkeypatch.setattr(tracker, "get_fill_orders", lambda *a, **k: [])
+    monkeypatch.setattr(tracker, "get_order", lambda *a, **k: None)
+    monkeypatch.setattr(tracker, "send_tg", lambda *a, **k: True)
+    monkeypatch.setattr(tracker, "get_all_orders", lambda *a, **k: [{
+        "orderId": "HIST_EXIT", "status": "FILLED", "side": "SELL", "type": "MARKET",
+        "executedQty": "1.0", "avgPrice": "102.0", "price": "102.0",
+        "positionSide": "LONG", "time": 2000, "updateTime": 2100, "stopPrice": "0",
+    }])
+    trade = {
+        "event_id": "EVT_HIST_EXIT", "symbol": "AAA-USDT", "direction": "LONG", "name": "AAA",
+        "entry_price": 100.0, "initial_qty": 1.0, "remaining_qty": 1.0, "entry_ts": 1000, "closed": False,
+        "entry_order": {"order_id": "ENTRY1"}, "tp_orders": [], "sl_order": {},
+        "hit_legs": [], "tp_filled_qty": {}, "realized_pnl_qty": 0.0, "realized_pnl_weighted_sum": 0.0,
+        "peak_pnl_pct": 0.0, "mae_pct": 0.0, "max_drawdown_pct": 0.0,
+        "planned_risk_pct": 10.0, "planned_weighted_rr": 0.45, "effective_weighted_rr": 0.45,
+        "setup": {}, "tp_levels": [], "effective_tp_levels": [],
+    }
+    active.write_text(json.dumps({trade["event_id"]: trade}), encoding="utf-8")
+
+    tracker.update_active_trades()
+    record = json.loads(trades_path.read_text(encoding="utf-8").strip())
+    assert record["exit_reason"] == "MANUAL_CLOSE_RECONCILED"
+    assert record["exit_order_id"] == "HIST_EXIT"
+    assert record["exit_order_evidence"]["order_id"] == "HIST_EXIT"
+    assert record["exit_order_evidence"]["executed_qty"] == pytest.approx(1.0)
+    assert record["exit_order_evidence"]["avg_price"] == pytest.approx(102.0)
+    assert record["exit_order_evidence"]["update_time_ms"] == 2100
+    assert record["exit_order_evidence"]["source"] == "HISTORICAL_ALL_ORDERS"
+    assert record["execution_close_ts"] == 2100
+    assert record["close_timestamp_source"] == "EXCHANGE_HISTORICAL_ORDER_TIME"
+    assert record["exit_price_semantics"] == "SINGLE_CONFIRMED_HISTORICAL_ORDER"
+    assert record["realized_pnl_abs"] is None
+
+
+def test_register_active_trade_persists_explicit_protection_status(monkeypatch, tmp_path):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", tmp_path / "active_trades.json")
+    monkeypatch.setattr(tracker, "TRADES_PATH", tmp_path / "trades.jsonl")
+    monkeypatch.setattr(tracker, "ACTIONS_PATH", tmp_path / "actions.jsonl")
+    ok = tracker.register_active_trade(
+        event_id="EVT_PROT_STATUS", symbol="AAA-USDT", name="AAA", direction="LONG",
+        entry_price=100.0, qty=1.0, tp_orders=[], sl_result={"status": "created", "order_id": "SL1"},
+        event_type="TEST", timeframe="5m", score=50.0,
+        setup={"execution_snapshot": {"protection_status": "SL_ONLY"}},
+    )
+    assert ok is True
+    state = tracker._load_active_trades()
+    assert state["EVT_PROT_STATUS"]["protection_status"] == "SL_ONLY"
+
+
+def test_trade_close_tp_full_persists_whole_exit_vwap_and_exchange_timestamp(monkeypatch, tmp_path):
+    from event_engine import tracker
+    active = tmp_path / "active_trades.json"
+    trades_path = tmp_path / "trades.jsonl"
+    actions = tmp_path / "actions.jsonl"
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", active)
+    monkeypatch.setattr(tracker, "TRADES_PATH", trades_path)
+    monkeypatch.setattr(tracker, "ACTIONS_PATH", actions)
+    monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: {"status": "not_found"})
+    monkeypatch.setattr(tracker, "fetch_klines", lambda *a, **k: [])
+    monkeypatch.setattr(tracker, "get_all_orders", lambda *a, **k: [])
+    monkeypatch.setattr(tracker, "get_order", lambda *a, **k: None)
+    monkeypatch.setattr(tracker, "send_tg", lambda *a, **k: True)
+    monkeypatch.setattr(tracker, "get_fill_orders", lambda *a, **k: [
+        {"order_id": "ENTRY1", "qty": 1.0, "price": 100.0, "fee": -0.10, "realized_pnl": 0.0, "time_ms": 900},
+        {"order_id": "TP1", "qty": 0.5, "price": 103.0, "fee": -0.15, "realized_pnl": 1.5, "time_ms": 1000},
+        {"order_id": "TP2", "qty": 0.5, "price": 106.0, "fee": -0.20, "realized_pnl": 3.0, "time_ms": 2000},
+    ])
+    trade = {
+        "event_id": "EVT_TP_FULL_CLOSE", "symbol": "AAA-USDT", "direction": "LONG", "name": "AAA",
+        "entry_price": 100.0, "initial_qty": 1.0, "remaining_qty": 0.0, "entry_ts": 800, "closed": False,
+        "entry_order": {"order_id": "ENTRY1"},
+        "tp_orders": [
+            {"leg": "tp1", "order_id": "TP1"},
+            {"leg": "tp2", "order_id": "TP2"},
+        ],
+        "sl_order": {}, "hit_legs": ["tp1", "tp2"], "tp_filled_qty": {"tp1": 0.5, "tp2": 0.5},
+        "realized_pnl_qty": 1.0, "realized_pnl_weighted_sum": 2.25,
+        "peak_pnl_pct": 6.0, "mae_pct": -1.0, "max_drawdown_pct": -1.0,
+        "planned_risk_pct": 10.0, "planned_weighted_rr": 0.45, "effective_weighted_rr": 0.45,
+        "setup": {}, "tp_levels": [], "effective_tp_levels": [],
+        "tp_fill_events": [
+            {"leg": "tp1", "order_id": "TP1", "order_status": "FILLED", "delta_qty": 0.5, "avg_price": 103.0, "fill_time_ms": 1000, "order_update_time_ms": 1010, "trigger_price": 103.0},
+            {"leg": "tp2", "order_id": "TP2", "order_status": "FILLED", "delta_qty": 0.5, "avg_price": 106.0, "fill_time_ms": 2000, "order_update_time_ms": 2010, "trigger_price": 106.0},
+        ],
+    }
+    active.write_text(json.dumps({trade["event_id"]: trade}), encoding="utf-8")
+
+    tracker.update_active_trades()
+    record = json.loads(trades_path.read_text(encoding="utf-8").strip())
+    assert record["exit_reason"] == "TAKE_PROFIT_FULL"
+    assert record["execution_close_ts"] == 2000
+    assert record["close_timestamp_source"] == "EXCHANGE_FILL_TIME"
+    assert record["exit_price"] == pytest.approx(104.5)
+    assert record["exit_price_semantics"] == "CONFIRMED_EXIT_VWAP"
+    assert record["exit_vwap_confirmed"] == pytest.approx(104.5)
+    assert record["exit_vwap_source"] == "CONFIRMED_FILL_HISTORY"
+    assert record["exit_leg_vwap_confirmed"] == pytest.approx(104.5)
+    assert record["exit_order_evidence"]["order_id"] == "TP2"
+    assert record["realized_pnl_abs_status"] == "CONFIRMED"
+    assert record["gross_realized_pnl_abs"] == pytest.approx(4.5)
+    assert record["fees_abs"] == pytest.approx(0.45)
+    assert record["net_realized_pnl_abs"] == pytest.approx(4.05)

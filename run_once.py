@@ -745,6 +745,7 @@ def _build_5m_zone_signal(
     demand: list[dict[str, Any]],
     supply: list[dict[str, Any]],
     zone_state: dict[str, Any],
+    df_5m: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """Build an execution-ready signal from the configured 5m touch of an existing 1H zone."""
     top = float(zone["top"])
@@ -783,10 +784,26 @@ def _build_5m_zone_signal(
     }
     event_id = _make_5m_event_id(symbol, direction, trigger_ts_ms, zone)
     atr_1h = float(df_1h.loc[current_idx, "atr50"]) if "atr50" in df_1h.columns else 0.0
-    volume_window = df_1h["volume"].rolling(20, min_periods=20).mean() if "volume" in df_1h.columns else pd.Series(dtype=float)
-    avg_vol = float(volume_window.iloc[-1]) if not volume_window.empty and pd.notna(volume_window.iloc[-1]) else 0.0
     trigger_volume = float(bar["volume"])
-    vol_ratio = trigger_volume / avg_vol if avg_vol > 0 else None
+    vol_ratio = None
+    vol_ratio_baseline = None
+    vol_ratio_baseline_count = 0
+    if df_5m is not None and not df_5m.empty and "timestamp" in df_5m.columns and "volume" in df_5m.columns:
+        x5 = df_5m.copy()
+        x5["timestamp"] = pd.to_datetime(x5["timestamp"], utc=True, errors="coerce")
+        x5["volume"] = pd.to_numeric(x5["volume"], errors="coerce")
+        trigger_ts_norm = pd.Timestamp(bar["timestamp"])
+        if trigger_ts_norm.tzinfo is None:
+            trigger_ts_norm = trigger_ts_norm.tz_localize("UTC")
+        else:
+            trigger_ts_norm = trigger_ts_norm.tz_convert("UTC")
+        prior = x5.loc[(x5["timestamp"] < trigger_ts_norm) & x5["volume"].notna(), "volume"].tail(20)
+        if len(prior) == 20:
+            baseline = float(prior.mean())
+            if math.isfinite(baseline) and baseline > 0:
+                vol_ratio_baseline = baseline
+                vol_ratio_baseline_count = 20
+                vol_ratio = trigger_volume / baseline
     # Zone age is diagnostic metadata only. An active zone may be traded
     # regardless of age; invalidation is determined by the zone engine itself.
     zone_age_bars = max(0, int(current_idx - int(zone.get("start", current_idx))))
@@ -862,6 +879,11 @@ def _build_5m_zone_signal(
             "trigger_timeframe": "5m",
             "zone_trigger_mode": ZONE_TRIGGER_MODE,
             "volume_ratio": vol_ratio,
+            "volume_ratio_5m20": vol_ratio,
+            "volume_ratio_semantics": "trigger_5m_volume_divided_by_mean_previous_20_closed_5m_volumes",
+            "volume_ratio_source": "5M_PREVIOUS_20_CLOSED_BARS" if vol_ratio is not None else "UNAVAILABLE_TRIGGER_TIMESTAMP_OR_20_BAR_BASELINE",
+            "volume_ratio_baseline": vol_ratio_baseline,
+            "volume_ratio_baseline_count": vol_ratio_baseline_count,
             "bullish_candle": float(bar["close"]) >= float(bar["open"]),
             "bearish_candle": float(bar["close"]) <= float(bar["open"]),
         },
@@ -1182,7 +1204,7 @@ def _process_5m_zone_visits(
                         "structure_room_R": (structural_distance / research_risk_abs) if research_risk_abs else None,
                     })
             try:
-                signal = _build_5m_zone_signal(symbol, direction, zone, bar, prev, df_1h, demand, supply, zs)
+                signal = _build_5m_zone_signal(symbol, direction, zone, bar, prev, df_1h, demand, supply, zs, df_5m=x)
             except ValueError as exc:
                 reason = str(exc)
                 zs.update({"state": "LOCKED", "lock_reason": reason, "trigger_event_id": None})
@@ -2350,11 +2372,13 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         "ask": execution_quote.get("ask"),
         "spread_pct": execution_quote.get("spread_pct"),
         "quote_source": execution_quote.get("quote_source"),
+        "execution_reference_quality": execution_quote.get("execution_reference_quality"),
         "quote_sources_attempted": execution_quote.get("quote_sources_attempted"),
         "quote_fallback_reason": execution_quote.get("quote_fallback_reason"),
         "quote_time": execution_quote.get("time"),
         "quote_exchange_time_ms": execution_quote.get("quote_exchange_time_ms"),
         "quote_observed_at_ms": execution_quote.get("quote_observed_at_ms"),
+        "execution_reference_quality": execution_quote.get("execution_reference_quality"),
     })
     telemetry.record_quote_snapshot(
         event_id=event_id,
@@ -2705,6 +2729,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         "tp2_fraction": 0.50,
         "be_rule": "after_tp1_filled",
         "quote_source": execution_quote.get("quote_source"),
+        "execution_reference_quality": execution_quote.get("execution_reference_quality"),
         "quote_sources_attempted": execution_quote.get("quote_sources_attempted"),
         "quote_fallback_reason": execution_quote.get("quote_fallback_reason"),
         "quote_time": execution_quote.get("time"),
@@ -2777,6 +2802,8 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         qty=sl_result.get("qty"),
         error=sl_result.get("error"),
         verified=(str(protection.get("status")) in {"PROTECTED", "SL_ONLY"}),
+        protection_order_verified=sl_result.get("protection_order_verified"),
+        execution_verified=sl_result.get("execution_verified"),
     )
     for tp in protection.get("tp_orders", []) if isinstance(protection.get("tp_orders"), list) else []:
         if not isinstance(tp, dict):
@@ -2811,6 +2838,8 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
             qty=tp.get("qty"),
             pnl_pct=tp.get("pnl_pct"),
             execution_verified=tp.get("execution_verified"),
+            protection_order_verified=tp.get("protection_order_verified"),
+            fill_evidence_status=tp.get("fill_evidence_status"),
             error=tp.get("error"),
         )
     if protection.get("status") != "PROTECTED":

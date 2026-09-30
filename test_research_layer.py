@@ -1261,3 +1261,116 @@ def test_pending_observation_can_be_replayed_without_raw_journal(tmp_path, monke
     assert ready == 1
     rows = [json.loads(x) for x in outcomes_path.read_text(encoding="utf-8").splitlines() if x.strip()]
     assert rows[0]["observation_id"] == "OBS_PENDING"
+
+
+def test_fetch_research_account_snapshot_marks_empty_fill_window_explicitly(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "get_credentials", lambda: ("TEST_PUBLIC_KEY", "TEST_SECRET"))
+
+    def fake_request(method, path, params=None, signed=True, **kwargs):
+        if path == bingx.BALANCE_PATH:
+            return {"code": 0, "data": [{"asset": "USDT", "balance": "100", "equity": "100", "availableMargin": "90", "usedMargin": "10", "freezedMargin": "0"}]}
+        if path == bingx.ALL_FILL_ORDERS_PATH:
+            return {"code": 0, "data": []}
+        if path == bingx.INCOME_PATH:
+            return {"code": 0, "data": []}
+        if path == bingx.FORCE_ORDERS_PATH:
+            return {"code": 0, "data": []}
+        if path == bingx.POSITION_PATH:
+            return {"code": 0, "data": []}
+        if path == bingx.COMMISSION_RATE_PATH:
+            return {"code": 0, "data": {"commission": {"takerCommissionRate": "0.0005", "makerCommissionRate": "0.0002"}}}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(bingx, "_request", fake_request)
+    snap = bingx.fetch_research_account_snapshot()
+    assert snap["recent_fill_status"] == "EMPTY"
+    assert snap["recent_fill_financial_status"] == "NO_FILLS"
+    assert snap["recent_fill_source"] == "ALL_FILL_ORDERS_EMPTY"
+    assert snap["recent_realized_pnl_source"] == "ALL_FILL_ORDERS_EMPTY"
+    assert snap["recent_fill_fee_total"] == 0.0
+    assert snap["recent_fill_realized_pnl_total"] == 0.0
+
+
+def test_fetch_research_account_snapshot_does_not_zero_partial_financial_fields(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "get_credentials", lambda: ("TEST_PUBLIC_KEY", "TEST_SECRET"))
+
+    def fake_request(method, path, params=None, signed=True, **kwargs):
+        if path == bingx.BALANCE_PATH:
+            return {"code": 0, "data": [{"asset": "USDT", "balance": "100", "equity": "100", "availableMargin": "90", "usedMargin": "10", "freezedMargin": "0"}]}
+        if path == bingx.ALL_FILL_ORDERS_PATH:
+            return {"code": 0, "data": [
+                {"tradeId": "T1", "orderId": "O1", "price": "100", "qty": "1", "realizedPnl": "1.5", "time": 1767225500000},
+                {"tradeId": "T2", "orderId": "O2", "price": "101", "qty": "1", "realizedPnl": "0.5", "fee": "-0.02", "time": 1767225501000},
+            ]}
+        if path == bingx.INCOME_PATH:
+            return {"code": 0, "data": []}
+        if path == bingx.FORCE_ORDERS_PATH:
+            return {"code": 0, "data": []}
+        if path == bingx.POSITION_PATH:
+            return {"code": 0, "data": []}
+        if path == bingx.COMMISSION_RATE_PATH:
+            return {"code": 0, "data": {"commission": {"takerCommissionRate": "0.0005", "makerCommissionRate": "0.0002"}}}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(bingx, "_request", fake_request)
+    snap = bingx.fetch_research_account_snapshot()
+    assert snap["recent_fill_status"] == "OK"
+    assert snap["recent_fill_financial_status"] == "PARTIAL_MISSING_FIELDS"
+    assert snap["recent_fill_fee_total"] is None
+    assert snap["recent_fill_realized_pnl_total"] == pytest.approx(2.0)
+    assert snap["recent_realized_pnl_total"] == pytest.approx(2.0)
+    assert snap["recent_realized_pnl_source"] == "ALL_FILL_ORDERS_PARTIAL_MISSING"
+    assert snap["recent_fill_fee_status"] == "PARTIAL_MISSING_FIELD"
+    assert snap["recent_fill_realized_pnl_status"] == "CONFIRMED"
+    assert snap["recent_realized_pnl_source"] == "ALL_FILL_ORDERS_PARTIAL_MISSING"
+
+
+def test_build_research_features_never_uses_unbounded_volume_tail_without_trigger_timestamp():
+    from event_engine import research
+    ts = pd.date_range("2026-01-01T00:00:00Z", periods=25, freq="5min")
+    df5 = pd.DataFrame({
+        "timestamp": ts,
+        "open": [100.0] * 25,
+        "high": [101.0] * 25,
+        "low": [99.0] * 25,
+        "close": [100.0] * 25,
+        "volume": [10.0] * 24 + [1000.0],
+    })
+    bar = {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 20.0}
+    features = research.build_research_features(
+        symbol="TEST-USDT", direction="LONG", zone={"zone_id": "Z", "top": 101.0, "btm": 99.0, "poi": 100.0},
+        bar=bar, df_5m=df5
+    )
+    assert features["volume_ratio_5m20"] is None
+    assert features["volume_ratio_5m20_source"] == "UNAVAILABLE_TRIGGER_TIMESTAMP_OR_20_BAR_BASELINE"
+
+
+def test_fetch_research_account_snapshot_does_not_override_confirmed_fill_realized_with_income(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "get_credentials", lambda: ("TEST_PUBLIC_KEY", "TEST_SECRET"))
+
+    def fake_request(method, path, params=None, signed=True, **kwargs):
+        if path == bingx.BALANCE_PATH:
+            return {"code": 0, "data": [{"asset": "USDT", "balance": "100", "equity": "100"}]}
+        if path == bingx.ALL_FILL_ORDERS_PATH:
+            return {"code": 0, "data": [
+                {"tradeId": "T1", "orderId": "O1", "price": "100", "qty": "1", "realizedPnl": "1.5", "fee": None, "time": 1767225500000},
+                {"tradeId": "T2", "orderId": "O2", "price": "101", "qty": "1", "realizedPnl": "0.5", "fee": "-0.02", "time": 1767225501000},
+            ]}
+        if path == bingx.INCOME_PATH:
+            return {"code": 0, "data": [{"incomeType": "REALIZED_PNL", "income": "99.0", "time": 1767225502000, "tranId": "I99"}]}
+        if path == bingx.FORCE_ORDERS_PATH:
+            return {"code": 0, "data": []}
+        if path == bingx.POSITION_PATH:
+            return {"code": 0, "data": []}
+        if path == bingx.COMMISSION_RATE_PATH:
+            return {"code": 0, "data": {"commission": {"takerCommissionRate": "0.0005", "makerCommissionRate": "0.0002"}}}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(bingx, "_request", fake_request)
+    snap = bingx.fetch_research_account_snapshot()
+    assert snap["recent_fill_realized_pnl_total"] == pytest.approx(2.0)
+    assert snap["recent_realized_pnl_total"] == pytest.approx(2.0)
+    assert snap["recent_realized_pnl_source"] == "ALL_FILL_ORDERS_PARTIAL_MISSING"
