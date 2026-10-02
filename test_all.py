@@ -367,6 +367,7 @@ def test_be_does_not_adopt_existing_stop_owned_by_other_event(monkeypatch, tmp_p
 def test_register_active_trade_persists_code_commit_sha(tmp_path, monkeypatch):
     from event_engine import tracker
     monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", tmp_path / "active_trades.json")
+    (tmp_path / "active_trades.json").write_text("{}", encoding="utf-8")
     setup = {"strategy_version": "v1", "code_commit_sha": "abc123", "attempt_id": "ATT_1"}
     assert tracker.register_active_trade(
         event_id="EVT_COMMIT", symbol="TEST-USDT", name="TEST-USDT", direction="LONG",
@@ -595,6 +596,7 @@ def test_bingx_min_qty_is_nonfatal_skip(monkeypatch):
     })
     monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
     monkeypatch.setattr(bingx, "has_open_position", lambda symbol, direction: False)
+    monkeypatch.setattr(bingx, "get_position_mode", lambda **kwargs: "HEDGE")
     monkeypatch.setattr(bingx, "_current_close_price", lambda symbol: 93.368)
     monkeypatch.setattr(bingx, "get_execution_quote", lambda symbol, **kwargs: {
         "status": "ok", "symbol": symbol, "bid": 93.368, "ask": 93.368, "spread_pct": 0.0,
@@ -3303,6 +3305,7 @@ def test_register_active_trade_preserves_5m_trigger_metadata(monkeypatch, tmp_pa
     monkeypatch.setattr(tracker, "DATA", tmp_path)
     monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", tmp_path / "active_trades.json")
     monkeypatch.setattr(tracker, "TRADES_PATH", tmp_path / "trades.jsonl")
+    (tmp_path / "active_trades.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr(tracker, "ACTIONS_PATH", tmp_path / "actions.jsonl")
     tracker.register_active_trade(
         event_id="EVT_META_5M",
@@ -4584,6 +4587,7 @@ def test_register_active_trade_persists_explicit_protection_status(monkeypatch, 
     monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", tmp_path / "active_trades.json")
     monkeypatch.setattr(tracker, "TRADES_PATH", tmp_path / "trades.jsonl")
     monkeypatch.setattr(tracker, "ACTIONS_PATH", tmp_path / "actions.jsonl")
+    (tmp_path / "active_trades.json").write_text("{}", encoding="utf-8")
     ok = tracker.register_active_trade(
         event_id="EVT_PROT_STATUS", symbol="AAA-USDT", name="AAA", direction="LONG",
         entry_price=100.0, qty=1.0, tp_orders=[], sl_result={"status": "created", "order_id": "SL1"},
@@ -4648,3 +4652,221 @@ def test_trade_close_tp_full_persists_whole_exit_vwap_and_exchange_timestamp(mon
     assert record["gross_realized_pnl_abs"] == pytest.approx(4.5)
     assert record["fees_abs"] == pytest.approx(0.45)
     assert record["net_realized_pnl_abs"] == pytest.approx(4.05)
+
+
+
+def test_signal_price_displacement_is_side_independent():
+    import run_once
+    up, up_dir = run_once._signal_price_displacement_pct(100.0, 102.5)
+    down, down_dir = run_once._signal_price_displacement_pct(100.0, 97.5)
+    assert round(up, 6) == 2.5 and up_dir == "UP"
+    assert round(down, 6) == 2.5 and down_dir == "DOWN"
+
+
+def test_short_adverse_signal_drift_remains_economic_semantics():
+    import run_once
+    assert run_once._adverse_signal_drift_pct(100.0, 105.0, "SHORT") == 0.0
+    assert run_once._adverse_signal_drift_pct(100.0, 95.0, "SHORT") == 5.0
+
+
+def test_bingx_short_final_gate_uses_economic_adverse_drift(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "TESTUSDT")
+    monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
+    monkeypatch.setattr(bingx, "get_contract", lambda symbol: {"quantityPrecision": 2, "tradeMinQuantity": 0.01, "multiplier": 1, "maxLeverage": 20})
+    monkeypatch.setattr(bingx, "has_open_position", lambda *a, **k: False)
+    monkeypatch.setattr(bingx, "_set_leverage", lambda *a, **k: True)
+    monkeypatch.setattr(bingx, "position_side_param", lambda *a, **k: "SHORT")
+    monkeypatch.setattr(bingx, "get_order", lambda *a, **k: {"status":"error", "error":"not found"})
+    now_ms = int(time.time() * 1000)
+    monkeypatch.setattr(bingx, "get_execution_quote", lambda *a, **k: {
+        "status":"ok", "symbol":"TESTUSDT", "bid":95.0, "ask":95.2,
+        "spread_pct":0.21, "quote_observed_at_ms":now_ms, "quote_exchange_time_ms":now_ms,
+        "quote_source":"bookTicker",
+    })
+    monkeypatch.setattr(bingx, "_request", lambda *a, **k: pytest.fail("market POST must not happen when SHORT entry price is economically worse by >1%"))
+    out = bingx.open_market("TEST-USDT", "SHORT", 100.0, "EVT_SHORT_ADVERSE")
+    assert out["status"] == "skipped_stale_signal"
+    assert out["signal_drift_pct"] == pytest.approx(5.0)
+
+
+def test_bingx_tp_geometry_accepts_exchange_price_precision_rounding(monkeypatch):
+    from event_engine import bingx
+    states = iter([
+        {"status":"ok","sl_orders":[{"orderId":"SL1","clientOrderId":"EVT_SL","type":"STOP_MARKET","stopPrice":"90.0","origQty":"1.0"}],"tp_orders":[]},
+        {"status":"ok","sl_orders":[{"orderId":"SL1","clientOrderId":"EVT_SL","type":"STOP_MARKET","stopPrice":"90.0","origQty":"1.0"}],"tp_orders":[
+            {"orderId":"TP1","clientOrderId":"EVT_TP1","type":"TAKE_PROFIT_MARKET","stopPrice":"103.1267","origQty":"0.5"},
+            {"orderId":"TP2","clientOrderId":"EVT_TP2","type":"TAKE_PROFIT_MARKET","stopPrice":"106.1304","origQty":"0.5"},
+        ]},
+    ])
+    monkeypatch.setattr(bingx, "get_open_protection_directional", lambda *a, **k: next(states))
+    monkeypatch.setattr(bingx, "get_position_mode", lambda *a, **k: "HEDGE")
+    monkeypatch.setattr(bingx, "get_contract", lambda symbol: {"symbol":"AAA-USDT","quantityPrecision":2,"pricePrecision":4,"tradeMinQuantity":0.01})
+    monkeypatch.setattr(bingx, "_current_close_price", lambda symbol: 100.0)
+    def fake_verify(symbol, direction, **kwargs):
+        if kwargs["order_kind"] == "STOP_MARKET":
+            order = {"orderId":"SL1","clientOrderId":kwargs["client_order_id"],"type":"STOP_MARKET","stopPrice":kwargs["expected_price"],"origQty":kwargs["expected_qty"]}
+        elif kwargs["client_order_id"].endswith("_TP1"):
+            order = {"orderId":"TP1","clientOrderId":kwargs["client_order_id"],"type":"TAKE_PROFIT_MARKET","stopPrice":"103.1267","origQty":kwargs["expected_qty"]}
+        else:
+            order = {"orderId":"TP2","clientOrderId":kwargs["client_order_id"],"type":"TAKE_PROFIT_MARKET","stopPrice":"106.1304","origQty":kwargs["expected_qty"]}
+        return {"status":"verified","order":order}
+    monkeypatch.setattr(bingx, "_verify_open_order", fake_verify)
+    monkeypatch.setattr(bingx, "_request", lambda method,path,params=None,**kwargs: {"code":0,"data":{"order":params or {}}})
+    out = bingx.ensure_directional_protection(
+        "AAA-USDT", "LONG", 100.123, 1.0, 10.0,
+        [{"leg":"tp1","pnl_pct":3.0,"close_fraction":0.5},{"leg":"tp2","pnl_pct":6.0,"close_fraction":0.5}],
+        trade_id="EVT_ROUND",
+    )
+    assert out["status"] == "PROTECTED"
+    assert out["protection_validation"]["tp_geometry_valid"] is True
+
+
+def test_register_active_trade_missing_state_after_entry_fails_closed(tmp_path, monkeypatch):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", tmp_path / "active_trades.json")
+    with pytest.raises(tracker.ActiveTradeStateCorrupt, match="active_trades.json is missing"):
+        tracker.register_active_trade(
+            event_id="EVT_MISSING_AFTER_ENTRY", symbol="AAA-USDT", name="AAA", direction="LONG",
+            entry_price=100.0, qty=1.0, tp_orders=[{"leg":"tp1","order_id":"TP1"}],
+            sl_result={"order_id":"SL1"}, event_type="TEST", setup={"risk_pct":10.0},
+        )
+    assert not (tmp_path / "active_trades.json").exists()
+
+
+def test_be_exit_classification_uses_order_identity():
+    from event_engine import tracker
+    trade = {"be_activated": True, "be_order_id": "BE123"}
+    assert tracker._classify_confirmed_stop_exit_reason(trade, "BE123", {"order_id": "BE123"}) == "BREAK_EVEN"
+    assert tracker._classify_confirmed_stop_exit_reason(trade, "SL123", {"order_id": "SL123"}) == "STOP_LOSS"
+
+
+def test_initial_protection_never_market_closes_crossed_tp(monkeypatch):
+    from event_engine import bingx
+    states = iter([
+        {"status": "ok", "sl_orders": [], "tp_orders": []},
+        {"status": "ok", "sl_orders": [{"orderId":"SL1","clientOrderId":"EVT_TEST_SL","type":"STOP_MARKET","stopPrice":"90.0","origQty":"1.0"}], "tp_orders": []},
+    ])
+    monkeypatch.setattr(bingx, "get_open_protection_directional", lambda *a, **k: next(states))
+    monkeypatch.setattr(bingx, "get_contract", lambda *a, **k: {"symbol": "AAA-USDT", "status": 1, "apiStateOpen": "true", "pricePrecision": 4, "quantityPrecision": 2, "tradeMinQuantity": 0.01})
+    monkeypatch.setattr(bingx, "contract_exists", lambda *a, **k: True)
+    monkeypatch.setattr(bingx, "get_position_mode", lambda *a, **k: "HEDGE")
+    monkeypatch.setattr(bingx, "_current_close_price", lambda symbol: 106.0)
+    monkeypatch.setattr(bingx, "_request", lambda *a, **k: {"code": 0, "data": {"order": {"orderId": "SL1", "clientOrderId": "EVT_TEST_SL", "type": "STOP_MARKET", "stopPrice": "90.0", "origQty": "1.0"}}})
+    out = bingx.ensure_directional_protection("AAA-USDT", "LONG", 100.0, 1.0, 10.0, [{"leg":"tp1","pnl_pct":3.0,"close_fraction":0.5},{"leg":"tp2","pnl_pct":6.0,"close_fraction":0.5}], trade_id="EVT_CROSSED_TP")
+    assert out["status"] == "PROTECTION_FAILED"
+    assert out["failure_class"] == "TP_TARGET_CROSSED_BEFORE_PROTECTION"
+
+
+def test_protection_postcondition_rejects_wrong_tp_price(monkeypatch):
+    from event_engine import bingx
+    states = iter([
+        {"status":"ok","sl_orders":[{"orderId":"SL1","clientOrderId":"EVT_SL","type":"STOP_MARKET","stopPrice":"90.0","origQty":"1.0"}],"tp_orders":[]},
+        {"status":"ok","sl_orders":[{"orderId":"SL1","clientOrderId":"EVT_SL","type":"STOP_MARKET","stopPrice":"90.0","origQty":"1.0"}],"tp_orders":[]},
+    ])
+    monkeypatch.setattr(bingx,"get_open_protection_directional",lambda *a,**k:next(states))
+    monkeypatch.setattr(bingx,"get_position_mode",lambda *a,**k:"HEDGE")
+    monkeypatch.setattr(bingx,"_current_close_price",lambda symbol:100.0)
+    monkeypatch.setattr(bingx,"_verify_open_order",lambda symbol,direction,**kwargs:{"status":"verified","order":{"orderId":kwargs["client_order_id"],"clientOrderId":kwargs["client_order_id"],"type":kwargs["order_kind"],"stopPrice":str(kwargs["expected_price"]+1.0 if kwargs["order_kind"]=="TAKE_PROFIT_MARKET" else kwargs["expected_price"]),"origQty":str(kwargs["expected_qty"])}})
+    monkeypatch.setattr(bingx,"_request",lambda method,path,params=None,**kwargs:{"code":0,"data":{"order":{"orderId":params.get("clientOrderId"),"clientOrderId":params.get("clientOrderId"),"type":params.get("type"),"stopPrice":params.get("stopPrice"),"origQty":params.get("quantity")}}})
+    out=bingx.ensure_directional_protection("AAA-USDT","LONG",100.0,1.0,10.0,[{"leg":"tp1","pnl_pct":3.0,"close_fraction":0.5},{"leg":"tp2","pnl_pct":6.0,"close_fraction":0.5}],trade_id="EVT_BAD_TP")
+    assert out["status"] != "PROTECTED"
+
+
+
+def test_open_market_short_all_direction_signal_displacement_blocks_post(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "TESTUSDT")
+    monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
+    monkeypatch.setattr(bingx, "get_contract", lambda symbol: {"quantityPrecision": 2, "tradeMinQuantity": 0.01, "multiplier": 1, "maxLeverage": 20})
+    monkeypatch.setattr(bingx, "has_open_position", lambda *a, **k: False)
+    monkeypatch.setattr(bingx, "_set_leverage", lambda *a, **k: True)
+    monkeypatch.setattr(bingx, "position_side_param", lambda *a, **k: "SHORT")
+    monkeypatch.setattr(bingx, "get_order", lambda *a, **k: {"status": "error", "error": "not found"})
+    now_ms = int(time.time() * 1000)
+    quote = {"status":"ok","symbol":"TESTUSDT","bid":101.5,"ask":101.7,"quote_observed_at_ms":now_ms,"quote_exchange_time_ms":now_ms,"quote_source":"bookTicker"}
+    monkeypatch.setattr(bingx, "get_execution_quote", lambda *a, **k: quote)
+    monkeypatch.setattr(bingx, "_request", lambda *a, **k: pytest.fail("market POST must not happen after all-direction displacement rejection"))
+    out = bingx.open_market("TEST-USDT", "SHORT", 100.0, "EVENT_DRIFT_SHORT")
+    assert out["status"] == "skipped_stale_signal"
+    assert out["signal_price_displacement_pct"] > 1.0
+    assert out["signal_price_displacement_direction"] == "UP"
+
+
+
+def test_invalid_nonempty_tp_configuration_fails_closed(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "get_contract", lambda *a, **k: {"symbol":"AAA-USDT","pricePrecision":4,"quantityPrecision":2,"tradeMinQuantity":0.01})
+    monkeypatch.setattr(bingx, "get_open_protection_directional", lambda *a, **k: {"status":"ok","sl_orders":[],"tp_orders":[]})
+    monkeypatch.setattr(bingx, "get_position_mode", lambda *a, **k: "HEDGE")
+    out = bingx.ensure_directional_protection("AAA-USDT", "LONG", 100.0, 1.0, 10.0, [{"leg":"tp1","pnl_pct":0,"close_fraction":0}], trade_id="EVT_BAD_CFG")
+    assert out["status"] == "PROTECTION_FAILED"
+    assert out["failure_class"] == "INVALID_TP_CONFIGURATION"
+
+
+def test_reconciliation_final_save_missing_state_fails_closed(tmp_path, monkeypatch):
+    from event_engine import tracker
+    active = tmp_path / "active_trades.json"
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", active)
+    original = {"event_id": "OLD", "symbol": "AAA-USDT", "direction": "LONG", "closed": False}
+    tracker._save_active_trades({"OLD": original})
+    original_snapshot = tracker._load_active_trades_required()
+    active.unlink()
+    with pytest.raises(tracker.ActiveTradeStateCorrupt, match="active_trades.json is missing"):
+        tracker._save_active_trades_after_reconciliation(original_snapshot, {})
+    assert not active.exists()
+    assert not list(tmp_path.glob("active_trades.json.quarantine.*"))
+
+
+def test_historical_be_exit_fallback_uses_be_order_identity(monkeypatch):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "_get_filled_order", lambda *a, **k: None)
+    monkeypatch.setattr(tracker, "get_all_orders", lambda *a, **k: [
+        {
+            "orderId": "BE123",
+            "clientOrderId": "EVT_BE_EVENT",
+            "status": "FILLED",
+            "side": "SELL",
+            "type": "STOP_MARKET",
+            "executedQty": "1",
+            "avgPrice": "100.20",
+            "stopPrice": "100.0",
+            "updateTime": 300,
+        }
+    ])
+    out = tracker._reconcile_historical_exit_order(
+        "AAA-USDT", "LONG", 100, 1, [],
+        {"order_id": "BE123", "client_order_id": "EVT_BE_EVENT"},
+        trade={"be_activated": True, "be_order_id": "BE123", "be_client_order_id": "EVT_BE_EVENT"},
+    )
+    assert out[0] == pytest.approx(100.20)
+    assert out[1] == "BREAK_EVEN"
+    assert out[2] == "historical_all_orders"
+    assert out[3]["orderId"] == "BE123"
+
+
+def test_live_owner_conflict_check_missing_state_fails_closed(tmp_path, monkeypatch):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", tmp_path / "active_trades.json")
+    with pytest.raises(tracker.ActiveTradeStateCorrupt, match="active_trades.json is missing"):
+        tracker.has_active_trade_conflict("AAA-USDT", "LONG")
+
+
+def test_execute_new_position_state_race_during_owner_check_blocks_before_order(monkeypatch):
+    import run_once
+    signal = {
+        "event_id": "EVT_STATE_RACE",
+        "symbol": "AAA-USDT",
+        "type": "LONG",
+        "entry": 100.0,
+        "sl": 90.0,
+        "tp1": 103.0,
+        "tp2": 106.0,
+        "risk_pct": 10.0,
+    }
+    monkeypatch.setattr(run_once, "_live_state_preflight", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(run_once, "has_active_trade_conflict", lambda *a, **k: (_ for _ in ()).throw(run_once.ActiveTradeStateCorrupt("active_trades.json is missing")))
+    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: pytest.fail("market order must not be sent after a state race"))
+    out = run_once.execute_new_position(signal)
+    assert out["status"] == "blocked_state_untrusted"
+    assert "active_trades.json is missing" in out["error"]

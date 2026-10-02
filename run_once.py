@@ -118,6 +118,10 @@ SCAN_BATCH_PAUSE_SEC = max(0.0, float(os.environ.get("SCAN_BATCH_PAUSE_SEC", "0.
 BINANCE_ASSET_CLASSES = {x.strip().upper() for x in os.environ.get("BINANCE_ASSET_CLASSES", "CRYPTO,EQUITY").split(",") if x.strip()}
 MAX_MARKET_SPREAD_PCT = float(os.environ.get("MAX_MARKET_SPREAD_PCT", "1.50"))
 MAX_ENTRY_SLIPPAGE_PCT = max(0.0, float(os.environ.get("MAX_ENTRY_SLIPPAGE_PCT", "1.00")))
+# Absolute movement from the original signal price. Unlike adverse execution
+# slippage, this deliberately rejects stale/broken ideas when price has moved
+# too far in either direction before the order is submitted.
+MAX_ENTRY_SIGNAL_DISPLACEMENT_PCT = max(0.0, float(os.environ.get("MAX_ENTRY_SIGNAL_DISPLACEMENT_PCT", "1.00")))
 EXECUTION_QUOTE_MAX_AGE_SEC = max(0.0, float(os.environ.get("EXECUTION_QUOTE_MAX_AGE_SEC", "2.0")))
 RESEARCH_RICH_CONTEXT_ENABLED = os.environ.get("RESEARCH_RICH_CONTEXT_ENABLED", "false").lower() == "true"
 RESEARCH_DEFER_UNTIL_AFTER_EXECUTION = os.environ.get("RESEARCH_DEFER_UNTIL_AFTER_EXECUTION", "true").lower() == "true"
@@ -2184,12 +2188,30 @@ def _rollback_after_registration_failure(
     }
 
 def _adverse_signal_drift_pct(signal_entry: float, executable_price: float, direction: str) -> float:
-    """Distance the current executable price has moved against the original signal."""
+    """Economic adverse entry drift relative to the original signal price.
+
+    LONG entries are economically worse when the executable price is above the
+    signal price; SHORT entries are economically worse when the executable price
+    is below the signal price. A separate absolute displacement gate protects
+    against a stale/broken thesis moving too far in either direction.
+    """
     if signal_entry <= 0 or executable_price <= 0:
         return float("inf")
-    if direction == "LONG":
+    if str(direction).upper() == "LONG":
         return max(0.0, executable_price - signal_entry) / signal_entry * 100.0
-    return max(0.0, signal_entry - executable_price) / signal_entry * 100.0
+    if str(direction).upper() == "SHORT":
+        return max(0.0, signal_entry - executable_price) / signal_entry * 100.0
+    return float("inf")
+
+
+def _signal_price_displacement_pct(signal_entry: float, executable_price: float) -> tuple[float, str]:
+    """Absolute signal-to-executable movement, independent of trade direction."""
+    if signal_entry <= 0 or executable_price <= 0:
+        return float("inf"), "UNKNOWN"
+    delta_pct = (executable_price - signal_entry) / signal_entry * 100.0
+    if abs(delta_pct) <= 1e-12:
+        return 0.0, "UNCHANGED"
+    return abs(delta_pct), "UP" if delta_pct > 0 else "DOWN"
 
 
 def _build_actual_signal_from_rebase(signal: dict[str, Any], rebased: dict[str, Any]) -> dict[str, Any]:
@@ -2304,8 +2326,19 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
 
     # Local ownership invariant: the engine must never create a second active
     # local owner for the same exchange position identity, even when exchange
-    # position polling temporarily reports flat/stale state.
-    if has_active_trade_conflict(symbol, direction, exclude_event_id=event_id):
+    # position polling temporarily reports flat/stale state. A state race between
+    # the admission preflight above and this ownership read is also fail-closed.
+    try:
+        local_owner_conflict = has_active_trade_conflict(symbol, direction, exclude_event_id=event_id)
+    except ActiveTradeStateCorrupt as exc:
+        reason = f"active-trade state became untrusted before ownership check: {exc}"
+        log.critical("[LIVE_BLOCKED_STATE] %s %s event=%s | %s", symbol, direction, event_id, reason)
+        _append_execution_ledger(event_id, signal.get("attempt_id"), "EXECUTION_BLOCKED_STATE", {
+            "status": "BLOCKED_STATE_UNTRUSTED",
+            "error": reason,
+        })
+        return {"status": "blocked_state_untrusted", "error": reason, "order": None, "position": None}
+    if local_owner_conflict:
         conflict = "local_active_trade_conflict"
         log.error("[EXEC_BLOCKED_LOCAL_OWNER] %s %s | event=%s | %s", symbol, direction, event_id, conflict)
         _append_execution_ledger(event_id, signal.get("attempt_id"), "LOCAL_OWNER_CONFLICT", {"status": "blocked_local_owner_conflict", "error": conflict})
@@ -2400,6 +2433,40 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
             return {"status": "skipped_stale_signal", "error": reason, "symbol": symbol, "direction": direction, "execution_quote": execution_quote}
     executable_price = float(execution_quote["ask"] if direction == "LONG" else execution_quote["bid"])
     signal_drift_pct = _adverse_signal_drift_pct(entry_price, executable_price, direction)
+    signal_price_displacement_pct, signal_price_displacement_direction = _signal_price_displacement_pct(
+        entry_price, executable_price
+    )
+    if signal_price_displacement_pct > MAX_ENTRY_SIGNAL_DISPLACEMENT_PCT:
+        reason = (
+            f"signal_price_displacement_pct={signal_price_displacement_pct:.4f}% "
+            f"> {MAX_ENTRY_SIGNAL_DISPLACEMENT_PCT:.4f}% "
+            f"direction={signal_price_displacement_direction}"
+        )
+        log.warning("[EXEC_REJECT_SIGNAL_DISPLACEMENT] %s %s | %s | signal=%s executable=%s", symbol, direction, reason, entry_price, executable_price)
+        _append_execution_ledger(event_id, signal.get("attempt_id"), "SIGNAL_PRICE_DISPLACEMENT_REJECTED", {
+            "status": "skipped_stale_signal",
+            "error": reason,
+            "signal_price": entry_price,
+            "execution_reference_price": executable_price,
+            "signal_price_displacement_pct": signal_price_displacement_pct,
+            "signal_price_displacement_direction": signal_price_displacement_direction,
+            "signal_price_displacement_limit_pct": MAX_ENTRY_SIGNAL_DISPLACEMENT_PCT,
+            "signal_drift_pct": signal_drift_pct,
+        })
+        return {
+            "status": "skipped_stale_signal",
+            "error": reason,
+            "symbol": symbol,
+            "direction": direction,
+            "signal_price": entry_price,
+            "pre_entry_bid": execution_quote.get("bid"),
+            "pre_entry_ask": execution_quote.get("ask"),
+            "execution_reference_price": executable_price,
+            "signal_drift_pct": signal_drift_pct,
+            "signal_price_displacement_pct": signal_price_displacement_pct,
+            "signal_price_displacement_direction": signal_price_displacement_direction,
+            "signal_price_displacement_limit_pct": MAX_ENTRY_SIGNAL_DISPLACEMENT_PCT,
+        }
     if signal_drift_pct > MAX_ENTRY_SLIPPAGE_PCT:
         reason = f"signal_drift_pct={signal_drift_pct:.4f}% > {MAX_ENTRY_SLIPPAGE_PCT:.4f}%"
         log.warning("[EXEC_REJECT_STALE] %s %s | %s | signal=%s executable=%s", symbol, direction, reason, entry_price, executable_price)
@@ -2444,6 +2511,18 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         log.warning("[EXEC_REJECT_PRECISION] %s %s | %s", symbol, direction, reason)
         _append_execution_ledger(event_id, signal.get("attempt_id"), "PRE_ENTRY_PRECISION_REJECTED", {"status": "skipped_invalid_setup", "error": reason})
         return {"status": "skipped_invalid_setup", "error": reason, "symbol": symbol, "direction": direction}
+
+    # Re-check state immediately before the exchange write. Earlier validation can
+    # take seconds; a state file disappearing/corrupting during those network calls
+    # must block the order rather than relying on the earlier snapshot.
+    state_ready, state_reason = _live_state_preflight(signal)
+    if not state_ready:
+        return {
+            "status": "blocked_state_untrusted",
+            "error": state_reason,
+            "order": None,
+            "position": None,
+        }
 
     setup = _build_setup(signal)
     # ``order_submit_ts`` is reserved for an actual MARKET POST. Do not populate
@@ -2692,6 +2771,9 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     setup["pre_entry_ask"] = pre_entry_ask
     setup["execution_reference_price"] = executable_reference_price
     setup["signal_drift_pct"] = signal_drift_pct
+    setup["signal_price_displacement_pct"] = signal_price_displacement_pct
+    setup["signal_price_displacement_direction"] = signal_price_displacement_direction
+    setup["signal_price_displacement_limit_pct"] = MAX_ENTRY_SIGNAL_DISPLACEMENT_PCT
     setup["execution_slippage_pct"] = execution_slippage_pct
     setup["invalidation_price"] = sl_price
     setup["risk_pct"] = actual_risk_pct
@@ -2712,6 +2794,9 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         "pre_entry_ask": pre_entry_ask,
         "execution_reference_price": executable_reference_price,
         "signal_drift_pct": signal_drift_pct,
+        "signal_price_displacement_pct": signal_price_displacement_pct,
+        "signal_price_displacement_direction": signal_price_displacement_direction,
+        "signal_price_displacement_limit_pct": MAX_ENTRY_SIGNAL_DISPLACEMENT_PCT,
         "fill_price": avg_price,
         "entry_slippage_pct": signed_entry_slippage_pct,
         "signed_entry_slippage_pct": signed_entry_slippage_pct,
@@ -3005,7 +3090,7 @@ def main() -> None:
             "zone_trigger_mode": ZONE_TRIGGER_MODE, "fixed_stop_pct": FIXED_STOP_PCT,
             "tp1_pct": TP1_PCT, "tp2_pct": TP2_PCT, "min_structure_room_r": MIN_STRUCTURE_ROOM_R,
             "require_directional_candle": REQUIRE_DIRECTIONAL_CANDLE, "require_structure_obstacle": REQUIRE_STRUCTURE_OBSTACLE,
-            "open_position_cap_enabled": False, "trades_per_cycle_cap_enabled": False, "max_entry_slippage_pct": MAX_ENTRY_SLIPPAGE_PCT,
+            "open_position_cap_enabled": False, "trades_per_cycle_cap_enabled": False, "max_entry_slippage_pct": MAX_ENTRY_SLIPPAGE_PCT, "max_entry_signal_displacement_pct": MAX_ENTRY_SIGNAL_DISPLACEMENT_PCT,
             "execution_quote_max_age_sec": EXECUTION_QUOTE_MAX_AGE_SEC,
             "execution_require_exchange_timestamp": os.environ.get("EXECUTION_REQUIRE_EXCHANGE_TIMESTAMP", "false"),
             "execution_unknown_quote_age_policy": os.environ.get("EXECUTION_UNKNOWN_QUOTE_AGE_POLICY", "allow_with_local_age"),
