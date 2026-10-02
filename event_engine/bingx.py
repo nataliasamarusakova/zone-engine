@@ -35,6 +35,7 @@ BASE_URL = os.environ.get("BINGX_BASE_URL", "https://open-api-vst.bingx.com").rs
 MARGIN_USDT = float(os.environ.get("BINGX_MARGIN_USDT", "1"))
 LEVERAGE = int(os.environ.get("BINGX_LEVERAGE", "10"))
 MAX_LEVERAGE = int(os.environ.get("BINGX_MAX_LEVERAGE", "10"))
+MAX_ENTRY_SIGNAL_DISPLACEMENT_PCT = max(0.0, float(os.environ.get("MAX_ENTRY_SIGNAL_DISPLACEMENT_PCT", "1.00")))
 
 SYMBOL_MAP = {}
 try:
@@ -839,6 +840,16 @@ def _find_recent_order_by_client_id(symbol: str, client_order_id: str, lookback_
     return None
 
 
+def _signal_price_displacement_pct(signal_price: float, executable_price: float) -> tuple[float, str]:
+    """Absolute signal-to-executable movement, independent of direction."""
+    if signal_price <= 0 or executable_price <= 0:
+        return float("inf"), "UNKNOWN"
+    delta_pct = (executable_price - signal_price) / signal_price * 100.0
+    if abs(delta_pct) <= 1e-12:
+        return 0.0, "UNCHANGED"
+    return abs(delta_pct), "UP" if delta_pct > 0 else "DOWN"
+
+
 def open_market(symbol: str, direction: str, price: float, trade_id: str, *, execution_quote: dict[str, Any] | None = None, attempt_id: str | None = None) -> dict:
     direction = str(direction).upper()
     if direction not in {"LONG", "SHORT"}:
@@ -949,7 +960,31 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str, *, exe
         max_entry_slippage_pct = max(0.0, float(os.environ.get("MAX_ENTRY_SLIPPAGE_PCT", "1.00")))
     except (TypeError, ValueError):
         max_entry_slippage_pct = 1.0
-    signal_drift_pct = max(0.0, (sizing_price - float(price)) / float(price) * 100.0) if direction == "LONG" else max(0.0, (float(price) - sizing_price) / float(price) * 100.0)
+    signal_drift_pct = (
+        max(0.0, (sizing_price - float(price)) / float(price) * 100.0)
+        if direction == "LONG"
+        else max(0.0, (float(price) - sizing_price) / float(price) * 100.0)
+        if direction == "SHORT"
+        else float("inf")
+    )
+    signal_price_displacement_pct, signal_price_displacement_direction = _signal_price_displacement_pct(float(price), sizing_price)
+    if signal_price_displacement_pct > MAX_ENTRY_SIGNAL_DISPLACEMENT_PCT:
+        return {
+            "status": "skipped_stale_signal",
+            "error": (
+                f"signal_price_displacement_pct={signal_price_displacement_pct:.4f}% "
+                f"> {MAX_ENTRY_SIGNAL_DISPLACEMENT_PCT:.4f}% direction={signal_price_displacement_direction}; "
+                f"signal_drift_pct={signal_drift_pct:.4f}%"
+            ),
+            "symbol": bx,
+            "execution_quote": final_quote,
+            "signal_drift_pct": signal_drift_pct,
+            "signal_price_displacement_pct": signal_price_displacement_pct,
+            "signal_price_displacement_direction": signal_price_displacement_direction,
+            "signal_price_displacement_limit_pct": MAX_ENTRY_SIGNAL_DISPLACEMENT_PCT,
+            "signal_price": float(price),
+            "execution_reference_price": sizing_price,
+        }
     if signal_drift_pct > max_entry_slippage_pct:
         return {"status": "skipped_stale_signal", "error": f"signal_drift_pct={signal_drift_pct:.4f}% > {max_entry_slippage_pct:.4f}% at final order gate", "symbol": bx, "execution_quote": final_quote, "signal_drift_pct": signal_drift_pct, "signal_price": float(price), "execution_reference_price": sizing_price}
 
@@ -1446,9 +1481,11 @@ def _normalize_tp_levels(tp_levels: list) -> list[dict]:
         normalized.append({"leg": leg, "pnl_pct": pnl_pct, "close_fraction": fraction})
 
     if not normalized:
-        normalized = [{"leg": "tp1", "pnl_pct": 2.0, "close_fraction": 1.0}]
+        return []
 
     total = sum(x["close_fraction"] for x in normalized)
+    if not math.isfinite(total) or total <= 0:
+        return []
     for x in normalized:
         x["close_fraction"] /= total
     return normalized
@@ -2552,6 +2589,17 @@ def ensure_directional_protection(
     existing_tp = list(existing.get("tp_orders", []))
     existing_sl = list(existing.get("sl_orders", []))
     tp_levels_norm = _normalize_tp_levels(tp_levels)
+    if tp_levels and not tp_levels_norm:
+        return {
+            "status": "PROTECTION_FAILED",
+            "symbol": symbol,
+            "bx_symbol": bx_symbol,
+            "direction": direction,
+            "avg_price": avg_price,
+            "qty": position_qty,
+            "error": "invalid_nonempty_tp_configuration",
+            "failure_class": "INVALID_TP_CONFIGURATION",
+        }
 
     valid_existing_sl = None
     engine_owned_invalid_sl_ids: list[str] = []
@@ -2800,60 +2848,26 @@ def ensure_directional_protection(
         trigger_invalid = (direction == "LONG" and tp_price <= current_price) or (direction == "SHORT" and tp_price >= current_price)
 
         if trigger_invalid:
-            log.warning("[BINGX] TP market execution for %s %s: price=%s current=%s (trigger crossed)", symbol, leg, _format_price(tp_price, price_precision), _format_price(current_price, price_precision))
-            client_order_id = build_tp_client_order_id(leg, trade_id)
-            market_params = {
-                "symbol": bx_symbol,
-                "side": "SELL" if direction == "LONG" else "BUY",
-                "positionSide": position_side_param(direction),
-                "type": "MARKET",
-                "quantity": _format_qty(tp_qty, precision),
-                "clientOrderId": client_order_id,
+            # Initial protection is established before local ownership is committed.
+            # Never reduce the just-opened position with a market TP in this window;
+            # return a protection failure so the caller uses its verified rollback path.
+            log.critical(
+                "[BINGX] TP target already crossed during initial protection for %s %s: price=%s current=%s",
+                symbol, leg, _format_price(tp_price, price_precision), _format_price(current_price, price_precision),
+            )
+            return {
+                "status": "PROTECTION_FAILED",
+                "symbol": symbol,
+                "bx_symbol": bx_symbol,
+                "direction": direction,
+                "avg_price": avg_price,
+                "qty": position_qty,
+                "sl_result": sl_result,
+                "tp_orders": tp_results,
+                "error": f"tp_target_crossed_before_initial_protection: leg={leg} tp={tp_price} current={current_price}",
+                "failed_leg": leg,
+                "failure_class": "TP_TARGET_CROSSED_BEFORE_PROTECTION",
             }
-
-            pre_position_qty = position_qty
-            resp = _request("POST", ORDER_PATH, market_params)
-            order = (resp.get("data") or {}).get("order") or resp.get("data") or {}
-            order_id = str(order.get("orderId", ""))
-            if resp.get("code") != 0:
-                # Never blind-retry an ambiguous MARKET reduction. Reconcile
-                # the order/position and only accept the leg when execution is
-                # actually observable.
-                verification = _verify_market_reduce_order(
-                    symbol, direction, order_id, tp_qty, pre_position_qty
-                )
-            else:
-                verification = _verify_market_reduce_order(
-                    symbol, direction, order_id, tp_qty, pre_position_qty
-                )
-
-            if verification.get("status") != "verified":
-                tp_results.append({
-                    "leg": leg,
-                    "status": "error",
-                    "error": (
-                        f"TP market close acknowledged/attempted but execution could not be verified: "
-                        f"response_code={resp.get('code')} verification={verification}"
-                    ),
-                    "qty": tp_qty,
-                    "pnl_pct": pnl_pct,
-                })
-            else:
-                tp_results.append({
-                    "leg": leg,
-                    "status": "created",
-                    "order_id": order_id,
-                    "client_order_id": order.get("clientOrderId") or client_order_id,
-                    "price": current_price,
-                    "qty": float(verification.get("reduced_qty") or verification.get("executed_qty") or tp_qty),
-                    "pnl_pct": pnl_pct,
-                    "protection_order_verified": None,
-                    "execution_verified": True,
-                    "fill_evidence_status": "CONFIRMED",
-                    "executed_qty": float(verification.get("executed_qty", 0.0) or 0.0),
-                    "remaining_qty": float(verification.get("remaining_qty", 0.0) or 0.0),
-                })
-            continue
 
         client_order_id = build_tp_client_order_id(leg, trade_id)
         params = {
@@ -2909,9 +2923,62 @@ def ensure_directional_protection(
         })
 
     successful_tps = [t for t in tp_results if t.get("status") in {"created", "already_exists", "reconciled_after_post_error"}]
+    tp_geometry_valid = True
+    tp_qty_valid = True
+    tp_identity_valid = True
+    seen_tp_order_ids: set[str] = set()
+    for level, expected_qty in zip(tp_levels_norm, desired_qtys):
+        leg = str(level["leg"])
+        pnl_pct = float(level["pnl_pct"])
+        expected_price = avg_price * (1.0 + pnl_pct / 100.0) if direction == "LONG" else avg_price * (1.0 - pnl_pct / 100.0)
+        matches = [t for t in successful_tps if str(t.get("leg", "")) == leg]
+        if len(matches) != 1:
+            tp_identity_valid = False
+            continue
+        item = matches[0]
+        oid = str(item.get("order_id") or "")
+        if not oid or oid in seen_tp_order_ids:
+            tp_identity_valid = False
+        seen_tp_order_ids.add(oid)
+        actual_price = float(item.get("price") or 0.0)
+        actual_qty = float(item.get("qty") or 0.0)
+        expected_price_norm = float(_format_price(expected_price, price_precision))
+        actual_price_norm = float(_format_price(actual_price, price_precision))
+        # Exchange pricePrecision is authoritative: 103.12669 submitted to a
+        # 4-decimal market is 103.1267. Compare the normalized exchange price,
+        # not the unrounded mathematical target, otherwise valid protection is
+        # falsely downgraded to SL_ONLY and can trigger an emergency close.
+        qty_tol = max(1e-12, abs(expected_qty) * 1e-8)
+        if actual_price <= 0 or actual_price_norm != expected_price_norm:
+            tp_geometry_valid = False
+        if actual_qty <= 0 or abs(actual_qty - float(expected_qty)) > qty_tol:
+            tp_qty_valid = False
+        if item.get("protection_order_verified") is not True or item.get("execution_verified") is True:
+            tp_identity_valid = False
+
+    tp_qty_sum = sum(float(t.get("qty") or 0.0) for t in successful_tps)
+    tp_qty_valid = tp_qty_valid and abs(tp_qty_sum - float(position_qty)) <= max(1e-12, abs(float(position_qty)) * 1e-8)
+
+    # Validate the actual rounded exchange trigger ladder. Rounding must not make
+    # TP1/TP2 collapse onto each other or cross the entry, otherwise the protection
+    # is economically invalid even when each individual order matches its target.
+    rounded_tp_prices = []
+    for level in tp_levels_norm:
+        pnl_pct = float(level["pnl_pct"])
+        expected = avg_price * (1.0 + pnl_pct / 100.0) if direction == "LONG" else avg_price * (1.0 - pnl_pct / 100.0)
+        rounded_tp_prices.append(float(_format_price(expected, price_precision)))
+    if any(p <= 0 for p in rounded_tp_prices):
+        tp_geometry_valid = False
+    elif direction == "LONG":
+        if any(p <= avg_price for p in rounded_tp_prices) or any(b <= a for a, b in zip(rounded_tp_prices, rounded_tp_prices[1:])):
+            tp_geometry_valid = False
+    elif direction == "SHORT":
+        if any(p >= avg_price for p in rounded_tp_prices) or any(b >= a for a, b in zip(rounded_tp_prices, rounded_tp_prices[1:])):
+            tp_geometry_valid = False
+
     if not verified_sl_valid:
         final_status = "PROTECTION_FAILED"
-    elif len(successful_tps) == len(tp_levels_norm):
+    elif len(successful_tps) == len(tp_levels_norm) and tp_geometry_valid and tp_qty_valid and tp_identity_valid:
         final_status = "PROTECTED"
     else:
         final_status = "SL_ONLY"
@@ -2937,6 +3004,14 @@ def ensure_directional_protection(
         "tp_mode": tp_mode,
         "effective_tp_levels": effective_levels,
         "effective_weighted_rr": effective_weighted_rr,
+        "protection_validation": {
+            "sl_verified": bool(verified_sl_valid),
+            "tp_geometry_valid": bool(tp_geometry_valid),
+            "tp_qty_valid": bool(tp_qty_valid),
+            "tp_identity_valid": bool(tp_identity_valid),
+            "tp_qty_sum": float(tp_qty_sum),
+            "position_qty": float(position_qty),
+        },
         "tp_orders": tp_results,
         "sl_result": sl_result,
     }

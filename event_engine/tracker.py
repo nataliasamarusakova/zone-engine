@@ -148,9 +148,18 @@ def _is_full_tp_close(position_gone: bool, realized_qty: float, initial_qty: flo
     return realized >= init - tolerance and realized <= init + tolerance
 
 
-def _load_active_trades() -> dict[str, dict]:
+def _load_active_trades(*, allow_missing: bool = True) -> dict[str, dict]:
+    """Load and validate active state.
+
+    Missing state is tolerated only for non-trading helpers that explicitly use the
+    default ``allow_missing=True``. Mutation paths that can own a live exchange
+    position must pass ``allow_missing=False`` so a missing state cannot silently
+    become an empty owner set after an entry has filled.
+    """
     if not ACTIVE_TRADES_PATH.exists():
-        return {}
+        if allow_missing:
+            return {}
+        raise ActiveTradeStateCorrupt("active_trades.json is missing")
     try:
         data = json.loads(ACTIVE_TRADES_PATH.read_text(encoding="utf-8"))
         if isinstance(data, dict):
@@ -194,6 +203,13 @@ def _load_active_trades() -> dict[str, dict]:
         raise ActiveTradeStateCorrupt(reason) from exc
 
 
+def _load_active_trades_required() -> dict[str, dict]:
+    """Load active state when a live owner is expected; missing state is fatal."""
+    if not ACTIVE_TRADES_PATH.exists():
+        raise ActiveTradeStateCorrupt("active_trades.json is missing")
+    return _load_active_trades()
+
+
 def _write_active_trades_unlocked(trades: dict[str, dict]) -> None:
     """Atomically replace active state; caller must hold _active_trades_lock()."""
     ACTIVE_TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -233,7 +249,12 @@ def _save_active_trades_after_reconciliation(
     This prevents both new-event loss and same-event stale-state clobbering.
     """
     with _active_trades_lock():
-        latest = _load_active_trades()
+        # Reconciliation writes are only valid against an already-trusted state file.
+        # A state file disappearing after preflight is an integrity failure, not a
+        # fresh-start condition, because this function is called only when it had
+        # a real active-state snapshot to reconcile. Never replace that missing state
+        # with an empty object.
+        latest = _load_active_trades_required()
         for raw_event_id, original in original_trades.items():
             key = str(raw_event_id)
             if key not in latest:
@@ -441,7 +462,11 @@ def _active_trade_conflicts(
 
 
 def has_active_trade_conflict(symbol: str, direction: str, *, exclude_event_id: str | None = None) -> bool:
-    return bool(_active_trade_conflicts(_load_active_trades(), symbol, direction, exclude_event_id=exclude_event_id))
+    # This helper is called only inside live-execution admission after state
+    # preflight. A missing/corrupt file at this point is an integrity failure,
+    # not an empty owner set. Fail closed instead of allowing an order through a
+    # state race.
+    return bool(_active_trade_conflicts(_load_active_trades_required(), symbol, direction, exclude_event_id=exclude_event_id))
 
 
 def _collect_order_ids(trade: dict) -> set[str]:
@@ -541,7 +566,7 @@ def _update_active_trade_protection_locked(
     *,
     event_id: str | None = None,
 ) -> bool:
-    trades = _load_active_trades()
+    trades = _load_active_trades_required()
     want_bx = _normalized_symbol(symbol)
     want_direction = str(direction).upper()
 
@@ -696,7 +721,11 @@ def _register_active_trade_locked(
     entry_ts_ms: int | None = None,
 ) -> bool:
     direction = _normalize_direction(direction)
-    trades = _load_active_trades()
+    # Registration happens only after a real exchange position exists and
+    # protection has been verified. Missing local state here is therefore not a
+    # fresh-start condition: it is an ownership-integrity failure that must force
+    # the caller's verified rollback path.
+    trades = _load_active_trades_required()
     now_ms = int(time.time() * 1000)
     actual_entry_ts = int(entry_ts_ms) if entry_ts_ms is not None and int(entry_ts_ms) > 0 else now_ms
 
@@ -1252,7 +1281,7 @@ def _move_sl_to_break_even(
             if be_client_id.upper() in cid or price_matches:
                 existing_id = str(order.get("orderId", ""))
                 if existing_id:
-                    current_trades = _load_active_trades()
+                    current_trades = _load_active_trades_required()
                     owners = _order_ids_owned_by_other_trades(
                         current_trades, {existing_id}, exclude_event_id=str(owner_event_id or trade_id or "")
                     )
@@ -1448,7 +1477,7 @@ def _move_sl_to_break_even(
     # The BE stop is now proven to exist. Before touching the old SL, prove the
     # new exchange order is not already attributed to another active local event.
     # If ownership is ambiguous, keep the old SL and surface a state conflict.
-    current_trades = _load_active_trades()
+    current_trades = _load_active_trades_required()
     owners = _order_ids_owned_by_other_trades(
         current_trades, {new_order_id}, exclude_event_id=str(owner_event_id or trade_id or "")
     )
@@ -2144,6 +2173,22 @@ def _close_execution_evidence(trade: dict, fill_accounting: dict[str, Any]) -> d
     }
 
 
+def _classify_confirmed_stop_exit_reason(trade: dict[str, Any], sl_order_id: str | None, sl_order: dict[str, Any] | None = None) -> str:
+    """Classify a confirmed SL/BE execution from order identity, not price tolerance."""
+    if bool(trade.get("be_activated")):
+        be_order_id = trade.get("be_order_id")
+        if be_order_id and sl_order_id and str(be_order_id) == str(sl_order_id):
+            return "BREAK_EVEN"
+        order = sl_order if isinstance(sl_order, dict) else {}
+        client_id = str(order.get("client_order_id") or order.get("clientOrderId") or "").upper()
+        be_client_id = str(trade.get("be_client_order_id") or "").upper()
+        if be_client_id and client_id == be_client_id:
+            return "BREAK_EVEN"
+        if client_id.startswith("EVT_BE_"):
+            return "BREAK_EVEN"
+    return "STOP_LOSS"
+
+
 def _get_exit_from_sl(symbol: str, sl_order_id: str | None) -> tuple[float | None, str | None]:
     info = _get_filled_order(symbol, sl_order_id)
     if not info:
@@ -2159,6 +2204,8 @@ def _reconcile_historical_exit_order(
     remaining_qty: float,
     tp_orders: list[dict],
     sl_order: dict | None,
+    *,
+    trade: dict | None = None,
 ) -> tuple[float | None, str | None, str | None, dict | None]:
     """Recover an exchange-verified residual exit after a position disappears.
 
@@ -2222,6 +2269,19 @@ def _reconcile_historical_exit_order(
     residual = max(0.0, float(remaining_qty))
     for order in pool:
         if residual <= 0 or order["_qty"] >= residual * 0.95:
+            order_id = str(order.get("orderId") or order.get("orderID") or "")
+            client_id = str(order.get("clientOrderId") or order.get("client_order_id") or "").upper()
+            trade_be_order_id = str((trade or {}).get("be_order_id") or "")
+            trade_be_client_id = str((trade or {}).get("be_client_order_id") or "").upper()
+            # Preserve BE semantics using durable order identity. This fallback is
+            # used specifically when the direct fill/order lookup is unavailable;
+            # a filled engine-owned BE order must remain BREAK_EVEN, not STOP_LOSS.
+            if trade_be_order_id and order_id and trade_be_order_id == order_id:
+                return order["_px"], "BREAK_EVEN", "historical_all_orders", order
+            if trade_be_client_id and client_id and trade_be_client_id == client_id:
+                return order["_px"], "BREAK_EVEN", "historical_all_orders", order
+            if client_id.startswith("EVT_BE_"):
+                return order["_px"], "BREAK_EVEN", "historical_all_orders", order
             reason = "STOP_LOSS" if str(order.get("type", "")).upper() in {"STOP", "STOP_MARKET"} else "MANUAL_CLOSE_RECONCILED"
             return order["_px"], reason, "historical_all_orders", order
 
@@ -2269,7 +2329,10 @@ def _reconciliation_status(local_qty: float, exchange_qty: float, base_status: s
 
 
 def update_active_trades() -> None:
-    trades = _load_active_trades()
+    # Reconciliation is a live-state operation. Once the engine has reached this
+    # stage, missing state must fail closed rather than be interpreted as an empty
+    # portfolio. Fresh-start bootstrap happens only in the top-level run preflight.
+    trades = _load_active_trades_required()
     if not trades:
         return
 
@@ -2587,7 +2650,7 @@ def update_active_trades() -> None:
                         )
                         if new_sl.get("status") in {"created", "created_cleanup_pending"}:
                             be_order_ids = _protection_order_ids([], new_sl)
-                            current_trades = _load_active_trades()
+                            current_trades = _load_active_trades_required()
                             owners = _order_ids_owned_by_other_trades(current_trades, set(be_order_ids), exclude_event_id=event_id)
                             if owners:
                                 conflict_ids = sorted(owners)
@@ -2740,15 +2803,13 @@ def update_active_trades() -> None:
             historical_order = None
             if sl_exit_price is not None:
                 exit_price = sl_exit_price
-                if trade.get("be_activated") and abs(exit_price - entry_price) / max(entry_price, 1e-12) < 0.003:
-                    exit_reason = "BREAK_EVEN"
-                else:
-                    exit_reason = "STOP_LOSS"
+                exit_reason = _classify_confirmed_stop_exit_reason(trade, sl_order_id, sl_order)
             elif closed_by_tp:
                 exit_reason = "TAKE_PROFIT_FULL"
             elif position_gone:
                 hist_px, hist_reason, hist_source, historical_order = _reconcile_historical_exit_order(
-                    symbol, direction, entry_ts, residual_qty_before_position_disappeared, trade.get("tp_orders", []), sl_order
+                    symbol, direction, entry_ts, residual_qty_before_position_disappeared, trade.get("tp_orders", []), sl_order,
+                    trade=trade,
                 )
                 if hist_px is not None:
                     exit_price = hist_px
