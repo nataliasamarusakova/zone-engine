@@ -52,6 +52,21 @@ jobs:
       RESEARCH_5M_HISTORY_LIMIT: "288"
       RESEARCH_DEPTH_LEVELS: "20"
       RESEARCH_RECENT_TRADES_LIMIT: "100"
+      # Trend Filter V1 is shadow-only for the current research phase. It never
+      # changes Demand/Supply construction or the existing closed-5m trigger.
+      TREND_FILTER_ENABLED: "true"
+      TREND_FILTER_MODE: "shadow"
+      TREND_FILTER_MIN_1H_BARS: "400"
+      TREND_FILTER_MIN_4H_BARS: "400"
+      TREND_FILTER_PERSISTENCE_LOOKBACK_1H: "6"
+      TREND_FILTER_PERSISTENCE_LOOKBACK_4H: "3"
+      TREND_FILTER_SLOPE_LOOKBACK_4H: "6"
+      TREND_FILTER_HISTORY_BUFFER_BARS: "12"
+      TREND_FILTER_REQUIRE_PERSISTENCE: "false"
+      ENTRY_CONTEXT_TELEMETRY_ENABLED: "true"
+      ENTRY_CONTEXT_DEPTH_LEVELS: "20"
+      ENTRY_CONTEXT_TRADES_LIMIT: "100"
+      ENTRY_CONTEXT_HTTP_TIMEOUT_SEC: "2.0"
       # Research must never add the four-endpoint microstructure sweep to the
       # production signal -> order critical path. It remains available as a
       # deliberate opt-in for research runs.
