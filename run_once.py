@@ -47,6 +47,7 @@ from event_engine.fundamental_assets import FUNDAMENTAL_ASSET_SYMBOLS
 from event_engine.telegram import format_signal, send as send_tg
 from event_engine.tracker import ActiveTradeStateCorrupt, register_active_trade, update_active_trades, update_active_trade_protection, has_active_trade_conflict, backfill_active_trade_provenance
 from event_engine import research, telemetry, shadow
+from event_engine.trend_filter import evaluate_trend_filter
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("zone_engine")
@@ -124,6 +125,24 @@ MAX_ENTRY_SLIPPAGE_PCT = max(0.0, float(os.environ.get("MAX_ENTRY_SLIPPAGE_PCT",
 MAX_ENTRY_SIGNAL_DISPLACEMENT_PCT = max(0.0, float(os.environ.get("MAX_ENTRY_SIGNAL_DISPLACEMENT_PCT", "1.00")))
 EXECUTION_QUOTE_MAX_AGE_SEC = max(0.0, float(os.environ.get("EXECUTION_QUOTE_MAX_AGE_SEC", "2.0")))
 RESEARCH_RICH_CONTEXT_ENABLED = os.environ.get("RESEARCH_RICH_CONTEXT_ENABLED", "false").lower() == "true"
+
+# Trend Filter V1 is diagnostic-only by default. It never changes zone construction
+# or the existing closed-5m trigger. Enforcement is an explicit opt-in.
+TREND_FILTER_ENABLED = os.environ.get("TREND_FILTER_ENABLED", "true").lower() == "true"
+TREND_FILTER_MODE = os.environ.get("TREND_FILTER_MODE", "shadow").strip().lower()
+if TREND_FILTER_MODE not in {"shadow", "enforce"}:
+    raise ValueError("TREND_FILTER_MODE must be shadow or enforce")
+TREND_FILTER_MIN_1H_BARS = max(200, int(os.environ.get("TREND_FILTER_MIN_1H_BARS", "400")))
+TREND_FILTER_MIN_4H_BARS = max(200, int(os.environ.get("TREND_FILTER_MIN_4H_BARS", "400")))
+TREND_FILTER_PERSISTENCE_LOOKBACK_1H = max(1, int(os.environ.get("TREND_FILTER_PERSISTENCE_LOOKBACK_1H", "6")))
+TREND_FILTER_PERSISTENCE_LOOKBACK_4H = max(1, int(os.environ.get("TREND_FILTER_PERSISTENCE_LOOKBACK_4H", "3")))
+TREND_FILTER_SLOPE_LOOKBACK_4H = max(1, int(os.environ.get("TREND_FILTER_SLOPE_LOOKBACK_4H", "6")))
+TREND_FILTER_HISTORY_BUFFER_BARS = max(4, int(os.environ.get("TREND_FILTER_HISTORY_BUFFER_BARS", "12")))
+TREND_FILTER_REQUIRE_PERSISTENCE = os.environ.get("TREND_FILTER_REQUIRE_PERSISTENCE", "false").lower() == "true"
+ENTRY_CONTEXT_TELEMETRY_ENABLED = os.environ.get("ENTRY_CONTEXT_TELEMETRY_ENABLED", "true").lower() == "true"
+ENTRY_CONTEXT_DEPTH_LEVELS = max(5, int(os.environ.get("ENTRY_CONTEXT_DEPTH_LEVELS", "20")))
+ENTRY_CONTEXT_TRADES_LIMIT = max(10, int(os.environ.get("ENTRY_CONTEXT_TRADES_LIMIT", "100")))
+ENTRY_CONTEXT_HTTP_TIMEOUT_SEC = max(0.5, float(os.environ.get("ENTRY_CONTEXT_HTTP_TIMEOUT_SEC", "2.0")))
 RESEARCH_DEFER_UNTIL_AFTER_EXECUTION = os.environ.get("RESEARCH_DEFER_UNTIL_AFTER_EXECUTION", "true").lower() == "true"
 RECONCILIATION_MAX_SECONDS = float(os.environ.get("RECONCILIATION_MAX_SECONDS", "45"))
 # Live execution requires the signal timestamp to be exactly the latest closed 1H bar.
@@ -256,6 +275,58 @@ def _append_execution_ledger(event_id: str, attempt_id: str | None, stage: str, 
         log.error("[EXECUTION_LEDGER_WRITE_FAILED] event_id=%s attempt_id=%s stage=%s error=%s", event_id, attempt_id, stage, exc)
 
 
+
+def _trend_filter_enforce_reject(snapshot: dict[str, Any] | None, mode: str) -> bool:
+    """Return True only when explicit enforce mode must veto the entry."""
+    if str(mode or "shadow").strip().lower() != "enforce":
+        return False
+    if not isinstance(snapshot, dict):
+        return True
+    return str(snapshot.get("trend_decision", "REJECT")).upper() != "ALIGNED"
+
+
+def _closed_count_for_decision(frame: pd.DataFrame | None, decision_ts_ms: int) -> int:
+    if not isinstance(frame, pd.DataFrame) or frame.empty or "close_time" not in frame.columns:
+        return 0
+    x = pd.to_numeric(frame["close_time"], errors="coerce").dropna()
+    return int((x <= int(decision_ts_ms)).sum())
+
+
+def _ensure_trend_history(*, symbol: str, timeframe: str, frame: pd.DataFrame | None, provider: str, binance_symbol: str, decision_ts_ms: int, min_bars: int) -> tuple[pd.DataFrame, bool]:
+    """Return enough causal bars for Trend Filter without changing strategy data."""
+    current = frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+    if _closed_count_for_decision(current, decision_ts_ms) >= int(min_bars):
+        return current, False
+    limit = int(min_bars) + TREND_FILTER_HISTORY_BUFFER_BARS
+    try:
+        rows = fetch_bingx_klines(symbol, timeframe, limit=limit, retryable=False) if provider == "bingx" else fetch_binance_klines(binance_symbol, timeframe, limit=limit, retryable=False)
+        refreshed = pd.DataFrame(rows)
+        if not refreshed.empty:
+            return refreshed, True
+    except Exception as exc:
+        log.warning("[TREND_HISTORY] %s/%s supplemental history unavailable: %s", _display_symbol(symbol), timeframe, exc)
+    return current, False
+
+
+def _signal_decision_boundary_ts_ms(signal: dict[str, Any]) -> int | None:
+    """Causal boundary = close of the existing closed 5m trigger bar."""
+    raw = signal.get("decision_boundary_ts") or signal.get("trigger_bar_close_time")
+    if raw:
+        try:
+            ts = pd.Timestamp(raw)
+            ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+            return int(ts.timestamp() * 1000)
+        except Exception:
+            pass
+    raw = signal.get("trigger_bar_time") or signal.get("time")
+    try:
+        ts = pd.Timestamp(raw)
+        ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+        return int((ts + pd.Timedelta(minutes=5)).timestamp() * 1000)
+    except Exception:
+        return None
+
+
 def _record_entry_decision(
     scan_id: str,
     signal: dict[str, Any],
@@ -326,6 +397,23 @@ def _record_entry_decision(
         "counterfactual_experiment_version": shadow.SHADOW_EXPERIMENT_VERSION,
         "counterfactual_applied": False,
         "counterfactual_experiment_ids": sorted(list((signal.get("shadow_experiments") or {}).get("experiments", {}).keys())),
+        "trend_filter_version": (signal.get("trend_filter") or {}).get("version"),
+        "trend_filter_enabled": (signal.get("trend_filter") or {}).get("enabled"),
+        "trend_filter_mode": (signal.get("trend_filter") or {}).get("mode"),
+        "trend_decision": (signal.get("trend_filter") or {}).get("trend_decision"),
+        "trend_reject_reason": (signal.get("trend_filter") or {}).get("trend_reject_reason"),
+        "trend_4h": (signal.get("trend_filter") or {}).get("trend_4h"),
+        "trend_1h": (signal.get("trend_filter") or {}).get("trend_1h"),
+        "trend_persistence": (signal.get("trend_filter") or {}).get("trend_persistence"),
+        "btc_regime": (signal.get("trend_filter") or {}).get("btc_regime"),
+        "trend_decision_boundary_ts": signal.get("decision_boundary_ts"),
+        "pre_execution_context_id": (signal.get("pre_execution_market_context") or {}).get("context_id"),
+        "pre_execution_context_status": (signal.get("pre_execution_market_context") or {}).get("status"),
+        "pre_execution_context_capture_ts": (signal.get("pre_execution_market_context") or {}).get("captured_at_ms"),
+        "pre_execution_context_capture_span_ms": (signal.get("pre_execution_market_context") or {}).get("context_capture_span_ms"),
+        "pre_execution_context_age_ms_at_order_ready": (signal.get("pre_execution_market_context") or {}).get("context_age_ms_at_order_ready"),
+        "pre_execution_context_age_ms_at_execution_call_start": (signal.get("pre_execution_market_context") or {}).get("context_age_ms_at_execution_call_start"),
+        "research_schema_version": research.RESEARCH_SCHEMA_VERSION,
     }
     try:
         ok = research.record_entry_decision(payload, path=ENTRY_DECISIONS_PATH)
@@ -775,6 +863,12 @@ def _build_5m_zone_signal(
     tp2 = entry * (1.0 + TP2_PCT / 100.0) if direction == "LONG" else entry * (1.0 - TP2_PCT / 100.0)
     ts = pd.Timestamp(bar["timestamp"])
     trigger_ts_ms = int(ts.timestamp() * 1000)
+    trigger_close_ts_raw = bar.get("close_time") if hasattr(bar, "get") else None
+    try:
+        trigger_close_ts = pd.Timestamp(trigger_close_ts_raw) if trigger_close_ts_raw is not None else ts + pd.Timedelta(minutes=5)
+        trigger_close_ts = trigger_close_ts.tz_localize("UTC") if trigger_close_ts.tzinfo is None else trigger_close_ts.tz_convert("UTC")
+    except Exception:
+        trigger_close_ts = ts + pd.Timedelta(minutes=5)
     zone_copy = {**zone, "kind": "DEMAND" if direction == "LONG" else "SUPPLY"}
     prev_bar_dict = {
         "timestamp": pd.Timestamp(prev_bar["timestamp"]).isoformat() if prev_bar is not None else None,
@@ -820,6 +914,8 @@ def _build_5m_zone_signal(
         "idx": trigger_ts_ms,
         "time": ts.isoformat(),
         "trigger_bar_time": ts.isoformat(),
+        "trigger_bar_close_time": trigger_close_ts.isoformat(),
+        "decision_boundary_ts": trigger_close_ts.isoformat(),
         "trigger_timeframe": "5m",
         "type": direction,
         "symbol": symbol.upper(),
@@ -3095,6 +3191,21 @@ def main() -> None:
             "execution_require_exchange_timestamp": os.environ.get("EXECUTION_REQUIRE_EXCHANGE_TIMESTAMP", "false"),
             "execution_unknown_quote_age_policy": os.environ.get("EXECUTION_UNKNOWN_QUOTE_AGE_POLICY", "allow_with_local_age"),
             "research_rich_context_enabled": RESEARCH_RICH_CONTEXT_ENABLED,
+            "entry_trigger_reference": "TRIGGER_BAR_CLOSE",
+            "trend_filter_enabled": TREND_FILTER_ENABLED,
+            "trend_filter_mode": TREND_FILTER_MODE,
+            "trend_filter_version": "trend-v1-2026-10-06",
+            "trend_filter_min_1h_bars": TREND_FILTER_MIN_1H_BARS,
+            "trend_filter_min_4h_bars": TREND_FILTER_MIN_4H_BARS,
+            "trend_filter_persistence_lookback_1h": TREND_FILTER_PERSISTENCE_LOOKBACK_1H,
+            "trend_filter_persistence_lookback_4h": TREND_FILTER_PERSISTENCE_LOOKBACK_4H,
+            "trend_filter_slope_lookback_4h": TREND_FILTER_SLOPE_LOOKBACK_4H,
+            "trend_filter_require_persistence": TREND_FILTER_REQUIRE_PERSISTENCE,
+            "entry_context_telemetry_enabled": ENTRY_CONTEXT_TELEMETRY_ENABLED,
+            "entry_context_depth_levels": ENTRY_CONTEXT_DEPTH_LEVELS,
+            "entry_context_trades_limit": ENTRY_CONTEXT_TRADES_LIMIT,
+            "entry_context_http_timeout_sec": ENTRY_CONTEXT_HTTP_TIMEOUT_SEC,
+            "research_schema_version": research.RESEARCH_SCHEMA_VERSION,
             "research_defer_until_after_execution": RESEARCH_DEFER_UNTIL_AFTER_EXECUTION,
             "max_market_spread_pct": MAX_MARKET_SPREAD_PCT, "max_5m_trigger_age_minutes": MAX_5M_TRIGGER_AGE_MINUTES,
             "shadow_short_filter_experiment": research.SHADOW_SHORT_FILTER_EXPERIMENT,
@@ -3234,6 +3345,14 @@ def main() -> None:
                 research.persist_market_bars("BTC-USDT", "1h", btc_raw_1h, provider="binance", source="binance_spot_btc_context", scan_id=scan_id, code_commit_sha=CODE_COMMIT_SHA)
         except Exception as exc:
             log.warning("[RESEARCH_BTC] 1h context unavailable: %s", exc)
+
+    if TREND_FILTER_ENABLED and (btc_research_df_1h is None or btc_research_df_1h.empty):
+        try:
+            btc_trend_rows = fetch_binance_klines("BTCUSDT", interval="1h", limit=max(12, TREND_FILTER_MIN_1H_BARS + TREND_FILTER_HISTORY_BUFFER_BARS), retryable=False)
+            if btc_trend_rows:
+                btc_research_df_1h = pd.DataFrame(btc_trend_rows)
+        except Exception as exc:
+            log.warning("[TREND_BTC] 1h context unavailable: %s", exc)
 
     research_pending_forward_symbols: set[str] = set()
     if research.RESEARCH_ENABLED:
@@ -3558,6 +3677,33 @@ def main() -> None:
                 except Exception as context_exc:
                     log.warning("[RESEARCH_CONTEXT] %s | collection failed: %s", _display_symbol(symbol), context_exc)
 
+            # Trend Filter is diagnostic-only by default. It evaluates the same
+            # candidate against causal 4H/1H data at the closed 5m trigger boundary.
+            if TREND_FILTER_ENABLED and recent:
+                for sig in recent:
+                    try:
+                        boundary_ms = _signal_decision_boundary_ts_ms(sig)
+                        if boundary_ms is None:
+                            raise ValueError("missing_decision_boundary")
+                        h1_for_trend, h1_refetched = _ensure_trend_history(symbol=symbol, timeframe="1h", frame=df, provider=provider, binance_symbol=binance_symbol, decision_ts_ms=boundary_ms, min_bars=TREND_FILTER_MIN_1H_BARS)
+                        h4_for_trend, h4_refetched = _ensure_trend_history(symbol=symbol, timeframe="4h", frame=None, provider=provider, binance_symbol=binance_symbol, decision_ts_ms=boundary_ms, min_bars=TREND_FILTER_MIN_4H_BARS)
+                        snapshot=evaluate_trend_filter(symbol=symbol, direction=str(sig.get("type","")), event_type=str((sig.get("trigger") or {}).get("type") or "ZONE_5M"), df_1h=h1_for_trend, df_4h=h4_for_trend, btc_1h_df=btc_research_df_1h, decision_ts_ms=boundary_ms, min_bars_1h=TREND_FILTER_MIN_1H_BARS, min_bars_4h=TREND_FILTER_MIN_4H_BARS, persistence_lookback_1h=TREND_FILTER_PERSISTENCE_LOOKBACK_1H, persistence_lookback_4h=TREND_FILTER_PERSISTENCE_LOOKBACK_4H, slope_lookback_4h=TREND_FILTER_SLOPE_LOOKBACK_4H, require_persistence=TREND_FILTER_REQUIRE_PERSISTENCE, mode=TREND_FILTER_MODE)
+                        snapshot.update({
+                            "decision_boundary_ts": pd.Timestamp(boundary_ms, unit="ms", tz="UTC").isoformat(),
+                            "decision_boundary_kind": "CLOSED_5M_TRIGGER_CLOSE",
+                            "causal_cutoff_ts_ms": int(boundary_ms),
+                            "causal_data_policy": "ALL_HTF_BARS_REQUIRE_CLOSE_TIME_LE_DECISION_BOUNDARY",
+                            "history_1h_refetched": bool(h1_refetched),
+                            "history_4h_refetched": bool(h4_refetched),
+                            "source_1h": provider,
+                            "source_4h": provider,
+                            "source_btc": "binance_spot",
+                        })
+                        sig["trend_filter"]=snapshot
+                    except Exception as trend_exc:
+                        log.warning("[TREND_FILTER] %s | diagnostic failed: %s", _display_symbol(symbol), trend_exc)
+                        sig["trend_filter"]={"version":"trend-v1-2026-10-06","enabled":True,"mode":TREND_FILTER_MODE,"trend_decision":"REJECT","trend_reject_reason":f"TREND_RUNTIME_ERROR:{type(trend_exc).__name__}"}
+
             # When live execution is enabled, keep the production critical path free of
             # research persistence/I/O. Capture the exact decision-time inputs in memory
             # and flush them after all selected live attempts are finished.
@@ -3811,6 +3957,10 @@ def main() -> None:
                 log.warning("[EXEC_REJECT_LATEST_BAR] %s %s | reason=%s", _display_symbol(signal["symbol"]), signal["type"], reject_reason)
                 _exec_gate(f"latest_bar_mismatch:{reject_reason}", signal)
                 continue
+        trend_snapshot = signal.get("trend_filter")
+        if TREND_FILTER_ENABLED and TREND_FILTER_MODE == "enforce" and _trend_filter_enforce_reject(trend_snapshot, TREND_FILTER_MODE):
+            _exec_gate(f"trend_filter:{(trend_snapshot or {}).get('trend_reject_reason', 'unknown')}", signal)
+            continue
         executable.append(signal)
 
     log.info("[EXEC_INPUT] fresh_signals=%d unique_symbols=%d open_positions=%d successful_event_ids=%d terminal_event_ids=%d failed_signal_records=%d", len(fresh_signals), len(latest_by_symbol), len(open_keys), len(successful_ids), len(terminal_event_ids), len(failed_ids))
@@ -3882,7 +4032,69 @@ def main() -> None:
             continue
         _record_entry_decision(scan_id, signal, "EXECUTION_CLAIM", "claimed", selection_rank=rank, attempt_id=attempt_id, execution_status="CLAIMED", terminal=False)
         signal["attempt_id"] = attempt_id
+        # Capture decision-time market context after the event claim but before the exchange order.
+        # The attempt id is therefore present in the immutable context record without changing
+        # the existing order/protection semantics. Collection remains fail-open.
+        if ENTRY_CONTEXT_TELEMETRY_ENABLED and research.RESEARCH_ENABLED:
+            try:
+                boundary_ms = _signal_decision_boundary_ts_ms(signal)
+                ctx = fetch_research_market_context(
+                    signal["symbol"], depth_limit=ENTRY_CONTEXT_DEPTH_LEVELS, trades_limit=ENTRY_CONTEXT_TRADES_LIMIT,
+                    timeout_sec=ENTRY_CONTEXT_HTTP_TIMEOUT_SEC,
+                )
+                capture_now_ms = int(time.time() * 1000)
+                capture_start_ms = ctx.get("captured_at_ms")
+                capture_completed_ms = ctx.get("capture_completed_at_ms") or capture_now_ms
+                boundary_iso = pd.Timestamp(boundary_ms, unit="ms", tz="UTC").isoformat() if boundary_ms else None
+                trigger_to_capture = (capture_now_ms - boundary_ms) if boundary_ms else None
+                ctx.update({
+                    "scan_id": scan_id, "event_id": event_id, "attempt_id": attempt_id,
+                    "symbol": signal["symbol"],
+                    "provider": "bingx",
+                    "data_provider": "bingx",
+                    "analysis_provider": str(((signal.get("market_snapshot") or {}).get("analysis_provider") or "binance")),
+                    "source": "pre_execution_entry_context",
+                    "context_source": "bingx_swap_public_pre_execution",
+                    "strategy_version": signal.get("strategy_version", _effective_strategy_version()),
+                    "engine_version": ENGINE_VERSION, "code_commit_sha": CODE_COMMIT_SHA,
+                    "decision_boundary_ts": boundary_iso,
+                    "decision_boundary_kind": "CLOSED_5M_TRIGGER_CLOSE",
+                    "pre_execution_decision_ts": boundary_iso,
+                    "context_capture_ts": pd.Timestamp(capture_now_ms, unit="ms", tz="UTC").isoformat(),
+                    "context_age_ms_at_order_ready": max(0, capture_now_ms - int(capture_completed_ms)),
+                    "context_lag_ms_from_decision_boundary": trigger_to_capture,
+                    "capture_phase": "PRE_EXECUTION",
+                    "feature_time_semantics": "CAPTURED_PRE_ORDER_NOT_TRIGGER_BOUNDARY",
+                })
+                ctx["persisted"] = bool(research.record_market_context(ctx))
+                signal["pre_execution_market_context"] = ctx
+                _record_entry_decision(
+                    scan_id, signal, "PRE_EXECUTION_CONTEXT", "captured", selection_rank=rank,
+                    attempt_id=attempt_id, execution_status="CONTEXT_CAPTURED", terminal=False,
+                )
+            except Exception as ctx_exc:
+                log.warning("[ENTRY_CONTEXT] %s | collection/persistence failed (fail-open): %s", _display_symbol(signal.get("symbol")), ctx_exc)
+                signal["pre_execution_market_context"] = {
+                    "schema_version": research.RESEARCH_SCHEMA_VERSION, "status": "error",
+                    "capture_phase": "PRE_EXECUTION", "feature_time_semantics": "CAPTURE_FAILED",
+                    "error_type": type(ctx_exc).__name__, "captured_at_ms": None, "persisted": False,
+                    "attempt_id": attempt_id, "event_id": event_id,
+                }
+                _record_entry_decision(
+                    scan_id, signal, "PRE_EXECUTION_CONTEXT", "collection_failed", selection_rank=rank,
+                    attempt_id=attempt_id, execution_status="CONTEXT_COLLECTION_FAILED", terminal=False,
+                )
         execution_call_start_ts = pd.Timestamp.now(tz="UTC")
+        pre_ctx = signal.get("pre_execution_market_context")
+        if isinstance(pre_ctx, dict):
+            try:
+                completed_ms = pre_ctx.get("capture_completed_at_ms")
+                if completed_ms is not None:
+                    pre_ctx["context_age_ms_at_execution_call_start"] = max(0, int(execution_call_start_ts.timestamp() * 1000) - int(completed_ms))
+                pre_ctx["execution_call_start_ts"] = execution_call_start_ts.isoformat()
+                signal["pre_execution_market_context"] = pre_ctx
+            except (TypeError, ValueError):
+                pass
         execution = execute_new_position(signal)
         execution_finish_ts = pd.Timestamp.now(tz="UTC")
         execution["attempt_id"] = attempt_id
