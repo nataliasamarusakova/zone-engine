@@ -28,6 +28,7 @@ NEAREST_APPROACH_RETENTION_HOURS = max(24, int(os.environ.get("DATA_RETENTION_NE
 RESEARCH_OUTCOME_RETENTION_HOURS = max(24, int(os.environ.get("DATA_RETENTION_OUTCOME_HOURS", "2160")))  # 90d
 COUNTERFACTUAL_RETENTION_HOURS = max(24, int(os.environ.get("DATA_RETENTION_COUNTERFACTUAL_HOURS", "2160")))  # 90d
 POSITION_RECONCILIATION_RETENTION_HOURS = max(24, int(os.environ.get("DATA_RETENTION_RECON_HOURS", "336")))  # 14d
+MARKET_CONTEXT_RETENTION_HOURS = max(24, int(os.environ.get("DATA_RETENTION_MARKET_CONTEXT_HOURS", "2160")))  # 90d
 
 # GitHub rejects individual Git blobs >= 100,000,000 bytes. We do not delete
 # more data merely to hit this number; this value is reported as a warning so
@@ -334,7 +335,7 @@ def _protected_audit_refs() -> tuple[set[str], set[str]]:
             for nested_name in ("signal_snapshot", "executed_signal", "signal"):
                 nested = row.get(nested_name)
                 if isinstance(nested, dict):
-                    for field in ("event_id", "attempt_id", "decision_id", "position_id", "signal_id", "scan_id", "zone_visit_id", "observation_id"):
+                    for field in ("event_id", "attempt_id", "decision_id", "position_id", "signal_id", "scan_id", "zone_visit_id", "observation_id", "context_id"):
                         value = nested.get(field)
                         if value not in (None, ""):
                             value_s = str(value)
@@ -407,6 +408,15 @@ def _size_guard_plan(path: Path, *, now: datetime, pending_ids: set[str], pendin
             ts = _parse_ts(row.get("recorded_at") or row.get("source_event_ts"))
             return ts is None or ts >= now - timedelta(hours=h)
         return [(f"keep_recent_counterfactual_{h}h", lambda row, h=h: keep_counterfactual(row, h)) for h in hours]
+    if name == "market_context.jsonl":
+        hours = [2160, 720, 336, 168, 72, 24]
+        def keep_context(row: dict[str, Any], h: int) -> bool:
+            refs = {str(row.get(f, "")) for f in ("context_id", "event_id", "attempt_id", "decision_id", "position_id", "signal_id", "scan_id", "observation_id") if row.get(f) not in (None, "")}
+            if refs & protected_refs:
+                return True
+            captured = _parse_ts(row.get("captured_at_ms") or row.get("captured_at") or row.get("recorded_at"))
+            return captured is None or captured >= now - timedelta(hours=h)
+        return [(f"keep_recent_market_context_{h}h_with_link_protection", lambda row, h=h: keep_context(row, h)) for h in hours]
     if name == "position_reconciliation.jsonl":
         # Size-based escalation for reconciliation is handled later by retaining
         # terminal/anomaly rows and the last healthy FOUND snapshot. The generic
@@ -532,6 +542,7 @@ def apply_size_guard(*, now: datetime | None = None, archive_root: Path | None =
         DATA_DIR / "research_outcomes.jsonl",
         DATA_DIR / "counterfactual_experiments.jsonl",
         DATA_DIR / "position_reconciliation.jsonl",
+        DATA_DIR / "market_context.jsonl",
     ]
     results = {"schema_version": 1, "mode": "size_guard", "started_at": now.isoformat(), "files": {}}
     for path in candidates:
@@ -925,6 +936,7 @@ def _compact_data_locked(*, apply: bool, archive_root: Path, now: datetime) -> d
                 "research_outcomes": RESEARCH_OUTCOME_RETENTION_HOURS,
                 "counterfactual_experiments": COUNTERFACTUAL_RETENTION_HOURS,
                 "position_reconciliation": POSITION_RECONCILIATION_RETENTION_HOURS,
+                "market_context": MARKET_CONTEXT_RETENTION_HOURS,
             },
             "protected_state": state_before,
             "active_trade_refs": len(active_refs),
@@ -937,6 +949,7 @@ def _compact_data_locked(*, apply: bool, archive_root: Path, now: datetime) -> d
     nearest_cutoff = now - timedelta(hours=NEAREST_APPROACH_RETENTION_HOURS)
     outcome_cutoff = now - timedelta(hours=RESEARCH_OUTCOME_RETENTION_HOURS)
     recon_cutoff = now - timedelta(hours=POSITION_RECONCILIATION_RETENTION_HOURS)
+    market_context_cutoff = now - timedelta(hours=MARKET_CONTEXT_RETENTION_HOURS)
 
     pending = _pending_observations()
     pending_bar_cutoffs = _pending_bar_cutoffs(five_m_cutoff=five_m_cutoff, pending=pending)
@@ -1013,6 +1026,13 @@ def _compact_data_locked(*, apply: bool, archive_root: Path, now: datetime) -> d
         ts = _parse_ts(row.get("recorded_at") or row.get("source_event_ts"))
         return ts is None or ts >= now - timedelta(hours=COUNTERFACTUAL_RETENTION_HOURS)
 
+    def keep_market_context(_: int, row: dict[str, Any]) -> bool:
+        refs = {str(row.get(f, "")) for f in ("context_id", "event_id", "attempt_id", "decision_id", "position_id", "signal_id", "scan_id", "observation_id") if row.get(f) not in (None, "")}
+        if refs & active_refs:
+            return True
+        ts = _parse_ts(row.get("captured_at_ms") or row.get("captured_at") or row.get("recorded_at"))
+        return ts is None or ts >= market_context_cutoff
+
     def keep_reconciliation(line_no: int, row: dict[str, Any]) -> bool:
         position_id = str(row.get("position_id") or row.get("event_id") or "")
         event_id = str(row.get("event_id") or "")
@@ -1051,6 +1071,10 @@ def _compact_data_locked(*, apply: bool, archive_root: Path, now: datetime) -> d
     )
     results["files"]["position_reconciliation.jsonl"] = _compact_jsonl(
         DATA_DIR / "position_reconciliation.jsonl", keep_reconciliation, archive_root=archive_root
+    )
+
+    results["files"]["market_context.jsonl"] = _compact_jsonl(
+        DATA_DIR / "market_context.jsonl", keep_market_context, archive_root=archive_root
     )
 
     _validate_state_unchanged(state_before)

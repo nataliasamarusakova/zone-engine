@@ -22,7 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 
 RESEARCH_ENABLED = os.environ.get("RESEARCH_ENABLED", "true").lower() == "true"
-RESEARCH_SCHEMA_VERSION = 2
+RESEARCH_SCHEMA_VERSION = 4
 
 ZONE_OBSERVATIONS_PATH = DATA_DIR / "zone_observations.jsonl"
 ENTRY_DECISIONS_PATH = DATA_DIR / "entry_decisions.jsonl"
@@ -852,6 +852,8 @@ def build_research_features(
         "departure_body_to_range": None,
         "departure_volume_ratio_20": None,
         "market_context_id": (market_context or {}).get("context_id"),
+        "market_context_status": (market_context or {}).get("status"),
+        "market_context_persisted": (market_context or {}).get("persisted"),
         "account_context_id": (account_context or {}).get("account_context_id"),
         "feature_availability_ts": decision_ts,
         "zone_width_abs": width if width is not None and width > 0 else None,
@@ -867,6 +869,13 @@ def build_research_features(
         "touch_count_before_trigger": touch_count_before_trigger,
         "structure_room_R": structure_room_r,
         "directional_candle_ok_current": (close >= open_) if direction == "LONG" and close is not None and open_ is not None else (close <= open_ if direction == "SHORT" and close is not None and open_ is not None else None),
+        "directional_close_location": None,
+        "5m_range_atr": None,
+        "5m_body_atr": None,
+        "trigger_hour_utc": None,
+        "decision_hour_utc": None,
+        "trigger_session_utc": None,
+        "decision_session_utc": None,
         "shadow_directional_candle_ok": None,
         "shadow_directional_threshold": 0.30,
         "shadow_penetration_le_20pct": None,
@@ -896,6 +905,15 @@ def build_research_features(
             features["shadow_penetration_le_20pct"] = penetration <= 0.20
             features["shadow_penetration_le_50pct"] = penetration <= 0.50
 
+    trigger_ts_for_features = _parse_timestamp(bar.get("timestamp"))
+    decision_ts_for_features = _parse_timestamp(decision_ts)
+    if trigger_ts_for_features is not None:
+        features["trigger_hour_utc"] = int(trigger_ts_for_features.hour)
+        features["trigger_session_utc"] = _session_name(trigger_ts_for_features)
+    if decision_ts_for_features is not None:
+        features["decision_hour_utc"] = int(decision_ts_for_features.hour)
+        features["decision_session_utc"] = _session_name(decision_ts_for_features)
+
     vr = None
     if volume is not None and df_5m is not None and not df_5m.empty and "volume" in df_5m.columns and "timestamp" in df_5m.columns:
         try:
@@ -914,6 +932,25 @@ def build_research_features(
     features["volume_ratio_5m20_source"] = (
         "5M_PREVIOUS_20_CLOSED_BARS" if vr is not None else "UNAVAILABLE_TRIGGER_TIMESTAMP_OR_20_BAR_BASELINE"
     )
+
+    # Match the forensic candle geometry from the trigger boundary, but keep it
+    # explicitly 5m/ATR14 so it cannot be confused with the strategy's existing
+    # 1H ATR50 zone-forensic fields.
+    try:
+        x5_forensic = _closed_market_frame(df_5m, decision_ts, "5m") if df_5m is not None and not df_5m.empty else pd.DataFrame()
+        if len(x5_forensic) >= 14 and close is not None and rng is not None and rng >= 0:
+            atr14 = _simple_atr(x5_forensic, 14)
+            if atr14 is not None and atr14 > 0:
+                features["5m_range_atr"] = rng / atr14
+                features["5m_body_atr"] = (body / atr14) if body is not None else None
+    except Exception:
+        pass
+    if features.get("close_location") is not None:
+        features["directional_close_location"] = (
+            features["close_location"] if str(direction).upper() == "LONG"
+            else 1.0 - float(features["close_location"])
+            if str(direction).upper() == "SHORT" else None
+        )
     # Explicit approach-to-zone metrics are computed from bars strictly before the trigger bar.
     if df_5m is not None and not df_5m.empty and bar.get("timestamp") is not None:
         try:
@@ -1053,6 +1090,21 @@ def build_research_features(
         "shadow_short_combined_gt_050": (None if btc_gt_050 is None else bool(geometry_bad and btc_gt_050)),
     })
     context = dict(market_context or {})
+    context_phase = str(context.get("capture_phase") or "").upper()
+    if context:
+        features["market_context_id"] = context.get("context_id")
+        features["market_context_capture_phase"] = context_phase or "UNSPECIFIED"
+        features["market_context_feature_time_semantics"] = context.get("feature_time_semantics")
+        features["market_context_captured_at_ms"] = context.get("captured_at_ms")
+        features["market_context_capture_completed_at_ms"] = context.get("capture_completed_at_ms")
+        features["market_context_context_capture_span_ms"] = context.get("context_capture_span_ms")
+        features["market_context_trigger_to_capture_ms"] = context.get("trigger_to_context_capture_ms")
+        features["market_context_age_ms_at_order_ready"] = context.get("context_age_ms_at_order_ready")
+        features["market_context_lag_ms_from_decision_boundary"] = context.get("context_lag_ms_from_decision_boundary")
+        features["market_context_data_provider"] = context.get("data_provider") or context.get("context_provider") or context.get("provider")
+        features["market_context_provider"] = context.get("provider")
+        features["market_context_decision_boundary_kind"] = context.get("decision_boundary_kind")
+        features["market_context_persisted_at_ms"] = context.get("persisted_at_ms")
     if account_context:
         context["account_context"] = account_context
     account = context.get("account_context") or {}
@@ -1066,18 +1118,91 @@ def build_research_features(
                 features["account_used_margin_ratio"] = used / equity
         except (TypeError, ValueError):
             features["account_used_margin_ratio"] = None
-    for src, dst in (("funding_rate","funding_rate"),("mark_price","mark_price"),("index_price","index_price"),("open_interest","open_interest"),("open_interest_ts","open_interest_ts"),("premium_index_ts","premium_index_ts"),("next_funding_time_ms","next_funding_time_ms"),("analysis_provider","analysis_provider"),("analysis_source","analysis_source"),("context_provider","context_provider"),("context_source","context_source"),("cross_venue_binance_price","cross_venue_binance_price"),("cross_venue_bingx_price","cross_venue_bingx_price"),("cross_venue_deviation_pct","cross_venue_deviation_pct"),("cross_venue_metric","cross_venue_metric")):
-        if src in context: features[dst] = context.get(src)
-    book = context.get("order_book") or {}
-    for src, dst in (("best_bid","book_best_bid"),("best_ask","book_best_ask"),("spread_pct","book_spread_pct"),("bid_qty_5","book_bid_qty_5"),("ask_qty_5","book_ask_qty_5"),("bid_qty_10","book_bid_qty_10"),("ask_qty_10","book_ask_qty_10"),("book_imbalance_5","book_imbalance_5"),("book_imbalance_10","book_imbalance_10"),("bid_quote_5","book_bid_quote_5"),("ask_quote_5","book_ask_quote_5"),("bid_quote_10","book_bid_quote_10"),("ask_quote_10","book_ask_quote_10"),("book_quote_imbalance_5","book_quote_imbalance_5"),("book_quote_imbalance_10","book_quote_imbalance_10"),("microprice","book_microprice"),("bid_depth_quote_0_1pct","book_bid_depth_quote_0_1pct"),("ask_depth_quote_0_1pct","book_ask_depth_quote_0_1pct"),("bid_depth_quote_0_5pct","book_bid_depth_quote_0_5pct"),("ask_depth_quote_0_5pct","book_ask_depth_quote_0_5pct"),("bid_depth_quote_1pct","book_bid_depth_quote_1pct"),("ask_depth_quote_1pct","book_ask_depth_quote_1pct")):
-        if src in book: features[dst] = book.get(src)
-    features["quote_source"] = context.get("quote_source")
-    features["quote_sources_attempted"] = context.get("quote_sources_attempted")
-    features["quote_fallback_reason"] = context.get("quote_fallback_reason")
-    features["quote_captured_at"] = context.get("captured_at")
-    trades = context.get("recent_trades") or {}
-    for src, dst in (("valid_trade_count","recent_trade_count"),("buy_aggressor_quote","recent_buy_aggressor_quote"),("sell_aggressor_quote","recent_sell_aggressor_quote"),("aggressor_delta_quote","recent_aggressor_delta_quote"),("buy_aggressor_ratio","recent_buy_aggressor_ratio"),("buyer_maker_field_present_count","recent_buyer_maker_present_count"),("buyer_maker_field_missing_count","recent_buyer_maker_missing_count"),("buyer_maker_field_coverage","recent_buyer_maker_coverage"),("trade_min_price","recent_trade_min_price"),("trade_max_price","recent_trade_max_price"),("last_trade_ts","recent_last_trade_ts"),("first_trade_ts","recent_first_trade_ts"),("sample_span_seconds","recent_trade_sample_span_seconds"),("avg_trade_quote","recent_avg_trade_quote")):
-        if src in trades: features[dst] = trades.get(src)
+    # Rich market context captured after the trigger boundary is never flattened
+    # into causal signal-time columns. Keep it under an explicit pre-execution
+    # namespace so downstream analysis cannot accidentally treat later data as
+    # though it existed at trigger-bar close.
+    if context and context_phase == "PRE_EXECUTION":
+        book = context.get("order_book") or {}
+        trades = context.get("recent_trades") or {}
+        features["pre_execution_context"] = sanitize({
+            "context_id": context.get("context_id"),
+            "status": context.get("status"),
+            "data_provider": context.get("data_provider") or context.get("context_provider") or context.get("provider"),
+            "provider": context.get("provider"),
+            "capture_phase": context.get("capture_phase"),
+            "captured_at_ms": context.get("captured_at_ms"),
+            "capture_completed_at_ms": context.get("capture_completed_at_ms"),
+            "context_capture_span_ms": context.get("context_capture_span_ms"),
+            "persistence_started_at_ms": context.get("persistence_started_at_ms"),
+            "persisted_at_ms": context.get("persisted_at_ms"),
+            "decision_boundary_ts": context.get("decision_boundary_ts"),
+            "decision_boundary_kind": context.get("decision_boundary_kind"),
+            "pre_execution_decision_ts": context.get("pre_execution_decision_ts"),
+            "context_capture_ts": context.get("context_capture_ts"),
+            "context_age_ms_at_order_ready": context.get("context_age_ms_at_order_ready"),
+            "context_age_ms_at_execution_call_start": context.get("context_age_ms_at_execution_call_start"),
+            "context_lag_ms_from_decision_boundary": context.get("context_lag_ms_from_decision_boundary"),
+            "funding_rate": context.get("funding_rate"),
+            "funding_rate_pct": context.get("funding_rate_pct"),
+            "funding_rate_unit": context.get("funding_rate_unit"),
+            "next_funding_time_ms": context.get("next_funding_time_ms"),
+            "open_interest": context.get("open_interest"),
+            "open_interest_raw": context.get("open_interest_raw"),
+            "open_interest_unit": context.get("open_interest_unit"),
+            "open_interest_ts": context.get("open_interest_ts"),
+            "mark_price": context.get("mark_price"),
+            "index_price": context.get("index_price"),
+            "mark_index_basis_pct": context.get("mark_index_basis_pct"),
+            "order_book": book,
+            "recent_trades": trades,
+        })
+        direction_multiplier = 1.0 if direction == "LONG" else -1.0
+        def _dir_numeric_pre(value: Any) -> float | None:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return None
+            return number * direction_multiplier if math.isfinite(number) else None
+        def _dir_ratio_pre(value: Any) -> float | None:
+            try:
+                ratio = float(value)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(ratio):
+                return None
+            return ratio if direction == "LONG" else 1.0 - ratio
+        features["pre_execution_directional_obi5"] = _dir_numeric_pre(book.get("book_imbalance_5"))
+        features["pre_execution_directional_obi10"] = _dir_numeric_pre(book.get("book_imbalance_10"))
+        features["pre_execution_directional_quote_obi5"] = _dir_numeric_pre(book.get("book_quote_imbalance_5"))
+        features["pre_execution_directional_quote_obi10"] = _dir_numeric_pre(book.get("book_quote_imbalance_10"))
+        features["pre_execution_directional_aggressor_delta_quote"] = _dir_numeric_pre(trades.get("aggressor_delta_quote"))
+        features["pre_execution_directional_aggressor_ratio"] = _dir_ratio_pre(trades.get("buy_aggressor_ratio"))
+        features["pre_execution_oi_funding"] = sanitize({
+            "funding_rate": context.get("funding_rate"),
+            "funding_rate_pct": context.get("funding_rate_pct"),
+            "funding_rate_unit": context.get("funding_rate_unit"),
+            "funding_rate_timestamp_ms": context.get("funding_rate_timestamp_ms"),
+            "open_interest_raw": context.get("open_interest_raw"),
+            "open_interest_unit": context.get("open_interest_unit"),
+            "open_interest_ts": context.get("open_interest_ts"),
+            "mark_price": context.get("mark_price"),
+            "index_price": context.get("index_price"),
+            "mark_index_basis_pct": context.get("mark_index_basis_pct"),
+        })
+    else:
+        for src, dst in (("funding_rate","funding_rate"),("funding_rate_pct","funding_rate_pct"),("funding_rate_unit","funding_rate_unit"),("mark_price","mark_price"),("index_price","index_price"),("mark_index_basis_pct","mark_index_basis_pct"),("open_interest","open_interest"),("open_interest_raw","open_interest_raw"),("open_interest_unit","open_interest_unit"),("open_interest_ts","open_interest_ts"),("premium_index_ts","premium_index_ts"),("next_funding_time_ms","next_funding_time_ms"),("analysis_provider","analysis_provider"),("analysis_source","analysis_source"),("context_provider","context_provider"),("context_source","context_source"),("cross_venue_binance_price","cross_venue_binance_price"),("cross_venue_bingx_price","cross_venue_bingx_price"),("cross_venue_deviation_pct","cross_venue_deviation_pct"),("cross_venue_metric","cross_venue_metric")):
+            if src in context: features[dst] = context.get(src)
+        book = context.get("order_book") or {}
+        for src, dst in (("best_bid","book_best_bid"),("best_ask","book_best_ask"),("spread_pct","book_spread_pct"),("book_mid_price","book_mid_price"),("depth_reference_type","book_depth_reference_type"),("depth_reference_price","book_depth_reference_price"),("bid_qty_5","book_bid_qty_5"),("ask_qty_5","book_ask_qty_5"),("bid_qty_10","book_bid_qty_10"),("ask_qty_10","book_ask_qty_10"),("book_imbalance_5","book_imbalance_5"),("book_imbalance_10","book_imbalance_10"),("bid_quote_5","book_bid_quote_5"),("ask_quote_5","book_ask_quote_5"),("bid_quote_10","book_bid_quote_10"),("ask_quote_10","book_ask_quote_10"),("book_quote_imbalance_5","book_quote_imbalance_5"),("book_quote_imbalance_10","book_quote_imbalance_10"),("microprice","book_microprice"),("microprice_distance_pct","book_microprice_distance_pct"),("bid_depth_quote_0_1pct","book_bid_depth_quote_0_1pct"),("ask_depth_quote_0_1pct","book_ask_depth_quote_0_1pct"),("bid_depth_quote_0_5pct","book_bid_depth_quote_0_5pct"),("ask_depth_quote_0_5pct","book_ask_depth_quote_0_5pct"),("bid_depth_quote_1pct","book_bid_depth_quote_1pct"),("ask_depth_quote_1pct","book_ask_depth_quote_1pct")):
+            if src in book: features[dst] = book.get(src)
+        features["quote_source"] = context.get("quote_source")
+        features["quote_sources_attempted"] = context.get("quote_sources_attempted")
+        features["quote_fallback_reason"] = context.get("quote_fallback_reason")
+        features["quote_captured_at"] = context.get("captured_at")
+        trades = context.get("recent_trades") or {}
+        for src, dst in (("valid_trade_count","recent_trade_count"),("buy_aggressor_quote","recent_buy_aggressor_quote"),("sell_aggressor_quote","recent_sell_aggressor_quote"),("aggressor_delta_quote","recent_aggressor_delta_quote"),("buy_aggressor_ratio","recent_buy_aggressor_ratio"),("buyer_maker_field_present_count","recent_buyer_maker_present_count"),("buyer_maker_field_missing_count","recent_buyer_maker_missing_count"),("buyer_maker_field_coverage","recent_buyer_maker_coverage"),("trade_min_price","recent_trade_min_price"),("trade_max_price","recent_trade_max_price"),("last_trade_ts","recent_last_trade_ts"),("first_trade_ts","recent_first_trade_ts"),("sample_span_seconds","recent_trade_sample_span_seconds"),("avg_trade_quote","recent_avg_trade_quote")):
+            if src in trades: features[dst] = trades.get(src)
     # Zone-departure measurements from the existing origin; these never gate production.
     if df_1h is not None and not df_1h.empty and zone.get("start") is not None:
         try:
@@ -1318,6 +1443,21 @@ def _observation_from_signal(
         "execution_age_semantics": "not_available_at_observation_generation",
         "trigger_to_observation_minutes": _elapsed_minutes_safe(ts, decision_ts),
     })
+    features["trend_filter"] = sanitize(signal.get("trend_filter") or {})
+    signal_forensics = signal.get("signal_forensics") if isinstance(signal.get("signal_forensics"), dict) else {}
+    features["entry_risk_telemetry"] = sanitize({
+        "volume_ratio_5m20": features.get("volume_ratio_5m20"),
+        "volume_ratio_1h20": signal.get("volume_ratio_1h20"),
+        "body_atr": signal_forensics.get("body_atr"),
+        "range_atr": signal_forensics.get("range_atr"),
+        "body_to_range": signal_forensics.get("body_to_range", features.get("body_to_range")),
+        "5m_body_atr": features.get("5m_body_atr"),
+        "5m_range_atr": features.get("5m_range_atr"),
+        "directional_close_location": features.get("directional_close_location"),
+        "zone_age_hours": features.get("zone_age_hours"),
+        "zone_penetration_ratio": features.get("zone_penetration_ratio"),
+    })
+
     shadow_snapshot = signal.get("shadow_experiments")
     if not isinstance(shadow_snapshot, dict):
         shadow_snapshot = shadow.build_entry_snapshot(
@@ -1370,8 +1510,14 @@ def record_market_context(row: dict[str, Any]) -> bool:
     payload = sanitize(dict(row))
     payload.setdefault("schema_version", RESEARCH_SCHEMA_VERSION)
     payload.setdefault("record_type", "MARKET_CONTEXT")
-    payload.setdefault("context_id", stable_id("market-context-v1", payload.get("scan_id", ""), payload.get("symbol", ""), payload.get("provider", ""), payload.get("captured_at_ms", ""), prefix="MC_"))
+    payload.setdefault("recorded_at", _now_iso())
+    payload.setdefault("context_capture_phase", payload.get("capture_phase") or "UNSPECIFIED")
+    payload.setdefault("data_provider", payload.get("context_provider") or payload.get("provider"))
+    payload.setdefault("provider", payload.get("data_provider"))
+    payload.setdefault("context_id", stable_id("market-context-v3", payload.get("scan_id", ""), payload.get("event_id", ""), payload.get("attempt_id", ""), payload.get("symbol", ""), payload.get("provider", ""), payload.get("captured_at_ms", ""), prefix="MC_"))
+    payload["persistence_started_at_ms"] = int(datetime.now(timezone.utc).timestamp() * 1000)
     try:
+        payload["persisted_at_ms"] = int(datetime.now(timezone.utc).timestamp() * 1000)
         written = _append_jsonl_locked(MARKET_CONTEXT_PATH, [payload])
         if written: _bump_manifest("market_context_written", written)
         return bool(written)
@@ -1448,21 +1594,31 @@ def record_scan_symbol(
             account_context = dict(account_payload, persisted=False)
     if market_context:
         context_payload = dict(market_context)
-        context_payload.update({"scan_id": scan_id, "strategy_version": strategy_version, "code_commit_sha": code_commit_sha, "symbol": symbol.upper(), "provider": provider, "source": source})
+        context_payload.update({"scan_id": scan_id, "strategy_version": strategy_version, "code_commit_sha": code_commit_sha, "symbol": symbol.upper()})
         context_payload.setdefault("analysis_provider", provider)
         context_payload.setdefault("analysis_source", source)
-        context_payload.setdefault("context_provider", "bingx")
+        context_payload.setdefault("context_provider", context_payload.get("data_provider") or "bingx")
         context_payload.setdefault("context_source", "bingx_swap_public")
-        context_payload.setdefault("context_id", stable_id("market-context-v1", scan_id, symbol, provider, context_payload.get("captured_at_ms", ""), prefix="MC_"))
+        context_payload.setdefault("data_provider", context_payload.get("context_provider"))
+        context_payload.setdefault("provider", context_payload.get("data_provider"))
+        context_payload.setdefault("source", context_payload.get("context_source") or source)
+        context_payload.setdefault("context_id", stable_id("market-context-v3", scan_id, context_payload.get("event_id", ""), context_payload.get("attempt_id", ""), symbol, context_payload.get("provider", ""), context_payload.get("captured_at_ms", ""), prefix="MC_"))
+        context_payload["decision_ts"] = decision_ts
+        context_payload["context_age_ms_at_decision"] = None
+        context_payload["context_lag_ms_from_decision_boundary"] = None
+        context_payload.setdefault("decision_boundary_ts", decision_ts)
+        context_payload.setdefault("context_capture_phase", context_payload.get("capture_phase") or "UNSPECIFIED")
+        captured_at = _parse_timestamp(context_payload.get("captured_at"))
+        decision_parsed = _parse_timestamp(context_payload.get("decision_boundary_ts") or decision_ts)
+        if captured_at is not None and decision_parsed is not None:
+            delta_ms = (captured_at - decision_parsed).total_seconds() * 1000.0
+            if delta_ms > 0:
+                context_payload["context_lag_ms_from_decision_boundary"] = delta_ms
+            else:
+                context_payload["context_age_ms_at_decision"] = -delta_ms
         market_context_persisted = record_market_context(context_payload)
         counts["market_context"] = 1 if market_context_persisted else 0
         context_payload["persisted"] = market_context_persisted
-        context_payload["decision_ts"] = decision_ts
-        context_payload["context_age_ms_at_decision"] = None
-        captured_at = _parse_timestamp(context_payload.get("captured_at"))
-        decision_parsed = _parse_timestamp(decision_ts)
-        if captured_at is not None and decision_parsed is not None:
-            context_payload["context_age_ms_at_decision"] = max(0.0, (decision_parsed - captured_at).total_seconds() * 1000.0)
         market_context = context_payload
     closed_5m: list[dict[str, Any]] = []
     if bars_5m:
@@ -1487,10 +1643,12 @@ def record_scan_symbol(
 
     # Production signals receive the richest record, including target/score/visit data.
     for signal in signals:
+        signal_boundary_ts = signal.get("decision_boundary_ts") or decision_ts
+        signal_context = signal.get("pre_execution_market_context") if isinstance(signal.get("pre_execution_market_context"), dict) else market_context
         observations.append(_observation_from_signal(
             signal, scan_id=scan_id, strategy_version=strategy_version,
-            code_commit_sha=code_commit_sha, df_1h=df_1h, df_5m=closed_5m_df, decision_ts=decision_ts,
-            provider=provider, source=source, market_context=market_context, account_context=account_context, btc_df_5m=btc_df_5m, btc_df_1h=btc_df_1h,
+            code_commit_sha=code_commit_sha, df_1h=df_1h, df_5m=closed_5m_df, decision_ts=signal_boundary_ts,
+            provider=provider, source=source, market_context=signal_context, account_context=account_context, btc_df_5m=btc_df_5m, btc_df_1h=btc_df_1h,
         ))
 
     # Every actual touch boundary that did NOT create a signal is retained as research data.
@@ -1607,8 +1765,14 @@ def record_scan_symbol(
         if captured_at is not None and decision_parsed is not None:
             account_context_age_ms_at_decision = max(0.0, (decision_parsed - captured_at).total_seconds() * 1000.0)
     for observation in observations:
-        observation["market_context_persisted"] = market_context_persisted
-        observation["market_context_status"] = ("PERSISTED" if market_context_persisted else ("PERSISTENCE_FAILED" if market_context else "NOT_COLLECTED"))
+        has_linked_context = bool(observation.get("market_context_id"))
+        existing_ctx_persisted = observation.get("market_context_persisted")
+        if existing_ctx_persisted is None:
+            observation["market_context_persisted"] = market_context_persisted
+        if not has_linked_context and existing_ctx_persisted is None:
+            observation["market_context_status"] = ("PERSISTED" if market_context_persisted else ("PERSISTENCE_FAILED" if market_context else "NOT_COLLECTED"))
+        elif observation.get("market_context_status") is None:
+            observation["market_context_status"] = "PERSISTED" if existing_ctx_persisted else "PERSISTENCE_FAILED"
         observation["account_context_persisted"] = account_context_persisted
         observation["account_context_status"] = ("PERSISTED" if account_context_persisted else ("PERSISTENCE_FAILED" if account_context else "NOT_COLLECTED"))
         if market_context:

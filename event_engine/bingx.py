@@ -1854,11 +1854,14 @@ def _research_depth_metrics(data: Any, *, mid_price: float | None = None) -> dic
         except (TypeError, ValueError):
             return None
 
-    bp = [x for x in (parse_level(v) for v in bids) if x]
-    ap = [x for x in (parse_level(v) for v in asks) if x]
+    # Normalize provider payload order before selecting top-N.
+    bp = sorted((x for x in (parse_level(v) for v in bids) if x), key=lambda x: x[0], reverse=True)
+    ap = sorted((x for x in (parse_level(v) for v in asks) if x), key=lambda x: x[0])
     best_bid = bp[0][0] if bp else None
     best_ask = ap[0][0] if ap else None
-    mid = mid_price or ((best_bid + best_ask) / 2.0 if best_bid and best_ask else None)
+    book_mid = ((best_bid + best_ask) / 2.0) if best_bid and best_ask else None
+    depth_reference_type = "MARK_PRICE" if mid_price is not None and float(mid_price) > 0 else "BOOK_MID"
+    mid = float(mid_price) if mid_price is not None and float(mid_price) > 0 else book_mid
 
     def depth_quote(levels: list[tuple[float, float]], pct: float) -> float:
         if mid is None or mid <= 0:
@@ -1883,12 +1886,22 @@ def _research_depth_metrics(data: Any, *, mid_price: float | None = None) -> dic
     if best_bid is not None and best_ask is not None and bp and ap:
         if (bp[0][1] + ap[0][1]) > 0:
             microprice = ((best_ask * bp[0][1]) + (best_bid * ap[0][1])) / (bp[0][1] + ap[0][1])
+    spread_pct = ((best_ask - best_bid) / ((best_ask + best_bid) / 2.0) * 100.0) if best_bid and best_ask and best_bid > 0 else None
+    microprice_distance_pct = (microprice / book_mid - 1.0) * 100.0 if microprice is not None and book_mid and book_mid > 0 else None
+    raw_ts = data.get("T") or data.get("timestamp") or data.get("time")
+    try:
+        book_timestamp_ms = int(float(raw_ts)) if raw_ts is not None else None
+    except (TypeError, ValueError):
+        book_timestamp_ms = None
     return {
         "status": "ok",
         "best_bid": best_bid,
         "best_ask": best_ask,
-        "spread_pct": ((best_ask - best_bid) / ((best_ask + best_bid) / 2.0) * 100.0) if best_bid and best_ask and best_bid > 0 else None,
+        "spread_pct": spread_pct,
         "mid_price": mid,
+        "book_mid_price": book_mid,
+        "depth_reference_price": mid,
+        "depth_reference_type": depth_reference_type,
         "bid_qty_5": bid_qty_5,
         "ask_qty_5": ask_qty_5,
         "bid_qty_10": bid_qty_10,
@@ -1902,6 +1915,7 @@ def _research_depth_metrics(data: Any, *, mid_price: float | None = None) -> dic
         "book_quote_imbalance_5": ((bid_quote_5 - ask_quote_5) / quote_total5) if quote_total5 > 0 else None,
         "book_quote_imbalance_10": ((bid_quote_10 - ask_quote_10) / quote_total10) if quote_total10 > 0 else None,
         "microprice": microprice,
+        "microprice_distance_pct": microprice_distance_pct,
         "bid_depth_quote_0_1pct": depth_quote(bp, 0.1),
         "ask_depth_quote_0_1pct": depth_quote(ap, 0.1),
         "bid_depth_quote_0_5pct": depth_quote(bp, 0.5),
@@ -1910,7 +1924,8 @@ def _research_depth_metrics(data: Any, *, mid_price: float | None = None) -> dic
         "ask_depth_quote_1pct": depth_quote(ap, 1.0),
         "bids_top10": [[p, q] for p, q in bp[:10]],
         "asks_top10": [[p, q] for p, q in ap[:10]],
-        "timestamp": data.get("T") or data.get("timestamp") or data.get("time"),
+        "timestamp": raw_ts,
+        "timestamp_ms": book_timestamp_ms,
     }
 
 
@@ -2006,6 +2021,7 @@ def fetch_research_market_context(
     *,
     depth_limit: int = 20,
     trades_limit: int = 100,
+    timeout_sec: float = 3.0,
 ) -> dict[str, Any]:
     """Collect a decision-time BingX market snapshot for research only.
 
@@ -2017,11 +2033,18 @@ def fetch_research_market_context(
     captured_ms = int(time.time() * 1000)
     collection_started = time.monotonic()
     result: dict[str, Any] = {
-        "schema": "bingx_research_market_context_v1",
+        "schema": "bingx_research_market_context_v3",
+        "context_schema_version": 3,
         "symbol": str(symbol).upper(),
         "bingx_symbol": bx,
+        "data_provider": "bingx_swap_public",
+        "provider": "bingx",
         "captured_at_ms": captured_ms,
         "captured_at": datetime.fromtimestamp(captured_ms / 1000.0, tz=timezone.utc).isoformat(),
+        "capture_started_at_ms": captured_ms,
+        "capture_phase": "PRE_EXECUTION",
+        "feature_time_semantics": "CAPTURED_PRE_ORDER_NOT_TRIGGER_BOUNDARY",
+        "timestamp_semantics": "LOCAL_CAPTURE_CLOCK_PLUS_EXCHANGE_TIMESTAMPS_WHEN_PRESENT",
         "status": "ok",
         "errors": [],
         "endpoint_status": {},
@@ -2035,7 +2058,7 @@ def fetch_research_market_context(
     def call(key: str, path: str, params: dict[str, Any]) -> dict[str, Any]:
         started = time.monotonic()
         try:
-            resp = _research_public_get(key, path, params)
+            resp = _research_public_get(key, path, params, timeout_sec=max(0.5, float(timeout_sec)))
             result["endpoint_latency_ms"][key] = round((time.monotonic() - started) * 1000.0, 3)
             if int(resp.get("code")) != 0:
                 result["endpoint_status"][key] = "error"
@@ -2058,6 +2081,9 @@ def fetch_research_market_context(
                     result[out_key] = float(prow[source_key]) if source_key not in {"nextFundingTime", "time"} else int(prow[source_key])
                 except (TypeError, ValueError):
                     result[out_key] = None
+        result["funding_rate_unit"] = "DECIMAL_RATE"
+        result["funding_rate_pct"] = (float(result["funding_rate"]) * 100.0) if result.get("funding_rate") is not None else None
+        result["funding_rate_timestamp_ms"] = result.get("premium_index_ts")
 
     if result.get("mark_price") and result.get("index_price"):
         idx = float(result["index_price"])
@@ -2067,22 +2093,36 @@ def fetch_research_market_context(
     oi = call("openInterest", OPEN_INTEREST_PATH, {"symbol": bx})
     orow = _research_symbol_row(oi.get("data"), bx) if isinstance(oi, dict) else None
     if orow:
+        raw_oi = orow.get("openInterest")
         try:
-            result["open_interest"] = float(orow.get("openInterest"))
+            result["open_interest"] = float(raw_oi)
         except (TypeError, ValueError):
             result["open_interest"] = None
-        result["open_interest_ts"] = orow.get("time")
+        result["open_interest_raw"] = raw_oi
+        result["open_interest_unit"] = str(orow.get("unit") or "PROVIDER_NATIVE_UNSPECIFIED")
+        raw_oi_ts = orow.get("time")
+        try:
+            result["open_interest_ts"] = int(float(raw_oi_ts)) if raw_oi_ts is not None else None
+        except (TypeError, ValueError):
+            result["open_interest_ts"] = None
+        result["open_interest_timestamp_semantics"] = "EXCHANGE_EVENT_TIME_IF_PROVIDER_SUPPLIES_IT"
 
     book = call("depth", DEPTH_PATH, {"symbol": bx, "limit": int(depth_limit)})
     if isinstance(book, dict) and isinstance(book.get("data"), dict):
         result["order_book"] = _research_depth_metrics(book["data"], mid_price=result.get("mark_price"))
         result["order_book_timestamp"] = result["order_book"].get("timestamp")
+        result["order_book_timestamp_semantics"] = "EXCHANGE_TIMESTAMP_IF_PRESENT"
 
     trades = call("trades", TRADES_PATH, {"symbol": bx, "limit": int(trades_limit)})
     result["recent_trades"] = _research_trade_metrics(trades.get("data")) if isinstance(trades, dict) else {"status": "error", "error": "trades_response_invalid"}
+    result["recent_trades_timestamp_semantics"] = "EXCHANGE_TRADE_TIME_IF_PRESENT"
 
     if result["errors"]:
         result["status"] = "partial" if len(result["errors"]) < 4 else "error"
+    completed_ms = int(time.time() * 1000)
+    result["capture_completed_at_ms"] = completed_ms
+    result["capture_completed_at"] = datetime.fromtimestamp(completed_ms / 1000.0, tz=timezone.utc).isoformat()
+    result["context_capture_span_ms"] = max(0, completed_ms - captured_ms)
     result["collection_latency_ms"] = round((time.monotonic() - collection_started) * 1000.0, 3)
     return _research_sanitize(result)
 
