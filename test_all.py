@@ -3073,6 +3073,48 @@ def test_update_mfe_mae_records_threshold_milestones():
     assert trade["mfe_milestones_r"]["2.00"] == 1_183
 
 
+
+
+def test_build_5m_signal_uses_only_causal_1h_boundary_for_obstacle_and_atr(monkeypatch):
+    import pandas as pd
+    import run_once
+    from run_once import _build_5m_zone_signal
+
+    boundary = pd.Timestamp("2026-01-02T06:00:00Z")
+    h1_ts = pd.date_range("2026-01-01T00:00:00Z", periods=31, freq="1h")
+    df1h = pd.DataFrame({
+        "timestamp": [int(ts.timestamp() * 1000) for ts in h1_ts],
+        "close_time": [int((ts + pd.Timedelta(hours=1)).timestamp() * 1000) for ts in h1_ts],
+        "open": [100.0] * len(h1_ts),
+        "high": [101.0] * len(h1_ts),
+        "low": [99.0] * len(h1_ts),
+        "close": [100.0] * len(h1_ts),
+        "volume": [1000.0] * len(h1_ts),
+        "atr50": list(range(1, len(h1_ts) + 1)),
+    })
+    bar_ts = boundary - pd.Timedelta(minutes=5)
+    bar = pd.Series({
+        "timestamp": bar_ts, "close_time": boundary, "open": 99.0, "high": 106.0,
+        "low": 94.0, "close": 100.0, "volume": 100.0,
+    })
+    zone = {"top": 110.0, "btm": 90.0, "poi": 100.0, "start": 10, "zone_id": "Z_CAUSAL"}
+    seen = {}
+    def fake_nearest(direction, entry, active_demand, active_supply, frame, current_idx):
+        seen["last_close"] = pd.Timestamp(frame.iloc[-1]["close_time"])
+        seen["current_idx"] = current_idx
+        seen["demand"] = list(active_demand)
+        seen["supply"] = list(active_supply)
+        return {"price": 120.0, "source": "test_obstacle"}
+    monkeypatch.setattr(run_once, "_nearest_opposing_level", fake_nearest)
+    monkeypatch.setattr(run_once, "MIN_STRUCTURE_ROOM_R", 1.2)
+    out = _build_5m_zone_signal(
+        "TEST-USDT", "LONG", zone, bar, None, df1h, [], [], {"visit_id": "V1"},
+    )
+    assert seen["last_close"] == boundary
+    assert seen["current_idx"] == len(df1h.iloc[:30]) - 1
+    assert out["atr"] == 30.0
+    assert out["target"]["obstacle_source"] == "test_obstacle"
+
 def test_5m_zone_visit_locks_after_midpoint_touch_and_does_not_retrigger_in_chop(monkeypatch):
     import time
     import pandas as pd

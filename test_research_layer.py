@@ -73,9 +73,57 @@ def test_touch_observation_anchors_entry_bar_timestamp_and_prevents_volume_looka
     )
     assert out["entry_bar"]["timestamp"] == event_ts
     assert out["trigger"]["touch_mode"] == "zone"
-    assert out["zone"]["age_bars"] == 49
+    # The event occurred at 02:00 and became knowable at 02:05.  The causal 1H
+    # prefix has only two closed bars at that point, so a synthetic zone with
+    # start=10 is not allowed to acquire a future-derived age.
+    assert out["zone"]["age_bars"] == 0
+    assert out["observation_ts"] == "2026-01-01T02:05:00+00:00"
+    assert out["counterfactual_path_start_ts"] == out["observation_ts"]
     assert out["features"]["volume_ratio_5m20"] == pytest.approx(2.0)
 
+
+
+
+def test_touch_event_boundary_overrides_late_scan_time_and_future_bars_do_not_change_features():
+    ts = pd.date_range("2026-01-01T00:00:00Z", periods=30, freq="5min")
+    base = pd.DataFrame({
+        "timestamp": ts[:25],
+        "open": [100.0] * 25,
+        "high": [101.0] * 25,
+        "low": [99.0] * 25,
+        "close": [100.0] * 25,
+        "volume": [100.0] * 25,
+    })
+    future = pd.DataFrame({
+        "timestamp": ts[25:],
+        "open": [100.0] * 5,
+        "high": [200.0] * 5,
+        "low": [1.0] * 5,
+        "close": [150.0] * 5,
+        "volume": [1_000_000.0] * 5,
+    })
+    extended = pd.concat([base, future], ignore_index=True)
+    event_ts = ts[24].isoformat()
+    event = {
+        "timestamp": event_ts,
+        "reason": "directional_candle_required",
+        "entry_ref": 100.0,
+        "touch_mode": "zone",
+        "bar": {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 200.0},
+    }
+    zone = {"zone_id": "Z_BOUNDARY", "top": 101.0, "btm": 99.0, "poi": 100.0, "origin_ts_ms": int(ts[0].timestamp() * 1000), "start": 0}
+    def build(df5):
+        return research.build_observation_from_touch_event(
+            event=dict(event), symbol="TEST-USDT", zone=zone, direction="LONG", df_1h=_df_1h(), df_5m=df5,
+            zone_visit_id="V_BOUNDARY", scan_id="S1", decision_ts="2026-01-01T02:25:00Z",
+            strategy_version="v1", code_commit_sha="abc", provider="binance", source="binance_spot",
+        )
+    a = build(base)
+    b = build(extended)
+    assert a["observation_ts"] == "2026-01-01T02:05:00+00:00"
+    assert b["observation_ts"] == a["observation_ts"]
+    for key in ("5m_atr14", "5m_range_atr", "market_regime", "session_vwap_approx", "5m_return_5m_pct"):
+        assert b["features"].get(key) == a["features"].get(key), key
 
 def test_record_entry_decision_uses_requested_path(tmp_path: Path):
     path = tmp_path / "entry_decisions.jsonl"
@@ -130,9 +178,10 @@ def test_record_scan_symbol_writes_signal_and_rejected_observations(tmp_path: Pa
         "zone": zone, "zone_visit": {"visit_id": "VISIT_X", "touch_count_before_trigger": 0},
         "entry_bar": bar, "previous_bar": {}, "target": {"obstacle_price": 120.0}, "trigger": {"zone_trigger_mode": "zone"},
     }
+    rearm_bar = {**bar, "timestamp": "2026-01-02T00:05:00+00:00", "close": 103.0, "high": 104.0, "low": 102.0}
     diagnostics = {
         "touch_events": [{"timestamp": bar["timestamp"], "zone_key": "DEMAND:ZID_X", "direction": "LONG", "midpoint": 100.0, "reason": "directional_candle_required", "visit_id": "VISIT_X", "bar": bar}],
-        "rearm_events": [],
+        "rearm_events": [{"timestamp": rearm_bar["timestamp"], "zone_key": "DEMAND:ZID_X", "direction": "LONG", "visit_id": "VISIT_X", **rearm_bar}],
         "zones": {"DEMAND:ZID_X": {"direction": "LONG", "midpoint": 100.0, "closest_midpoint_bar": {**bar, "distance_pct": 0.5}}},
     }
     state = {"zones": {"DEMAND:ZID_X": {"visit_id": "VISIT_X"}}}
@@ -141,9 +190,13 @@ def test_record_scan_symbol_writes_signal_and_rejected_observations(tmp_path: Pa
         provider="binance", source="binance_spot", bars_1h=_df_1h().to_dict("records"), bars_5m=[bar],
         df_1h=df, demand=[zone], supply=[], diagnostics=diagnostics, symbol_state=state, signals=[signal],
     )
-    assert result["observations"] >= 2
+    assert result["observations"] >= 3
     rows = [json.loads(line) for line in (tmp_path / "zone_observations.jsonl").read_text().splitlines()]
-    assert {r["event_type"] for r in rows} >= {"SIGNAL_CREATED", "TOUCH_REJECTED", "NEAREST_APPROACH"}
+    assert {r["event_type"] for r in rows} >= {"SIGNAL_CREATED", "TOUCH_REJECTED", "REARM", "NEAREST_APPROACH"}
+    by_type = {r["event_type"]: r for r in rows}
+    assert by_type["TOUCH_REJECTED"]["observation_ts"] == "2026-01-02T00:05:00+00:00"
+    assert by_type["REARM"]["observation_ts"] == "2026-01-02T00:10:00+00:00"
+    assert by_type["NEAREST_APPROACH"]["observation_ts"] == "2026-01-02T00:05:00+00:00"
     assert all("features" in r for r in rows)
 
 
