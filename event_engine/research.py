@@ -22,7 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 
 RESEARCH_ENABLED = os.environ.get("RESEARCH_ENABLED", "true").lower() == "true"
-RESEARCH_SCHEMA_VERSION = 4
+RESEARCH_SCHEMA_VERSION = 5
 
 ZONE_OBSERVATIONS_PATH = DATA_DIR / "zone_observations.jsonl"
 ENTRY_DECISIONS_PATH = DATA_DIR / "entry_decisions.jsonl"
@@ -666,6 +666,31 @@ def _closed_market_frame(df: pd.DataFrame | None, decision_ts: Any, timeframe: s
     return x.reset_index(drop=True)
 
 
+def _event_decision_boundary_ts(event: dict[str, Any]) -> str | None:
+    """Return the causal decision boundary for a closed 5m lifecycle event.
+
+    Lifecycle events store the 5m candle OPEN timestamp in ``timestamp``.
+    Their decision boundary is the candle CLOSE (open + 5 minutes), never the
+    wall-clock time at which the scan happened.  An explicit event close_time,
+    when present, takes precedence.
+    """
+    if not isinstance(event, dict):
+        return None
+    for value in (
+        event.get("decision_boundary_ts"),
+        (event.get("bar") or {}).get("close_time") if isinstance(event.get("bar"), dict) else None,
+    ):
+        parsed = _parse_timestamp(value)
+        if parsed is not None:
+            return parsed.isoformat()
+    raw = event.get("timestamp")
+    parsed = _parse_timestamp(raw)
+    if parsed is None:
+        bar = event.get("bar") or {}
+        parsed = _parse_timestamp(bar.get("timestamp") if isinstance(bar, dict) else None)
+    return (parsed + pd.Timedelta(minutes=5)).isoformat() if parsed is not None else None
+
+
 def _simple_atr(df: pd.DataFrame, period: int = 14) -> float | None:
     if len(df) < period or not all(c in df.columns for c in ("high", "low", "close")):
         return None
@@ -1264,9 +1289,13 @@ def build_observation_from_touch_event(
     ts = event.get("timestamp")
     if not ts:
         return None
-    # The outer event timestamp is the authoritative 5m event boundary. Keep it
-    # inside entry_bar as well so downstream feature calculations never fall back
-    # to an unbounded tail of bars (which would permit lookahead).
+    # The event's own closed-5m boundary is authoritative.  The caller may be
+    # processing the event minutes later, but research features must remain
+    # anchored to when this event became knowable.
+    event_decision_ts = _event_decision_boundary_ts(event)
+    decision_ts = event_decision_ts or decision_ts or _now_iso()
+    # Keep the event bar timestamp explicit so downstream feature calculations
+    # cannot fall back to a later scan-time tail (which would permit lookahead).
     bar.setdefault("timestamp", ts)
     zone_id_value = str(zone.get("zone_id") or event.get("zone_key") or "")
     if not zone_id_value:
@@ -1305,9 +1334,11 @@ def build_observation_from_touch_event(
         structure_room = None
     if zone.get("age_bars") is None and df_1h is not None and not df_1h.empty:
         try:
-            current_idx = len(df_1h) - 1
-            zone_start = int(zone.get("start", current_idx))
-            zone["age_bars"] = max(0, int(current_idx - zone_start))
+            x1_causal = _closed_market_frame(df_1h, decision_ts, "1h")
+            current_idx = len(x1_causal) - 1
+            if current_idx >= 0:
+                zone_start = int(zone.get("start", current_idx))
+                zone["age_bars"] = max(0, int(current_idx - zone_start))
         except (TypeError, ValueError):
             pass
     features = build_research_features(
@@ -1659,9 +1690,10 @@ def record_scan_symbol(
         zone_key = str(event.get("zone_key", ""))
         zone = zones.get(zone_key)
         direction = str(event.get("direction", "")).upper()
+        event_decision_ts = _event_decision_boundary_ts(event) or decision_ts
         built = build_observation_from_touch_event(
             event=event, symbol=symbol, zone=zone, direction=direction, df_1h=df_1h, df_5m=closed_5m_df,
-            zone_visit_id=str(event.get("visit_id") or ""), scan_id=scan_id, decision_ts=decision_ts,
+            zone_visit_id=str(event.get("visit_id") or ""), scan_id=scan_id, decision_ts=event_decision_ts,
             strategy_version=strategy_version, code_commit_sha=code_commit_sha, provider=provider, source=source, market_context=market_context, account_context=account_context, btc_df_5m=btc_df_5m, btc_df_1h=btc_df_1h,
         )
         if built:
@@ -1672,6 +1704,7 @@ def record_scan_symbol(
         zone_key = str(event.get("zone_key", ""))
         zone = zones.get(zone_key) or {}
         direction = str(event.get("direction", "")).upper()
+        event_decision_ts = _event_decision_boundary_ts(event) or decision_ts
         bar = {
             "timestamp": event.get("timestamp"), "open": event.get("open", event.get("close")),
             "high": event.get("high", event.get("close")), "low": event.get("low", event.get("close")),
@@ -1685,10 +1718,10 @@ def record_scan_symbol(
             "source_event_reason": "zone_rearmed",
             "scan_id": scan_id, "strategy_version": strategy_version, "code_commit_sha": code_commit_sha,
             "provider": provider, "source": source, "market_context_id": (market_context or {}).get("context_id"), "account_context_id": (account_context or {}).get("account_context_id"),
-            "symbol": symbol.upper(), "direction": direction, "observation_ts": decision_ts, "source_event_ts": event.get("timestamp"), "counterfactual_path_start_ts": decision_ts,
+            "symbol": symbol.upper(), "direction": direction, "observation_ts": event_decision_ts, "source_event_ts": event.get("timestamp"), "counterfactual_path_start_ts": event_decision_ts, "decision_boundary_ts": event_decision_ts, "decision_boundary_kind": "CLOSED_5M_EVENT_CLOSE",
             "reference_price": event.get("close"), "zone_id": zone.get("zone_id") or zone_key,
             "zone_visit_id": event.get("visit_id"), "zone": sanitize(zone), "entry_bar": sanitize(bar),
-            "features": build_research_features(symbol=symbol, direction=direction, zone=zone, bar=bar, df_1h=df_1h, df_5m=closed_5m_df, decision_ts=decision_ts, market_context=market_context, btc_df_5m=btc_df_5m, btc_df_1h=btc_df_1h),
+            "features": build_research_features(symbol=symbol, direction=direction, zone=zone, bar=bar, df_1h=df_1h, df_5m=closed_5m_df, decision_ts=event_decision_ts, market_context=market_context, btc_df_5m=btc_df_5m, btc_df_1h=btc_df_1h),
             "research": {"source": "shadow_research_v1", "production_gate_applied": False, "outcome_class": "HYPOTHETICAL_FORWARD_OUTCOME"},
             "recorded_at": _now_iso(),
         })
@@ -1704,6 +1737,7 @@ def record_scan_symbol(
         zone = zones.get(str(zone_key)) or {}
         direction = str(zdiag.get("direction", "")).upper()
         ts = bar.get("timestamp")
+        event_decision_ts = _event_decision_boundary_ts({"timestamp": ts, "bar": bar}) or decision_ts
         zid = str(zone.get("zone_id") or zone_key)
         observations.append({
             "observation_id": observation_id("NEAREST_APPROACH", symbol, direction, zid, ts),
@@ -1713,11 +1747,11 @@ def record_scan_symbol(
             "source_event_reason": "closest_midpoint_without_touch",
             "scan_id": scan_id, "strategy_version": strategy_version, "code_commit_sha": code_commit_sha,
             "provider": provider, "source": source, "market_context_id": (market_context or {}).get("context_id"), "account_context_id": (account_context or {}).get("account_context_id"),
-            "symbol": symbol.upper(), "direction": direction, "observation_ts": decision_ts, "source_event_ts": ts, "counterfactual_path_start_ts": decision_ts,
+            "symbol": symbol.upper(), "direction": direction, "observation_ts": event_decision_ts, "source_event_ts": ts, "counterfactual_path_start_ts": event_decision_ts, "decision_boundary_ts": event_decision_ts, "decision_boundary_kind": "CLOSED_5M_EVENT_CLOSE",
             "reference_price": bar.get("close"), "zone_id": zid,
             "zone_visit_id": (symbol_state.get("zones", {}).get(zone_key) or {}).get("visit_id"),
             "zone": sanitize(zone), "entry_bar": sanitize(bar),
-            "features": {**build_research_features(symbol=symbol, direction=direction, zone=zone, bar=bar, df_1h=df_1h, df_5m=closed_5m_df, decision_ts=decision_ts, market_context=market_context, btc_df_5m=btc_df_5m, btc_df_1h=btc_df_1h), "distance_to_midpoint_pct": distance},
+            "features": {**build_research_features(symbol=symbol, direction=direction, zone=zone, bar=bar, df_1h=df_1h, df_5m=closed_5m_df, decision_ts=event_decision_ts, market_context=market_context, btc_df_5m=btc_df_5m, btc_df_1h=btc_df_1h), "distance_to_midpoint_pct": distance},
             "research": {"source": "shadow_research_v1", "production_gate_applied": False, "outcome_class": "HYPOTHETICAL_FORWARD_OUTCOME"},
             "recorded_at": _now_iso(),
         })
@@ -1726,10 +1760,11 @@ def record_scan_symbol(
     for signal in signals:
         try:
             snap = signal.get("shadow_experiments")
+            signal_decision_ts = signal.get("decision_boundary_ts") or decision_ts
             if not isinstance(snap, dict):
                 snap = shadow.build_entry_snapshot(
                     signal, df_5m=closed_5m_df, df_1h=df_1h,
-                    account_context=account_context, decision_ts=decision_ts
+                    account_context=account_context, decision_ts=signal_decision_ts
                 )
                 signal["shadow_experiments"] = snap
             record_counterfactual_snapshot(
@@ -1740,7 +1775,7 @@ def record_scan_symbol(
                 scan_id=scan_id,
                 strategy_version=strategy_version,
                 code_commit_sha=code_commit_sha,
-                ts=decision_ts,
+                ts=signal_decision_ts,
             )
         except Exception as exc:
             _record_error("counterfactual_snapshot_build", COUNTERFACTUAL_EXPERIMENTS_PATH, exc, symbol=symbol)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import numbers
 from datetime import timezone
 from typing import Any
 
@@ -8,7 +9,7 @@ import pandas as pd
 
 
 SHADOW_SCHEMA_VERSION = 1
-SHADOW_EXPERIMENT_VERSION = "counterfactual-v2"
+SHADOW_EXPERIMENT_VERSION = "counterfactual-v3"
 
 VOLUME_5M_THRESHOLDS = (0.8, 1.0, 1.2, 1.5, 1.8, 2.0)
 VOLUME_1H_THRESHOLDS = (0.8, 1.0, 1.2, 1.5, 1.8, 2.0)
@@ -73,41 +74,78 @@ def _parse_ts(value: Any) -> pd.Timestamp | None:
         return None
 
 
-def _closed_5m(df: pd.DataFrame | None, entry_ts: pd.Timestamp) -> pd.DataFrame:
+def _timestamp_series_to_utc(series: pd.Series) -> pd.Series:
+    """Vectorized UTC normalization for ISO strings and epoch timestamps."""
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return pd.to_datetime(series, utc=True, errors="coerce")
+    numeric = pd.to_numeric(series, errors="coerce")
+    numeric_ratio = float(numeric.notna().mean()) if len(numeric) else 0.0
+    if numeric_ratio >= 0.99:
+        finite = numeric.dropna().abs()
+        magnitude = float(finite.median()) if not finite.empty else 0.0
+        if magnitude >= 1e17:
+            unit = "ns"
+        elif magnitude >= 1e14:
+            unit = "us"
+        elif magnitude >= 1e11:
+            unit = "ms"
+        elif magnitude >= 1e8:
+            unit = "s"
+        else:
+            unit = None
+        if unit is not None:
+            return pd.to_datetime(numeric, unit=unit, utc=True, errors="coerce")
+    return pd.to_datetime(series, utc=True, errors="coerce")
+
+
+def _closed_market_frame(
+    df: pd.DataFrame | None,
+    boundary_ts: pd.Timestamp,
+    *,
+    interval: str,
+    require_volume: bool = True,
+    deduplicate: bool = True,
+) -> pd.DataFrame:
+    """Normalize exchange/persisted market timestamps before causal filtering.
+
+    BingX/Binance kline payloads use epoch milliseconds.  Using
+    ``pd.to_datetime(series)`` without an explicit unit would interpret those
+    values as nanoseconds, turning real 2026 bars into 1970 timestamps and
+    allowing future bars to pass a causal ``<= boundary`` filter.
+    """
     if df is None or df.empty or "timestamp" not in df.columns:
         return pd.DataFrame()
+    delta = pd.Timedelta(minutes=5) if str(interval).lower() == "5m" else pd.Timedelta(hours=1)
     x = df.copy()
-    x["timestamp"] = pd.to_datetime(x["timestamp"], utc=True, errors="coerce")
-    if "close_time" not in x.columns:
-        x["close_time"] = x["timestamp"] + pd.Timedelta(minutes=5)
+    x["timestamp"] = _timestamp_series_to_utc(x["timestamp"])
+    if "close_time" in x.columns:
+        x["close_time"] = _timestamp_series_to_utc(x["close_time"])
     else:
-        x["close_time"] = pd.to_datetime(x["close_time"], utc=True, errors="coerce")
+        x["close_time"] = x["timestamp"] + delta
     for col in ("open", "high", "low", "close", "volume"):
         if col in x.columns:
             x[col] = pd.to_numeric(x[col], errors="coerce")
-    x = x.dropna(subset=["timestamp", "close_time", "open", "high", "low", "close", "volume"])
+    required = ["timestamp", "close_time", "open", "high", "low", "close"]
+    if require_volume:
+        required.append("volume")
+    x = x.dropna(subset=required)
+    x = x.sort_values("timestamp")
+    if deduplicate:
+        x = x.drop_duplicates("timestamp", keep="last")
+    return x
+
+
+def _closed_5m(df: pd.DataFrame | None, entry_ts: pd.Timestamp) -> pd.DataFrame:
+    x = _closed_market_frame(df, entry_ts + pd.Timedelta(minutes=5), interval="5m")
     # The signal is created from a CLOSED trigger candle whose timestamp is its
     # candle-open time. Include that trigger bar by extending the close boundary
     # exactly one 5m interval; do not include any later bar.
-    x = x.loc[x["close_time"] <= (entry_ts + pd.Timedelta(minutes=5))].copy()
-    return x.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+    return x.loc[x["close_time"] <= (entry_ts + pd.Timedelta(minutes=5))].copy() if not x.empty else x
 
 
 def _closed_1h(df: pd.DataFrame | None, entry_ts: pd.Timestamp) -> pd.DataFrame:
-    if df is None or df.empty or "timestamp" not in df.columns:
-        return pd.DataFrame()
-    x = df.copy()
-    x["timestamp"] = pd.to_datetime(x["timestamp"], utc=True, errors="coerce")
-    if "close_time" not in x.columns:
-        x["close_time"] = x["timestamp"] + pd.Timedelta(hours=1)
-    else:
-        x["close_time"] = pd.to_datetime(x["close_time"], utc=True, errors="coerce")
-    for col in ("open", "high", "low", "close", "volume"):
-        if col in x.columns:
-            x[col] = pd.to_numeric(x[col], errors="coerce")
-    x = x.dropna(subset=["timestamp", "close_time", "open", "high", "low", "close", "volume"])
-    x = x.loc[x["close_time"] <= entry_ts].copy()
-    return x.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+    x = _closed_market_frame(df, entry_ts, interval="1h")
+    return x.loc[x["close_time"] <= entry_ts].copy() if not x.empty else x
 
 
 def _atr14_5m(x: pd.DataFrame) -> float | None:
@@ -192,7 +230,9 @@ def build_entry_snapshot(
         }
 
     x5 = _closed_5m(df_5m, entry_ts)
-    x1 = _closed_1h(df_1h, entry_ts)
+    # 1H context is causal to the closed 5M decision boundary; at an exact hour
+    # boundary the just-closed 1H candle is available and must be included.
+    x1 = _closed_1h(df_1h, decision_ts_parsed)
     trigger_bar = x5.iloc[-1] if not x5.empty else None
     prev5 = x5.iloc[:-1].tail(20) if len(x5) >= 21 else pd.DataFrame()
     vol5 = _finite(trigger_bar["volume"]) if trigger_bar is not None else None
@@ -516,9 +556,9 @@ def _simulate_management_only(
     tp1_pnl_pct = _pct_return(direction, entry, production_tp1)
 
     future = future.reset_index(drop=True)
-    all_bars = all_bars.copy().reset_index(drop=True)
-    all_bars["timestamp"] = pd.to_datetime(all_bars["timestamp"], utc=True, errors="coerce")
-    all_bars["close_time"] = pd.to_datetime(all_bars["close_time"], utc=True, errors="coerce")
+    all_bars = _closed_market_frame(
+        all_bars, pd.Timestamp.max.tz_localize("UTC"), interval="5m", require_volume=False, deduplicate=False
+    ).reset_index(drop=True)
     for col in ("open", "high", "low", "close"):
         all_bars[col] = pd.to_numeric(all_bars[col], errors="coerce")
 
@@ -687,14 +727,9 @@ def calculate_counterfactual_outcomes(observation: dict[str, Any], bars: pd.Data
     )
     if direction not in {"LONG", "SHORT"} or entry is None or entry <= 0 or source_ts is None or bars is None or bars.empty:
         return {"schema_version": SHADOW_SCHEMA_VERSION, "status": "INSUFFICIENT_INPUT"}
-    x = bars.copy()
-    x["timestamp"] = pd.to_datetime(x["timestamp"], utc=True, errors="coerce")
-    if "close_time" not in x.columns:
-        x["close_time"] = x["timestamp"] + pd.Timedelta(minutes=5)
-    else:
-        x["close_time"] = pd.to_datetime(x["close_time"], utc=True, errors="coerce")
-    for col in ("open", "high", "low", "close"):
-        x[col] = pd.to_numeric(x[col], errors="coerce")
+    x = _closed_market_frame(
+        bars, pd.Timestamp.max.tz_localize("UTC"), interval="5m", require_volume=False, deduplicate=False
+    )
     x = x.dropna(subset=["timestamp", "close_time", "open", "high", "low", "close"]).sort_values("timestamp")
     future = x.loc[(x["timestamp"] >= source_ts) & (x["close_time"] > source_ts)].copy().reset_index(drop=True)
     if future.empty:
