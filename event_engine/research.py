@@ -204,6 +204,18 @@ def _load_json(path: Path, default: Any) -> Any:
         return default
 
 
+def _fsync_parent_directory(path: Path) -> None:
+    try:
+        flags = getattr(os, "O_DIRECTORY", 0) | os.O_RDONLY
+        fd = os.open(str(path.parent), flags)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _atomic_json_locked(path: Path, payload: Any) -> None:
     with _FileLock(path):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -214,6 +226,7 @@ def _atomic_json_locked(path: Path, payload: Any) -> None:
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp_name, path)
+            _fsync_parent_directory(path)
         finally:
             try:
                 os.unlink(tmp_name)
@@ -603,6 +616,7 @@ def _bump_manifest(key: str, amount: int) -> None:
                     fh.flush()
                     os.fsync(fh.fileno())
                 os.replace(tmp_name, RESEARCH_MANIFEST_PATH)
+                _fsync_parent_directory(RESEARCH_MANIFEST_PATH)
             finally:
                 try:
                     os.unlink(tmp_name)
@@ -648,6 +662,7 @@ def update_manifest_run(*, scan_id: str, code_commit_sha: str | None, effective_
                     fh.flush()
                     os.fsync(fh.fileno())
                 os.replace(tmp_name, RESEARCH_MANIFEST_PATH)
+                _fsync_parent_directory(RESEARCH_MANIFEST_PATH)
             finally:
                 try:
                     os.unlink(tmp_name)

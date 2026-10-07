@@ -1572,8 +1572,18 @@ def _quote_freshness(quote: dict[str, Any], max_age_sec: float) -> tuple[bool, f
     exchange_age = None
     if exchange_ms is not None:
         raw_age = (exchange_now_ms - exchange_ms) / 1000.0
+        try:
+            future_tolerance = max(0.0, float(os.environ.get("EXECUTION_QUOTE_MAX_FUTURE_SKEW_SEC", "1.0")))
+        except (TypeError, ValueError):
+            future_tolerance = 1.0
         if raw_age >= 0:
             exchange_age = raw_age
+        elif raw_age >= -future_tolerance:
+            # BingX's HTTP Date synchronization is only second-granular; a tiny
+            # negative age is normal clock/rounding skew, not a future quote.
+            exchange_age = 0.0
+        else:
+            return False, local_age, raw_age, "exchange_timestamp_future"
     if limit > 0 and exchange_age is not None and exchange_age > limit:
         return False, local_age, exchange_age, "exchange_timestamp"
     if limit > 0 and local_age is not None and local_age > limit:
@@ -1663,23 +1673,60 @@ def _quote_error(source: str, resp: Any, symbol: str) -> str:
     return f"{source} unavailable: code={code} msg={msg or 'invalid response'}"
 
 
-def _quote_provenance_fields(quote_time: Any) -> dict[str, Any]:
+def _quote_provenance_fields(quote_time: Any, *, observed_at_ms: int | None = None) -> dict[str, Any]:
     exchange_time_ms = _normalize_market_timestamp_ms(quote_time)
-    observed_ms = int(time.time() * 1000)
-    _ok, local_age, exchange_age, source = _quote_freshness(
+    observed_ms = int(time.time() * 1000) if observed_at_ms is None else int(observed_at_ms)
+    fresh, local_age, exchange_age, source = _quote_freshness(
         {"quote_observed_at_ms": observed_ms, "quote_exchange_time_ms": exchange_time_ms},
         max(0.0, float(os.environ.get("EXECUTION_QUOTE_MAX_AGE_SEC", "2.0"))),
     )
+    policy = _unknown_exchange_quote_age_policy()
+    if exchange_time_ms is None:
+        freshness_status = "EXCHANGE_AGE_UNKNOWN_LOCAL_ALLOWED" if policy == "allow_with_local_age" else "EXCHANGE_AGE_UNKNOWN_BLOCKED"
+        quality = "LOCAL_OBSERVED_ONLY"
+    elif fresh and exchange_time_ms is not None and exchange_age is not None and source != "exchange_timestamp_future":
+        freshness_status = "EXCHANGE_TIME_VERIFIED"
+        quality = "EXCHANGE_TIME_VERIFIED"
+    elif source == "exchange_timestamp_future":
+        freshness_status = "EXCHANGE_TIMESTAMP_FUTURE"
+        quality = "EXCHANGE_TIME_UNVERIFIED"
+    else:
+        freshness_status = "EXCHANGE_TIME_STALE"
+        quality = "EXCHANGE_TIME_UNVERIFIED"
     return {
         "quote_exchange_time_ms": exchange_time_ms,
         "quote_observed_at_ms": observed_ms,
         "quote_local_age_sec": local_age,
         "quote_exchange_age_sec": exchange_age,
         "quote_freshness_source": source,
-        "execution_reference_quality": (
-            "EXCHANGE_TIME_VERIFIED" if exchange_time_ms is not None else "LOCAL_OBSERVED_ONLY"
-        ),
+        "quote_freshness_status": freshness_status,
+        "quote_unknown_age_policy": policy,
+        "execution_reference_quality": quality,
     }
+
+
+def _quote_acceptance(quote_time: Any, *, observed_at_ms: int | None = None) -> tuple[bool, dict[str, Any], str | None]:
+    provenance = _quote_provenance_fields(quote_time, observed_at_ms=observed_at_ms)
+    exchange_time_ms = provenance.get("quote_exchange_time_ms")
+    if exchange_time_ms is None and (_require_exchange_quote_timestamp() or _unknown_exchange_quote_age_policy() == "block"):
+        return False, provenance, "execution_quote_missing_exchange_timestamp"
+    source = provenance.get("quote_freshness_source")
+    if source == "exchange_timestamp_future":
+        return False, provenance, "execution_quote_exchange_timestamp_in_future"
+    try:
+        max_age = max(0.0, float(os.environ.get("EXECUTION_QUOTE_MAX_AGE_SEC", "2.0")))
+    except (TypeError, ValueError):
+        max_age = 2.0
+    fresh, _, _, _ = _quote_freshness(
+        {"quote_observed_at_ms": provenance.get("quote_observed_at_ms"), "quote_exchange_time_ms": exchange_time_ms},
+        max_age,
+    )
+    if not fresh:
+        return False, provenance, (
+            f"execution_quote_stale local_age={provenance.get('quote_local_age_sec')} "
+            f"exchange_age={provenance.get('quote_exchange_age_sec')} limit={max_age}"
+        )
+    return True, provenance, None
 
 
 def get_execution_quote(symbol: str, *, min_interval_sec: float | None = None, reference_price: float | None = None) -> dict[str, Any]:
@@ -1721,17 +1768,17 @@ def get_execution_quote(symbol: str, *, min_interval_sec: float | None = None, r
         parsed = _parse_top_of_book_payload(resp, bx, "bookTicker")
         if parsed is not None:
             bid, ask, quote_time = parsed
-            exchange_time_ms = _normalize_market_timestamp_ms(quote_time)
-            if _require_exchange_quote_timestamp() and exchange_time_ms is None:
-                log.warning("[EXEC_QUOTE_REJECT] %s | bookTicker returned no usable exchange timestamp", bx)
+            accepted, provenance, rejection_reason = _quote_acceptance(quote_time)
+            exchange_time_ms = provenance.get("quote_exchange_time_ms")
+            if not accepted:
+                log.warning("[EXEC_QUOTE_REJECT] %s | bookTicker | %s", bx, rejection_reason)
             else:
-                provenance = _quote_provenance_fields(quote_time)
                 return {
                     "status": "ok", "symbol": bx, "bid": bid, "ask": ask,
                     "spread_pct": ((ask - bid) / bid * 100.0) if bid > 0 else None,
                     "time": quote_time, "last_price": None, "quote_source": "bookTicker",
-                    "quote_freshness_status": "EXCHANGE_TIME_VERIFIED" if exchange_time_ms is not None else "EXCHANGE_AGE_UNKNOWN_LOCAL_ALLOWED",
-                    "quote_unknown_age_policy": _unknown_exchange_quote_age_policy(),
+                    "quote_freshness_status": provenance.get("quote_freshness_status"),
+                    "quote_unknown_age_policy": provenance.get("quote_unknown_age_policy"),
                     "quote_sources_attempted": ["bookTicker"],
                     "quote_fallback_reason": None,
                     **provenance,
@@ -1742,18 +1789,18 @@ def get_execution_quote(symbol: str, *, min_interval_sec: float | None = None, r
         parsed = _parse_top_of_book_payload(ticker_resp, bx, "ticker")
         if parsed is not None:
             bid, ask, quote_time = parsed
-            exchange_time_ms = _normalize_market_timestamp_ms(quote_time)
-            if _require_exchange_quote_timestamp() and exchange_time_ms is None:
-                log.warning("[EXEC_QUOTE_REJECT] %s | ticker returned no usable exchange timestamp", bx)
+            accepted, provenance, rejection_reason = _quote_acceptance(quote_time)
+            exchange_time_ms = provenance.get("quote_exchange_time_ms")
+            if not accepted:
+                log.warning("[EXEC_QUOTE_REJECT] %s | ticker | %s", bx, rejection_reason)
             else:
                 log.warning("[EXEC_QUOTE_FALLBACK] %s | bookTicker invalid/unavailable -> ticker", bx)
-                provenance = _quote_provenance_fields(quote_time)
                 return {
                     "status": "ok", "symbol": bx, "bid": bid, "ask": ask,
                     "spread_pct": ((ask - bid) / bid * 100.0) if bid > 0 else None,
                     "time": quote_time, "last_price": None, "quote_source": "ticker",
-                    "quote_freshness_status": "EXCHANGE_TIME_VERIFIED" if exchange_time_ms is not None else "EXCHANGE_AGE_UNKNOWN_LOCAL_ALLOWED",
-                    "quote_unknown_age_policy": _unknown_exchange_quote_age_policy(),
+                    "quote_freshness_status": provenance.get("quote_freshness_status"),
+                    "quote_unknown_age_policy": provenance.get("quote_unknown_age_policy"),
                     "quote_sources_attempted": [source for source, _ in attempts],
                     "quote_fallback_reason": _quote_error("bookTicker", attempts[0][1], bx) if attempts else "bookTicker_invalid",
                     **provenance,
@@ -1764,18 +1811,18 @@ def get_execution_quote(symbol: str, *, min_interval_sec: float | None = None, r
         parsed = _parse_depth_top(depth_resp)
         if parsed is not None:
             bid, ask, quote_time = parsed
-            exchange_time_ms = _normalize_market_timestamp_ms(quote_time)
-            if _require_exchange_quote_timestamp() and exchange_time_ms is None:
-                log.warning("[EXEC_QUOTE_REJECT] %s | depth returned no usable exchange timestamp", bx)
+            accepted, provenance, rejection_reason = _quote_acceptance(quote_time)
+            exchange_time_ms = provenance.get("quote_exchange_time_ms")
+            if not accepted:
+                log.warning("[EXEC_QUOTE_REJECT] %s | depth | %s", bx, rejection_reason)
             else:
                 log.warning("[EXEC_QUOTE_FALLBACK] %s | bookTicker/ticker invalid -> depth", bx)
-                provenance = _quote_provenance_fields(quote_time)
                 return {
                     "status": "ok", "symbol": bx, "bid": bid, "ask": ask,
                     "spread_pct": ((ask - bid) / bid * 100.0) if bid > 0 else None,
                     "time": quote_time, "last_price": None, "quote_source": "depth",
-                    "quote_freshness_status": "EXCHANGE_TIME_VERIFIED" if exchange_time_ms is not None else "EXCHANGE_AGE_UNKNOWN_LOCAL_ALLOWED",
-                    "quote_unknown_age_policy": _unknown_exchange_quote_age_policy(),
+                    "quote_freshness_status": provenance.get("quote_freshness_status"),
+                    "quote_unknown_age_policy": provenance.get("quote_unknown_age_policy"),
                     "quote_sources_attempted": [source for source, _ in attempts],
                     "quote_fallback_reason": "; ".join(_quote_error(source, response, bx) for source, response in attempts[:-1]),
                     **provenance,
