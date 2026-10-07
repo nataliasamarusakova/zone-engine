@@ -1545,13 +1545,13 @@ def _normalize_market_timestamp_ms(value: Any) -> int | None:
 
 
 def _require_exchange_quote_timestamp() -> bool:
-    raw = str(os.environ.get("EXECUTION_REQUIRE_EXCHANGE_TIMESTAMP", "false")).strip().lower()
+    raw = str(os.environ.get("EXECUTION_REQUIRE_EXCHANGE_TIMESTAMP", "true")).strip().lower()
     return raw not in {"0", "false", "no", "off"}
 
 
 def _unknown_exchange_quote_age_policy() -> str:
     """Explicit policy when the venue response has no usable exchange timestamp."""
-    raw = str(os.environ.get("EXECUTION_UNKNOWN_QUOTE_AGE_POLICY", "allow_with_local_age")).strip().lower()
+    raw = str(os.environ.get("EXECUTION_UNKNOWN_QUOTE_AGE_POLICY", "block")).strip().lower()
     aliases = {
         "allow": "allow_with_local_age",
         "allow_with_local": "allow_with_local_age",
@@ -1559,7 +1559,7 @@ def _unknown_exchange_quote_age_policy() -> str:
         "block": "block",
         "reject": "block",
     }
-    return aliases.get(raw, "allow_with_local_age")
+    return aliases.get(raw, "block")
 
 
 def _quote_freshness(quote: dict[str, Any], max_age_sec: float) -> tuple[bool, float | None, float | None, str]:
@@ -2037,6 +2037,9 @@ def fetch_research_market_context(
         "context_schema_version": 2,
         "symbol": str(symbol).upper(),
         "bingx_symbol": bx,
+        "provider": "bingx",
+        "context_provider": "bingx",
+        "context_source": "bingx_swap_public",
         "captured_at_ms": captured_ms,
         "captured_at": datetime.fromtimestamp(captured_ms / 1000.0, tz=timezone.utc).isoformat(),
         "capture_started_at_ms": captured_ms,

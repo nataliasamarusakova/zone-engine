@@ -1515,6 +1515,28 @@ def record_market_context(row: dict[str, Any]) -> bool:
     payload.setdefault("record_type", "MARKET_CONTEXT")
     payload.setdefault("recorded_at", _now_iso())
     payload.setdefault("context_capture_phase", payload.get("capture_phase") or "UNSPECIFIED")
+
+    # A market-context record describes the venue snapshot itself. Its provider
+    # must therefore name the venue that supplied the context, not the provider
+    # used for the analytical candles. Older call sites passed the analysis
+    # provider in `provider`, so normalize those records here and preserve the
+    # analytical provenance in dedicated fields.
+    source = str(payload.get("source") or "")
+    schema = str(payload.get("schema") or "")
+    looks_like_bingx_context = (
+        str(payload.get("context_provider") or "").lower() == "bingx"
+        or str(payload.get("bingx_symbol") or "").strip() != ""
+        or schema.startswith("bingx_")
+        or source == "pre_execution_entry_context"
+    )
+    if looks_like_bingx_context:
+        existing_provider = str(payload.get("provider") or "").strip().lower() or None
+        if payload.get("analysis_provider") in (None, "") and existing_provider not in (None, "", "bingx"):
+            payload["analysis_provider"] = existing_provider
+        payload["provider"] = "bingx"
+        payload.setdefault("context_provider", "bingx")
+        payload.setdefault("context_source", "bingx_swap_public")
+        payload.setdefault("provenance_version", 1)
     payload.setdefault("context_id", stable_id("market-context-v3", payload.get("scan_id", ""), payload.get("event_id", ""), payload.get("attempt_id", ""), payload.get("symbol", ""), payload.get("provider", ""), payload.get("captured_at_ms", ""), prefix="MC_"))
     persistence_started_at_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     payload["persistence_started_at_ms"] = persistence_started_at_ms
