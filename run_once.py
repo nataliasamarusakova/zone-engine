@@ -90,11 +90,11 @@ EXECUTION_ENABLED = os.environ.get("EXECUTION_ENABLED", "true").lower() == "true
 MARGIN_USDT = float(os.environ.get("BINGX_MARGIN_USDT", "1"))
 MAX_SCAN_SYMBOLS = int(os.environ.get("MAX_SCAN_SYMBOLS", "0"))
 WATCHLIST_ONLY = os.environ.get("WATCHLIST_ONLY", "false").lower() == "true"
-# Temporary test switches. Normal mode keeps the curated 150-asset whitelist and
-# midpoint trigger. The test workflow can disable either without changing the
-# underlying 1H Demand/Supply zone-construction algorithm.
-FUNDAMENTAL_WHITELIST_ENABLED = os.environ.get("FUNDAMENTAL_WHITELIST_ENABLED", "true").lower() == "true"
-ZONE_TRIGGER_MODE = os.environ.get("ZONE_TRIGGER_MODE", "midpoint").strip().lower()
+# Production defaults. The active workflow uses the full BingX universe and zone-touch
+# trigger mode. These defaults keep a direct `python run_once.py` invocation aligned
+# with production without changing the underlying 1H Demand/Supply zone construction.
+FUNDAMENTAL_WHITELIST_ENABLED = os.environ.get("FUNDAMENTAL_WHITELIST_ENABLED", "false").lower() == "true"
+ZONE_TRIGGER_MODE = os.environ.get("ZONE_TRIGGER_MODE", "zone").strip().lower()
 if ZONE_TRIGGER_MODE not in {"midpoint", "zone"}:
     raise ValueError("ZONE_TRIGGER_MODE must be midpoint or zone")
 WATCHLIST_SYMBOLS = tuple(x.strip().upper() for x in os.environ.get(
@@ -231,6 +231,34 @@ def _init_diagnostic_log() -> None:
 def _display_symbol(symbol: Any) -> str:
     value = str(symbol or "").strip().upper()
     return value.replace("-", "") if value else value
+
+
+def _atomic_write_text_durable(path: Path, text: str) -> None:
+    """Atomically replace a small JSON/state file and durably commit its directory entry."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
+    try:
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        try:
+            flags = getattr(os, "O_DIRECTORY", 0) | os.O_RDONLY
+            dir_fd = os.open(str(path.parent), flags)
+        except OSError:
+            dir_fd = None
+        if dir_fd is not None:
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
 
 
 def _append_jsonl(path: Path, obj: dict[str, Any]) -> None:
@@ -471,9 +499,7 @@ def _load_failed_signal_ids() -> dict[str, dict[str, Any]]:
             if ts > 0 and now - ts <= FAILED_SIGNAL_TTL_SEC:
                 cleaned[str(event_id)] = record
         if cleaned != raw:
-            tmp = FAILED_SIGNALS_PATH.with_suffix(".tmp")
-            tmp.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2), encoding="utf-8")
-            os.replace(tmp, FAILED_SIGNALS_PATH)
+            _atomic_write_text_durable(FAILED_SIGNALS_PATH, json.dumps(cleaned, ensure_ascii=False, indent=2))
         return cleaned
     except Exception as exc:
         log.warning("[FAILED_SIGNALS] load failed: %s", exc)
@@ -493,10 +519,7 @@ def _load_event_claims_unlocked() -> dict[str, dict[str, Any]]:
 
 
 def _write_event_claims_unlocked(raw: dict[str, dict[str, Any]]) -> None:
-    DATA.mkdir(parents=True, exist_ok=True)
-    tmp = EVENT_CLAIMS_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, EVENT_CLAIMS_PATH)
+    _atomic_write_text_durable(EVENT_CLAIMS_PATH, json.dumps(raw, ensure_ascii=False, indent=2))
 
 
 def _claim_event_for_execution(event_id: str) -> tuple[bool, str, str]:
@@ -632,9 +655,7 @@ def _mark_failed_signal(event_id: str, status: str, error: str = "", *, force_te
             "next_retry_at": 0 if terminal else now + delay,
             "terminal": terminal,
         }
-        tmp = FAILED_SIGNALS_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, FAILED_SIGNALS_PATH)
+        _atomic_write_text_durable(FAILED_SIGNALS_PATH, json.dumps(raw, ensure_ascii=False, indent=2))
     except Exception as exc:
         log.warning("[FAILED_SIGNALS] mark failed for %s: %s", event_id, exc)
 
@@ -749,16 +770,16 @@ def _load_zone_visit_state() -> dict[str, Any]:
 
 
 def _save_zone_visit_state(state: dict[str, Any]) -> None:
-    """Atomically persist zone-visit state after a complete scan batch."""
+    """Atomically and durably persist zone-visit state after a complete scan batch."""
     DATA.mkdir(parents=True, exist_ok=True)
     payload = {"version": ZONE_VISIT_STATE_VERSION, "trigger_mode": ZONE_TRIGGER_MODE, "symbols": state.get("symbols", {})}
     lock_path = ZONE_VISIT_STATE_LOCK_PATH
     with lock_path.open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        tmp = ZONE_VISIT_STATE_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-        os.replace(tmp, ZONE_VISIT_STATE_PATH)
-        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        try:
+            _atomic_write_text_durable(ZONE_VISIT_STATE_PATH, json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def _make_5m_event_id(symbol: str, direction: str, trigger_ts_ms: int, zone: dict[str, Any]) -> str:
@@ -1795,9 +1816,7 @@ def _load_active_trades_file(*, fresh_runtime_start: bool = False) -> dict[str, 
     if not path.exists():
         if fresh_runtime_start:
             path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = path.with_name(path.name + ".tmp")
-            tmp_path.write_text("{}\n", encoding="utf-8")
-            os.replace(tmp_path, path)
+            _atomic_write_text_durable(path, "{}\n")
             log.warning("[STATE_BOOTSTRAP] fresh runtime start detected; initialized empty active_trades.json")
             return {}
         fail("active_trades.json is missing")
@@ -2544,7 +2563,6 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         "quote_time": execution_quote.get("time"),
         "quote_exchange_time_ms": execution_quote.get("quote_exchange_time_ms"),
         "quote_observed_at_ms": execution_quote.get("quote_observed_at_ms"),
-        "execution_reference_quality": execution_quote.get("execution_reference_quality"),
     })
     telemetry.record_quote_snapshot(
         event_id=event_id,
@@ -2679,6 +2697,12 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         quote_source=execution_quote.get("quote_source"),
         quote_exchange_time_ms=execution_quote.get("quote_exchange_time_ms"),
         quote_observed_at_ms=execution_quote.get("quote_observed_at_ms"),
+        quote_local_age_sec=execution_quote.get("quote_local_age_sec"),
+        quote_exchange_age_sec=execution_quote.get("quote_exchange_age_sec"),
+        quote_freshness_source=execution_quote.get("quote_freshness_source"),
+        quote_freshness_status=execution_quote.get("quote_freshness_status"),
+        quote_unknown_age_policy=execution_quote.get("quote_unknown_age_policy"),
+        execution_reference_quality=execution_quote.get("execution_reference_quality"),
     )
     order = open_market(symbol, direction, entry_price, event_id, execution_quote=execution_quote, attempt_id=signal.get("attempt_id"))
     order_status = str(order.get("status", "")).lower() if isinstance(order, dict) else ""
@@ -3179,14 +3203,13 @@ def _write_runtime_version_metadata() -> None:
         "engine_version": ENGINE_VERSION,
         "strategy_version": _effective_strategy_version(),
         "zone_trigger_mode": ZONE_TRIGGER_MODE,
+        "execution_quote_max_future_skew_sec": os.environ.get("EXECUTION_QUOTE_MAX_FUTURE_SKEW_SEC", "1.0"),
         "code_commit_sha": CODE_COMMIT_SHA,
         "written_ts": int(time.time() * 1000),
     }
     try:
         DATA.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
+        _atomic_write_text_durable(path, json.dumps(payload, ensure_ascii=False, indent=2))
     except Exception as exc:
         log.warning("[VERSION_METADATA] write failed: %s", type(exc).__name__)
 

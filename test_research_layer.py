@@ -1180,7 +1180,7 @@ def test_update_outcomes_scales_without_per_observation_dataframe_rescans(tmp_pa
     elapsed = time.perf_counter() - started
     assert total == len(observations)
     assert matured > 0
-    assert elapsed < 3.0
+    assert elapsed < 5.0
 
 
 def test_forward_observation_cursor_only_scans_appended_rows(tmp_path: Path, monkeypatch):

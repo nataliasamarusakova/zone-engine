@@ -2693,6 +2693,7 @@ def test_be_failure_notification_is_truthful_for_verified_close(monkeypatch):
 def test_emergency_be_rollback_verifies_order_before_final_unverified(monkeypatch):
     from event_engine import tracker
     monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: next(states))
+    monkeypatch.setattr(tracker, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
     states = iter([
         {"status": "found", "positionAmt": 1.0},
         {"status": "found", "positionAmt": 1.0},
@@ -2939,6 +2940,7 @@ def test_watchlist_is_exact_20_symbols():
 def test_get_execution_quote_accepts_current_nested_bookticker_envelope(monkeypatch):
     from event_engine import bingx
     calls = []
+    now_ms = int(time.time() * 1000)
     monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)
     responses = [
         {
@@ -2951,7 +2953,7 @@ def test_get_execution_quote_accepts_current_nested_bookticker_envelope(monkeypa
                     "bidQty": "2.5",
                     "askPrice": "100.10",
                     "askQty": "1.5",
-                    "time": 1234567890000,
+                    "time": now_ms - 250,
                 }
             },
         },
@@ -2968,17 +2970,18 @@ def test_get_execution_quote_accepts_current_nested_bookticker_envelope(monkeypa
     assert out["quote_source"] == "bookTicker"
     assert out["bid"] == 100.00
     assert out["ask"] == 100.10
-    assert out["quote_exchange_time_ms"] == 1234567890000
+    assert out["quote_exchange_time_ms"] == now_ms - 250
     assert calls == [bingx.BOOK_TICKER_PATH]
 
 
 def test_get_execution_quote_falls_back_from_bookticker_to_ticker(monkeypatch):
     from event_engine import bingx
     calls = []
+    now_ms = int(time.time() * 1000)
     monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)
     responses = [
         {"code": 0, "data": {"symbol": "FLOKI-USDT", "bidPrice": "0", "askPrice": "0"}},
-        {"code": 0, "data": [{"symbol": "FLOKI-USDT", "bidPrice": "0.00002460", "askPrice": "0.00002461", "time": 1234567890000}]},
+        {"code": 0, "data": [{"symbol": "FLOKI-USDT", "bidPrice": "0.00002460", "askPrice": "0.00002461", "time": now_ms - 250}]},
     ]
     def fake_request(method, path, params, signed=True, **kwargs):
         calls.append(path)
@@ -2996,11 +2999,12 @@ def test_get_execution_quote_falls_back_from_bookticker_to_ticker(monkeypatch):
 def test_get_execution_quote_falls_back_to_depth(monkeypatch):
     from event_engine import bingx
     calls = []
+    now_ms = int(time.time() * 1000)
     monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)
     responses = [
         {"code": 0, "data": {"symbol": "S-USDT", "bidPrice": "0", "askPrice": "0"}},
         {"code": 0, "data": {"symbol": "S-USDT", "bidPrice": "0", "askPrice": "0"}},
-        {"code": 0, "data": {"bids": [["0.02690", "10"]], "asks": [["0.02691", "11"]], "T": 1234567890000}},
+        {"code": 0, "data": {"bids": [["0.02690", "10"]], "asks": [["0.02691", "11"]], "T": now_ms - 250}},
     ]
     def fake_request(method, path, params, signed=True, **kwargs):
         calls.append(path)
@@ -3984,6 +3988,53 @@ def test_unknown_quote_age_policy_is_explicit_and_fail_closed_by_default(monkeyp
     assert bingx._unknown_exchange_quote_age_policy() == "block"
     monkeypatch.setenv("EXECUTION_UNKNOWN_QUOTE_AGE_POLICY", "nonsense")
     assert bingx._unknown_exchange_quote_age_policy() == "block"
+
+
+def test_quote_freshness_allows_small_exchange_clock_skew_but_rejects_real_future_timestamp(monkeypatch):
+    from event_engine import bingx
+    now_ms = 1_900_000_000_000
+    monkeypatch.setattr(bingx.time, "time", lambda: now_ms / 1000.0)
+    monkeypatch.delenv("EXECUTION_QUOTE_MAX_FUTURE_SKEW_SEC", raising=False)
+    ok, local_age, exchange_age, source = bingx._quote_freshness({
+        "quote_observed_at_ms": now_ms, "quote_exchange_time_ms": now_ms + 500,
+    }, 2.0)
+    assert ok is True
+    assert exchange_age == pytest.approx(0.0)
+    assert source == "exchange_timestamp"
+    ok2, _, exchange_age2, source2 = bingx._quote_freshness({
+        "quote_observed_at_ms": now_ms, "quote_exchange_time_ms": now_ms + 2500,
+    }, 2.0)
+    assert ok2 is False
+    assert exchange_age2 < -1.0
+    assert source2 == "exchange_timestamp_future"
+
+
+def test_get_execution_quote_rejects_stale_bookticker_and_uses_fresh_timestamped_fallback(monkeypatch):
+    from event_engine import bingx
+    now_ms = 1_900_000_000_000
+    monkeypatch.setattr(bingx.time, "time", lambda: now_ms / 1000.0)
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)
+    monkeypatch.setenv("BINGX_BOOK_TICKER_MIN_INTERVAL_SEC", "0")
+    responses = [
+        {"code": 0, "data": {"symbol": "AAA-USDT", "bidPrice": "100", "askPrice": "101", "time": now_ms - 5000}},
+        {"code": 0, "data": {"symbol": "AAA-USDT", "bidPrice": "100.1", "askPrice": "100.2", "time": now_ms - 500}},
+    ]
+    monkeypatch.setattr(bingx, "_request", lambda *a, **k: responses.pop(0))
+    out = bingx.get_execution_quote("AAA-USDT")
+    assert out["status"] == "ok"
+    assert out["quote_source"] == "ticker"
+    assert out["execution_reference_quality"] == "EXCHANGE_TIME_VERIFIED"
+    assert out["quote_exchange_age_sec"] == pytest.approx(0.5)
+
+
+def test_runtime_version_metadata_records_quote_future_skew_policy(tmp_path, monkeypatch):
+    import json
+    import run_once
+    monkeypatch.setattr(run_once, "DATA", tmp_path)
+    monkeypatch.setenv("EXECUTION_QUOTE_MAX_FUTURE_SKEW_SEC", "1.25")
+    run_once._write_runtime_version_metadata()
+    row = json.loads((tmp_path / "runtime_version.json").read_text(encoding="utf-8"))
+    assert row["execution_quote_max_future_skew_sec"] == "1.25"
 
 
 def test_adverse_exit_slippage_sign_is_correct_for_both_directions():
