@@ -34,8 +34,8 @@ def test_workflow_runs_size_guard_before_commit():
     assert "Verify tests did not mutate runtime data" in text
     assert "git diff --quiet -- data" in text
     assert "git status --ignored --porcelain -- data" in text
-    assert 'EXECUTION_REQUIRE_EXCHANGE_TIMESTAMP: "false"' in text
-    assert 'EXECUTION_UNKNOWN_QUOTE_AGE_POLICY: "allow_with_local_age"' in text
+    assert 'EXECUTION_REQUIRE_EXCHANGE_TIMESTAMP: "true"' in text
+    assert 'EXECUTION_UNKNOWN_QUOTE_AGE_POLICY: "block"' in text
 
 
 def test_size_guard_constants_have_headroom():

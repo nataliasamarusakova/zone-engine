@@ -309,19 +309,20 @@ def test_tp_adverse_fill_does_not_activate_be(monkeypatch):
     assert classification2 == "FAVORABLE_OR_TOLERATED_TP_FILL"
 
 
-def test_execution_quote_uses_local_observation_when_exchange_timestamp_missing(monkeypatch):
+def test_execution_quote_requires_exchange_timestamp_by_default(monkeypatch):
     from event_engine import bingx
     monkeypatch.delenv("EXECUTION_REQUIRE_EXCHANGE_TIMESTAMP", raising=False)
+    monkeypatch.delenv("EXECUTION_UNKNOWN_QUOTE_AGE_POLICY", raising=False)
     monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)
     responses = [
         {"code": 0, "data": {"symbol": "AAA-USDT", "bidPrice": "100", "askPrice": "101"}},
+        {"code": 0, "data": [{"symbol": "AAA-USDT", "bidPrice": "100", "askPrice": "101"}]},
+        {"code": 0, "data": {"bids": [["100", "10"]], "asks": [["101", "10"]]}},
     ]
     monkeypatch.setattr(bingx, "_request", lambda *a, **k: responses.pop(0))
     monkeypatch.setenv("BINGX_BOOK_TICKER_MIN_INTERVAL_SEC", "0")
     out = bingx.get_execution_quote("AAA-USDT")
-    assert out["status"] == "ok"
-    assert out["quote_exchange_time_ms"] is None
-    assert out["quote_freshness_source"] == "local_observed_elapsed"
+    assert out["status"] == "error"
 
 
 def test_execution_quote_can_be_configured_to_require_exchange_timestamp(monkeypatch):
@@ -337,6 +338,28 @@ def test_execution_quote_can_be_configured_to_require_exchange_timestamp(monkeyp
     monkeypatch.setenv("BINGX_BOOK_TICKER_MIN_INTERVAL_SEC", "0")
     out = bingx.get_execution_quote("AAA-USDT")
     assert out["status"] == "error"
+
+
+def test_quote_snapshot_persists_execution_reference_quality(tmp_path, monkeypatch):
+    from event_engine import telemetry
+    monkeypatch.setattr(telemetry, "QUOTE_SNAPSHOTS_PATH", tmp_path / "quote_snapshots.jsonl")
+    monkeypatch.setenv("TELEMETRY_FSYNC", "false")
+    telemetry.record_quote_snapshot(
+        event_id="EVT_Q", attempt_id="ATT_Q", symbol="AAA-USDT", direction="LONG",
+        quote={
+            "bid": 99.0, "ask": 100.0, "quote_source": "ticker",
+            "quote_exchange_time_ms": None, "quote_observed_at_ms": 1000,
+            "quote_local_age_sec": 0.1, "quote_exchange_age_sec": None,
+            "quote_freshness_source": "local_observed_elapsed",
+            "quote_freshness_status": "EXCHANGE_AGE_UNKNOWN_LOCAL_ALLOWED",
+            "quote_unknown_age_policy": "allow_with_local_age",
+            "execution_reference_quality": "LOCAL_OBSERVED_ONLY",
+        },
+        signal_price=99.5,
+    )
+    row = json.loads((tmp_path / "quote_snapshots.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert row["execution_reference_quality"] == "LOCAL_OBSERVED_ONLY"
+    assert row["quote_unknown_age_policy"] == "allow_with_local_age"
 
 
 def test_be_does_not_adopt_existing_stop_owned_by_other_event(monkeypatch, tmp_path):
@@ -3937,28 +3960,30 @@ def test_data_retention_archives_research_outcomes_and_reconciliation_without_lo
     assert len(restored_recon) == len(recon)
 
 
-def test_runtime_version_metadata_writes_current_provenance(tmp_path, monkeypatch):
+def test_runtime_version_metadata_writes_exact_effective_strategy_variant(tmp_path, monkeypatch):
     import json
     import run_once
     monkeypatch.setattr(run_once, "DATA", tmp_path)
     monkeypatch.setattr(run_once, "ENGINE_VERSION", "5.48.5")
     monkeypatch.setattr(run_once, "STRATEGY_VERSION", "test-strategy")
+    monkeypatch.setattr(run_once, "ZONE_TRIGGER_MODE", "zone")
     monkeypatch.setattr(run_once, "CODE_COMMIT_SHA", "deadbeef")
     run_once._write_runtime_version_metadata()
     row = json.loads((tmp_path / "runtime_version.json").read_text(encoding="utf-8"))
     assert row["engine_version"] == "5.48.5"
-    assert row["strategy_version"] == "test-strategy"
+    assert row["strategy_version"] == "test-strategy-zone-touch-test"
+    assert row["zone_trigger_mode"] == "zone"
     assert row["code_commit_sha"] == "deadbeef"
 
 
-def test_unknown_quote_age_policy_is_explicit(monkeypatch):
+def test_unknown_quote_age_policy_is_explicit_and_fail_closed_by_default(monkeypatch):
     from event_engine import bingx
     monkeypatch.delenv("EXECUTION_UNKNOWN_QUOTE_AGE_POLICY", raising=False)
-    assert bingx._unknown_exchange_quote_age_policy() == "allow_with_local_age"
+    assert bingx._unknown_exchange_quote_age_policy() == "block"
     monkeypatch.setenv("EXECUTION_UNKNOWN_QUOTE_AGE_POLICY", "block")
     assert bingx._unknown_exchange_quote_age_policy() == "block"
     monkeypatch.setenv("EXECUTION_UNKNOWN_QUOTE_AGE_POLICY", "nonsense")
-    assert bingx._unknown_exchange_quote_age_policy() == "allow_with_local_age"
+    assert bingx._unknown_exchange_quote_age_policy() == "block"
 
 
 def test_adverse_exit_slippage_sign_is_correct_for_both_directions():

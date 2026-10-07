@@ -3177,7 +3177,8 @@ def _write_runtime_version_metadata() -> None:
         "schema_version": 1,
         "record_type": "RUNTIME_VERSION",
         "engine_version": ENGINE_VERSION,
-        "strategy_version": STRATEGY_VERSION,
+        "strategy_version": _effective_strategy_version(),
+        "zone_trigger_mode": ZONE_TRIGGER_MODE,
         "code_commit_sha": CODE_COMMIT_SHA,
         "written_ts": int(time.time() * 1000),
     }
@@ -3227,8 +3228,8 @@ def main() -> None:
             "require_directional_candle": REQUIRE_DIRECTIONAL_CANDLE, "require_structure_obstacle": REQUIRE_STRUCTURE_OBSTACLE,
             "open_position_cap_enabled": False, "trades_per_cycle_cap_enabled": False, "max_entry_slippage_pct": MAX_ENTRY_SLIPPAGE_PCT, "max_entry_signal_displacement_pct": MAX_ENTRY_SIGNAL_DISPLACEMENT_PCT,
             "execution_quote_max_age_sec": EXECUTION_QUOTE_MAX_AGE_SEC,
-            "execution_require_exchange_timestamp": os.environ.get("EXECUTION_REQUIRE_EXCHANGE_TIMESTAMP", "false"),
-            "execution_unknown_quote_age_policy": os.environ.get("EXECUTION_UNKNOWN_QUOTE_AGE_POLICY", "allow_with_local_age"),
+            "execution_require_exchange_timestamp": os.environ.get("EXECUTION_REQUIRE_EXCHANGE_TIMESTAMP", "true"),
+            "execution_unknown_quote_age_policy": os.environ.get("EXECUTION_UNKNOWN_QUOTE_AGE_POLICY", "block"),
             "research_rich_context_enabled": RESEARCH_RICH_CONTEXT_ENABLED,
             "entry_trigger_reference": "TRIGGER_BAR_CLOSE",
             "trend_filter_enabled": TREND_FILTER_ENABLED,
@@ -4081,7 +4082,14 @@ def main() -> None:
                 ctx.update({
                     "scan_id": scan_id, "event_id": event_id, "attempt_id": attempt_id,
                     "symbol": signal["symbol"],
-                    "provider": str(((signal.get("market_snapshot") or {}).get("analysis_provider") or "binance")),
+                    # This record contains BingX execution-venue telemetry. Keep
+                    # the venue provider explicit and preserve the analysis/bar
+                    # provider separately; conflating them breaks research provenance.
+                    "provider": "bingx",
+                    "analysis_provider": str(((signal.get("market_snapshot") or {}).get("analysis_provider") or "binance")),
+                    "analysis_source": str(((signal.get("market_snapshot") or {}).get("analysis_source") or "")) or None,
+                    "context_provider": "bingx",
+                    "context_source": "bingx_swap_public",
                     "source": "pre_execution_entry_context",
                     "strategy_version": signal.get("strategy_version", _effective_strategy_version()),
                     "engine_version": ENGINE_VERSION, "code_commit_sha": CODE_COMMIT_SHA,

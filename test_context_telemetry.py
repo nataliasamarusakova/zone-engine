@@ -54,7 +54,7 @@ def test_record_market_context_persists_decision_provenance_before_write(tmp_pat
     for name in ["MARKET_CONTEXT_PATH", "RESEARCH_MANIFEST_PATH", "RESEARCH_ERRORS_PATH"]:
         monkeypatch.setattr(research, name, tmp_path / getattr(research, name).name)
     row = {
-        "scan_id": "S1", "event_id": "E1", "symbol": "TEST-USDT", "provider": "bingx",
+        "scan_id": "S1", "event_id": "E1", "symbol": "TEST-USDT", "provider": "binance",
         "source": "pre_execution_entry_context", "captured_at_ms": 1000,
         "captured_at": "1970-01-01T00:00:01Z", "decision_ts": "1970-01-01T00:00:02Z",
         "context_age_ms_at_decision": 1000, "capture_phase": "PRE_EXECUTION",
@@ -64,6 +64,10 @@ def test_record_market_context_persists_decision_provenance_before_write(tmp_pat
     assert stored["decision_ts"] == row["decision_ts"]
     assert stored["context_age_ms_at_decision"] == 1000
     assert stored["context_capture_phase"] == "PRE_EXECUTION"
+    assert stored["provider"] == "bingx"
+    assert stored["analysis_provider"] == "binance"
+    assert stored["context_provider"] == "bingx"
+    assert stored["context_source"] == "bingx_swap_public"
     assert stored["recorded_at"]
 
 
