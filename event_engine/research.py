@@ -22,7 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 
 RESEARCH_ENABLED = os.environ.get("RESEARCH_ENABLED", "true").lower() == "true"
-RESEARCH_SCHEMA_VERSION = 5
+RESEARCH_SCHEMA_VERSION = 3
 
 ZONE_OBSERVATIONS_PATH = DATA_DIR / "zone_observations.jsonl"
 ENTRY_DECISIONS_PATH = DATA_DIR / "entry_decisions.jsonl"
@@ -62,17 +62,23 @@ def _now_iso() -> str:
 
 
 def _parse_timestamp(value: Any) -> pd.Timestamp | None:
-    """Parse ISO or epoch-second/millisecond timestamps deterministically as UTC."""
+    """Parse ISO or epoch ns/us/ms/s timestamps deterministically as UTC."""
     if value is None:
         return None
     try:
         if isinstance(value, pd.Timestamp):
             ts = value
         elif isinstance(value, (int, float)) and not isinstance(value, bool):
-            if not math.isfinite(float(value)):
+            numeric = float(value)
+            if not math.isfinite(numeric):
                 return None
-            magnitude = abs(float(value))
-            unit = "ms" if magnitude >= 1e11 else "s" if magnitude >= 1e8 else None
+            magnitude = abs(numeric)
+            unit = (
+                "ns" if magnitude >= 1e17 else
+                "us" if magnitude >= 1e14 else
+                "ms" if magnitude >= 1e11 else
+                "s" if magnitude >= 1e8 else None
+            )
             ts = pd.to_datetime(value, unit=unit, utc=True) if unit else pd.to_datetime(value, utc=True)
         else:
             text = str(value).strip()
@@ -80,19 +86,26 @@ def _parse_timestamp(value: Any) -> pd.Timestamp | None:
                 return None
             numeric = pd.to_numeric(text, errors="coerce")
             if pd.notna(numeric):
-                magnitude = abs(float(numeric))
-                unit = "ms" if magnitude >= 1e11 else "s" if magnitude >= 1e8 else None
+                numeric = float(numeric)
+                magnitude = abs(numeric)
+                unit = (
+                    "ns" if magnitude >= 1e17 else
+                    "us" if magnitude >= 1e14 else
+                    "ms" if magnitude >= 1e11 else
+                    "s" if magnitude >= 1e8 else None
+                )
                 ts = pd.to_datetime(numeric, unit=unit, utc=True) if unit else pd.to_datetime(text, utc=True)
             else:
                 ts = pd.to_datetime(text, utc=True)
+        if pd.isna(ts):
+            return None
         if ts.tzinfo is None:
             ts = ts.tz_localize("UTC")
         else:
             ts = ts.tz_convert("UTC")
-        return ts if not pd.isna(ts) else None
+        return ts
     except Exception:
         return None
-
 
 def _finite_number(value: Any) -> bool:
     try:
@@ -659,36 +672,16 @@ def _closed_market_frame(df: pd.DataFrame | None, decision_ts: Any, timeframe: s
     for col in ("open", "high", "low", "close", "volume", "quote_volume", "taker_buy_base", "taker_buy_quote", "bar_delta_usdt"):
         if col in x.columns:
             x[col] = pd.to_numeric(x[col], errors="coerce")
-    x = x.dropna(subset=["timestamp", "close_time", "close"]).sort_values("timestamp")
+    x = (
+        x.dropna(subset=["timestamp", "close_time", "close"])
+        .sort_values(["close_time", "timestamp"])
+        .drop_duplicates("timestamp", keep="last")
+        .sort_values("timestamp")
+    )
     asof = _parse_timestamp(decision_ts)
     if asof is not None:
         x = x.loc[x["close_time"] <= asof]
     return x.reset_index(drop=True)
-
-
-def _event_decision_boundary_ts(event: dict[str, Any]) -> str | None:
-    """Return the causal decision boundary for a closed 5m lifecycle event.
-
-    Lifecycle events store the 5m candle OPEN timestamp in ``timestamp``.
-    Their decision boundary is the candle CLOSE (open + 5 minutes), never the
-    wall-clock time at which the scan happened.  An explicit event close_time,
-    when present, takes precedence.
-    """
-    if not isinstance(event, dict):
-        return None
-    for value in (
-        event.get("decision_boundary_ts"),
-        (event.get("bar") or {}).get("close_time") if isinstance(event.get("bar"), dict) else None,
-    ):
-        parsed = _parse_timestamp(value)
-        if parsed is not None:
-            return parsed.isoformat()
-    raw = event.get("timestamp")
-    parsed = _parse_timestamp(raw)
-    if parsed is None:
-        bar = event.get("bar") or {}
-        parsed = _parse_timestamp(bar.get("timestamp") if isinstance(bar, dict) else None)
-    return (parsed + pd.Timedelta(minutes=5)).isoformat() if parsed is not None else None
 
 
 def _simple_atr(df: pd.DataFrame, period: int = 14) -> float | None:
@@ -879,7 +872,9 @@ def build_research_features(
         "market_context_id": (market_context or {}).get("context_id"),
         "market_context_status": (market_context or {}).get("status"),
         "market_context_persisted": (market_context or {}).get("persisted"),
-        "account_context_id": (account_context or {}).get("account_context_id"),
+        "market_context_persisted_at_ms": (market_context or {}).get("persisted_at_ms"),
+        "market_context_persist_write_started_at_ms": (market_context or {}).get("persist_write_started_at_ms"),
+        "account_context_id": (market_context or {}).get("account_context_id"),
         "feature_availability_ts": decision_ts,
         "zone_width_abs": width if width is not None and width > 0 else None,
         "zone_width_pct": (width / close * 100.0) if width is not None and close and close > 0 else None,
@@ -917,12 +912,14 @@ def build_research_features(
         "shadow_age_le_72h": None,
     }
     if features.get("zone_age_bars") is None and df_1h is not None and not df_1h.empty:
-        try:
-            current_idx = len(df_1h) - 1
-            zone_start = int(zone.get("start", current_idx))
+        x1_causal = _closed_market_frame(df_1h, decision_ts, "1h")
+        if not x1_causal.empty:
+            current_idx = len(x1_causal) - 1
+            try:
+                zone_start = int(zone.get("start", current_idx))
+            except (TypeError, ValueError):
+                zone_start = current_idx
             features["zone_age_bars"] = max(0, int(current_idx - zone_start))
-        except (TypeError, ValueError):
-            pass
     if width is not None and width > 0 and high is not None and low is not None:
         penetration = ((top - low) / width) if direction == "LONG" and top is not None else ((high - bottom) / width if direction == "SHORT" and bottom is not None else None)
         features["zone_penetration_ratio"] = penetration
@@ -1042,11 +1039,12 @@ def build_research_features(
 
     origin_ms = zone.get("origin_ts_ms")
     try:
-        origin = pd.to_datetime(int(origin_ms), unit="ms", utc=True) if origin_ms is not None else None
+        origin_num = float(origin_ms) if origin_ms is not None else None
+        origin = pd.to_datetime(int(origin_num), unit="ms", utc=True) if origin_num is not None and math.isfinite(origin_num) and origin_num > 0 else None
         trigger = _parse_timestamp(bar.get("timestamp"))
-        if origin is not None and trigger is not None:
-            features["zone_age_hours"] = max(0.0, (trigger - origin).total_seconds() / 3600.0)
-    except Exception:
+        if origin is not None and trigger is not None and origin <= trigger:
+            features["zone_age_hours"] = (trigger - origin).total_seconds() / 3600.0
+    except (TypeError, ValueError, OverflowError):
         pass
     age_h = features.get("zone_age_hours")
     if age_h is not None:
@@ -1126,10 +1124,6 @@ def build_research_features(
         features["market_context_trigger_to_capture_ms"] = context.get("trigger_to_context_capture_ms")
         features["market_context_age_ms_at_order_ready"] = context.get("context_age_ms_at_order_ready")
         features["market_context_lag_ms_from_decision_boundary"] = context.get("context_lag_ms_from_decision_boundary")
-        features["market_context_data_provider"] = context.get("data_provider") or context.get("context_provider") or context.get("provider")
-        features["market_context_provider"] = context.get("provider")
-        features["market_context_decision_boundary_kind"] = context.get("decision_boundary_kind")
-        features["market_context_persisted_at_ms"] = context.get("persisted_at_ms")
     if account_context:
         context["account_context"] = account_context
     account = context.get("account_context") or {}
@@ -1153,18 +1147,12 @@ def build_research_features(
         features["pre_execution_context"] = sanitize({
             "context_id": context.get("context_id"),
             "status": context.get("status"),
-            "data_provider": context.get("data_provider") or context.get("context_provider") or context.get("provider"),
-            "provider": context.get("provider"),
             "capture_phase": context.get("capture_phase"),
             "captured_at_ms": context.get("captured_at_ms"),
             "capture_completed_at_ms": context.get("capture_completed_at_ms"),
             "context_capture_span_ms": context.get("context_capture_span_ms"),
-            "persistence_started_at_ms": context.get("persistence_started_at_ms"),
-            "persisted_at_ms": context.get("persisted_at_ms"),
             "decision_boundary_ts": context.get("decision_boundary_ts"),
-            "decision_boundary_kind": context.get("decision_boundary_kind"),
             "pre_execution_decision_ts": context.get("pre_execution_decision_ts"),
-            "context_capture_ts": context.get("context_capture_ts"),
             "context_age_ms_at_order_ready": context.get("context_age_ms_at_order_ready"),
             "context_age_ms_at_execution_call_start": context.get("context_age_ms_at_execution_call_start"),
             "context_lag_ms_from_decision_boundary": context.get("context_lag_ms_from_decision_boundary"),
@@ -1181,39 +1169,6 @@ def build_research_features(
             "mark_index_basis_pct": context.get("mark_index_basis_pct"),
             "order_book": book,
             "recent_trades": trades,
-        })
-        direction_multiplier = 1.0 if direction == "LONG" else -1.0
-        def _dir_numeric_pre(value: Any) -> float | None:
-            try:
-                number = float(value)
-            except (TypeError, ValueError):
-                return None
-            return number * direction_multiplier if math.isfinite(number) else None
-        def _dir_ratio_pre(value: Any) -> float | None:
-            try:
-                ratio = float(value)
-            except (TypeError, ValueError):
-                return None
-            if not math.isfinite(ratio):
-                return None
-            return ratio if direction == "LONG" else 1.0 - ratio
-        features["pre_execution_directional_obi5"] = _dir_numeric_pre(book.get("book_imbalance_5"))
-        features["pre_execution_directional_obi10"] = _dir_numeric_pre(book.get("book_imbalance_10"))
-        features["pre_execution_directional_quote_obi5"] = _dir_numeric_pre(book.get("book_quote_imbalance_5"))
-        features["pre_execution_directional_quote_obi10"] = _dir_numeric_pre(book.get("book_quote_imbalance_10"))
-        features["pre_execution_directional_aggressor_delta_quote"] = _dir_numeric_pre(trades.get("aggressor_delta_quote"))
-        features["pre_execution_directional_aggressor_ratio"] = _dir_ratio_pre(trades.get("buy_aggressor_ratio"))
-        features["pre_execution_oi_funding"] = sanitize({
-            "funding_rate": context.get("funding_rate"),
-            "funding_rate_pct": context.get("funding_rate_pct"),
-            "funding_rate_unit": context.get("funding_rate_unit"),
-            "funding_rate_timestamp_ms": context.get("funding_rate_timestamp_ms"),
-            "open_interest_raw": context.get("open_interest_raw"),
-            "open_interest_unit": context.get("open_interest_unit"),
-            "open_interest_ts": context.get("open_interest_ts"),
-            "mark_price": context.get("mark_price"),
-            "index_price": context.get("index_price"),
-            "mark_index_basis_pct": context.get("mark_index_basis_pct"),
         })
     else:
         for src, dst in (("funding_rate","funding_rate"),("funding_rate_pct","funding_rate_pct"),("funding_rate_unit","funding_rate_unit"),("mark_price","mark_price"),("index_price","index_price"),("mark_index_basis_pct","mark_index_basis_pct"),("open_interest","open_interest"),("open_interest_raw","open_interest_raw"),("open_interest_unit","open_interest_unit"),("open_interest_ts","open_interest_ts"),("premium_index_ts","premium_index_ts"),("next_funding_time_ms","next_funding_time_ms"),("analysis_provider","analysis_provider"),("analysis_source","analysis_source"),("context_provider","context_provider"),("context_source","context_source"),("cross_venue_binance_price","cross_venue_binance_price"),("cross_venue_bingx_price","cross_venue_bingx_price"),("cross_venue_deviation_pct","cross_venue_deviation_pct"),("cross_venue_metric","cross_venue_metric")):
@@ -1264,6 +1219,13 @@ def _safe_float(value: Any) -> float | None:
     return x if math.isfinite(x) else None
 
 
+def _event_decision_boundary_ts(event: dict[str, Any]) -> str | None:
+    """Return the close timestamp of the event's 5m bar, never scan wall-clock."""
+    raw = event.get("timestamp") or (event.get("bar") or {}).get("timestamp")
+    ts = _parse_timestamp(raw)
+    return (ts + pd.Timedelta(minutes=5)).isoformat() if ts is not None else None
+
+
 def build_observation_from_touch_event(
     *,
     event: dict[str, Any],
@@ -1289,13 +1251,10 @@ def build_observation_from_touch_event(
     ts = event.get("timestamp")
     if not ts:
         return None
-    # The event's own closed-5m boundary is authoritative.  The caller may be
-    # processing the event minutes later, but research features must remain
-    # anchored to when this event became knowable.
-    event_decision_ts = _event_decision_boundary_ts(event)
-    decision_ts = event_decision_ts or decision_ts or _now_iso()
-    # Keep the event bar timestamp explicit so downstream feature calculations
-    # cannot fall back to a later scan-time tail (which would permit lookahead).
+    event_decision_ts = _event_decision_boundary_ts(event) or decision_ts
+    # The outer event timestamp is the authoritative 5m event boundary. Keep it
+    # inside entry_bar as well so downstream feature calculations never fall back
+    # to an unbounded tail of bars (which would permit lookahead).
     bar.setdefault("timestamp", ts)
     zone_id_value = str(zone.get("zone_id") or event.get("zone_key") or "")
     if not zone_id_value:
@@ -1333,14 +1292,14 @@ def build_observation_from_touch_event(
     except Exception:
         structure_room = None
     if zone.get("age_bars") is None and df_1h is not None and not df_1h.empty:
-        try:
-            x1_causal = _closed_market_frame(df_1h, decision_ts, "1h")
-            current_idx = len(x1_causal) - 1
-            if current_idx >= 0:
+        causal_df = _closed_market_frame(df_1h, event_decision_ts, "1h")
+        if not causal_df.empty:
+            current_idx = len(causal_df) - 1
+            try:
                 zone_start = int(zone.get("start", current_idx))
-                zone["age_bars"] = max(0, int(current_idx - zone_start))
-        except (TypeError, ValueError):
-            pass
+            except (TypeError, ValueError):
+                zone_start = current_idx
+            zone["age_bars"] = max(0, int(current_idx - zone_start))
     features = build_research_features(
         symbol=symbol,
         direction=direction,
@@ -1349,7 +1308,7 @@ def build_observation_from_touch_event(
         df_1h=df_1h,
         df_5m=df_5m,
         touch_count_before_trigger=event.get("touch_count_before_trigger"),
-        decision_ts=decision_ts,
+        decision_ts=event_decision_ts,
         structure_room_r=structure_room,
         market_context=market_context, account_context=account_context, btc_df_5m=btc_df_5m, btc_df_1h=btc_df_1h,
     )
@@ -1368,12 +1327,18 @@ def build_observation_from_touch_event(
         "provider": provider,
         "source": source,
         "market_context_id": (market_context or {}).get("context_id"),
+        "market_context_persisted": (market_context or {}).get("persisted"),
+        "market_context_persisted_at_ms": (market_context or {}).get("persisted_at_ms"),
+        "market_context_persist_write_started_at_ms": (market_context or {}).get("persist_write_started_at_ms"),
+        "market_context_status": "PERSISTED" if (market_context or {}).get("persisted") is True else "PERSISTENCE_FAILED" if (market_context or {}).get("persisted") is False else (market_context or {}).get("status"),
         "account_context_id": (account_context or {}).get("account_context_id"),
         "symbol": str(symbol).upper(),
         "direction": str(direction).upper(),
-        "observation_ts": decision_ts or _now_iso(),
+        "observation_ts": event_decision_ts or _now_iso(),
         "source_event_ts": ts,
-        "counterfactual_path_start_ts": decision_ts or _now_iso(),
+        "counterfactual_path_start_ts": event_decision_ts or _now_iso(),
+        "decision_boundary_ts": event_decision_ts,
+        "decision_boundary_kind": "CLOSED_5M_EVENT_CLOSE",
         "reference_price": reference_price,
         "zone_id": zone_id_value,
         "zone_visit_id": zone_visit_id or event.get("zone_visit_id"),
@@ -1495,6 +1460,7 @@ def _observation_from_signal(
             signal, df_5m=df_5m, df_1h=df_1h, account_context=account_context, decision_ts=decision_ts
         )
     features["shadow_experiments"] = shadow_snapshot
+    canonical_decision_ts = decision_ts or _now_iso()
     event_id = str(signal.get("event_id", ""))
     zid = str(zone.get("zone_id", ""))
     visit_id = str((signal.get("zone_visit") or {}).get("visit_id") or (signal.get("trigger") or {}).get("zone_visit_id") or "")
@@ -1510,12 +1476,18 @@ def _observation_from_signal(
         "provider": provider,
         "source": source,
         "market_context_id": (market_context or {}).get("context_id"),
+        "market_context_persisted": (market_context or {}).get("persisted"),
+        "market_context_persisted_at_ms": (market_context or {}).get("persisted_at_ms"),
+        "market_context_persist_write_started_at_ms": (market_context or {}).get("persist_write_started_at_ms"),
+        "market_context_status": "PERSISTED" if (market_context or {}).get("persisted") is True else "PERSISTENCE_FAILED" if (market_context or {}).get("persisted") is False else (market_context or {}).get("status"),
         "account_context_id": (account_context or {}).get("account_context_id"),
         "symbol": str(signal.get("symbol", "")).upper(),
         "direction": direction,
-        "observation_ts": decision_ts or _now_iso(),
+        "observation_ts": canonical_decision_ts,
         "source_event_ts": ts,
-        "counterfactual_path_start_ts": decision_ts or _now_iso(),
+        "counterfactual_path_start_ts": canonical_decision_ts,
+        "decision_boundary_ts": canonical_decision_ts,
+        "decision_boundary_kind": "CLOSED_5M_TRIGGER_CLOSE",
         "reference_price": signal.get("entry"),
         "event_id": event_id,
         "zone_id": zid,
@@ -1543,20 +1515,36 @@ def record_market_context(row: dict[str, Any]) -> bool:
     payload.setdefault("record_type", "MARKET_CONTEXT")
     payload.setdefault("recorded_at", _now_iso())
     payload.setdefault("context_capture_phase", payload.get("capture_phase") or "UNSPECIFIED")
-    payload.setdefault("data_provider", payload.get("context_provider") or payload.get("provider"))
-    payload.setdefault("provider", payload.get("data_provider"))
     payload.setdefault("context_id", stable_id("market-context-v3", payload.get("scan_id", ""), payload.get("event_id", ""), payload.get("attempt_id", ""), payload.get("symbol", ""), payload.get("provider", ""), payload.get("captured_at_ms", ""), prefix="MC_"))
-    payload["persistence_started_at_ms"] = int(datetime.now(timezone.utc).timestamp() * 1000)
+    persistence_started_at_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    payload["persistence_started_at_ms"] = persistence_started_at_ms
+    row.update({
+        "schema_version": payload.get("schema_version"),
+        "record_type": payload.get("record_type"),
+        "recorded_at": payload.get("recorded_at"),
+        "context_capture_phase": payload.get("context_capture_phase"),
+        "context_id": payload.get("context_id"),
+        "persistence_started_at_ms": persistence_started_at_ms,
+    })
     try:
-        payload["persisted_at_ms"] = int(datetime.now(timezone.utc).timestamp() * 1000)
+        # The immutable journal row records the time immediately before append;
+        # the caller receives a later in-memory completion timestamp after the
+        # append+fsync operation returns. Both are explicit and comparable.
+        payload["persist_write_started_at_ms"] = int(datetime.now(timezone.utc).timestamp() * 1000)
+        row["persist_write_started_at_ms"] = payload["persist_write_started_at_ms"]
         written = _append_jsonl_locked(MARKET_CONTEXT_PATH, [payload])
-        if written: _bump_manifest("market_context_written", written)
+        if written:
+            completed_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            row["persisted_at_ms"] = completed_ms
+            row["persisted"] = True
+            _bump_manifest("market_context_written", written)
         return bool(written)
     except Exception as exc:
+        row["persisted"] = False
+        row["persisted_at_ms"] = None
         _record_error("market_context_write", MARKET_CONTEXT_PATH, exc, symbol=str(payload.get("symbol", "")))
         _bump_manifest("persistence_errors", 1)
         return False
-
 
 def record_account_context(row: dict[str, Any]) -> bool:
     if not RESEARCH_ENABLED:
@@ -1625,15 +1613,12 @@ def record_scan_symbol(
             account_context = dict(account_payload, persisted=False)
     if market_context:
         context_payload = dict(market_context)
-        context_payload.update({"scan_id": scan_id, "strategy_version": strategy_version, "code_commit_sha": code_commit_sha, "symbol": symbol.upper()})
+        context_payload.update({"scan_id": scan_id, "strategy_version": strategy_version, "code_commit_sha": code_commit_sha, "symbol": symbol.upper(), "provider": provider, "source": source})
         context_payload.setdefault("analysis_provider", provider)
         context_payload.setdefault("analysis_source", source)
-        context_payload.setdefault("context_provider", context_payload.get("data_provider") or "bingx")
+        context_payload.setdefault("context_provider", "bingx")
         context_payload.setdefault("context_source", "bingx_swap_public")
-        context_payload.setdefault("data_provider", context_payload.get("context_provider"))
-        context_payload.setdefault("provider", context_payload.get("data_provider"))
-        context_payload.setdefault("source", context_payload.get("context_source") or source)
-        context_payload.setdefault("context_id", stable_id("market-context-v3", scan_id, context_payload.get("event_id", ""), context_payload.get("attempt_id", ""), symbol, context_payload.get("provider", ""), context_payload.get("captured_at_ms", ""), prefix="MC_"))
+        context_payload.setdefault("context_id", stable_id("market-context-v2", scan_id, context_payload.get("event_id", ""), context_payload.get("attempt_id", ""), symbol, provider, context_payload.get("captured_at_ms", ""), prefix="MC_"))
         context_payload["decision_ts"] = decision_ts
         context_payload["context_age_ms_at_decision"] = None
         context_payload["context_lag_ms_from_decision_boundary"] = None
@@ -1690,10 +1675,9 @@ def record_scan_symbol(
         zone_key = str(event.get("zone_key", ""))
         zone = zones.get(zone_key)
         direction = str(event.get("direction", "")).upper()
-        event_decision_ts = _event_decision_boundary_ts(event) or decision_ts
         built = build_observation_from_touch_event(
             event=event, symbol=symbol, zone=zone, direction=direction, df_1h=df_1h, df_5m=closed_5m_df,
-            zone_visit_id=str(event.get("visit_id") or ""), scan_id=scan_id, decision_ts=event_decision_ts,
+            zone_visit_id=str(event.get("visit_id") or ""), scan_id=scan_id, decision_ts=(_event_decision_boundary_ts(event) or decision_ts),
             strategy_version=strategy_version, code_commit_sha=code_commit_sha, provider=provider, source=source, market_context=market_context, account_context=account_context, btc_df_5m=btc_df_5m, btc_df_1h=btc_df_1h,
         )
         if built:
@@ -1704,12 +1688,12 @@ def record_scan_symbol(
         zone_key = str(event.get("zone_key", ""))
         zone = zones.get(zone_key) or {}
         direction = str(event.get("direction", "")).upper()
-        event_decision_ts = _event_decision_boundary_ts(event) or decision_ts
         bar = {
             "timestamp": event.get("timestamp"), "open": event.get("open", event.get("close")),
             "high": event.get("high", event.get("close")), "low": event.get("low", event.get("close")),
             "close": event.get("close"), "volume": event.get("volume"),
         }
+        rearm_decision_ts = _event_decision_boundary_ts(event) or decision_ts
         observations.append({
             "observation_id": observation_id("REARM", symbol, direction, str(zone.get("zone_id") or zone_key), event.get("timestamp"), visit_id=str(event.get("visit_id") or "")),
             "schema_version": RESEARCH_SCHEMA_VERSION,
@@ -1718,10 +1702,11 @@ def record_scan_symbol(
             "source_event_reason": "zone_rearmed",
             "scan_id": scan_id, "strategy_version": strategy_version, "code_commit_sha": code_commit_sha,
             "provider": provider, "source": source, "market_context_id": (market_context or {}).get("context_id"), "account_context_id": (account_context or {}).get("account_context_id"),
-            "symbol": symbol.upper(), "direction": direction, "observation_ts": event_decision_ts, "source_event_ts": event.get("timestamp"), "counterfactual_path_start_ts": event_decision_ts, "decision_boundary_ts": event_decision_ts, "decision_boundary_kind": "CLOSED_5M_EVENT_CLOSE",
+            "symbol": symbol.upper(), "direction": direction, "observation_ts": (_event_decision_boundary_ts(event) or decision_ts), "source_event_ts": event.get("timestamp"), "counterfactual_path_start_ts": (_event_decision_boundary_ts(event) or decision_ts),
+            "decision_boundary_ts": (_event_decision_boundary_ts(event) or decision_ts), "decision_boundary_kind": "CLOSED_5M_EVENT_CLOSE",
             "reference_price": event.get("close"), "zone_id": zone.get("zone_id") or zone_key,
             "zone_visit_id": event.get("visit_id"), "zone": sanitize(zone), "entry_bar": sanitize(bar),
-            "features": build_research_features(symbol=symbol, direction=direction, zone=zone, bar=bar, df_1h=df_1h, df_5m=closed_5m_df, decision_ts=event_decision_ts, market_context=market_context, btc_df_5m=btc_df_5m, btc_df_1h=btc_df_1h),
+            "features": build_research_features(symbol=symbol, direction=direction, zone=zone, bar=bar, df_1h=df_1h, df_5m=closed_5m_df, decision_ts=rearm_decision_ts, market_context=market_context, btc_df_5m=btc_df_5m, btc_df_1h=btc_df_1h),
             "research": {"source": "shadow_research_v1", "production_gate_applied": False, "outcome_class": "HYPOTHETICAL_FORWARD_OUTCOME"},
             "recorded_at": _now_iso(),
         })
@@ -1737,8 +1722,8 @@ def record_scan_symbol(
         zone = zones.get(str(zone_key)) or {}
         direction = str(zdiag.get("direction", "")).upper()
         ts = bar.get("timestamp")
-        event_decision_ts = _event_decision_boundary_ts({"timestamp": ts, "bar": bar}) or decision_ts
         zid = str(zone.get("zone_id") or zone_key)
+        nearest_decision_ts = _event_decision_boundary_ts({"timestamp": ts}) or decision_ts
         observations.append({
             "observation_id": observation_id("NEAREST_APPROACH", symbol, direction, zid, ts),
             "schema_version": RESEARCH_SCHEMA_VERSION,
@@ -1747,11 +1732,12 @@ def record_scan_symbol(
             "source_event_reason": "closest_midpoint_without_touch",
             "scan_id": scan_id, "strategy_version": strategy_version, "code_commit_sha": code_commit_sha,
             "provider": provider, "source": source, "market_context_id": (market_context or {}).get("context_id"), "account_context_id": (account_context or {}).get("account_context_id"),
-            "symbol": symbol.upper(), "direction": direction, "observation_ts": event_decision_ts, "source_event_ts": ts, "counterfactual_path_start_ts": event_decision_ts, "decision_boundary_ts": event_decision_ts, "decision_boundary_kind": "CLOSED_5M_EVENT_CLOSE",
+            "symbol": symbol.upper(), "direction": direction, "observation_ts": (_event_decision_boundary_ts({"timestamp": ts}) or decision_ts), "source_event_ts": ts, "counterfactual_path_start_ts": (_event_decision_boundary_ts({"timestamp": ts}) or decision_ts),
+            "decision_boundary_ts": (_event_decision_boundary_ts({"timestamp": ts}) or decision_ts), "decision_boundary_kind": "CLOSED_5M_EVENT_CLOSE",
             "reference_price": bar.get("close"), "zone_id": zid,
             "zone_visit_id": (symbol_state.get("zones", {}).get(zone_key) or {}).get("visit_id"),
             "zone": sanitize(zone), "entry_bar": sanitize(bar),
-            "features": {**build_research_features(symbol=symbol, direction=direction, zone=zone, bar=bar, df_1h=df_1h, df_5m=closed_5m_df, decision_ts=event_decision_ts, market_context=market_context, btc_df_5m=btc_df_5m, btc_df_1h=btc_df_1h), "distance_to_midpoint_pct": distance},
+            "features": {**build_research_features(symbol=symbol, direction=direction, zone=zone, bar=bar, df_1h=df_1h, df_5m=closed_5m_df, decision_ts=nearest_decision_ts, market_context=market_context, btc_df_5m=btc_df_5m, btc_df_1h=btc_df_1h), "distance_to_midpoint_pct": distance},
             "research": {"source": "shadow_research_v1", "production_gate_applied": False, "outcome_class": "HYPOTHETICAL_FORWARD_OUTCOME"},
             "recorded_at": _now_iso(),
         })
@@ -1760,8 +1746,8 @@ def record_scan_symbol(
     for signal in signals:
         try:
             snap = signal.get("shadow_experiments")
-            signal_decision_ts = signal.get("decision_boundary_ts") or decision_ts
             if not isinstance(snap, dict):
+                signal_decision_ts = signal.get("decision_boundary_ts") or decision_ts
                 snap = shadow.build_entry_snapshot(
                     signal, df_5m=closed_5m_df, df_1h=df_1h,
                     account_context=account_context, decision_ts=signal_decision_ts
@@ -1775,7 +1761,7 @@ def record_scan_symbol(
                 scan_id=scan_id,
                 strategy_version=strategy_version,
                 code_commit_sha=code_commit_sha,
-                ts=signal_decision_ts,
+                ts=signal.get("decision_boundary_ts") or decision_ts,
             )
         except Exception as exc:
             _record_error("counterfactual_snapshot_build", COUNTERFACTUAL_EXPERIMENTS_PATH, exc, symbol=symbol)
@@ -1804,10 +1790,14 @@ def record_scan_symbol(
         existing_ctx_persisted = observation.get("market_context_persisted")
         if existing_ctx_persisted is None:
             observation["market_context_persisted"] = market_context_persisted
-        if not has_linked_context and existing_ctx_persisted is None:
-            observation["market_context_status"] = ("PERSISTED" if market_context_persisted else ("PERSISTENCE_FAILED" if market_context else "NOT_COLLECTED"))
-        elif observation.get("market_context_status") is None:
-            observation["market_context_status"] = "PERSISTED" if existing_ctx_persisted else "PERSISTENCE_FAILED"
+            existing_ctx_persisted = market_context_persisted
+        if observation.get("market_context_status") is None:
+            if existing_ctx_persisted is True:
+                observation["market_context_status"] = "PERSISTED"
+            elif existing_ctx_persisted is False:
+                observation["market_context_status"] = "PERSISTENCE_FAILED"
+            else:
+                observation["market_context_status"] = "PERSISTENCE_FAILED" if (has_linked_context or market_context) else "NOT_COLLECTED"
         observation["account_context_persisted"] = account_context_persisted
         observation["account_context_status"] = ("PERSISTED" if account_context_persisted else ("PERSISTENCE_FAILED" if account_context else "NOT_COLLECTED"))
         if market_context:

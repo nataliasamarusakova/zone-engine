@@ -2033,18 +2033,15 @@ def fetch_research_market_context(
     captured_ms = int(time.time() * 1000)
     collection_started = time.monotonic()
     result: dict[str, Any] = {
-        "schema": "bingx_research_market_context_v3",
-        "context_schema_version": 3,
+        "schema": "bingx_research_market_context_v2",
+        "context_schema_version": 2,
         "symbol": str(symbol).upper(),
         "bingx_symbol": bx,
-        "data_provider": "bingx_swap_public",
-        "provider": "bingx",
         "captured_at_ms": captured_ms,
         "captured_at": datetime.fromtimestamp(captured_ms / 1000.0, tz=timezone.utc).isoformat(),
         "capture_started_at_ms": captured_ms,
         "capture_phase": "PRE_EXECUTION",
-        "feature_time_semantics": "CAPTURED_PRE_ORDER_NOT_TRIGGER_BOUNDARY",
-        "timestamp_semantics": "LOCAL_CAPTURE_CLOCK_PLUS_EXCHANGE_TIMESTAMPS_WHEN_PRESENT",
+        "feature_time_semantics": "PRE_EXECUTION_CONTEXT_NOT_TRIGGER_BOUNDARY",
         "status": "ok",
         "errors": [],
         "endpoint_status": {},
@@ -2083,7 +2080,6 @@ def fetch_research_market_context(
                     result[out_key] = None
         result["funding_rate_unit"] = "DECIMAL_RATE"
         result["funding_rate_pct"] = (float(result["funding_rate"]) * 100.0) if result.get("funding_rate") is not None else None
-        result["funding_rate_timestamp_ms"] = result.get("premium_index_ts")
 
     if result.get("mark_price") and result.get("index_price"):
         idx = float(result["index_price"])
@@ -2100,22 +2096,15 @@ def fetch_research_market_context(
             result["open_interest"] = None
         result["open_interest_raw"] = raw_oi
         result["open_interest_unit"] = str(orow.get("unit") or "PROVIDER_NATIVE_UNSPECIFIED")
-        raw_oi_ts = orow.get("time")
-        try:
-            result["open_interest_ts"] = int(float(raw_oi_ts)) if raw_oi_ts is not None else None
-        except (TypeError, ValueError):
-            result["open_interest_ts"] = None
-        result["open_interest_timestamp_semantics"] = "EXCHANGE_EVENT_TIME_IF_PROVIDER_SUPPLIES_IT"
+        result["open_interest_ts"] = orow.get("time")
 
     book = call("depth", DEPTH_PATH, {"symbol": bx, "limit": int(depth_limit)})
     if isinstance(book, dict) and isinstance(book.get("data"), dict):
         result["order_book"] = _research_depth_metrics(book["data"], mid_price=result.get("mark_price"))
         result["order_book_timestamp"] = result["order_book"].get("timestamp")
-        result["order_book_timestamp_semantics"] = "EXCHANGE_TIMESTAMP_IF_PRESENT"
 
     trades = call("trades", TRADES_PATH, {"symbol": bx, "limit": int(trades_limit)})
     result["recent_trades"] = _research_trade_metrics(trades.get("data")) if isinstance(trades, dict) else {"status": "error", "error": "trades_response_invalid"}
-    result["recent_trades_timestamp_semantics"] = "EXCHANGE_TRADE_TIME_IF_PRESENT"
 
     if result["errors"]:
         result["status"] = "partial" if len(result["errors"]) < 4 else "error"

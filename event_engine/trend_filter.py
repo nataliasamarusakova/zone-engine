@@ -12,6 +12,38 @@ from typing import Any
 import pandas as pd
 
 
+def _parse_ts(value: Any) -> pd.Timestamp | None:
+    """Normalize ISO/epoch ns/us/ms/s timestamps to UTC."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, pd.Timestamp):
+            ts = value
+        elif isinstance(value, (int, float)):
+            x = float(value)
+            if not math.isfinite(x):
+                return None
+            m = abs(x)
+            unit = "ns" if m >= 1e17 else "us" if m >= 1e14 else "ms" if m >= 1e11 else "s" if m >= 1e8 else None
+            ts = pd.to_datetime(value, unit=unit, utc=True) if unit else pd.to_datetime(value, utc=True)
+        else:
+            text = str(value).strip()
+            numeric = pd.to_numeric(text, errors="coerce")
+            if pd.notna(numeric):
+                x = float(numeric); m = abs(x)
+                unit = "ns" if m >= 1e17 else "us" if m >= 1e14 else "ms" if m >= 1e11 else "s" if m >= 1e8 else None
+                ts = pd.to_datetime(numeric, unit=unit, utc=True) if unit else pd.to_datetime(text, utc=True)
+            else:
+                ts = pd.to_datetime(text, utc=True)
+        return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+    except Exception:
+        return None
+
+
+def _timestamp_series_to_ms(series: pd.Series) -> pd.Series:
+    return series.map(lambda x: int(_parse_ts(x).timestamp() * 1000) if _parse_ts(x) is not None else None).astype("Float64")
+
+
 def _clean_closed_frame(df: pd.DataFrame | None, decision_ts_ms: int | float | None) -> pd.DataFrame:
     if not isinstance(df, pd.DataFrame) or "close" not in df.columns:
         return pd.DataFrame()
@@ -19,7 +51,7 @@ def _clean_closed_frame(df: pd.DataFrame | None, decision_ts_ms: int | float | N
     if "close_time" not in work.columns:
         return pd.DataFrame()
     work["close"] = pd.to_numeric(work["close"], errors="coerce")
-    work["close_time"] = pd.to_numeric(work["close_time"], errors="coerce")
+    work["close_time"] = _timestamp_series_to_ms(work["close_time"])
     work = work.dropna(subset=["close", "close_time"]).sort_values("close_time").drop_duplicates("close_time", keep="last")
     work = work[work["close"] > 0]
     if decision_ts_ms is not None:
@@ -88,14 +120,8 @@ def _structure_snapshot(df: pd.DataFrame, *, pivot_span: int = 2) -> dict[str, A
         def _close_ts_ms(row_idx: int) -> int | None:
             try:
                 value = work.iloc[row_idx]["close_time"]
-                if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value)):
-                    return int(float(value))
-                ts = pd.Timestamp(value)
-                if ts.tzinfo is None:
-                    ts = ts.tz_localize("UTC")
-                else:
-                    ts = ts.tz_convert("UTC")
-                return int(ts.timestamp() * 1000)
+                ts = _parse_ts(value)
+                return int(ts.timestamp() * 1000) if ts is not None else None
             except Exception:
                 return None
 
@@ -200,9 +226,6 @@ def evaluate_trend_filter(
         "event_direction": d,
         "event_type": event_u or None,
         "decision_ts": decision_ts,
-        "decision_boundary_kind": "CLOSED_5M_TRIGGER_CLOSE",
-        "causal_cutoff_ts_ms": decision_ts,
-        "causal_data_policy": "CLOSE_TIME_LE_DECISION_BOUNDARY",
         "trend_decision": "REJECT",
         "trend_reject_reason": None,
         "trend_4h": "UNKNOWN",

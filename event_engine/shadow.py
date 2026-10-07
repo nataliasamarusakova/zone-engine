@@ -9,7 +9,7 @@ import pandas as pd
 
 
 SHADOW_SCHEMA_VERSION = 1
-SHADOW_EXPERIMENT_VERSION = "counterfactual-v3"
+SHADOW_EXPERIMENT_VERSION = "counterfactual-v2"
 
 VOLUME_5M_THRESHOLDS = (0.8, 1.0, 1.2, 1.5, 1.8, 2.0)
 VOLUME_1H_THRESHOLDS = (0.8, 1.0, 1.2, 1.5, 1.8, 2.0)
@@ -49,14 +49,35 @@ def _parse_ts(value: Any) -> pd.Timestamp | None:
     try:
         if isinstance(value, bool):
             return None
-        if isinstance(value, (int, float)):
-            if not math.isfinite(float(value)):
+        if isinstance(value, numbers.Real):
+            numeric = float(value)
+            if not math.isfinite(numeric):
                 return None
-            ts = pd.to_datetime(value, unit="ms", utc=True)
+            magnitude = abs(numeric)
+            unit = (
+                "ns" if magnitude >= 1e17 else
+                "us" if magnitude >= 1e14 else
+                "ms" if magnitude >= 1e11 else
+                "s" if magnitude >= 1e8 else None
+            )
+            if unit is None:
+                return None
+            ts = pd.to_datetime(value, unit=unit, utc=True)
         elif isinstance(value, str):
             raw = value.strip()
-            if raw and raw.lstrip("+-").isdigit():
-                ts = pd.to_datetime(int(raw), unit="ms", utc=True)
+            numeric = pd.to_numeric(raw, errors="coerce")
+            if pd.notna(numeric):
+                numeric = float(numeric)
+                magnitude = abs(numeric)
+                unit = (
+                    "ns" if magnitude >= 1e17 else
+                    "us" if magnitude >= 1e14 else
+                    "ms" if magnitude >= 1e11 else
+                    "s" if magnitude >= 1e8 else None
+                )
+                if unit is None:
+                    return None
+                ts = pd.to_datetime(numeric, unit=unit, utc=True)
             else:
                 ts = pd.Timestamp(raw)
                 if ts.tzinfo is None:
@@ -75,77 +96,60 @@ def _parse_ts(value: Any) -> pd.Timestamp | None:
 
 
 def _timestamp_series_to_utc(series: pd.Series) -> pd.Series:
-    """Vectorized UTC normalization for ISO strings and epoch timestamps."""
+    """Normalize ISO and epoch ns/us/ms/s values without pandas nanosecond inference."""
     if pd.api.types.is_datetime64_any_dtype(series):
         return pd.to_datetime(series, utc=True, errors="coerce")
     numeric = pd.to_numeric(series, errors="coerce")
-    numeric_ratio = float(numeric.notna().mean()) if len(numeric) else 0.0
-    if numeric_ratio >= 0.99:
+    ratio = float(numeric.notna().mean()) if len(series) else 0.0
+    if ratio >= 0.99:
         finite = numeric.dropna().abs()
         magnitude = float(finite.median()) if not finite.empty else 0.0
-        if magnitude >= 1e17:
-            unit = "ns"
-        elif magnitude >= 1e14:
-            unit = "us"
-        elif magnitude >= 1e11:
-            unit = "ms"
-        elif magnitude >= 1e8:
-            unit = "s"
-        else:
-            unit = None
+        unit = (
+            "ns" if magnitude >= 1e17 else
+            "us" if magnitude >= 1e14 else
+            "ms" if magnitude >= 1e11 else
+            "s" if magnitude >= 1e8 else None
+        )
         if unit is not None:
             return pd.to_datetime(numeric, unit=unit, utc=True, errors="coerce")
     return pd.to_datetime(series, utc=True, errors="coerce")
 
 
-def _closed_market_frame(
-    df: pd.DataFrame | None,
-    boundary_ts: pd.Timestamp,
-    *,
-    interval: str,
-    require_volume: bool = True,
-    deduplicate: bool = True,
-) -> pd.DataFrame:
-    """Normalize exchange/persisted market timestamps before causal filtering.
-
-    BingX/Binance kline payloads use epoch milliseconds.  Using
-    ``pd.to_datetime(series)`` without an explicit unit would interpret those
-    values as nanoseconds, turning real 2026 bars into 1970 timestamps and
-    allowing future bars to pass a causal ``<= boundary`` filter.
-    """
+def _closed_5m(df: pd.DataFrame | None, entry_ts: pd.Timestamp) -> pd.DataFrame:
     if df is None or df.empty or "timestamp" not in df.columns:
         return pd.DataFrame()
-    delta = pd.Timedelta(minutes=5) if str(interval).lower() == "5m" else pd.Timedelta(hours=1)
     x = df.copy()
     x["timestamp"] = _timestamp_series_to_utc(x["timestamp"])
-    if "close_time" in x.columns:
-        x["close_time"] = _timestamp_series_to_utc(x["close_time"])
+    if "close_time" not in x.columns:
+        x["close_time"] = x["timestamp"] + pd.Timedelta(minutes=5)
     else:
-        x["close_time"] = x["timestamp"] + delta
+        x["close_time"] = _timestamp_series_to_utc(x["close_time"])
     for col in ("open", "high", "low", "close", "volume"):
         if col in x.columns:
             x[col] = pd.to_numeric(x[col], errors="coerce")
-    required = ["timestamp", "close_time", "open", "high", "low", "close"]
-    if require_volume:
-        required.append("volume")
-    x = x.dropna(subset=required)
-    x = x.sort_values("timestamp")
-    if deduplicate:
-        x = x.drop_duplicates("timestamp", keep="last")
-    return x
-
-
-def _closed_5m(df: pd.DataFrame | None, entry_ts: pd.Timestamp) -> pd.DataFrame:
-    x = _closed_market_frame(df, entry_ts + pd.Timedelta(minutes=5), interval="5m")
+    x = x.dropna(subset=["timestamp", "close_time", "open", "high", "low", "close", "volume"])
     # The signal is created from a CLOSED trigger candle whose timestamp is its
     # candle-open time. Include that trigger bar by extending the close boundary
     # exactly one 5m interval; do not include any later bar.
-    return x.loc[x["close_time"] <= (entry_ts + pd.Timedelta(minutes=5))].copy() if not x.empty else x
+    x = x.loc[x["close_time"] <= (entry_ts + pd.Timedelta(minutes=5))].copy()
+    return x.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
 
 
 def _closed_1h(df: pd.DataFrame | None, entry_ts: pd.Timestamp) -> pd.DataFrame:
-    x = _closed_market_frame(df, entry_ts, interval="1h")
-    return x.loc[x["close_time"] <= entry_ts].copy() if not x.empty else x
+    if df is None or df.empty or "timestamp" not in df.columns:
+        return pd.DataFrame()
+    x = df.copy()
+    x["timestamp"] = _timestamp_series_to_utc(x["timestamp"])
+    if "close_time" not in x.columns:
+        x["close_time"] = x["timestamp"] + pd.Timedelta(hours=1)
+    else:
+        x["close_time"] = _timestamp_series_to_utc(x["close_time"])
+    for col in ("open", "high", "low", "close", "volume"):
+        if col in x.columns:
+            x[col] = pd.to_numeric(x[col], errors="coerce")
+    x = x.dropna(subset=["timestamp", "close_time", "open", "high", "low", "close", "volume"])
+    x = x.loc[x["close_time"] <= entry_ts].copy()
+    return x.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
 
 
 def _atr14_5m(x: pd.DataFrame) -> float | None:
@@ -229,9 +233,11 @@ def build_entry_snapshot(
             "experiments": {},
         }
 
+    # 5M trigger history is anchored to trigger-bar open because _closed_5m
+    # includes that closed trigger bar (open + 5m).  HTF history is anchored to
+    # the actual canonical decision boundary so an hourly candle that closes
+    # between trigger open and trigger close is included when it was knowable.
     x5 = _closed_5m(df_5m, entry_ts)
-    # 1H context is causal to the closed 5M decision boundary; at an exact hour
-    # boundary the just-closed 1H candle is available and must be included.
     x1 = _closed_1h(df_1h, decision_ts_parsed)
     trigger_bar = x5.iloc[-1] if not x5.empty else None
     prev5 = x5.iloc[:-1].tail(20) if len(x5) >= 21 else pd.DataFrame()
@@ -304,7 +310,7 @@ def build_entry_snapshot(
             invalid = (direction == "LONG" and c < bottom) or (direction == "SHORT" and c > top)
             if invalid:
                 body_close_invalid_before_entry = True
-                invalidation_ts = pd.Timestamp(row["close_time"]).isoformat()
+                invalidation_ts = _parse_ts(row["close_time"]).isoformat() if _parse_ts(row["close_time"]) is not None else None
                 break
 
     open_symbols: list[str] = []
@@ -510,7 +516,7 @@ def _simulate_single_exit(
         result["exit"] = event
         result["ambiguous"] = ambiguous
         result["exit_price"] = target if event == "TARGET" else stop if event == "STOP" else None
-        result["exit_ts"] = pd.Timestamp(row["close_time"]).isoformat()
+        result["exit_ts"] = _parse_ts(row["close_time"]).isoformat() if _parse_ts(row["close_time"]) is not None else None
         result["bars_to_exit"] = idx + 1
         if result["exit_price"] is not None:
             result["pnl_pct"] = _pct_return(direction, entry, float(result["exit_price"]))
@@ -556,9 +562,9 @@ def _simulate_management_only(
     tp1_pnl_pct = _pct_return(direction, entry, production_tp1)
 
     future = future.reset_index(drop=True)
-    all_bars = _closed_market_frame(
-        all_bars, pd.Timestamp.max.tz_localize("UTC"), interval="5m", require_volume=False, deduplicate=False
-    ).reset_index(drop=True)
+    all_bars = all_bars.copy().reset_index(drop=True)
+    all_bars["timestamp"] = _timestamp_series_to_utc(all_bars["timestamp"])
+    all_bars["close_time"] = _timestamp_series_to_utc(all_bars["close_time"])
     for col in ("open", "high", "low", "close"):
         all_bars[col] = pd.to_numeric(all_bars[col], errors="coerce")
 
@@ -573,7 +579,7 @@ def _simulate_management_only(
                 "status": "AMBIGUOUS_PRE_TP1_BAR",
                 "exit": "AMBIGUOUS",
                 "exit_price": None,
-                "exit_ts": pd.Timestamp(row["close_time"]).isoformat(),
+                "exit_ts": _parse_ts(row["close_time"]).isoformat() if _parse_ts(row["close_time"]) is not None else None,
                 "pnl_pct": None,
                 "standalone_management_only": True,
             }
@@ -603,7 +609,7 @@ def _simulate_management_only(
             }
         if tp1_hit:
             tp1_hit_idx = int(idx)
-            tp1_fill_ts = pd.Timestamp(row["close_time"]).isoformat()
+            tp1_fill_ts = _parse_ts(row["close_time"]).isoformat() if _parse_ts(row["close_time"]) is not None else None
             break
 
     if tp1_hit_idx is None:
@@ -631,7 +637,7 @@ def _simulate_management_only(
         elif mode == "DELAYED_BE":
             current_stop = float(production_stop)
 
-        current_close_ts = pd.Timestamp(row["close_time"])
+        current_close_ts = _parse_ts(row["close_time"])
         if mode == "TRAIL_ATR":
             # No intrabar look-ahead: build the trail only from bars that closed
             # before the current bar. The current bar can trigger the already-set stop,
@@ -727,9 +733,14 @@ def calculate_counterfactual_outcomes(observation: dict[str, Any], bars: pd.Data
     )
     if direction not in {"LONG", "SHORT"} or entry is None or entry <= 0 or source_ts is None or bars is None or bars.empty:
         return {"schema_version": SHADOW_SCHEMA_VERSION, "status": "INSUFFICIENT_INPUT"}
-    x = _closed_market_frame(
-        bars, pd.Timestamp.max.tz_localize("UTC"), interval="5m", require_volume=False, deduplicate=False
-    )
+    x = bars.copy()
+    x["timestamp"] = _timestamp_series_to_utc(x["timestamp"])
+    if "close_time" not in x.columns:
+        x["close_time"] = x["timestamp"] + pd.Timedelta(minutes=5)
+    else:
+        x["close_time"] = _timestamp_series_to_utc(x["close_time"])
+    for col in ("open", "high", "low", "close"):
+        x[col] = pd.to_numeric(x[col], errors="coerce")
     x = x.dropna(subset=["timestamp", "close_time", "open", "high", "low", "close"]).sort_values("timestamp")
     future = x.loc[(x["timestamp"] >= source_ts) & (x["close_time"] > source_ts)].copy().reset_index(drop=True)
     if future.empty:
