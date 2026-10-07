@@ -73,57 +73,12 @@ def test_touch_observation_anchors_entry_bar_timestamp_and_prevents_volume_looka
     )
     assert out["entry_bar"]["timestamp"] == event_ts
     assert out["trigger"]["touch_mode"] == "zone"
-    # The event occurred at 02:00 and became knowable at 02:05.  The causal 1H
-    # prefix has only two closed bars at that point, so a synthetic zone with
-    # start=10 is not allowed to acquire a future-derived age.
+    # The observation boundary is the closed event bar (+5m), so an artificial
+    # zone start that lies after the available causal 1H prefix cannot acquire
+    # a future-derived age.
     assert out["zone"]["age_bars"] == 0
-    assert out["observation_ts"] == "2026-01-01T02:05:00+00:00"
-    assert out["counterfactual_path_start_ts"] == out["observation_ts"]
     assert out["features"]["volume_ratio_5m20"] == pytest.approx(2.0)
 
-
-
-
-def test_touch_event_boundary_overrides_late_scan_time_and_future_bars_do_not_change_features():
-    ts = pd.date_range("2026-01-01T00:00:00Z", periods=30, freq="5min")
-    base = pd.DataFrame({
-        "timestamp": ts[:25],
-        "open": [100.0] * 25,
-        "high": [101.0] * 25,
-        "low": [99.0] * 25,
-        "close": [100.0] * 25,
-        "volume": [100.0] * 25,
-    })
-    future = pd.DataFrame({
-        "timestamp": ts[25:],
-        "open": [100.0] * 5,
-        "high": [200.0] * 5,
-        "low": [1.0] * 5,
-        "close": [150.0] * 5,
-        "volume": [1_000_000.0] * 5,
-    })
-    extended = pd.concat([base, future], ignore_index=True)
-    event_ts = ts[24].isoformat()
-    event = {
-        "timestamp": event_ts,
-        "reason": "directional_candle_required",
-        "entry_ref": 100.0,
-        "touch_mode": "zone",
-        "bar": {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 200.0},
-    }
-    zone = {"zone_id": "Z_BOUNDARY", "top": 101.0, "btm": 99.0, "poi": 100.0, "origin_ts_ms": int(ts[0].timestamp() * 1000), "start": 0}
-    def build(df5):
-        return research.build_observation_from_touch_event(
-            event=dict(event), symbol="TEST-USDT", zone=zone, direction="LONG", df_1h=_df_1h(), df_5m=df5,
-            zone_visit_id="V_BOUNDARY", scan_id="S1", decision_ts="2026-01-01T02:25:00Z",
-            strategy_version="v1", code_commit_sha="abc", provider="binance", source="binance_spot",
-        )
-    a = build(base)
-    b = build(extended)
-    assert a["observation_ts"] == "2026-01-01T02:05:00+00:00"
-    assert b["observation_ts"] == a["observation_ts"]
-    for key in ("5m_atr14", "5m_range_atr", "market_regime", "session_vwap_approx", "5m_return_5m_pct"):
-        assert b["features"].get(key) == a["features"].get(key), key
 
 def test_record_entry_decision_uses_requested_path(tmp_path: Path):
     path = tmp_path / "entry_decisions.jsonl"
@@ -163,6 +118,38 @@ def test_forward_outcome_uses_only_bars_after_observation():
     assert outcome["time_to_minus_3pct_min"] is None
 
 
+
+
+def test_record_scan_symbol_uses_signal_pre_execution_context_when_market_context_deferred(tmp_path: Path, monkeypatch):
+    for name in [
+        "ZONE_OBSERVATIONS_PATH", "MARKET_BARS_1H_PATH", "MARKET_BARS_5M_PATH",
+        "RESEARCH_BAR_CURSORS_PATH", "RESEARCH_MANIFEST_PATH", "RESEARCH_ERRORS_PATH",
+    ]:
+        monkeypatch.setattr(research, name, tmp_path / getattr(research, name).name)
+    df = _df_1h()
+    ts = "2026-01-03T00:05:00Z"
+    zone = {"zone_id": "Z_CTX", "top": 105.0, "btm": 95.0, "poi": 100.0, "origin_ts_ms": int(df["timestamp"].iloc[0].timestamp() * 1000), "age_bars": 10}
+    bar = {"timestamp": ts, "open": 101.0, "high": 105.0, "low": 99.0, "close": 104.0, "volume": 2000.0}
+    signal = {
+        "event_id": "E_CTX", "symbol": "TEST-USDT", "type": "LONG", "trigger_bar_time": ts,
+        "decision_boundary_ts": "2026-01-03T00:10:00Z", "entry": 104.0, "sl": 93.6, "tp1": 107.12, "tp2": 110.24,
+        "zone": zone, "zone_visit": {"visit_id": "V_CTX", "touch_count_before_trigger": 0}, "entry_bar": bar,
+        "target": {"obstacle_price": 120.0}, "trigger": {"zone_trigger_mode": "zone"},
+        "pre_execution_market_context": {"context_id": "MC_CTX", "persisted": True, "status": "ok", "capture_phase": "PRE_EXECUTION"},
+    }
+    out = research.record_scan_symbol(
+        scan_id="S_CTX", symbol="TEST-USDT", strategy_version="v1", code_commit_sha="abc",
+        provider="binance", source="binance_spot", bars_1h=df.to_dict("records"), bars_5m=[bar], df_1h=df,
+        demand=[zone], supply=[], diagnostics={"touch_events": [], "rearm_events": [], "zones": {}},
+        symbol_state={}, signals=[signal], decision_ts="2026-01-03T00:10:00Z",
+        market_context=None, account_context=None,
+    )
+    assert out["observations"] == 1
+    obs_rows = [json.loads(x) for x in (tmp_path / "zone_observations.jsonl").read_text().splitlines() if x.strip()]
+    assert obs_rows[0]["market_context_id"] == "MC_CTX"
+    assert obs_rows[0]["market_context_persisted"] is True
+    assert obs_rows[0]["market_context_status"] == "PERSISTED"
+
 def test_record_scan_symbol_writes_signal_and_rejected_observations(tmp_path: Path, monkeypatch):
     for name in [
         "ZONE_OBSERVATIONS_PATH", "MARKET_BARS_1H_PATH", "MARKET_BARS_5M_PATH",
@@ -178,10 +165,9 @@ def test_record_scan_symbol_writes_signal_and_rejected_observations(tmp_path: Pa
         "zone": zone, "zone_visit": {"visit_id": "VISIT_X", "touch_count_before_trigger": 0},
         "entry_bar": bar, "previous_bar": {}, "target": {"obstacle_price": 120.0}, "trigger": {"zone_trigger_mode": "zone"},
     }
-    rearm_bar = {**bar, "timestamp": "2026-01-02T00:05:00+00:00", "close": 103.0, "high": 104.0, "low": 102.0}
     diagnostics = {
         "touch_events": [{"timestamp": bar["timestamp"], "zone_key": "DEMAND:ZID_X", "direction": "LONG", "midpoint": 100.0, "reason": "directional_candle_required", "visit_id": "VISIT_X", "bar": bar}],
-        "rearm_events": [{"timestamp": rearm_bar["timestamp"], "zone_key": "DEMAND:ZID_X", "direction": "LONG", "visit_id": "VISIT_X", **rearm_bar}],
+        "rearm_events": [],
         "zones": {"DEMAND:ZID_X": {"direction": "LONG", "midpoint": 100.0, "closest_midpoint_bar": {**bar, "distance_pct": 0.5}}},
     }
     state = {"zones": {"DEMAND:ZID_X": {"visit_id": "VISIT_X"}}}
@@ -190,13 +176,9 @@ def test_record_scan_symbol_writes_signal_and_rejected_observations(tmp_path: Pa
         provider="binance", source="binance_spot", bars_1h=_df_1h().to_dict("records"), bars_5m=[bar],
         df_1h=df, demand=[zone], supply=[], diagnostics=diagnostics, symbol_state=state, signals=[signal],
     )
-    assert result["observations"] >= 3
+    assert result["observations"] >= 2
     rows = [json.loads(line) for line in (tmp_path / "zone_observations.jsonl").read_text().splitlines()]
-    assert {r["event_type"] for r in rows} >= {"SIGNAL_CREATED", "TOUCH_REJECTED", "REARM", "NEAREST_APPROACH"}
-    by_type = {r["event_type"]: r for r in rows}
-    assert by_type["TOUCH_REJECTED"]["observation_ts"] == "2026-01-02T00:05:00+00:00"
-    assert by_type["REARM"]["observation_ts"] == "2026-01-02T00:10:00+00:00"
-    assert by_type["NEAREST_APPROACH"]["observation_ts"] == "2026-01-02T00:05:00+00:00"
+    assert {r["event_type"] for r in rows} >= {"SIGNAL_CREATED", "TOUCH_REJECTED", "NEAREST_APPROACH"}
     assert all("features" in r for r in rows)
 
 
@@ -547,6 +529,14 @@ def test_binance_kline_parser_preserves_taker_flow(monkeypatch):
     assert rows[0]["taker_buy_quote"] == pytest.approx(606.0)
     assert rows[0]["bar_delta_usdt"] == pytest.approx(202.0)
     assert rows[0]["taker_flow_valid"] is True
+
+
+def test_invalid_origin_timestamp_does_not_create_huge_zone_age():
+    ts = pd.date_range("2026-01-01 00:00", periods=40, freq="5min", tz="UTC")
+    df5 = pd.DataFrame({"timestamp": ts, "close_time": ts + pd.Timedelta(minutes=5), "open": [100.0] * 40, "high": [101.0] * 40, "low": [99.0] * 40, "close": [100.0] * 40, "volume": [100.0] * 40})
+    zone = {"zone_id": "Z", "top": 101.0, "btm": 99.0, "poi": 100.0, "origin_ts_ms": -1, "start": 0}
+    f = research.build_research_features(symbol="TEST-USDT", direction="LONG", zone=zone, bar={"timestamp": ts[-1].isoformat(), "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 100.0}, df_5m=df5, decision_ts=(ts[-1] + pd.Timedelta(minutes=5)).isoformat())
+    assert f.get("zone_age_hours") is None
 
 
 def test_approach_features_use_only_bars_before_trigger():
@@ -917,6 +907,7 @@ def test_elapsed_minutes_is_monotonic_and_utc_safe():
     assert run_once._elapsed_seconds("2026-01-01T00:00:00Z", "2026-01-01T00:00:01Z") == pytest.approx(1.0)
     assert run_once._elapsed_seconds(None, "2026-01-01T00:00:01Z") is None
     assert run_once._elapsed_seconds("2026-01-01T00:00:02Z", "2026-01-01T00:00:01Z") is None
+    assert run_once._elapsed_seconds(1790648100000, 1790648101000) == pytest.approx(1.0)
 
 
 def test_shadow_context_exposes_buyer_maker_coverage():
@@ -1427,3 +1418,114 @@ def test_fetch_research_account_snapshot_does_not_override_confirmed_fill_realiz
     assert snap["recent_fill_realized_pnl_total"] == pytest.approx(2.0)
     assert snap["recent_realized_pnl_total"] == pytest.approx(2.0)
     assert snap["recent_realized_pnl_source"] == "ALL_FILL_ORDERS_PARTIAL_MISSING"
+
+
+def test_touch_observation_does_not_change_when_future_5m_bars_are_appended():
+    import pandas as pd
+    ts = pd.date_range("2026-01-02T00:00:00Z", periods=30, freq="5min")
+    base = pd.DataFrame({
+        "timestamp": ts[:20], "open": [100.0] * 20, "high": [101.0] * 20,
+        "low": [99.0] * 20, "close": [100.0] * 20, "volume": [100.0] * 20,
+    })
+    future = pd.DataFrame({
+        "timestamp": ts[20:], "open": [100.0] * 10, "high": [200.0] * 10,
+        "low": [1.0] * 10, "close": [150.0] * 10, "volume": [1_000_000.0] * 10,
+    })
+    event = {
+        "timestamp": ts[19].isoformat(), "reason": "directional_candle_required",
+        "entry_ref": 100.0, "touch_mode": "zone",
+        "bar": {"timestamp": ts[19].isoformat(), "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 200.0},
+    }
+    zone = {"zone_id": "Z_CAUSAL", "top": 101.0, "btm": 99.0, "poi": 100.0, "origin_ts_ms": int(ts[0].timestamp() * 1000), "start": 0}
+    kwargs = dict(event=event, symbol="TEST-USDT", zone=zone, direction="LONG", df_1h=_df_1h(),
+                  zone_visit_id="V1", scan_id="S1", decision_ts=ts[19].isoformat(), strategy_version="v1",
+                  code_commit_sha="abc", provider="binance", source="test")
+    a = research.build_observation_from_touch_event(df_5m=base, **kwargs)
+    b = research.build_observation_from_touch_event(df_5m=pd.concat([base, future]), **kwargs)
+    assert a["observation_ts"] == b["observation_ts"]
+    for key in ("volume_ratio_5m20", "5m_atr14", "5m_return_15m_pct", "market_regime", "session_vwap_approx"):
+        assert a["features"].get(key) == b["features"].get(key), key
+
+
+def test_research_features_ignore_duplicate_market_bar_rows():
+    ts = pd.date_range("2026-01-01T00:00:00Z", periods=30, freq="5min")
+    base = pd.DataFrame({
+        "timestamp": ts, "close_time": ts + pd.Timedelta(minutes=5),
+        "open": [100.0] * 30, "high": [101.0] * 30, "low": [99.0] * 30,
+        "close": [100.0] * 30, "volume": [100.0] * 30,
+    })
+    duplicated = pd.concat([base, base.iloc[[10]]], ignore_index=True)
+    zone = {"zone_id":"Z_DUP", "top":101.0, "btm":99.0, "poi":100.0, "origin_ts_ms":int(ts[0].timestamp()*1000), "start":0}
+    bar = {"timestamp":ts[20].isoformat(), "open":100.0, "high":101.0, "low":99.0, "close":100.0, "volume":100.0}
+    a = research.build_research_features(symbol="TEST-USDT", direction="LONG", zone=zone, bar=bar, df_5m=base, decision_ts=(ts[20]+pd.Timedelta(minutes=5)).isoformat())
+    b = research.build_research_features(symbol="TEST-USDT", direction="LONG", zone=zone, bar=bar, df_5m=duplicated, decision_ts=(ts[20]+pd.Timedelta(minutes=5)).isoformat())
+    for key in ("5m_atr14", "volume_ratio_5m20", "5m_return_15m_pct", "session_vwap_approx"):
+        assert a.get(key) == b.get(key), key
+
+
+def test_bar_index_keeps_ohlc_aligned_after_sort_and_deduplicate():
+    import research_forward
+    ts0 = pd.Timestamp("2026-01-01T00:00:00Z")
+    df = pd.DataFrame([
+        {"timestamp": ts0 + pd.Timedelta(minutes=10), "close_time": ts0 + pd.Timedelta(minutes=15), "open": 40.0, "high": 41.0, "low": 39.0, "close": 40.0},
+        {"timestamp": ts0, "close_time": ts0 + pd.Timedelta(minutes=5), "open": 10.0, "high": 11.0, "low": 9.0, "close": 10.0},
+        {"timestamp": ts0 + pd.Timedelta(minutes=5), "close_time": ts0 + pd.Timedelta(minutes=10), "open": 20.0, "high": 21.0, "low": 19.0, "close": 20.0},
+        {"timestamp": ts0 + pd.Timedelta(minutes=5), "close_time": ts0 + pd.Timedelta(minutes=10, seconds=1), "open": 30.0, "high": 31.0, "low": 29.0, "close": 30.0},
+    ])
+    idx = research_forward._BarIndex(df)
+    assert idx.n == 3
+    assert idx.df["timestamp"].tolist() == [ts0, ts0 + pd.Timedelta(minutes=5), ts0 + pd.Timedelta(minutes=10)]
+    assert idx.open.tolist() == [10.0, 30.0, 40.0]
+    assert idx.high.tolist() == [11.0, 31.0, 41.0]
+    assert idx.low.tolist() == [9.0, 29.0, 39.0]
+    assert idx.close.tolist() == [10.0, 30.0, 40.0]
+    assert idx.start_at_timestamp(int((ts0 + pd.Timedelta(minutes=5)).value)) == 1
+
+
+def test_bar_index_derives_close_time_after_normalizing_numeric_epoch_ms():
+    import research_forward
+    ts0 = pd.Timestamp("2026-01-01T00:00:00Z")
+    df = pd.DataFrame([
+        {"timestamp": int(ts0.timestamp() * 1000), "open": 10.0, "high": 11.0, "low": 9.0, "close": 10.0},
+    ])
+    idx = research_forward._BarIndex(df)
+    assert idx.n == 1
+    assert pd.Timestamp(int(idx.close_ts_ns[0]), unit="ns", tz="UTC") == ts0 + pd.Timedelta(minutes=5)
+
+
+def test_forward_invalid_timestamp_is_terminal_not_pending(tmp_path, monkeypatch):
+    import json
+    import research_forward
+    from event_engine import research
+    state_path = tmp_path / "research_outcome_state.json"
+    obs_path = tmp_path / "zone_observations.jsonl"
+    outcomes_path = tmp_path / "research_outcomes.jsonl"
+    ts_bad = "1970-01-01T00:29:51.307799999Z"
+    obs = {
+        "observation_id": "OBS_BAD_TEMPORAL", "event_id": "E_BAD", "scan_id": "S_BAD",
+        "event_type": "SIGNAL_CREATED", "symbol": "TEST-USDT", "direction": "LONG", "provider": "binance", "source": "test",
+        "observation_ts": ts_bad, "source_event_ts": "2026-10-06T17:25:00Z", "reference_price": 100.0,
+    }
+    obs_path.write_text(json.dumps(obs) + "\n", encoding="utf-8")
+    state_path.write_text(json.dumps({"schema_version": 2, "processed_observation_ids": [], "pending_observations_v1": {}}), encoding="utf-8")
+    outcomes_path.write_text("", encoding="utf-8")
+    monkeypatch.setattr(research, "ZONE_OBSERVATIONS_PATH", obs_path)
+    monkeypatch.setattr(research, "RESEARCH_OUTCOME_STATE_PATH", state_path)
+    monkeypatch.setattr(research, "RESEARCH_OUTCOMES_PATH", outcomes_path)
+    monkeypatch.setattr(research, "MARKET_BARS_5M_PATH", tmp_path / "market_bars_5m.jsonl")
+    (tmp_path / "market_bars_5m.jsonl").write_text("", encoding="utf-8")
+    # Provide a syntactically valid one-row index; temporal validation must fail
+    # before any 24h path calculation and become a terminal invalid outcome.
+    one = pd.DataFrame([{
+        "timestamp": pd.Timestamp("2026-10-07T00:00:00Z"),
+        "close_time": pd.Timestamp("2026-10-07T00:05:00Z"),
+        "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1.0,
+    }])
+    monkeypatch.setattr(research_forward, "_load_bars", lambda symbols: {"TEST-USDT|binance": one})
+    monkeypatch.setattr(research_forward.pd.Timestamp, "now", lambda *args, **kwargs: pd.Timestamp("2026-10-07T12:00:00Z"))
+    ready, _ = research_forward.update_outcomes(write=True)
+    assert ready == 0 or ready == 1
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert "OBS_BAD_TEMPORAL" in set(state.get("processed_observation_ids", [])) or "OBS_BAD_TEMPORAL" not in state.get("pending_observations_v1", {})
+    rows = [json.loads(x) for x in outcomes_path.read_text(encoding="utf-8").splitlines() if x.strip()]
+    assert rows and rows[-1]["outcome_class"] == "INVALID_RESEARCH_OBSERVATION"

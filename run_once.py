@@ -309,22 +309,49 @@ def _ensure_trend_history(*, symbol: str, timeframe: str, frame: pd.DataFrame | 
 
 
 def _signal_decision_boundary_ts_ms(signal: dict[str, Any]) -> int | None:
-    """Causal boundary = close of the existing closed 5m trigger bar."""
-    raw = signal.get("decision_boundary_ts") or signal.get("trigger_bar_close_time")
-    if raw:
-        try:
-            ts = pd.Timestamp(raw)
-            ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
-            return int(ts.timestamp() * 1000)
-        except Exception:
-            pass
-    raw = signal.get("trigger_bar_time") or signal.get("time")
-    try:
-        ts = pd.Timestamp(raw)
-        ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
-        return int((ts + pd.Timedelta(minutes=5)).timestamp() * 1000)
-    except Exception:
-        return None
+    """Return the canonical causal boundary for the closed 5m trigger bar."""
+    trigger_ts = _coerce_utc_timestamp(signal.get("trigger_bar_time") or signal.get("time"))
+    canonical = trigger_ts + pd.Timedelta(minutes=5) if trigger_ts is not None else None
+    for raw in (signal.get("decision_boundary_ts"), signal.get("trigger_bar_close_time")):
+        if raw in (None, ""):
+            continue
+        parsed = _coerce_utc_timestamp(raw)
+        if parsed is None:
+            continue
+        if canonical is None:
+            return int(parsed.timestamp() * 1000)
+        # Provider close should match the deterministic 5m trigger-close boundary.
+        # A small tolerance covers millisecond/rounding differences without allowing
+        # stale/future values to become a decision boundary.
+        if parsed >= trigger_ts and abs((parsed - canonical).total_seconds()) <= 2.0:
+            return int(parsed.timestamp() * 1000)
+    return int(canonical.timestamp() * 1000) if canonical is not None else None
+
+
+def _causal_1h_frame(df_1h: pd.DataFrame, boundary_ts: pd.Timestamp) -> pd.DataFrame:
+    """Return only 1H candles whose close was known by the 5M decision boundary."""
+    if df_1h is None or df_1h.empty or "timestamp" not in df_1h.columns:
+        return pd.DataFrame()
+    x = df_1h.copy()
+    x["timestamp"] = x["timestamp"].map(_coerce_utc_timestamp)
+    if "close_time" in x.columns:
+        x["close_time"] = x["close_time"].map(_coerce_utc_timestamp)
+    else:
+        x["close_time"] = x["timestamp"] + pd.Timedelta(hours=1)
+    x = x.dropna(subset=["timestamp", "close_time"]).sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+    return x.loc[x["close_time"] <= boundary_ts].reset_index(drop=True)
+
+
+def _causal_zone_lists(demand: list[dict[str, Any]], supply: list[dict[str, Any]], df_1h: pd.DataFrame, boundary_ts: pd.Timestamp) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Filter existing zones to those whose confirmation candle had closed by boundary."""
+    def active(zones: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for zone in zones:
+            activation_ts = _zone_activation_timestamp(zone, df_1h)
+            if activation_ts is not None and activation_ts <= boundary_ts:
+                out.append(zone)
+        return out
+    return active(demand), active(supply)
 
 
 def _record_entry_decision(
@@ -409,6 +436,9 @@ def _record_entry_decision(
         "trend_decision_boundary_ts": signal.get("decision_boundary_ts"),
         "pre_execution_context_id": (signal.get("pre_execution_market_context") or {}).get("context_id"),
         "pre_execution_context_status": (signal.get("pre_execution_market_context") or {}).get("status"),
+        "pre_execution_context_persisted": (signal.get("pre_execution_market_context") or {}).get("persisted"),
+        "pre_execution_context_persisted_at_ms": (signal.get("pre_execution_market_context") or {}).get("persisted_at_ms"),
+        "pre_execution_context_persist_write_started_at_ms": (signal.get("pre_execution_market_context") or {}).get("persist_write_started_at_ms"),
         "pre_execution_context_capture_ts": (signal.get("pre_execution_market_context") or {}).get("captured_at_ms"),
         "pre_execution_context_capture_span_ms": (signal.get("pre_execution_market_context") or {}).get("context_capture_span_ms"),
         "pre_execution_context_age_ms_at_order_ready": (signal.get("pre_execution_market_context") or {}).get("context_age_ms_at_order_ready"),
@@ -825,67 +855,6 @@ def _normalize_closed_5m(bars: list[dict[str, Any]]) -> pd.DataFrame:
     return x
 
 
-def _causal_1h_frame(df_1h: pd.DataFrame, decision_ts: pd.Timestamp) -> pd.DataFrame:
-    """Return the exact 1H prefix known at a closed-5m decision boundary.
-
-    This helper only slices the already-fetched 1H frame.  It does not alter
-    Demand/Supply construction; it provides a causal input snapshot for
-    structural obstacle diagnostics and signal metadata.
-    """
-    if not isinstance(df_1h, pd.DataFrame) or df_1h.empty or "timestamp" not in df_1h.columns:
-        return pd.DataFrame()
-    x = df_1h.copy()
-    x["timestamp"] = x["timestamp"].map(_coerce_utc_timestamp)
-    if "close_time" in x.columns:
-        x["close_time"] = x["close_time"].map(_coerce_utc_timestamp)
-    else:
-        x["close_time"] = x["timestamp"] + pd.Timedelta(hours=1)
-    x = x.dropna(subset=["timestamp", "close_time"]).sort_values("timestamp")
-    boundary = _coerce_utc_timestamp(decision_ts)
-    if boundary is None:
-        return pd.DataFrame()
-    x = x.loc[x["close_time"] <= boundary].copy()
-    return x.reset_index(drop=True)
-
-
-def _causal_obstacle_state(
-    *, symbol: str, direction: str, entry: float, decision_ts: pd.Timestamp,
-    df_1h: pd.DataFrame, active_demand: list[dict[str, Any]], active_supply: list[dict[str, Any]],
-) -> tuple[pd.DataFrame, list[dict[str, Any]], list[dict[str, Any]], dict[str, Any] | None]:
-    """Reconstruct structural obstacle state without using post-boundary 1H information.
-
-    When the live scan occurs shortly after an hourly close, the current active
-    zone lists may already reflect that new 1H bar.  For a 5M trigger that closed
-    before it, rebuild the zone state from the causal 1H prefix using the unchanged
-    zone engine, then search pivots on that same causal prefix.
-    """
-    causal_df = _causal_1h_frame(df_1h, decision_ts)
-    if causal_df.empty:
-        return causal_df, [], [], None
-    latest_close = _coerce_utc_timestamp(df_1h["close_time"].iloc[-1]) if "close_time" in df_1h.columns else None
-    if latest_close is None:
-        latest_open = _coerce_utc_timestamp(df_1h["timestamp"].iloc[-1])
-        latest_close = latest_open + pd.Timedelta(hours=1) if latest_open is not None else None
-    needs_reconstruction = latest_close is not None and decision_ts < latest_close
-    causal_demand = list(active_demand)
-    causal_supply = list(active_supply)
-    if needs_reconstruction:
-        try:
-            _, causal_supply, causal_demand, _ = generate_zone_signals(
-                causal_df.copy(), symbol=symbol, mode=DIAGNOSTICS_MODE
-            )
-        except Exception as exc:
-            # Never fall back to post-boundary zone state for a causal decision.
-            log.warning(
-                "[CAUSAL_ZONE_RECONSTRUCT] %s | boundary=%s | reconstruction failed: %s",
-                _display_symbol(symbol), decision_ts.isoformat(), exc,
-            )
-            causal_demand, causal_supply = [], []
-    current_idx = len(causal_df) - 1
-    obstacle = _nearest_opposing_level(direction, entry, causal_demand, causal_supply, causal_df, current_idx) if current_idx >= 0 else None
-    return causal_df, causal_demand, causal_supply, obstacle
-
-
 def _build_5m_zone_signal(
     symbol: str,
     direction: str,
@@ -897,9 +866,6 @@ def _build_5m_zone_signal(
     supply: list[dict[str, Any]],
     zone_state: dict[str, Any],
     df_5m: pd.DataFrame | None = None,
-    causal_df_1h: pd.DataFrame | None = None,
-    causal_demand: list[dict[str, Any]] | None = None,
-    causal_supply: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build an execution-ready signal from the configured 5m touch of an existing 1H zone."""
     top = float(zone["top"])
@@ -913,22 +879,18 @@ def _build_5m_zone_signal(
     fixed_stop_pct = FIXED_STOP_PCT
     risk = entry * fixed_stop_pct / 100.0
     stop = entry - risk if direction == "LONG" else entry + risk
-    ts = pd.Timestamp(bar["timestamp"])
-    trigger_close_ts_raw = bar.get("close_time") if hasattr(bar, "get") else None
-    try:
-        trigger_close_ts = pd.Timestamp(trigger_close_ts_raw) if trigger_close_ts_raw is not None else ts + pd.Timedelta(minutes=5)
-        trigger_close_ts = trigger_close_ts.tz_localize("UTC") if trigger_close_ts.tzinfo is None else trigger_close_ts.tz_convert("UTC")
-    except Exception:
-        trigger_close_ts = ts + pd.Timedelta(minutes=5)
-    if causal_df_1h is None or causal_demand is None or causal_supply is None:
-        causal_df_1h, causal_demand, causal_supply, obstacle = _causal_obstacle_state(
-            symbol=symbol, direction=direction, entry=entry, decision_ts=trigger_close_ts,
-            df_1h=df_1h, active_demand=demand, active_supply=supply,
-        )
-    else:
-        current_idx = len(causal_df_1h) - 1
-        obstacle = _nearest_opposing_level(direction, entry, causal_demand, causal_supply, causal_df_1h, current_idx) if current_idx >= 0 else None
-    current_idx = len(causal_df_1h) - 1
+    ts = _coerce_utc_timestamp(bar.get("timestamp") if hasattr(bar, "get") else None)
+    if ts is None:
+        raise ValueError("invalid_trigger_bar_timestamp")
+    canonical_trigger_close_ts = ts + pd.Timedelta(minutes=5)
+    provider_close_ts = _coerce_utc_timestamp(bar.get("close_time") if hasattr(bar, "get") else None)
+    trigger_close_ts = provider_close_ts if provider_close_ts is not None and provider_close_ts >= ts and abs((provider_close_ts - canonical_trigger_close_ts).total_seconds()) <= 2.0 else canonical_trigger_close_ts
+    causal_df_1h = _causal_1h_frame(df_1h, trigger_close_ts)
+    if causal_df_1h.empty:
+        raise ValueError("causal_1h_history_unavailable")
+    causal_idx = len(causal_df_1h) - 1
+    causal_demand, causal_supply = _causal_zone_lists(demand, supply, df_1h, trigger_close_ts)
+    obstacle = _nearest_opposing_level(direction, entry, causal_demand, causal_supply, causal_df_1h, causal_idx)
     if obstacle is not None:
         obstacle_price = float(obstacle["price"])
         structural_distance = obstacle_price - entry if direction == "LONG" else entry - obstacle_price
@@ -941,8 +903,9 @@ def _build_5m_zone_signal(
     tp2 = entry * (1.0 + TP2_PCT / 100.0) if direction == "LONG" else entry * (1.0 - TP2_PCT / 100.0)
     trigger_ts_ms = int(ts.timestamp() * 1000)
     zone_copy = {**zone, "kind": "DEMAND" if direction == "LONG" else "SUPPLY"}
+    prev_ts = _coerce_utc_timestamp(prev_bar.get("timestamp")) if prev_bar is not None and hasattr(prev_bar, "get") else None
     prev_bar_dict = {
-        "timestamp": pd.Timestamp(prev_bar["timestamp"]).isoformat() if prev_bar is not None else None,
+        "timestamp": prev_ts.isoformat() if prev_ts is not None else None,
         "open": float(prev_bar["open"]) if prev_bar is not None else None,
         "high": float(prev_bar["high"]) if prev_bar is not None else None,
         "low": float(prev_bar["low"]) if prev_bar is not None else None,
@@ -950,20 +913,16 @@ def _build_5m_zone_signal(
         "volume": float(prev_bar["volume"]) if prev_bar is not None else None,
     }
     event_id = _make_5m_event_id(symbol, direction, trigger_ts_ms, zone)
-    atr_1h = float(causal_df_1h.loc[current_idx, "atr50"]) if current_idx >= 0 and "atr50" in causal_df_1h.columns else 0.0
+    atr_1h = float(causal_df_1h.loc[causal_idx, "atr50"]) if "atr50" in causal_df_1h.columns else 0.0
     trigger_volume = float(bar["volume"])
     vol_ratio = None
     vol_ratio_baseline = None
     vol_ratio_baseline_count = 0
     if df_5m is not None and not df_5m.empty and "timestamp" in df_5m.columns and "volume" in df_5m.columns:
         x5 = df_5m.copy()
-        x5["timestamp"] = pd.to_datetime(x5["timestamp"], utc=True, errors="coerce")
+        x5["timestamp"] = x5["timestamp"].map(_coerce_utc_timestamp)
         x5["volume"] = pd.to_numeric(x5["volume"], errors="coerce")
-        trigger_ts_norm = pd.Timestamp(bar["timestamp"])
-        if trigger_ts_norm.tzinfo is None:
-            trigger_ts_norm = trigger_ts_norm.tz_localize("UTC")
-        else:
-            trigger_ts_norm = trigger_ts_norm.tz_convert("UTC")
+        trigger_ts_norm = ts
         prior = x5.loc[(x5["timestamp"] < trigger_ts_norm) & x5["volume"].notna(), "volume"].tail(20)
         if len(prior) == 20:
             baseline = float(prior.mean())
@@ -973,11 +932,11 @@ def _build_5m_zone_signal(
                 vol_ratio = trigger_volume / baseline
     # Zone age is diagnostic metadata only. An active zone may be traded
     # regardless of age; invalidation is determined by the zone engine itself.
-    zone_age_bars = max(0, int(current_idx - int(zone.get("start", current_idx))))
+    zone_age_bars = max(0, int(causal_idx - int(zone.get("start", causal_idx))))
     directional_ok = (float(bar["close"]) >= float(bar["open"])) if direction == "LONG" else (float(bar["close"]) <= float(bar["open"]))
     if REQUIRE_DIRECTIONAL_CANDLE and not directional_ok:
         raise ValueError("directional_candle_required")
-    entry_bar = {k: (pd.Timestamp(bar[k]).isoformat() if k == "timestamp" else float(bar[k])) for k in ["timestamp", "open", "high", "low", "close", "volume"]}
+    entry_bar = {k: (ts.isoformat() if k == "timestamp" else float(bar[k])) for k in ["timestamp", "open", "high", "low", "close", "volume"]}
     setup_zone = {**zone_copy, "age_bars": zone_age_bars}
     signal_forensics = _signal_forensics(direction, float(bar["open"]), float(bar["high"]), float(bar["low"]), float(bar["close"]), max(atr_1h, 1e-12), setup_zone)
     return {
@@ -987,6 +946,8 @@ def _build_5m_zone_signal(
         "trigger_bar_time": ts.isoformat(),
         "trigger_bar_close_time": trigger_close_ts.isoformat(),
         "decision_boundary_ts": trigger_close_ts.isoformat(),
+        "decision_boundary_kind": "CLOSED_5M_TRIGGER_CLOSE",
+        "decision_boundary_source": "PROVIDER_CLOSE_TIME" if provider_close_ts is not None and provider_close_ts >= ts and abs((provider_close_ts - canonical_trigger_close_ts).total_seconds()) <= 2.0 else "DERIVED_TRIGGER_OPEN_PLUS_5M",
         "trigger_timeframe": "5m",
         "type": direction,
         "symbol": symbol.upper(),
@@ -1084,11 +1045,9 @@ def _zone_activation_timestamp(zone: dict[str, Any], df_1h: pd.DataFrame) -> pd.
         return None
     if activation_idx < 0 or activation_idx >= len(df_1h):
         return None
-    ts = pd.Timestamp(df_1h.loc[activation_idx, "timestamp"])
-    if ts.tzinfo is None:
-        ts = ts.tz_localize("UTC")
-    else:
-        ts = ts.tz_convert("UTC")
+    ts = _coerce_utc_timestamp(df_1h.loc[activation_idx, "timestamp"])
+    if ts is None:
+        return None
     return ts + pd.Timedelta(hours=1)
 
 
@@ -1193,7 +1152,9 @@ def _process_5m_zone_visits(
             midpoint = float(zdiag["midpoint"])
             activation_ts = _zone_activation_timestamp(zone, df_1h)
             for _, wbar in x.iterrows():
-                low = float(wbar["low"]); high = float(wbar["high"]); ts = pd.Timestamp(wbar["timestamp"])
+                low = float(wbar["low"]); high = float(wbar["high"]); ts = _coerce_utc_timestamp(wbar["timestamp"])
+                if ts is None:
+                    continue
                 if activation_ts is not None and ts < activation_ts:
                     continue
                 zone_touched = low <= float(zone["top"]) and high >= float(zone["btm"])
@@ -1214,8 +1175,8 @@ def _process_5m_zone_visits(
     # cannot be resurrected by an old 5m visit.
     symbol_state["zones"] = {k: v for k, v in symbol_state["zones"].items() if k in active_zone_map and isinstance(v, dict)}
     last_processed_raw = symbol_state.get("last_processed_5m_ts")
-    if last_processed_raw:
-        last_processed = pd.Timestamp(last_processed_raw)
+    last_processed = _coerce_utc_timestamp(last_processed_raw) if last_processed_raw else None
+    if last_processed is not None:
         start_mask = x["timestamp"] > last_processed
     else:
         # Align the initial lookback boundary to the 5m bar clock. Without this,
@@ -1231,9 +1192,12 @@ def _process_5m_zone_visits(
     if diagnostics is not None:
         diagnostics["processed_bars"] = int(len(processed_rows))
         if not x.empty:
-            diagnostics["latest_closed_5m_ts"] = pd.Timestamp(x["timestamp"].iloc[-1]).isoformat()
+            _latest_ts = _coerce_utc_timestamp(x["timestamp"].iloc[-1])
+            diagnostics["latest_closed_5m_ts"] = _latest_ts.isoformat() if _latest_ts is not None else None
     for _, bar in processed_rows.iterrows():
-        bar_ts = pd.Timestamp(bar["timestamp"])
+        bar_ts = _coerce_utc_timestamp(bar["timestamp"])
+        if bar_ts is None:
+            continue
         prev_bar = x.loc[x["timestamp"] < bar_ts].tail(1)
         prev = prev_bar.iloc[0] if not prev_bar.empty else None
         # First update re-arm status for every currently active zone. Re-arm only
@@ -1249,7 +1213,8 @@ def _process_5m_zone_visits(
                 rearmed = (close > float(zone["top"])) if direction == "LONG" else (close < float(zone["btm"]))
                 # A bar that both exits beyond the far edge and crosses the midpoint
                 # is an exit/breakout bar, not a fresh return. Re-arm only after it.
-                if rearmed and zs.get("first_touch_ts") and bar_ts > pd.Timestamp(zs["first_touch_ts"]):
+                first_touch_ts = _coerce_utc_timestamp(zs.get("first_touch_ts"))
+                if rearmed and first_touch_ts is not None and bar_ts > first_touch_ts:
                     zs.update({"state": "ARMED", "rearm_ts": bar_ts.isoformat(), "pending_signal": None, "trigger_event_id": None, "touch_count": 0, "first_touch_ts": None, "last_touch_ts": None})
                     if diagnostics is not None:
                         zdiag = diagnostics["zones"][zone_key]
@@ -1320,7 +1285,7 @@ def _process_5m_zone_visits(
             # the persisted zone state itself (LOCKED), so they do not need this guard.
             prev_was_processed_now = False
             if prev is not None:
-                prev_ts = pd.Timestamp(prev["timestamp"])
+                prev_ts = _coerce_utc_timestamp(prev["timestamp"])
                 if last_processed_raw:
                     try:
                         prev_was_processed_now = prev_ts > last_processed
@@ -1353,14 +1318,10 @@ def _process_5m_zone_visits(
             # for an executable signal. This does not change the production decision.
             research_entry_ref = midpoint if ZONE_TRIGGER_MODE == "midpoint" else float(bar["close"])
             research_risk_abs = research_entry_ref * FIXED_STOP_PCT / 100.0 if research_entry_ref > 0 else None
-            try:
-                event_close_ts = pd.Timestamp(bar_ts) + pd.Timedelta(minutes=5)
-            except Exception:
-                event_close_ts = now
-            causal_df_1h, causal_demand, causal_supply, research_obstacle = _causal_obstacle_state(
-                symbol=symbol, direction=direction, entry=research_entry_ref, decision_ts=event_close_ts,
-                df_1h=df_1h, active_demand=demand, active_supply=supply,
-            )
+            event_boundary_ts = bar_ts + pd.Timedelta(minutes=5)
+            causal_df_1h = _causal_1h_frame(df_1h, event_boundary_ts)
+            causal_demand, causal_supply = _causal_zone_lists(demand, supply, df_1h, event_boundary_ts)
+            research_obstacle = _nearest_opposing_level(direction, research_entry_ref, causal_demand, causal_supply, causal_df_1h, len(causal_df_1h) - 1) if not causal_df_1h.empty else None
             if diagnostics is not None:
                 touch_payload = {
                     "timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction,
@@ -1380,10 +1341,7 @@ def _process_5m_zone_visits(
                         "structure_room_R": (structural_distance / research_risk_abs) if research_risk_abs else None,
                     })
             try:
-                signal = _build_5m_zone_signal(
-                    symbol, direction, zone, bar, prev, df_1h, demand, supply, zs, df_5m=x,
-                    causal_df_1h=causal_df_1h, causal_demand=causal_demand, causal_supply=causal_supply,
-                )
+                signal = _build_5m_zone_signal(symbol, direction, zone, bar, prev, df_1h, demand, supply, zs, df_5m=x)
             except ValueError as exc:
                 reason = str(exc)
                 zs.update({"state": "LOCKED", "lock_reason": reason, "trigger_event_id": None})
@@ -1443,12 +1401,13 @@ def _process_5m_zone_visits(
                         "obstacle_price": (signal.get("target") or {}).get("obstacle_price"),
                         "zone_age_bars": (signal.get("confirmation") or {}).get("zone_age_bars"),
                         "bar": {"timestamp": bar_ts.isoformat(), "open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"]), "volume": float(bar["volume"])},
-                        "previous_bar": ({"timestamp": pd.Timestamp(prev["timestamp"]).isoformat(), "open": float(prev["open"]), "high": float(prev["high"]), "low": float(prev["low"]), "close": float(prev["close"]), "volume": float(prev["volume"])} if prev is not None else {}),
+                        "previous_bar": ({"timestamp": (_coerce_utc_timestamp(prev["timestamp"]).isoformat() if _coerce_utc_timestamp(prev["timestamp"]) is not None else None), "open": float(prev["open"]), "high": float(prev["high"]), "low": float(prev["low"]), "close": float(prev["close"]), "volume": float(prev["volume"])} if prev is not None else {}),
                     })
                 _set_decision("SIGNAL_CREATED", zone_key=zone_key, direction=direction, reason="signal_created", timestamp=bar_ts.isoformat())
 
     if not processed_rows.empty:
-        symbol_state["last_processed_5m_ts"] = pd.Timestamp(processed_rows["timestamp"].max()).isoformat()
+        _processed_ts = _coerce_utc_timestamp(processed_rows["timestamp"].max())
+        symbol_state["last_processed_5m_ts"] = _processed_ts.isoformat() if _processed_ts is not None else symbol_state.get("last_processed_5m_ts")
     symbol_state["last_scan_ts"] = now.isoformat()
 
     if diagnostics is not None:
@@ -1475,7 +1434,8 @@ def _process_5m_zone_visits(
         if not eid or eid in successful_ids or eid in terminal_event_ids:
             continue
         try:
-            age_min = max(0.0, (now - pd.Timestamp(pending["trigger_bar_time"])).total_seconds() / 60.0)
+            _pending_ts = _coerce_utc_timestamp(pending["trigger_bar_time"])
+            age_min = max(0.0, (now - _pending_ts).total_seconds() / 60.0) if _pending_ts is not None else float("inf")
         except Exception:
             age_min = float("inf")
         if age_min <= MAX_5M_TRIGGER_AGE_MINUTES and not any(str(s.get("event_id")) == eid for s in signals):
@@ -1596,7 +1556,9 @@ def _signal_matches_latest_bar(signal: dict[str, Any], latest_closed_idx: int, l
     if signal_time is None or latest_closed_time is None:
         return False, "missing_signal_or_latest_time"
     try:
-        if pd.Timestamp(signal_time) != pd.Timestamp(latest_closed_time):
+        signal_ts = _coerce_utc_timestamp(signal_time)
+        latest_ts = _coerce_utc_timestamp(latest_closed_time)
+        if signal_ts is None or latest_ts is None or signal_ts != latest_ts:
             return False, "signal_time_not_latest"
     except Exception:
         return False, "invalid_signal_time"
@@ -2455,14 +2417,10 @@ def _elapsed_seconds(start_ts: Any, end_ts: Any) -> float | None:
     try:
         if start_ts in (None, "") or end_ts in (None, ""):
             return None
-        a = pd.Timestamp(start_ts)
-        b = pd.Timestamp(end_ts)
-        if pd.isna(a) or pd.isna(b):
+        a = _coerce_utc_timestamp(start_ts)
+        b = _coerce_utc_timestamp(end_ts)
+        if a is None or b is None:
             return None
-        if a.tzinfo is None:
-            a = a.tz_localize("UTC")
-        if b.tzinfo is None:
-            b = b.tz_localize("UTC")
         seconds = (b - a).total_seconds()
         if not math.isfinite(float(seconds)) or seconds < 0:
             return None
@@ -3663,9 +3621,10 @@ def main() -> None:
             decision_boundary_ts = pd.Timestamp.now(tz="UTC")
             for sig in recent:
                 try:
-                    # Immutable research-only snapshot. This never gates execution.
-                    # Anchor it to the signal's closed-5m decision boundary, not scan wall-clock.
-                    shadow_decision_ts = sig.get("decision_boundary_ts") or sig.get("trigger_bar_close_time")
+                    # Shadow features for a signal must be anchored to that signal's
+                    # closed 5m trigger boundary, not the later scan wall-clock.
+                    boundary_ms = _signal_decision_boundary_ts_ms(sig)
+                    shadow_decision_ts = pd.Timestamp(boundary_ms, unit="ms", tz="UTC").isoformat() if boundary_ms is not None else sig.get("decision_boundary_ts")
                     sig["shadow_experiments"] = shadow.build_entry_snapshot(
                         sig, df_5m=pd.DataFrame(trigger_bars_raw), df_1h=df,
                         account_context=research_account_context, decision_ts=shadow_decision_ts
@@ -3673,7 +3632,7 @@ def main() -> None:
                 except Exception as shadow_exc:
                     log.warning("[SHADOW_TELEMETRY] %s | snapshot build failed: %s", _display_symbol(symbol), shadow_exc)
                 market_snapshot = sig.setdefault("market_snapshot", {})
-                trigger_ts = pd.Timestamp(sig.get("trigger_bar_time")) if sig.get("trigger_bar_time") else pd.Timestamp.now(tz="UTC")
+                trigger_ts = _coerce_utc_timestamp(sig.get("trigger_bar_time")) or pd.Timestamp.now(tz="UTC")
                 market_snapshot.update({
                     "bingx_live_price": bingx_price,
                     "binance_live_price": binance_live_price,
@@ -3770,17 +3729,7 @@ def main() -> None:
                         h1_for_trend, h1_refetched = _ensure_trend_history(symbol=symbol, timeframe="1h", frame=df, provider=provider, binance_symbol=binance_symbol, decision_ts_ms=boundary_ms, min_bars=TREND_FILTER_MIN_1H_BARS)
                         h4_for_trend, h4_refetched = _ensure_trend_history(symbol=symbol, timeframe="4h", frame=None, provider=provider, binance_symbol=binance_symbol, decision_ts_ms=boundary_ms, min_bars=TREND_FILTER_MIN_4H_BARS)
                         snapshot=evaluate_trend_filter(symbol=symbol, direction=str(sig.get("type","")), event_type=str((sig.get("trigger") or {}).get("type") or "ZONE_5M"), df_1h=h1_for_trend, df_4h=h4_for_trend, btc_1h_df=btc_research_df_1h, decision_ts_ms=boundary_ms, min_bars_1h=TREND_FILTER_MIN_1H_BARS, min_bars_4h=TREND_FILTER_MIN_4H_BARS, persistence_lookback_1h=TREND_FILTER_PERSISTENCE_LOOKBACK_1H, persistence_lookback_4h=TREND_FILTER_PERSISTENCE_LOOKBACK_4H, slope_lookback_4h=TREND_FILTER_SLOPE_LOOKBACK_4H, require_persistence=TREND_FILTER_REQUIRE_PERSISTENCE, mode=TREND_FILTER_MODE)
-                        snapshot.update({
-                            "decision_boundary_ts": pd.Timestamp(boundary_ms, unit="ms", tz="UTC").isoformat(),
-                            "decision_boundary_kind": "CLOSED_5M_TRIGGER_CLOSE",
-                            "causal_cutoff_ts_ms": int(boundary_ms),
-                            "causal_data_policy": "ALL_HTF_BARS_REQUIRE_CLOSE_TIME_LE_DECISION_BOUNDARY",
-                            "history_1h_refetched": bool(h1_refetched),
-                            "history_4h_refetched": bool(h4_refetched),
-                            "source_1h": provider,
-                            "source_4h": provider,
-                            "source_btc": "binance_spot",
-                        })
+                        snapshot.update({"decision_boundary_ts":pd.Timestamp(boundary_ms,unit="ms",tz="UTC").isoformat(),"history_1h_refetched":bool(h1_refetched),"history_4h_refetched":bool(h4_refetched),"source_1h":provider,"source_4h":provider,"source_btc":"binance_spot"})
                         sig["trend_filter"]=snapshot
                     except Exception as trend_exc:
                         log.warning("[TREND_FILTER] %s | diagnostic failed: %s", _display_symbol(symbol), trend_exc)
@@ -4008,9 +3957,9 @@ def main() -> None:
         trigger_tf = str(signal.get("trigger_timeframe", "1h")).lower()
         if trigger_tf == "5m":
             try:
-                trigger_ts = pd.Timestamp(signal.get("trigger_bar_time") or signal.get("time"))
-                if trigger_ts.tzinfo is None:
-                    trigger_ts = trigger_ts.tz_localize("UTC")
+                trigger_ts = _coerce_utc_timestamp(signal.get("trigger_bar_time") or signal.get("time"))
+                if trigger_ts is None:
+                    raise ValueError("invalid_5m_trigger_timestamp")
                 age_min = max(0.0, (now_exec - trigger_ts).total_seconds() / 60.0)
             except Exception:
                 log.warning("[EXEC_REJECT_TRIGGER_TIME] %s %s | invalid 5m trigger time=%s", _display_symbol(signal.get("symbol")), signal.get("type"), signal.get("trigger_bar_time"))
@@ -4062,9 +4011,9 @@ def main() -> None:
         signal["execution_gate_ts"] = execution_gate_ts.isoformat()
         trigger_raw = signal.get("trigger_bar_time") or signal.get("time")
         try:
-            trigger_ts = pd.Timestamp(trigger_raw)
-            if trigger_ts.tzinfo is None:
-                trigger_ts = trigger_ts.tz_localize("UTC")
+            trigger_ts = _coerce_utc_timestamp(trigger_raw)
+            if trigger_ts is None:
+                raise ValueError("invalid_trigger_timestamp")
             signal["trigger_to_execution_gate_minutes"] = max(0.0, (execution_gate_ts - trigger_ts).total_seconds() / 60.0)
         except Exception:
             signal["trigger_to_execution_gate_minutes"] = None
@@ -4132,17 +4081,12 @@ def main() -> None:
                 ctx.update({
                     "scan_id": scan_id, "event_id": event_id, "attempt_id": attempt_id,
                     "symbol": signal["symbol"],
-                    "provider": "bingx",
-                    "data_provider": "bingx",
-                    "analysis_provider": str(((signal.get("market_snapshot") or {}).get("analysis_provider") or "binance")),
+                    "provider": str(((signal.get("market_snapshot") or {}).get("analysis_provider") or "binance")),
                     "source": "pre_execution_entry_context",
-                    "context_source": "bingx_swap_public_pre_execution",
                     "strategy_version": signal.get("strategy_version", _effective_strategy_version()),
                     "engine_version": ENGINE_VERSION, "code_commit_sha": CODE_COMMIT_SHA,
                     "decision_boundary_ts": boundary_iso,
-                    "decision_boundary_kind": "CLOSED_5M_TRIGGER_CLOSE",
-                    "pre_execution_decision_ts": boundary_iso,
-                    "context_capture_ts": pd.Timestamp(capture_now_ms, unit="ms", tz="UTC").isoformat(),
+                    "pre_execution_decision_ts": pd.Timestamp(capture_now_ms, unit="ms", tz="UTC").isoformat(),
                     "context_age_ms_at_order_ready": max(0, capture_now_ms - int(capture_completed_ms)),
                     "context_lag_ms_from_decision_boundary": trigger_to_capture,
                     "capture_phase": "PRE_EXECUTION",

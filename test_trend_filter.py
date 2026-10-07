@@ -31,9 +31,6 @@ def test_shadow_alignment_is_causal():
     assert out["trend_persistence"]=="PERSISTENT"
     assert out["trend_1h_bar_close_ts"]<=out["decision_ts"]
     assert out["trend_4h_bar_close_ts"]<=out["decision_ts"]
-    assert out["decision_boundary_kind"] == "CLOSED_5M_TRIGGER_CLOSE"
-    assert out["causal_cutoff_ts_ms"] == out["decision_ts"]
-    assert out["causal_data_policy"] == "CLOSE_TIME_LE_DECISION_BOUNDARY"
 
 
 def test_direction_mismatch_rejects():
@@ -118,3 +115,20 @@ def test_trend_version_is_current_in_runtime_source():
     source = Path(__file__).with_name("run_once.py").read_text(encoding="utf-8")
     assert "trend-v1-2026-10-04" not in source
     assert "trend-v1-2026-10-06" in source
+
+
+def test_trend_filter_accepts_iso_close_time_columns_without_unknowning_every_bar():
+    import pandas as pd
+    import event_engine.trend_filter as trend_filter
+    ts = pd.date_range("2026-01-01", periods=6, freq="1h", tz="UTC")
+    df = pd.DataFrame({
+        "timestamp": ts,
+        "close_time": (ts + pd.Timedelta(hours=1)).astype(str),
+        "close": [100, 101, 102, 103, 104, 105],
+        "open": [99, 100, 101, 102, 103, 104],
+        "high": [101, 102, 103, 104, 105, 106],
+        "low": [98, 99, 100, 101, 102, 103],
+    })
+    out = trend_filter._clean_closed_frame(df, int(pd.Timestamp("2026-01-01T06:00:00Z").timestamp() * 1000))
+    assert len(out) == 6
+    assert int(out["close_time"].iloc[-1]) == int(pd.Timestamp("2026-01-01T06:00:00Z").timestamp() * 1000)

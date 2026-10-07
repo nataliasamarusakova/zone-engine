@@ -12,11 +12,15 @@ This migration is designed for the **current live Zone Engine state**. It does *
 
 ## 1. Audit-chain safety guarantee
 
-Before any JSONL file is compacted, the migration takes a **byte-faithful gzip snapshot of the complete original file** under the external archive root:
+Before any JSONL file is compacted, the migration takes a **byte-faithful gzip snapshot of the complete original file** under the selected archive root.
+
+In GitHub Actions the workflow explicitly selects `data/retention_archive` (ignored by Git):
 
 ```text
-zone-engine-data-archive/<UTC_RUN>/snapshots_before/<file>.before.jsonl.gz
+data/retention_archive/<UTC_RUN>/snapshots_before/<file>.before.jsonl.gz
 ```
+
+When the command is run without `--archive-dir`, the implementation defaults to the external sibling directory `../zone-engine-data-archive`, keeping large recovery snapshots outside the repository working tree.
 
 The manifest records the original SHA-256, byte count, and row count. Therefore the exact pre-migration file can be restored even if a later analyst needs the full historical chain.
 
@@ -95,7 +99,7 @@ The `snapshots_before` file is the authoritative recovery copy.
 Example:
 
 ```bash
-gzip -cd /path/to/zone-engine-data-archive/<UTC_RUN>/snapshots_before/research_outcomes.jsonl.before.jsonl.gz \
+gzip -cd <ARCHIVE_ROOT>/<UTC_RUN>/snapshots_before/research_outcomes.jsonl.before.jsonl.gz \
   > data/research_outcomes.jsonl.restore
 ```
 
@@ -119,7 +123,7 @@ cat data/data_retention_manifest.json
 For files intended to remain tracked by Git, inspect their staged size:
 
 ```bash
-git add .gitignore event_engine/data_retention.py event_engine/tracker.py test_all.py CHANGES_STEPWISE.md DATA_RETENTION_RUNBOOK.md
+git add .gitignore event_engine/data_retention.py event_engine/tracker.py test_all.py DATA_RETENTION_RUNBOOK.md
 
 git cat-file -s :data/market_bars_5m.jsonl 2>/dev/null || true
 git cat-file -s :data/zone_observations.jsonl 2>/dev/null || true

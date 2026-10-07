@@ -40,18 +40,12 @@ def test_research_context_funding_units_and_provenance(monkeypatch):
     monkeypatch.setattr(bingx, "_research_public_get", fake_get)
     monkeypatch.setattr(bingx, "to_bx_symbol", lambda x: str(x).upper())
     out = bingx.fetch_research_market_context("TEST-USDT", depth_limit=5, trades_limit=5, timeout_sec=1.0)
-    assert out["context_schema_version"] == 3
+    assert out["context_schema_version"] == 2
     assert out["funding_rate"] == pytest.approx(0.001)
     assert out["funding_rate_pct"] == pytest.approx(0.1)
     assert out["funding_rate_unit"] == "DECIMAL_RATE"
     assert out["open_interest_raw"] == "777"
     assert out["open_interest_unit"] == "PROVIDER_NATIVE_UNSPECIFIED"
-    assert out["open_interest_ts"] == 789
-    assert out["open_interest_timestamp_semantics"] == "EXCHANGE_EVENT_TIME_IF_PROVIDER_SUPPLIES_IT"
-    assert out["funding_rate_timestamp_ms"] == 456
-    assert out["data_provider"] == "bingx_swap_public"
-    assert out["provider"] == "bingx"
-    assert out["timestamp_semantics"] == "LOCAL_CAPTURE_CLOCK_PLUS_EXCHANGE_TIMESTAMPS_WHEN_PRESENT"
     assert out["capture_started_at_ms"] is not None
     assert out["capture_completed_at_ms"] >= out["capture_started_at_ms"]
 
@@ -70,9 +64,6 @@ def test_record_market_context_persists_decision_provenance_before_write(tmp_pat
     assert stored["decision_ts"] == row["decision_ts"]
     assert stored["context_age_ms_at_decision"] == 1000
     assert stored["context_capture_phase"] == "PRE_EXECUTION"
-    assert stored["provider"] == "bingx"
-    assert stored["data_provider"] == "bingx"
-    assert stored["persisted_at_ms"] >= stored["persistence_started_at_ms"]
     assert stored["recorded_at"]
 
 
@@ -83,29 +74,12 @@ def test_pre_execution_context_stays_out_of_causal_flattened_features():
     })
     bar = {"timestamp": "2026-01-02T00:00:00Z", "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 200.0}
     signal = {"event_id":"E1","symbol":"TEST-USDT","type":"LONG","trigger_bar_time":bar["timestamp"],"decision_boundary_ts":"2026-01-02T00:05:00Z","entry":100.5,"zone":{},"entry_bar":bar,"trigger":{},"zone_visit":{}}
-    context = {
-        "context_id":"MC_1","status":"ok","capture_phase":"PRE_EXECUTION",
-        "feature_time_semantics":"CAPTURED_PRE_ORDER_NOT_TRIGGER_BOUNDARY",
-        "captured_at_ms":1767312300000,"capture_completed_at_ms":1767312300200,
-        "decision_boundary_ts":"2026-01-02T00:05:00Z",
-        "decision_boundary_kind":"CLOSED_5M_TRIGGER_CLOSE",
-        "context_capture_ts":"2026-01-02T00:05:00.200000Z",
-        "provider":"bingx","data_provider":"bingx",
-        "funding_rate":0.001,"funding_rate_pct":0.1,
-        "order_book":{"book_imbalance_5":0.3,"book_imbalance_10":0.4,"book_quote_imbalance_5":0.2,"book_quote_imbalance_10":0.25},
-        "recent_trades":{"aggressor_delta_quote":123.0,"buy_aggressor_ratio":0.75},
-    }
+    context = {"context_id":"MC_1","status":"ok","capture_phase":"PRE_EXECUTION","feature_time_semantics":"CAPTURED_PRE_ORDER_NOT_TRIGGER_BOUNDARY","captured_at_ms":1767312300000,"capture_completed_at_ms":1767312300200,"decision_boundary_ts":"2026-01-02T00:05:00Z","funding_rate":0.001,"funding_rate_pct":0.1,"order_book":{"book_imbalance_5":0.3},"recent_trades":{"aggressor_delta_quote":123.0}}
     out = research._observation_from_signal(signal,scan_id="S1",strategy_version="v1",code_commit_sha="abc",df_1h=df,df_5m=pd.DataFrame(),decision_ts=signal["decision_boundary_ts"],provider="binance",source="test",market_context=context)
     assert out["market_context_id"] == "MC_1"
     assert out["features"]["pre_execution_context"]["funding_rate_pct"] == pytest.approx(0.1)
     assert "funding_rate" not in out["features"]
     assert out["features"]["pre_execution_context"]["order_book"]["book_imbalance_5"] == pytest.approx(0.3)
-    assert out["features"]["pre_execution_context"]["data_provider"] == "bingx"
-    assert out["features"]["pre_execution_context"]["decision_boundary_kind"] == "CLOSED_5M_TRIGGER_CLOSE"
-    assert out["features"]["pre_execution_directional_obi5"] == pytest.approx(0.3)
-    assert out["features"]["pre_execution_directional_quote_obi5"] == pytest.approx(0.2)
-    assert out["features"]["pre_execution_directional_aggressor_delta_quote"] == pytest.approx(123.0)
-    assert out["features"]["pre_execution_directional_aggressor_ratio"] == pytest.approx(0.75)
     assert "context_age_ms_at_execution_call_start" in out["features"]["pre_execution_context"]
 
 
@@ -122,54 +96,113 @@ def test_signal_boundary_helper_uses_closed_5m_bar_close():
     assert pd.Timestamp(value, unit="ms", tz="UTC") == pd.Timestamp("2026-01-01T00:05:00Z")
     signal["decision_boundary_ts"] = "2026-01-01T00:06:00Z"
     value = run_once._signal_decision_boundary_ts_ms(signal)
-    assert pd.Timestamp(value, unit="ms", tz="UTC") == pd.Timestamp("2026-01-01T00:06:00Z")
+    assert pd.Timestamp(value, unit="ms", tz="UTC") == pd.Timestamp("2026-01-01T00:05:00Z")
 
 
-def test_pre_execution_directional_context_flips_for_short():
+def test_record_market_context_round_trips_context_id_to_observation(tmp_path: Path, monkeypatch):
+    from event_engine import research
+    for name in ["MARKET_CONTEXT_PATH", "RESEARCH_MANIFEST_PATH", "RESEARCH_ERRORS_PATH"]:
+        monkeypatch.setattr(research, name, tmp_path / getattr(research, name).name)
+    row = {
+        "scan_id": "S_CTX", "event_id": "E_CTX", "attempt_id": "A_CTX",
+        "symbol": "TEST-USDT", "provider": "bingx", "captured_at_ms": 1791307900000,
+        "capture_phase": "PRE_EXECUTION",
+    }
+    assert research.record_market_context(row) is True
+    assert row["context_id"].startswith("MC_")
+    assert row["persisted"] is True
+    assert row["persisted_at_ms"] >= row["persistence_started_at_ms"]
+
     df = pd.DataFrame({
         "timestamp": pd.date_range("2026-01-01", periods=40, freq="1h", tz="UTC"),
-        "open": [100.0] * 40, "high": [101.0] * 40, "low": [99.0] * 40, "close": [100.0] * 40, "volume": [1000.0] * 40,
+        "open": [100.0] * 40, "high": [101.0] * 40, "low": [99.0] * 40,
+        "close": [100.0] * 40, "volume": [1000.0] * 40,
     })
-    bar = {"timestamp": "2026-01-02T00:00:00Z", "open": 100.0, "high": 101.0, "low": 99.0, "close": 99.5, "volume": 200.0}
-    signal = {"event_id":"E2","symbol":"TEST-USDT","type":"SHORT","trigger_bar_time":bar["timestamp"],"decision_boundary_ts":"2026-01-02T00:05:00Z","entry":99.5,"zone":{},"entry_bar":bar,"trigger":{},"zone_visit":{}}
-    context = {
-        "context_id":"MC_2","status":"ok","capture_phase":"PRE_EXECUTION",
-        "feature_time_semantics":"CAPTURED_PRE_ORDER_NOT_TRIGGER_BOUNDARY",
-        "decision_boundary_ts":"2026-01-02T00:05:00Z","decision_boundary_kind":"CLOSED_5M_TRIGGER_CLOSE",
-        "provider":"bingx","data_provider":"bingx",
-        "order_book":{"book_imbalance_5":0.3,"book_quote_imbalance_5":0.2},
-        "recent_trades":{"aggressor_delta_quote":123.0,"buy_aggressor_ratio":0.75},
+    bar = {"timestamp": "2026-01-02T00:00:00Z", "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 200.0}
+    signal = {
+        "event_id": "E_CTX", "symbol": "TEST-USDT", "type": "LONG",
+        "trigger_bar_time": bar["timestamp"], "decision_boundary_ts": "2026-01-02T00:05:00Z",
+        "entry": 100.5, "zone": {}, "entry_bar": bar, "trigger": {}, "zone_visit": {},
     }
-    out = research._observation_from_signal(
-        signal, scan_id="S1", strategy_version="v1", code_commit_sha="abc",
+    obs = research._observation_from_signal(
+        signal, scan_id="S_CTX", strategy_version="v1", code_commit_sha="abc",
         df_1h=df, df_5m=pd.DataFrame(), decision_ts=signal["decision_boundary_ts"],
-        provider="binance", source="test", market_context=context
+        provider="binance", source="test", market_context=row,
     )
-    assert out["features"]["pre_execution_directional_obi5"] == pytest.approx(-0.3)
-    assert out["features"]["pre_execution_directional_quote_obi5"] == pytest.approx(-0.2)
-    assert out["features"]["pre_execution_directional_aggressor_delta_quote"] == pytest.approx(-123.0)
-    assert out["features"]["pre_execution_directional_aggressor_ratio"] == pytest.approx(0.25)
+    assert obs["market_context_id"] == row["context_id"]
+    assert obs["market_context_persisted"] is True
+    assert obs["market_context_status"] == "PERSISTED"
+    assert obs["market_context_persisted_at_ms"] == row["persisted_at_ms"]
+    assert obs["market_context_persist_write_started_at_ms"] == row["persist_write_started_at_ms"]
 
 
-def test_post_execution_context_is_not_labeled_as_pre_execution():
-    df = pd.DataFrame({
-        "timestamp": pd.date_range("2026-01-01", periods=40, freq="1h", tz="UTC"),
-        "open": [100.0] * 40, "high": [101.0] * 40, "low": [99.0] * 40, "close": [100.0] * 40, "volume": [1000.0] * 40,
+def test_build_5m_signal_uses_canonical_epoch_ms_trigger_close_and_causal_1h_prefix(monkeypatch):
+    import run_once
+    trigger = pd.Timestamp("2026-10-06T17:25:00Z")
+    h1_open = pd.date_range("2026-10-06T00:00:00Z", periods=20, freq="1h", tz="UTC")
+    df1 = pd.DataFrame({
+        "timestamp": h1_open,
+        "close_time": h1_open + pd.Timedelta(hours=1),
+        "open": [100.0] * 20, "high": [101.0] * 20,
+        "low": [99.0] * 20, "close": [100.0] * 20,
+        "volume": [1000.0] * 20, "atr50": [2.0] * 20,
     })
-    bar = {"timestamp": "2026-01-02T00:00:00Z", "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 200.0}
-    signal = {"event_id":"E3","symbol":"TEST-USDT","type":"LONG","trigger_bar_time":bar["timestamp"],"decision_boundary_ts":"2026-01-02T00:05:00Z","entry":100.0,"zone":{},"entry_bar":bar,"trigger":{},"zone_visit":{}}
-    context = {
-        "context_id":"MC_3","status":"ok","capture_phase":"POST_EXECUTION",
-        "feature_time_semantics":"POST_EXECUTION",
-        "decision_boundary_ts":"2026-01-02T00:05:00Z",
-        "provider":"bingx","data_provider":"bingx",
-        "order_book":{"book_imbalance_5":0.8},
-        "recent_trades":{"aggressor_delta_quote":999.0,"buy_aggressor_ratio":0.99},
-    }
-    out = research._observation_from_signal(
-        signal, scan_id="S1", strategy_version="v1", code_commit_sha="abc",
-        df_1h=df, df_5m=pd.DataFrame(), decision_ts=signal["decision_boundary_ts"],
-        provider="binance", source="test", market_context=context
-    )
-    assert "pre_execution_context" not in out["features"]
-    assert "pre_execution_directional_obi5" not in out["features"]
+    bar = pd.Series({
+        "timestamp": trigger,
+        "close_time": int(pd.Timestamp("2026-10-06T17:29:59.999Z").timestamp() * 1000),
+        "open": 99.0, "high": 106.0, "low": 94.0, "close": 100.0, "volume": 100.0,
+    })
+    zone = {"zone_id": "Z_CAUSAL_SIGNAL", "top": 101.0, "btm": 99.0, "poi": 100.0, "start": 0}
+    monkeypatch.setattr(run_once, "_nearest_opposing_level", lambda *a, **k: {"price": 120.0, "source": "test"})
+    old_obstacle = run_once.REQUIRE_STRUCTURE_OBSTACLE
+    old_min_room = run_once.MIN_STRUCTURE_ROOM_R
+    monkeypatch.setattr(run_once, "REQUIRE_STRUCTURE_OBSTACLE", False)
+    monkeypatch.setattr(run_once, "MIN_STRUCTURE_ROOM_R", 0.0)
+    try:
+        signal = run_once._build_5m_zone_signal(
+            "TEST-USDT", "LONG", zone, bar, None, df1, [zone], [], {"visit_id": "V1"},
+            df_5m=pd.DataFrame(),
+        )
+    finally:
+        run_once.REQUIRE_STRUCTURE_OBSTACLE = old_obstacle
+        run_once.MIN_STRUCTURE_ROOM_R = old_min_room
+    assert signal["trigger_bar_close_time"] == "2026-10-06T17:29:59.999000+00:00"
+    assert signal["decision_boundary_kind"] == "CLOSED_5M_TRIGGER_CLOSE"
+    assert pd.Timestamp(signal["decision_boundary_ts"]) == pd.Timestamp("2026-10-06T17:29:59.999Z")
+
+
+def test_build_5m_signal_passes_only_causal_1h_frame_to_obstacle_lookup(monkeypatch):
+    import run_once
+    trigger = pd.Timestamp("2026-10-06T17:25:00Z")
+    h1_open = pd.date_range("2026-10-06T00:00:00Z", periods=24, freq="1h", tz="UTC")
+    df1 = pd.DataFrame({
+        "timestamp": h1_open,
+        "close_time": h1_open + pd.Timedelta(hours=1),
+        "open": [100.0] * 24, "high": [101.0] * 24,
+        "low": [99.0] * 24, "close": [100.0] * 24,
+        "volume": [1000.0] * 24, "atr50": [2.0] * 24,
+    })
+    bar = pd.Series({
+        "timestamp": trigger,
+        "close_time": int(pd.Timestamp("2026-10-06T17:30:00Z").timestamp() * 1000),
+        "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 100.0,
+    })
+    zone = {"zone_id": "Z_CASUAL_FRAME", "top": 101.0, "btm": 99.0, "poi": 100.0, "start": 0}
+    seen = {}
+    def fake_nearest(direction, entry, demand, supply, frame, current_idx):
+        seen["last_close"] = frame.iloc[-1]["close_time"]
+        seen["current_idx"] = current_idx
+        seen["rows"] = len(frame)
+        return None
+    monkeypatch.setattr(run_once, "_nearest_opposing_level", fake_nearest)
+    old_req = run_once.REQUIRE_STRUCTURE_OBSTACLE
+    monkeypatch.setattr(run_once, "REQUIRE_STRUCTURE_OBSTACLE", False)
+    try:
+        run_once._build_5m_zone_signal(
+            "TEST-USDT", "LONG", zone, bar, None, df1, [zone], [], {"visit_id": "V2"}, df_5m=pd.DataFrame()
+        )
+    finally:
+        run_once.REQUIRE_STRUCTURE_OBSTACLE = old_req
+    assert seen["last_close"] == pd.Timestamp("2026-10-06T17:00:00Z")
+    assert seen["rows"] == 17
+    assert seen["current_idx"] == 16

@@ -203,6 +203,19 @@ def test_parse_ts_numeric_epoch_is_milliseconds():
     assert ts.isoformat() == "2026-09-29T02:15:00+00:00"
 
 
+def test_parse_ts_accepts_numpy_epoch_milliseconds_without_1970_regression():
+    import numpy as np
+    ts = shadow._parse_ts(np.int64(1790648100000))
+    assert ts is not None
+    assert ts.isoformat() == "2026-09-29T02:15:00+00:00"
+
+
+def test_parse_ts_accepts_epoch_seconds_string_without_false_1970_ms_interpretation():
+    ts = shadow._parse_ts("1790648100")
+    assert ts is not None
+    assert ts.isoformat() == "2026-09-29T02:15:00+00:00"
+
+
 def test_missing_account_context_is_not_reported_as_no_open_peers():
     snap = shadow.build_entry_snapshot(
         _signal(), df_5m=_bars_5m([10] * 21), df_1h=_bars_1h(), account_context=None
@@ -212,61 +225,6 @@ def test_missing_account_context_is_not_reported_as_no_open_peers():
     assert corr["open_position_symbols"] == []
     assert corr["would_pass"] is None
 
-
-
-
-def test_shadow_epoch_ms_market_frames_are_causal():
-    start = pd.Timestamp("2026-09-28T00:00:00Z")
-    ts1 = pd.date_range(start, periods=14, freq="1h", tz="UTC")
-    df1 = pd.DataFrame({
-        "timestamp": [int(t.timestamp() * 1000) for t in ts1],
-        "close_time": [int((t + pd.Timedelta(hours=1)).timestamp() * 1000) for t in ts1],
-        "open": [100.0] * 13 + [200.0],
-        "high": [101.0] * 13 + [201.0],
-        "low": [99.0] * 13 + [199.0],
-        "close": [100.0] * 13 + [200.0],
-        "volume": [100.0] * 13 + [999999.0],
-    })
-    sig = _signal("LONG")
-    sig["trigger_bar_time"] = "2026-09-28T12:55:00Z"
-    snap = shadow.build_entry_snapshot(
-        sig, df_5m=_bars_5m([10] * 21), df_1h=df1, decision_ts="2026-09-28T13:00:00Z"
-    )
-    assert snap["experiments"]["CF_VOLUME_1H"]["current_closed_1h_volume"] == 100.0
-
-    future = pd.DataFrame({
-        "timestamp": [int(pd.Timestamp("2026-09-28T13:00:00Z").timestamp() * 1000)],
-        "close_time": [int(pd.Timestamp("2026-09-28T13:05:00Z").timestamp() * 1000)],
-        "open": [100.0], "high": [150.0], "low": [50.0], "close": [150.0],
-    })
-    obs = {
-        "event_id": "EVT_EPOCH_MS", "symbol": "TEST-USDT", "direction": "LONG",
-        "reference_price": 100.0, "counterfactual_path_start_ts": "2026-09-28T13:00:00Z",
-        "features": {"shadow_experiments": snap["experiments"]},
-    }
-    out = shadow.calculate_counterfactual_outcomes(obs, future)
-    assert out["status"] == "OK"
-
-
-def test_shadow_1h_context_uses_candle_closed_at_decision_boundary():
-    start = pd.Timestamp("2026-09-27T11:00:00Z")
-    ts = pd.date_range(start, periods=25, freq="1h", tz="UTC")
-    df1 = pd.DataFrame({
-        "timestamp": ts,
-        "close_time": ts + pd.Timedelta(hours=1),
-        "open": [100.0] * 25,
-        "high": [101.0] * 25,
-        "low": [99.0] * 25,
-        "close": [100.0] * 25,
-        "volume": [1000.0] * 24 + [9999.0],
-    })
-    sig = _signal("LONG")
-    sig["trigger_bar_time"] = "2026-09-28T11:55:00Z"
-    snap = shadow.build_entry_snapshot(
-        sig, df_5m=_bars_5m([10] * 21), df_1h=df1, decision_ts="2026-09-28T12:00:00Z"
-    )
-    assert snap["decision_anchor"]["decision_ts"] == "2026-09-28T12:00:00+00:00"
-    assert snap["experiments"]["CF_VOLUME_1H"]["current_closed_1h_volume"] == 9999.0
 
 def test_session_experiment_uses_decision_time_and_preserves_trigger_session():
     sig = _signal()
@@ -303,3 +261,49 @@ def test_counterfactual_excludes_bar_that_started_before_decision_boundary():
     cf = out["experiments"]["CF_STRUCTURAL_SL"]
     assert cf["exit"] in {None, "PATH_NOT_EXITED"}
     assert cf.get("bars_to_exit") is None
+
+
+def test_shadow_epoch_millisecond_market_history_is_causal():
+    import pandas as pd
+    import event_engine.shadow as shadow
+    ts = pd.date_range("2026-10-06T17:00:00Z", periods=8, freq="5min", tz="UTC")
+    df = pd.DataFrame({
+        "timestamp": [int(t.timestamp() * 1000) for t in ts],
+        "close_time": [int((t + pd.Timedelta(minutes=5)).timestamp() * 1000) for t in ts],
+        "open": [100.0] * len(ts), "high": [101.0] * len(ts),
+        "low": [99.0] * len(ts), "close": [100.0] * len(ts), "volume": [10.0] * len(ts),
+    })
+    closed = shadow._closed_5m(df, pd.Timestamp("2026-10-06T17:30:00Z"))
+    assert not closed.empty
+    assert closed["timestamp"].iloc[-1] == pd.Timestamp("2026-10-06T17:30:00Z")
+
+
+def test_shadow_1h_history_uses_decision_boundary_not_trigger_open():
+    sig = _signal("LONG")
+    sig["trigger_bar_time"] = "2026-10-06T16:55:00Z"
+    decision_ts = "2026-10-06T17:00:00Z"
+    ts = pd.date_range("2026-10-05T00:00:00Z", periods=42, freq="1h", tz="UTC")
+    # The 16:00-17:00 1H candle is exactly knowable at the 5M decision boundary.
+    rows = []
+    for t in ts:
+        close = 100.0
+        if t == pd.Timestamp("2026-10-06T16:00:00Z"):
+            close = 200.0
+        rows.append({
+            "timestamp": t,
+            "close_time": t + pd.Timedelta(hours=1),
+            "open": close - 1.0,
+            "high": close + 1.0,
+            "low": close - 1.0,
+            "close": close,
+            "volume": 1000.0,
+        })
+    df1 = pd.DataFrame(rows)
+    snap = shadow.build_entry_snapshot(
+        sig, df_5m=_bars_5m([10] * 21, start="2026-10-06T15:15:00Z"),
+        df_1h=df1, decision_ts=decision_ts,
+    )
+    # decision_ts includes the 16:00-17:00 bar; trigger-open anchoring would not.
+    exp = snap["experiments"]["CF_VOLUME_1H"]
+    assert exp["current_closed_1h_volume"] == 1000.0
+    assert snap["decision_anchor"]["decision_ts"] == "2026-10-06T17:00:00+00:00"

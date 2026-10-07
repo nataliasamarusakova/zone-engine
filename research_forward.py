@@ -14,6 +14,21 @@ import pandas as pd
 import numpy as np
 
 
+def _timestamp_series_to_utc(series: pd.Series) -> pd.Series:
+    """Normalize ISO/epoch ns/us/ms/s market timestamps without nanosecond inference."""
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return pd.to_datetime(series, utc=True, errors="coerce")
+    numeric = pd.to_numeric(series, errors="coerce")
+    ratio = float(numeric.notna().mean()) if len(series) else 0.0
+    if ratio >= 0.99:
+        finite = numeric.dropna().abs()
+        magnitude = float(finite.median()) if not finite.empty else 0.0
+        unit = ("ns" if magnitude >= 1e17 else "us" if magnitude >= 1e14 else "ms" if magnitude >= 1e11 else "s" if magnitude >= 1e8 else None)
+        if unit is not None:
+            return pd.to_datetime(numeric, unit=unit, utc=True, errors="coerce")
+    return pd.to_datetime(series, utc=True, errors="coerce")
+
+
 class _BarIndex:
     """Numpy-backed index over one symbol/provider 5m bar series.
 
@@ -22,17 +37,36 @@ class _BarIndex:
     """
 
     def __init__(self, df: pd.DataFrame) -> None:
-        if "close_time" not in df.columns:
-            df = df.copy()
-            df["close_time"] = df["timestamp"] + pd.Timedelta(minutes=5)
-        self.df = df
-        self.ts_ns = df["timestamp"].astype("int64").to_numpy()
-        self.close_ts_ns = df["close_time"].astype("int64").to_numpy()
-        self.open = df["open"].to_numpy(dtype=float)
-        self.high = df["high"].to_numpy(dtype=float)
-        self.low = df["low"].to_numpy(dtype=float)
-        self.close = df["close"].to_numpy(dtype=float)
-        self.n = len(df)
+        work = df.copy()
+        work["timestamp"] = _timestamp_series_to_utc(work["timestamp"])
+        if "close_time" not in work.columns:
+            work["close_time"] = work["timestamp"] + pd.Timedelta(minutes=5)
+        else:
+            work["close_time"] = _timestamp_series_to_utc(work["close_time"])
+        required = ["timestamp", "close_time", "open", "high", "low", "close"]
+        work = work.dropna(subset=required)
+        # _load_bars() already delivers sorted/deduplicated frames.  Avoid a
+        # second full sort in the hot path, but retain deterministic repair for
+        # direct callers that provide unsorted or duplicate rows.
+        needs_repair = (
+            not work["timestamp"].is_monotonic_increasing
+            or not work["close_time"].is_monotonic_increasing
+            or work["timestamp"].duplicated().any()
+        )
+        if needs_repair:
+            work = work.sort_values(["close_time", "timestamp"]).drop_duplicates("timestamp", keep="last")
+        work = work.reset_index(drop=True)
+        self.df = work
+        self.ts_ns = work["timestamp"].astype("int64").to_numpy()
+        self.close_ts_ns = work["close_time"].astype("int64").to_numpy()
+        # OHLC arrays MUST follow the exact same sorted/deduplicated rows as the
+        # timestamp arrays. Previously they were read from the pre-sort input,
+        # which could silently pair one bar's time with another bar's OHLC data.
+        self.open = work["open"].to_numpy(dtype=float)
+        self.high = work["high"].to_numpy(dtype=float)
+        self.low = work["low"].to_numpy(dtype=float)
+        self.close = work["close"].to_numpy(dtype=float)
+        self.n = len(work)
 
     def start_at_timestamp(self, ts_ns: int) -> int:
         return int(np.searchsorted(self.ts_ns, ts_ns, side="left"))
@@ -61,7 +95,7 @@ OBS_SIGNATURE_BYTES = 64 * 1024
 PENDING_META_SCHEMA_VERSION = 2
 PENDING_REPLAY_FIELDS = (
     "observation_id", "event_id", "scan_id", "event_type", "symbol",
-    "direction", "provider", "source", "observation_ts", "reference_price",
+    "direction", "provider", "source", "observation_ts", "source_event_ts", "reference_price",
 )
 
 
@@ -84,7 +118,10 @@ def _pending_meta_from_observation(obs: dict[str, Any], *, offset: int) -> dict[
 
 
 def _pending_meta_is_replayable(meta: dict[str, Any]) -> bool:
-    return all(meta.get(field) not in (None, "") for field in PENDING_REPLAY_FIELDS if field != "event_id")
+    # source_event_ts was added for temporal-integrity validation but remains optional
+    # for legacy pending rows so old clean state can still be replayed after upgrade.
+    required = [field for field in PENDING_REPLAY_FIELDS if field not in {"event_id", "source_event_ts"}]
+    return all(meta.get(field) not in (None, "") for field in required)
 
 
 def _observation_from_pending_meta(meta: dict[str, Any], oid: str) -> dict[str, Any] | None:
@@ -209,9 +246,9 @@ def _load_bars(*, symbols: set[str] | None = None) -> dict[str, pd.DataFrame]:
         df = pd.DataFrame(items)
         if df.empty:
             continue
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        df["timestamp"] = _timestamp_series_to_utc(df["timestamp"])
         if "close_time" in df.columns:
-            df["close_time"] = pd.to_datetime(df["close_time"], utc=True, errors="coerce")
+            df["close_time"] = _timestamp_series_to_utc(df["close_time"])
         else:
             df["close_time"] = df["timestamp"] + pd.Timedelta(minutes=5)
         for col in ("open", "high", "low", "close", "volume"):
@@ -286,7 +323,9 @@ def _time_to_threshold(direction: str, reference: float, bars: pd.DataFrame, thr
         else:
             hit = float(row["low"]) <= reference * (1.0 - threshold_pct / 100.0) if direction == "LONG" else float(row["high"]) >= reference * (1.0 + threshold_pct / 100.0)
         if hit:
-            ts = pd.Timestamp(row["close_time"] if "close_time" in row else row["timestamp"])
+            ts = research._parse_timestamp(row["close_time"] if "close_time" in row else row["timestamp"])
+            if ts is None:
+                return None
             return max(0.0, (ts - bars.attrs["observation_ts"]).total_seconds() / 60.0)
     return None
 
@@ -296,17 +335,38 @@ def _calculate_forward_outcome_indexed(observation: dict[str, Any], index: _BarI
     symbol = str(observation.get("symbol", "")).upper()
     if direction not in {"LONG", "SHORT"} or index.n == 0:
         return None
+    obs_ts = research._parse_timestamp(observation.get("observation_ts"))
+    if obs_ts is None:
+        return None
     try:
-        obs_ts = pd.Timestamp(observation.get("observation_ts"))
-        if obs_ts.tzinfo is None:
-            obs_ts = obs_ts.tz_localize("UTC")
-        else:
-            obs_ts = obs_ts.tz_convert("UTC")
         reference = float(observation.get("reference_price"))
-    except Exception:
+    except (TypeError, ValueError):
         return None
     if reference <= 0 or not math.isfinite(reference):
         return None
+
+    source_event_ts = research._parse_timestamp(observation.get("source_event_ts"))
+    if source_event_ts is not None:
+        delta_sec = (obs_ts - source_event_ts).total_seconds()
+        if delta_sec < -1.0 or delta_sec > 6 * 60.0:
+            return {
+                "outcome_id": research.stable_id("forward-invalid-v1", observation.get("observation_id"), obs_ts.isoformat(), prefix="OUT_"),
+                "schema_version": research.RESEARCH_SCHEMA_VERSION,
+                "record_type": "FORWARD_OUTCOME",
+                "observation_id": observation.get("observation_id"),
+                "event_id": observation.get("event_id"),
+                "scan_id": observation.get("scan_id"),
+                "event_type": observation.get("event_type"),
+                "outcome_class": "INVALID_RESEARCH_OBSERVATION",
+                "symbol": symbol, "direction": direction,
+                "provider": observation.get("provider"), "source": observation.get("source"),
+                "observation_ts": obs_ts.isoformat(), "reference_price": reference,
+                "data_last_ts": None, "bars_available_after_observation": 0,
+                "forward_gap_count_24h": None, "forward_path_complete_24h": False,
+                "temporal_integrity_status": "INVALID_OBSERVATION_BOUNDARY",
+                "temporal_integrity_source_event_ts": source_event_ts.isoformat(),
+                "temporal_integrity_delta_sec": delta_sec,
+            }
 
     obs_ns = int(obs_ts.value)
     future_start = index.start_at_timestamp(obs_ns)
@@ -437,6 +497,46 @@ def _load_state() -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
+def _invalid_temporal_outcome(observation: dict[str, Any]) -> dict[str, Any] | None:
+    """Return a terminal outcome when observation_ts cannot belong to its source 5m event."""
+    obs_ts = research._parse_timestamp(observation.get("observation_ts"))
+    source_ts = research._parse_timestamp(observation.get("source_event_ts"))
+    if obs_ts is None or source_ts is None:
+        return None
+    delta_sec = (obs_ts - source_ts).total_seconds()
+    if -1.0 <= delta_sec <= 6 * 60.0:
+        return None
+    try:
+        reference = float(observation.get("reference_price"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(reference) or reference <= 0:
+        return None
+    return {
+        "outcome_id": research.stable_id("forward-invalid-v1", observation.get("observation_id"), obs_ts.isoformat(), prefix="OUT_"),
+        "schema_version": research.RESEARCH_SCHEMA_VERSION,
+        "record_type": "FORWARD_OUTCOME",
+        "observation_id": observation.get("observation_id"),
+        "event_id": observation.get("event_id"),
+        "scan_id": observation.get("scan_id"),
+        "event_type": observation.get("event_type"),
+        "outcome_class": "INVALID_RESEARCH_OBSERVATION",
+        "symbol": str(observation.get("symbol", "")).upper(),
+        "direction": str(observation.get("direction", "")).upper(),
+        "provider": observation.get("provider"),
+        "source": observation.get("source"),
+        "observation_ts": obs_ts.isoformat(),
+        "reference_price": reference,
+        "data_last_ts": None,
+        "bars_available_after_observation": 0,
+        "forward_gap_count_24h": None,
+        "forward_path_complete_24h": False,
+        "temporal_integrity_status": "INVALID_OBSERVATION_BOUNDARY",
+        "temporal_integrity_source_event_ts": source_ts.isoformat(),
+        "temporal_integrity_delta_sec": delta_sec,
+    }
+
+
 def update_outcomes(*, write: bool = False) -> tuple[int, int]:
     started = time.perf_counter()
     state = _load_state()
@@ -468,6 +568,7 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
         read_offset = 0
 
     observations: list[dict[str, Any]] = []
+    terminal_invalid: list[dict[str, Any]] = []
     pending_now: dict[str, dict[str, Any]] = dict(pending)
     candidate_symbols: set[str] = set()
     candidate_meta: dict[str, dict[str, Any]] = {}
@@ -500,13 +601,12 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
                     continue
                 seen_new_ids.add(oid)
                 new_unique += 1
-                try:
-                    obs_ts = pd.Timestamp(obs.get("observation_ts"))
-                    if obs_ts.tzinfo is None:
-                        obs_ts = obs_ts.tz_localize("UTC")
-                    else:
-                        obs_ts = obs_ts.tz_convert("UTC")
-                except Exception:
+                invalid = _invalid_temporal_outcome(obs)
+                if invalid is not None:
+                    terminal_invalid.append(invalid)
+                    continue
+                obs_ts = research._parse_timestamp(obs.get("observation_ts"))
+                if obs_ts is None:
                     continue
                 age_ready = now >= obs_ts + pd.Timedelta(hours=24)
                 if age_ready:
@@ -521,13 +621,8 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
     # Revisit only the small pending set that can have matured since the last run.
     stale_pending: list[str] = []
     for oid, meta in sorted(pending_now.items(), key=lambda item: int(item[1].get("offset", 0))):
-        try:
-            obs_ts = pd.Timestamp(meta.get("observation_ts"))
-            if obs_ts.tzinfo is None:
-                obs_ts = obs_ts.tz_localize("UTC")
-            else:
-                obs_ts = obs_ts.tz_convert("UTC")
-        except Exception:
+        obs_ts = research._parse_timestamp(meta.get("observation_ts"))
+        if obs_ts is None:
             stale_pending.append(oid)
             continue
         if now < obs_ts + pd.Timedelta(hours=24):
@@ -607,11 +702,9 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
                         continue
                     seen.add(oid)
                     try:
-                        obs_ts = pd.Timestamp(obs.get("observation_ts"))
-                        if obs_ts.tzinfo is None:
-                            obs_ts = obs_ts.tz_localize("UTC")
-                        else:
-                            obs_ts = obs_ts.tz_convert("UTC")
+                        obs_ts = research._parse_timestamp(obs.get("observation_ts"))
+                        if obs_ts is None:
+                            continue
                     except Exception:
                         continue
                     if now < obs_ts + pd.Timedelta(hours=24):
@@ -623,7 +716,7 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
             rebuilt_pending.pop(oid, None)
         pending_now = rebuilt_pending
 
-    if not observations or not candidate_symbols:
+    if not observations and not candidate_symbols and not terminal_invalid:
         if write:
             state_payload = dict(state)
             state_payload.update({
@@ -645,7 +738,7 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
     bars_started = time.perf_counter()
     bars_by_symbol = _load_bars(symbols=candidate_symbols)
     log.info("[RESEARCH_FORWARD_BARS] symbols=%d groups=%d seconds=%.3f", len(candidate_symbols), len(bars_by_symbol), time.perf_counter() - bars_started)
-    if not bars_by_symbol:
+    if not bars_by_symbol and not terminal_invalid:
         if write:
             state_payload = dict(state)
             state_payload.update({
@@ -676,7 +769,7 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
                 existing_outcome_ids.add(str(row["outcome_id"]))
 
     calc_started = time.perf_counter()
-    ready: list[dict[str, Any]] = []
+    ready: list[dict[str, Any]] = list(terminal_invalid)
     for obs in observations:
         symbol = str(obs.get("symbol", "")).upper()
         provider = str(obs.get("provider", "")).lower()
@@ -688,17 +781,23 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
             continue
         outcome = _calculate_forward_outcome_indexed(obs, index)
         oid = str(obs.get("observation_id", ""))
-        if outcome is None or not bool(outcome.get("forward_path_complete_24h")):
+        invalid_observation = isinstance(outcome, dict) and outcome.get("outcome_class") == "INVALID_RESEARCH_OBSERVATION"
+        if outcome is None or (not invalid_observation and not bool(outcome.get("forward_path_complete_24h"))):
             if oid:
-                # If we cannot complete the 24h horizon yet, revisit next run.
+                # Incomplete but otherwise valid observations stay pending; explicit
+                # temporal-integrity failures are terminal research records instead.
                 meta = pending_now.get(oid) or candidate_meta.get(oid)
                 if meta is None:
-                    meta = {"offset": 0, "observation_ts": str(obs.get("observation_ts", ""))}
+                    meta = {"offset": 0, "observation_ts": str(obs.get("observation_ts", "")), "source_event_ts": obs.get("source_event_ts")}
                 pending_now[oid] = dict(meta)
             continue
-        if not bootstrap_complete and str(outcome.get("outcome_id", "")) in existing_outcome_ids:
-            processed.add(oid)
-            pending_now.pop(oid, None)
+        if invalid_observation:
+            ready.append(outcome)
+            continue
+        if str(outcome.get("outcome_id", "")) in existing_outcome_ids:
+            if oid:
+                processed.add(oid)
+                pending_now.pop(oid, None)
             continue
         ready.append(outcome)
 
@@ -718,7 +817,7 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
             for outcome_row in unique_ready:
                 try:
                     obs = next((o for o in observations if str(o.get("observation_id", "")) == str(outcome_row.get("observation_id", ""))), None)
-                    if obs is not None:
+                    if obs is not None and outcome_row.get("outcome_class") != "INVALID_RESEARCH_OBSERVATION":
                         research.record_counterfactual_outcome(observation=obs, outcomes=outcome_row.get("counterfactual_experiments") or {}, outcome_id=str(outcome_row.get("outcome_id") or ""))
                 except Exception as cf_exc:
                     log.warning("[COUNTERFACTUAL_OUTCOME] event_id=%s error=%s", outcome_row.get("event_id"), cf_exc)
