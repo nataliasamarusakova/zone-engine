@@ -46,8 +46,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:50.248657+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:46.219245+00:00"
     },
     "A-USDT": {
       "version": 1,
@@ -83,8 +83,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:49.413111+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:47.009120+00:00"
     },
     "ACH-USDT": {
       "version": 1,
@@ -100,14 +100,414 @@
           "touch_count": 0
         },
         "DEMAND:ZID_83432D42C83F7D019BBDB539": {
-          "state": "ARMED",
-          "visit_id": "ACH-USDT:DEMAND:ZID_83432D42C83F7D019BBDB539:1791396900000",
+          "state": "LOCKED",
+          "visit_id": "ACH-USDT:DEMAND:ZID_83432D42C83F7D019BBDB539:1791397800000",
           "touch_count": 0,
-          "first_touch_ts": null,
-          "last_touch_ts": null,
+          "first_touch_ts": "2026-10-07T18:30:00+00:00",
+          "last_touch_ts": "2026-10-07T18:30:00+00:00",
           "lock_reason": "zone_touch",
-          "trigger_event_id": null,
-          "pending_signal": null,
+          "trigger_event_id": "ZONE_7099EAF9D9D0D4D96D32E6E8",
+          "pending_signal": {
+            "event_id": "ZONE_7099EAF9D9D0D4D96D32E6E8",
+            "idx": 1791397800000,
+            "time": "2026-10-07T18:30:00+00:00",
+            "trigger_bar_time": "2026-10-07T18:30:00+00:00",
+            "trigger_bar_close_time": "2026-10-07T18:34:59.999000+00:00",
+            "decision_boundary_ts": "2026-10-07T18:34:59.999000+00:00",
+            "decision_boundary_kind": "CLOSED_5M_TRIGGER_CLOSE",
+            "decision_boundary_source": "PROVIDER_CLOSE_TIME",
+            "trigger_timeframe": "5m",
+            "type": "LONG",
+            "symbol": "ACH-USDT",
+            "entry": 0.00553,
+            "sl": 0.0049770000000000005,
+            "tp1": 0.0056959,
+            "tp2": 0.0058618,
+            "risk_pct": 10.0,
+            "risk_abs": 0.000553,
+            "atr": 6.925743992234018e-05,
+            "tp1_rr": 0.3,
+            "tp2_rr": 0.6,
+            "strategy": "Demand/Supply Zone First",
+            "strategy_version": "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp3-tp6-be-on-tp1-zone-touch-test",
+            "entry_bar": {
+              "timestamp": "2026-10-07T18:30:00+00:00",
+              "open": 0.00556,
+              "high": 0.00557,
+              "low": 0.00553,
+              "close": 0.00553,
+              "volume": 173872.0
+            },
+            "previous_bar": {
+              "timestamp": "2026-10-07T18:25:00+00:00",
+              "open": 0.00554,
+              "high": 0.00556,
+              "low": 0.00553,
+              "close": 0.00555,
+              "volume": 123791.0
+            },
+            "trigger": {
+              "type": "ZONE_TOUCH_5M",
+              "alma_required": false,
+              "alternate_timeframe": "8h",
+              "zone_touch": true,
+              "zone_entry_rule": "fresh_zone_touch_5m",
+              "zone_trigger_mode": "zone",
+              "zone_midpoint": 0.0055208629217413435,
+              "zone_midpoint_pct": 50.0,
+              "midpoint_touched_diagnostic": false,
+              "previous_bar_midpoint_touch": false,
+              "previous_bar_zone_touch": false,
+              "trigger_entry_reference": "trigger_bar_close",
+              "zone_visit_id": "ACH-USDT:DEMAND:ZID_83432D42C83F7D019BBDB539:1791397800000",
+              "zone_visit_state": "TRIGGERED"
+            },
+            "zone": {
+              "top": 0.005531725843482687,
+              "btm": 0.00551,
+              "poi": 0.0055208629217413435,
+              "start": 665,
+              "origin_ts_ms": 1790193600000,
+              "zone_id": "ZID_83432D42C83F7D019BBDB539",
+              "kind": "DEMAND",
+              "age_bars": 333
+            },
+            "zone_counts": {
+              "demand": 4,
+              "supply": 2
+            },
+            "target": {
+              "source": "fixed_entry_percentage",
+              "obstacle_source": "supply_zone",
+              "obstacle_price": 0.006252253881920838,
+              "tp1_pct": 3.0,
+              "tp2_pct": 6.0,
+              "tp1_close_fraction": 0.5,
+              "tp2_close_fraction": 0.5,
+              "be_rule": "after_tp1_filled"
+            },
+            "risk_model": {
+              "sl_source": "fixed_percent_from_entry",
+              "fixed_stop_pct": 10.0,
+              "max_signal_risk_pct": 10.0,
+              "initial_risk_pct": 10.0
+            },
+            "confirmation": {
+              "alma_cross": false,
+              "directional_candle_required": false,
+              "directional_candle_ok": false,
+              "zone_age_bars": 333,
+              "minimum_structure_room_r": 1.2,
+              "zone_touch": true,
+              "midpoint_touch": false,
+              "trigger_timeframe": "5m",
+              "zone_trigger_mode": "zone",
+              "volume_ratio": 0.2241609804644928,
+              "volume_ratio_5m20": 0.2241609804644928,
+              "volume_ratio_semantics": "trigger_5m_volume_divided_by_mean_previous_20_closed_5m_volumes",
+              "volume_ratio_source": "5M_PREVIOUS_20_CLOSED_BARS",
+              "volume_ratio_baseline": 775656.85,
+              "volume_ratio_baseline_count": 20,
+              "bullish_candle": false,
+              "bearish_candle": true
+            },
+            "source_bar_close": 0.00553,
+            "zone_midpoint": 0.0055208629217413435,
+            "zone_width_abs": 2.172584348268669e-05,
+            "zone_width_pct_of_entry": 0.39287239570862004,
+            "signal_forensics": {
+              "range_atr": 0.577555,
+              "body_atr": 0.433166,
+              "body_to_range": 0.75,
+              "upper_wick_ratio": 0.25,
+              "lower_wick_ratio": 0.0,
+              "directional_wick_ratio": 0.0,
+              "directional_wick_to_body": 0.0,
+              "close_location": 0.0,
+              "directional_close_location": 0.0,
+              "zone_width_abs": 2.1725843e-05,
+              "zone_width_atr": 0.313697,
+              "zone_penetration_ratio_raw": 0.079437,
+              "zone_penetration_pct_capped": 7.9437,
+              "zone_close_vs_entry_edge_atr": -0.024919,
+              "zone_close_to_poi_atr": 0.131929,
+              "directional_rejection_side": "lower_wick"
+            },
+            "zone_visit": {
+              "visit_id": "ACH-USDT:DEMAND:ZID_83432D42C83F7D019BBDB539:1791397800000",
+              "first_touch_ts": "2026-10-07T18:30:00+00:00",
+              "touch_count_before_trigger": 0,
+              "state": "LOCKED"
+            },
+            "score": 60.0,
+            "market_snapshot": {
+              "analysis_provider": "binance",
+              "analysis_source": "binance_spot",
+              "asset_class": "CRYPTO",
+              "binance_symbol": "ACHUSDT",
+              "analysis_last_price": 0.00552,
+              "analysis_latest_closed_time": "2026-10-07T17:59:59.999000+00:00",
+              "trigger_timeframe": "5m",
+              "trigger_bar_time": "2026-10-07T18:30:00+00:00",
+              "zone_visit_id": "ACH-USDT:DEMAND:ZID_83432D42C83F7D019BBDB539:1791397800000",
+              "bingx_live_price": null,
+              "binance_live_price": 0.00553,
+              "market_spread_pct": null,
+              "venue_price_deviation_pct": null,
+              "market_spread_metric": "cross_venue_price_deviation",
+              "scan_time": "2026-10-07T18:36:48.846829+00:00",
+              "trigger_age_minutes_at_scan": 6.814114033333333
+            },
+            "shadow_experiments": {
+              "schema_version": 1,
+              "experiment_version": "counterfactual-v2",
+              "applied": false,
+              "decision_anchor": {
+                "event_id": "ZONE_7099EAF9D9D0D4D96D32E6E8",
+                "symbol": "ACH-USDT",
+                "direction": "LONG",
+                "entry": 0.00553,
+                "trigger_bar_time": "2026-10-07T18:30:00+00:00",
+                "decision_ts": "2026-10-07T18:34:59.999000+00:00",
+                "counterfactual_path_start_ts": "2026-10-07T18:34:59.999000+00:00",
+                "source": "closed_5m_signal_bar"
+              },
+              "experiments": {
+                "CF_STRUCTURAL_SL": {
+                  "version": 1,
+                  "rule": "far_zone_edge_plus_0.5x_ATR_5m",
+                  "far_zone_edge": 0.00551,
+                  "atr_5m": 2.3571428571428663e-05,
+                  "atr_multiplier": 0.5,
+                  "hypothetical_sl": 0.005498214285714286,
+                  "risk_pct": 0.5747868767760259,
+                  "min_risk_pct": 1.0,
+                  "max_risk_pct": 6.0,
+                  "would_pass": false
+                },
+                "CF_TP_RR_15_30": {
+                  "version": 1,
+                  "risk_pct": 0.5747868767760259,
+                  "tp1_rr": 1.5,
+                  "tp2_rr": 3.0,
+                  "hypothetical_tp1": 0.005577678571428572,
+                  "hypothetical_tp2": 0.005625357142857143,
+                  "would_be_valid": true
+                },
+                "CF_VOLUME_5M": {
+                  "version": 1,
+                  "trigger_volume": 173872.0,
+                  "baseline_sma20_previous_bars": 775656.85,
+                  "ratio": 0.2241609804644928,
+                  "threshold_grid": {
+                    "0.8": false,
+                    "1.0": false,
+                    "1.2": false,
+                    "1.5": false,
+                    "1.8": false,
+                    "2.0": false
+                  }
+                },
+                "CF_VOLUME_1H": {
+                  "version": 1,
+                  "current_closed_1h_volume": 8212572.0,
+                  "baseline_sma20_previous_bars": 4347852.85,
+                  "ratio": 1.8888799329995727,
+                  "threshold_grid": {
+                    "0.8": true,
+                    "1.0": true,
+                    "1.2": true,
+                    "1.5": true,
+                    "1.8": true,
+                    "2.0": false
+                  }
+                },
+                "CF_DELTA_CONFIRM": {
+                  "version": 1,
+                  "bar_delta_usdt": -826.3587299999999,
+                  "rule": "LONG>0 / SHORT<0",
+                  "would_pass": false
+                },
+                "CF_EMA200_1H": {
+                  "version": 1,
+                  "ema200_1h": 0.006035868712857126,
+                  "distance_pct": -8.381042347385137,
+                  "ema200_trend_up": false,
+                  "rule": "LONG price>EMA200 / SHORT price<EMA200",
+                  "would_pass": false
+                },
+                "CF_ATR_MIN_5M": {
+                  "version": 1,
+                  "atr14_5m": 2.3571428571428663e-05,
+                  "atr_pct": 0.4262464479462687,
+                  "threshold_grid_pct": {
+                    "0.1": true,
+                    "0.2": true,
+                    "0.3": true,
+                    "0.4": true,
+                    "0.5": false,
+                    "0.75": false,
+                    "1.0": false
+                  }
+                },
+                "CF_SESSION": {
+                  "version": 1,
+                  "session_utc": "NEW_YORK",
+                  "utc_hour": 18,
+                  "trigger_session_utc": "NEW_YORK",
+                  "trigger_utc_hour": 18,
+                  "decision_session_utc": "NEW_YORK",
+                  "decision_utc_hour": 18,
+                  "asia_block_window": "00:00<=UTC<06:00",
+                  "asia_off_hours": false,
+                  "would_pass_if_asia_blocked": true
+                },
+                "CF_ZONE_INVALIDATION": {
+                  "version": 1,
+                  "zone_top": 0.005531725843482687,
+                  "zone_bottom": 0.00551,
+                  "body_close_invalid_before_entry": true,
+                  "invalidation_ts": "2026-10-07T17:44:59.999000+00:00",
+                  "would_pass": false
+                },
+                "CF_CORRELATION": {
+                  "version": 1,
+                  "threshold": 0.8,
+                  "open_position_symbols": [],
+                  "max_open_position_correlation": null,
+                  "would_pass": null,
+                  "status": "CONTEXT_UNAVAILABLE"
+                },
+                "CF_PRODUCTION_MANAGEMENT": {
+                  "version": 1,
+                  "stop": 0.0049770000000000005,
+                  "tp1": 0.0056959,
+                  "tp2": 0.0058618,
+                  "tp1_fraction": 0.5,
+                  "management_baseline": "current_production_SL_TP1_TP2_BE_after_TP1"
+                },
+                "CF_COST_MODEL": {
+                  "version": 1,
+                  "taker_fee_rate": null,
+                  "maker_fee_rate": null,
+                  "roundtrip_taker_fee_pct": null,
+                  "roundtrip_cost_scenarios_pct": {
+                    "0.0": null,
+                    "0.1": null,
+                    "0.2": null,
+                    "0.5": null
+                  },
+                  "slippage_scenario_semantics": "roundtrip_pct_added_to_roundtrip_taker_fee"
+                },
+                "CF_DELAYED_BE": {
+                  "version": 2,
+                  "activation": "after_production_TP1_then_N_completed_closed_bars",
+                  "bars_grid": [
+                    1,
+                    2
+                  ],
+                  "production_sl": 0.0049770000000000005,
+                  "production_tp1": 0.0056959,
+                  "production_tp2": 0.0058618,
+                  "tp1_fraction": 0.5,
+                  "standalone_management_only": true,
+                  "production_gate_applied": false
+                },
+                "CF_TRAIL_ATR": {
+                  "version": 2,
+                  "activation": "after_production_TP1",
+                  "atr_multiplier_grid": [
+                    0.75,
+                    1.0,
+                    1.5
+                  ],
+                  "production_sl": 0.0049770000000000005,
+                  "production_tp1": 0.0056959,
+                  "production_tp2": 0.0058618,
+                  "tp1_fraction": 0.5,
+                  "standalone_management_only": true,
+                  "production_gate_applied": false
+                }
+              }
+            },
+            "trend_filter": {
+              "version": "trend-v1-2026-10-06",
+              "enabled": true,
+              "mode": "shadow",
+              "symbol": "ACH-USDT",
+              "event_direction": "LONG",
+              "event_type": "ZONE_TOUCH_5M",
+              "decision_ts": 1791398099999,
+              "trend_decision": "REJECT",
+              "trend_reject_reason": "TREND_4H_TRANSITION",
+              "trend_4h": "TRANSITION",
+              "trend_1h": "SHORT",
+              "trend_persistence": "TRANSITION",
+              "trend_4h_bars": 411,
+              "trend_1h_bars": 999,
+              "trend_4h_bar_close_ts": 1791388799999,
+              "trend_1h_bar_close_ts": 1791395999999,
+              "trend_persistence_1h_return_pct": -2.9876977152899826,
+              "trend_persistence_4h_return_pct": -1.5706806282722479,
+              "btc_regime": "BEARISH",
+              "btc_bar_close_ts": 1791395999999,
+              "btc_chg_1h_pct": -0.27234758219265504,
+              "btc_chg_4h_pct": -0.03969131170167607,
+              "btc_context_veto": false,
+              "require_persistence": false,
+              "min_bars_1h": 400,
+              "min_bars_4h": 400,
+              "persistence_lookback_1h": 6,
+              "persistence_lookback_4h": 3,
+              "slope_lookback_4h": 6,
+              "structure_1h": {
+                "pivot_span": 2,
+                "last_swing_high": 0.00579,
+                "last_swing_high_ts": 1791363599999,
+                "last_swing_high_confirmation_ts": 1791370799999,
+                "last_swing_low": 0.00558,
+                "last_swing_low_ts": 1791381599999,
+                "last_swing_low_confirmation_ts": 1791388799999,
+                "break_above_last_swing_high": false,
+                "break_below_last_swing_low": true,
+                "sweep_below_last_swing_low_reclaim": false,
+                "sweep_above_last_swing_high_reject": false,
+                "structure_state": "BEAR_BREAK"
+              },
+              "structure_4h": {
+                "pivot_span": 2,
+                "last_swing_high": 0.00621,
+                "last_swing_high_ts": 1791259199999,
+                "last_swing_high_confirmation_ts": 1791287999999,
+                "last_swing_low": 0.00556,
+                "last_swing_low_ts": 1791345599999,
+                "last_swing_low_confirmation_ts": 1791374399999,
+                "break_above_last_swing_high": false,
+                "break_below_last_swing_low": false,
+                "sweep_below_last_swing_low_reclaim": false,
+                "sweep_above_last_swing_high_reject": false,
+                "structure_state": "RANGE_OR_UNBROKEN"
+              },
+              "btc_bars": 411,
+              "trend_4h_close": 0.00564,
+              "trend_4h_ema50": 0.006042049509738433,
+              "trend_4h_ema200": 0.005716473180618124,
+              "trend_4h_ema50_slope_pct": -1.2181936835351848,
+              "trend_4h_slope_lookback": 6,
+              "trend_1h_close": 0.00552,
+              "trend_1h_ema20": 0.005712700305403131,
+              "trend_1h_ema50": 0.005860369204068608,
+              "trend_1h_ema200": 0.006035868712857126,
+              "trend_1h_ema50_slope_pct": -1.2117303189332906,
+              "decision_boundary_ts": "2026-10-07T18:34:59.999000+00:00",
+              "history_1h_refetched": false,
+              "history_4h_refetched": true,
+              "source_1h": "binance",
+              "source_4h": "binance",
+              "source_btc": "binance_spot"
+            },
+            "code_commit_sha": "1bb191ed04917ac10a2d9a8ddfc6a08533dff550"
+          },
           "rearm_ts": "2026-10-07T18:25:00+00:00"
         },
         "DEMAND:ZID_E88051D5CBA9088DCFB627E3": {
@@ -126,8 +526,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:49.291873+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:47.821799+00:00"
     },
     "ADA-USDT": {
       "version": 1,
@@ -163,8 +563,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:50.462739+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:47.312712+00:00"
     },
     "1000CAT-USDT": {
       "version": 1,
@@ -210,8 +610,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:50.016209+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:47.784264+00:00"
     },
     "2Z-USDT": {
       "version": 1,
@@ -253,8 +653,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:50.278993+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:47.664777+00:00"
     },
     "1INCH-USDT": {
       "version": 1,
@@ -286,8 +686,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:49.110768+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:47.235534+00:00"
     },
     "ACE-USDT": {
       "version": 1,
@@ -724,8 +1124,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:50.353981+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:48.020396+00:00"
     },
     "ACT-USDT": {
       "version": 1,
@@ -761,8 +1161,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:49.827253+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:47.760360+00:00"
     },
     "1000CHEEMS-USDT": {
       "version": 1,
@@ -793,8 +1193,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:49.578661+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:47.042227+00:00"
     },
     "0G-USDT": {
       "version": 1,
@@ -840,8 +1240,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:50.173302+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:47.927755+00:00"
     },
     "AERO-USDT": {
       "version": 1,
@@ -882,8 +1282,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:51.297470+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:49.221561+00:00"
     },
     "AEVO-USDT": {
       "version": 1,
@@ -914,8 +1314,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:51.714980+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:48.925281+00:00"
     },
     "AAVE-USDT": {
       "version": 1,
@@ -946,8 +1346,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:50.282335+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:48.163180+00:00"
     },
     "AGLD-USDT": {
       "version": 1,
@@ -988,8 +1388,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:51.414400+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:49.300105+00:00"
     },
     "AIXBT-USDT": {
       "version": 1,
@@ -1020,8 +1420,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:51.680923+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:49.354914+00:00"
     },
     "ALLO-USDT": {
       "version": 1,
@@ -1077,8 +1477,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:52.231720+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:49.886962+00:00"
     },
     "ALPINE-USDT": {
       "version": 1,
@@ -1109,8 +1509,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:52.386359+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:49.349882+00:00"
     },
     "ALGO-USDT": {
       "version": 1,
@@ -1156,8 +1556,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:51.615603+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:49.614488+00:00"
     },
     "ALICE-USDT": {
       "version": 1,
@@ -1193,8 +1593,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:52.308418+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:50.019160+00:00"
     },
     "ANIME-USDT": {
       "version": 1,
@@ -1230,8 +1630,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:53.419375+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:50.407110+00:00"
     },
     "ALT-USDT": {
       "version": 1,
@@ -1257,8 +1657,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:52.463071+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:50.270761+00:00"
     },
     "ANKR-USDT": {
       "version": 1,
@@ -1299,8 +1699,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:52.346392+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:50.628927+00:00"
     },
     "APE-USDT": {
       "version": 1,
@@ -1336,8 +1736,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:53.645958+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:51.157900+00:00"
     },
     "API3-USDT": {
       "version": 1,
@@ -1388,8 +1788,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:53.781514+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:51.438199+00:00"
     },
     "APT-USDT": {
       "version": 1,
@@ -1415,8 +1815,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:53.738753+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:51.708049+00:00"
     },
     "AR-USDT": {
       "version": 1,
@@ -1452,8 +1852,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:53.944575+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:51.637428+00:00"
     },
     "ARK-USDT": {
       "version": 1,
@@ -1499,8 +1899,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:54.700203+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:51.953776+00:00"
     },
     "ARB-USDT": {
       "version": 1,
@@ -1551,8 +1951,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:54.243105+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:51.342535+00:00"
     },
     "ARKM-USDT": {
       "version": 1,
@@ -1583,8 +1983,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:54.508641+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:52.358012+00:00"
     },
     "ARPA-USDT": {
       "version": 1,
@@ -1610,8 +2010,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:54.674141+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:52.122263+00:00"
     },
     "ASR-USDT": {
       "version": 1,
@@ -1642,8 +2042,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:54.977612+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:52.275847+00:00"
     },
     "ASTER-USDT": {
       "version": 1,
@@ -1684,8 +2084,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:54.577500+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:52.235397+00:00"
     },
     "ASTR-USDT": {
       "version": 1,
@@ -1731,8 +2131,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:54.885024+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:52.578990+00:00"
     },
     "ATOM-USDT": {
       "version": 1,
@@ -1768,8 +2168,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:55.726578+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:53.219565+00:00"
     },
     "AT-USDT": {
       "version": 1,
@@ -1805,8 +2205,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:55.808135+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:52.820248+00:00"
     },
     "AUCTION-USDT": {
       "version": 1,
@@ -1837,8 +2237,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:55.815994+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:53.300701+00:00"
     },
     "AVA-USDT": {
       "version": 1,
@@ -1874,8 +2274,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:56.069981+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:53.666535+00:00"
     },
     "AVAX-USDT": {
       "version": 1,
@@ -1921,8 +2321,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:55.741075+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:53.637076+00:00"
     },
     "AWE-USDT": {
       "version": 1,
@@ -1968,8 +2368,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:56.924382+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:53.840321+00:00"
     },
     "AVNT-USDT": {
       "version": 1,
@@ -2015,8 +2415,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:56.251052+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:53.892663+00:00"
     },
     "AXS-USDT": {
       "version": 1,
@@ -2067,8 +2467,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:56.752033+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:54.211732+00:00"
     },
     "BANANAS31-USDT": {
       "version": 1,
@@ -2104,8 +2504,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:57.196241+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:54.618616+00:00"
     },
     "AXL-USDT": {
       "version": 1,
@@ -2136,8 +2536,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:56.547266+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:54.434878+00:00"
     },
     "BABY-USDT": {
       "version": 1,
@@ -2173,8 +2573,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:56.920623+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:54.342150+00:00"
     },
     "BANANA-USDT": {
       "version": 1,
@@ -2205,8 +2605,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:56.802004+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:54.193825+00:00"
     },
     "BANK-USDT": {
       "version": 1,
@@ -2257,8 +2657,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:57.299816+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:54.661352+00:00"
     },
     "BARD-USDT": {
       "version": 1,
@@ -2284,8 +2684,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:57.267512+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:54.793014+00:00"
     },
     "BERA-USDT": {
       "version": 1,
@@ -2326,8 +2726,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:00.398935+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:57.689953+00:00"
     },
     "BIO-USDT": {
       "version": 1,
@@ -2363,8 +2763,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:00.053086+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:57.733111+00:00"
     },
     "BCH-USDT": {
       "version": 1,
@@ -2410,8 +2810,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:59.862048+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:57.837234+00:00"
     },
     "BOME-USDT": {
       "version": 1,
@@ -2463,8 +2863,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:00.045403+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:57.581942+00:00"
     },
     "BICO-USDT": {
       "version": 1,
@@ -2505,8 +2905,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:00.349184+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:58.127112+00:00"
     },
     "BLUR-USDT": {
       "version": 1,
@@ -2542,8 +2942,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:59.898129+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:57.238971+00:00"
     },
     "BAT-USDT": {
       "version": 1,
@@ -2599,8 +2999,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:58.947779+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:56.576575+00:00"
     },
     "BIGTIME-USDT": {
       "version": 1,
@@ -2641,8 +3041,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:59.276732+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:57.196914+00:00"
     },
     "BMT-USDT": {
       "version": 1,
@@ -2688,8 +3088,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:00.573936+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:57.660847+00:00"
     },
     "BNB-USDT": {
       "version": 1,
@@ -2730,8 +3130,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:59.746906+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:57.643386+00:00"
     },
     "BB-USDT": {
       "version": 1,
@@ -2772,8 +3172,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:32:59.355442+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:57.855666+00:00"
     },
     "BREV-USDT": {
       "version": 1,
@@ -2804,8 +3204,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:01.190208+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:58.581838+00:00"
     },
     "BTC-USDT": {
       "version": 1,
@@ -2836,8 +3236,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:01.171145+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:58.640211+00:00"
     },
     "CELR-USDT": {
       "version": 1,
@@ -2878,8 +3278,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:02.021684+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:59.697409+00:00"
     },
     "CELO-USDT": {
       "version": 1,
@@ -2920,8 +3320,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:01.708278+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:59.108651+00:00"
     },
     "CAKE-USDT": {
       "version": 1,
@@ -2972,8 +3372,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:01.417739+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:59.152530+00:00"
     },
     "CATI-USDT": {
       "version": 1,
@@ -3014,8 +3414,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:02.115397+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:59.505806+00:00"
     },
     "CGPT-USDT": {
       "version": 1,
@@ -3041,8 +3441,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:02.360301+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:59.642664+00:00"
     },
     "CETUS-USDT": {
       "version": 1,
@@ -3068,8 +3468,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:02.035592+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:59.833842+00:00"
     },
     "CFG-USDT": {
       "version": 1,
@@ -3105,8 +3505,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:02.212214+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:59.857768+00:00"
     },
     "CHIP-USDT": {
       "version": 1,
@@ -3137,8 +3537,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:02.606644+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:00.259238+00:00"
     },
     "C-USDT": {
       "version": 1,
@@ -3179,8 +3579,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:01.591603+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:36:59.114856+00:00"
     },
     "CFX-USDT": {
       "version": 1,
@@ -3206,8 +3606,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:02.722626+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:00.057243+00:00"
     },
     "CHR-USDT": {
       "version": 1,
@@ -3259,8 +3659,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:03.439493+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:00.513362+00:00"
     },
     "COOKIE-USDT": {
       "version": 1,
@@ -3306,8 +3706,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:03.786577+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:01.060769+00:00"
     },
     "CHZ-USDT": {
       "version": 1,
@@ -3348,8 +3748,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:03.402799+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:00.795110+00:00"
     },
     "COW-USDT": {
       "version": 1,
@@ -3395,8 +3795,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:04.386790+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:01.828244+00:00"
     },
     "CKB-USDT": {
       "version": 1,
@@ -3437,8 +3837,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:03.538947+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:01.444434+00:00"
     },
     "COMP-USDT": {
       "version": 1,
@@ -3479,8 +3879,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:03.738413+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:01.477763+00:00"
     },
     "CRV-USDT": {
       "version": 1,
@@ -3522,8 +3922,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:04.257345+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:01.624757+00:00"
     },
     "CTK-USDT": {
       "version": 1,
@@ -3559,8 +3959,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:04.544787+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:01.812588+00:00"
     },
     "CTSI-USDT": {
       "version": 1,
@@ -3601,8 +4001,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:04.193880+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:02.153091+00:00"
     },
     "COTI-USDT": {
       "version": 1,
@@ -3648,8 +4048,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:04.545832+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:01.631511+00:00"
     },
     "CVX-USDT": {
       "version": 1,
@@ -3685,8 +4085,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:04.978611+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:02.260602+00:00"
     },
     "CVC-USDT": {
       "version": 1,
@@ -3747,8 +4147,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:04.798966+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:02.142204+00:00"
     },
     "CYBER-USDT": {
       "version": 1,
@@ -3779,8 +4179,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:05.504102+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:02.736826+00:00"
     },
     "DOGE-USDT": {
       "version": 1,
@@ -3811,8 +4211,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:05.703944+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:04.007657+00:00"
     },
     "DIA-USDT": {
       "version": 1,
@@ -3853,8 +4253,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:06.233572+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:03.523528+00:00"
     },
     "DOT-USDT": {
       "version": 1,
@@ -3890,8 +4290,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:06.432931+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:04.027715+00:00"
     },
     "DEXE-USDT": {
       "version": 1,
@@ -3932,8 +4332,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:05.811515+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:03.152765+00:00"
     },
     "DASH-USDT": {
       "version": 1,
@@ -3974,8 +4374,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:05.625205+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:02.908481+00:00"
     },
     "DUSK-USDT": {
       "version": 1,
@@ -4011,8 +4411,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:06.477223+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:03.653829+00:00"
     },
     "DOLO-USDT": {
       "version": 1,
@@ -4048,8 +4448,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:06.426869+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:03.613022+00:00"
     },
     "DYDX-USDT": {
       "version": 1,
@@ -4080,8 +4480,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:06.681109+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:04.217595+00:00"
     },
     "DOGS-USDT": {
       "version": 1,
@@ -4133,8 +4533,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:06.223831+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:03.716867+00:00"
     },
     "DYM-USDT": {
       "version": 1,
@@ -4181,8 +4581,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:06.768443+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:04.128389+00:00"
     },
     "EDU-USDT": {
       "version": 1,
@@ -4213,8 +4613,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:06.821591+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:04.113668+00:00"
     },
     "ETC-USDT": {
       "version": 1,
@@ -4255,8 +4655,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:08.383433+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:06.154326+00:00"
     },
     "ENJ-USDT": {
       "version": 1,
@@ -4297,8 +4697,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:10.014027+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:07.033598+00:00"
     },
     "ETHFI-USDT": {
       "version": 1,
@@ -4339,8 +4739,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:09.672299+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:07.178596+00:00"
     },
     "EPIC-USDT": {
       "version": 1,
@@ -4397,8 +4797,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:09.926898+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:06.479916+00:00"
     },
     "ENSO-USDT": {
       "version": 1,
@@ -4439,8 +4839,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:09.588774+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:06.831163+00:00"
     },
     "ETH-USDT": {
       "version": 1,
@@ -4461,8 +4861,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:09.712775+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:06.989179+00:00"
     },
     "ENA-USDT": {
       "version": 1,
@@ -4503,8 +4903,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:10.072129+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:07.203972+00:00"
     },
     "ENS-USDT": {
       "version": 1,
@@ -4540,8 +4940,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:09.382559+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:06.183472+00:00"
     },
     "ESP-USDT": {
       "version": 1,
@@ -4582,8 +4982,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:09.798412+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:07.360403+00:00"
     },
     "ERA-USDT": {
       "version": 1,
@@ -4614,8 +5014,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:08.909793+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:05.881536+00:00"
     },
     "EIGEN-USDT": {
       "version": 1,
@@ -4646,8 +5046,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:09.433242+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:07.083109+00:00"
     },
     "EGLD-USDT": {
       "version": 1,
@@ -4678,8 +5078,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:10.134576+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:06.876338+00:00"
     },
     "FET-USDT": {
       "version": 1,
@@ -4710,8 +5110,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:11.468795+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:08.517437+00:00"
     },
     "F-USDT": {
       "version": 1,
@@ -4763,8 +5163,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:10.963848+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:08.119008+00:00"
     },
     "EUL-USDT": {
       "version": 1,
@@ -4800,8 +5200,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:10.575743+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:07.873136+00:00"
     },
     "FIDA-USDT": {
       "version": 1,
@@ -4832,8 +5232,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:11.247670+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:08.712484+00:00"
     },
     "FF-USDT": {
       "version": 1,
@@ -4884,8 +5284,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:11.345166+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:08.364117+00:00"
     },
     "FIL-USDT": {
       "version": 1,
@@ -4921,8 +5321,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:11.239313+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:08.682830+00:00"
     },
     "FLOKI-USDT": {
       "version": 1,
@@ -4953,8 +5353,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:12.239070+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:09.349950+00:00"
     },
     "FLUX-USDT": {
       "version": 1,
@@ -5005,8 +5405,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:11.753127+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:09.115555+00:00"
     },
     "FLOW-USDT": {
       "version": 1,
@@ -5032,8 +5432,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:12.222952+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:09.184321+00:00"
     },
     "FOGO-USDT": {
       "version": 1,
@@ -5074,8 +5474,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:12.047798+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:09.387615+00:00"
     },
     "FORM-USDT": {
       "version": 1,
@@ -5116,8 +5516,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:12.166468+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:09.267468+00:00"
     },
     "FRAX-USDT": {
       "version": 1,
@@ -5154,8 +5554,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:12.314426+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:09.685453+00:00"
     },
     "GENIUS-USDT": {
       "version": 1,
@@ -5201,8 +5601,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:13.312913+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:10.476734+00:00"
     },
     "G-USDT": {
       "version": 1,
@@ -5273,8 +5673,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:12.730233+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:10.073367+00:00"
     },
     "GAS-USDT": {
       "version": 1,
@@ -5305,8 +5705,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:13.166435+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:10.578658+00:00"
     },
     "GALA-USDT": {
       "version": 1,
@@ -5352,8 +5752,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:13.445360+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:10.446061+00:00"
     },
     "GSTOCK-USDT": {
       "version": 1,
@@ -5405,8 +5805,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:14.447574+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:10.654858+00:00"
     },
     "GIGGLE-USDT": {
       "version": 1,
@@ -5447,8 +5847,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:13.666350+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:11.100295+00:00"
     },
     "GLM-USDT": {
       "version": 1,
@@ -5494,8 +5894,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:13.601085+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:10.850357+00:00"
     },
     "GMX-USDT": {
       "version": 1,
@@ -5526,8 +5926,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:13.805191+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:11.381902+00:00"
     },
     "GRT-USDT": {
       "version": 1,
@@ -5583,8 +5983,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:14.368320+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:11.578288+00:00"
     },
     "GPS-USDT": {
       "version": 1,
@@ -5626,8 +6026,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:14.144971+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:11.796176+00:00"
     },
     "GMT-USDT": {
       "version": 1,
@@ -5658,8 +6058,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:14.417899+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:11.343849+00:00"
     },
     "GUN-USDT": {
       "version": 1,
@@ -5701,8 +6101,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:14.820745+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:12.052143+00:00"
     },
     "HYPE-USDT": {
       "version": 1,
@@ -5718,8 +6118,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:15.072666+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:12.380265+00:00"
     },
     "HAEDAL-USDT": {
       "version": 1,
@@ -5761,8 +6161,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:14.919891+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:12.415846+00:00"
     },
     "HEI-USDT": {
       "version": 1,
@@ -5819,8 +6219,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:15.903292+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:12.626301+00:00"
     },
     "HEMI-USDT": {
       "version": 1,
@@ -5871,8 +6271,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:15.946711+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:12.697777+00:00"
     },
     "HBAR-USDT": {
       "version": 1,
@@ -5923,8 +6323,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:15.534615+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:12.830344+00:00"
     },
     "HMSTR-USDT": {
       "version": 1,
@@ -5955,8 +6355,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:15.666435+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:13.422433+00:00"
     },
     "HIVE-USDT": {
       "version": 1,
@@ -5997,8 +6397,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:15.324380+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:12.892201+00:00"
     },
     "HOLO-USDT": {
       "version": 1,
@@ -6024,8 +6424,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:15.939578+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:13.180172+00:00"
     },
     "HOME-USDT": {
       "version": 1,
@@ -6066,8 +6466,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:16.148494+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:13.452301+00:00"
     },
     "HUMA-USDT": {
       "version": 1,
@@ -6118,8 +6518,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:16.219112+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:13.529412+00:00"
     },
     "ID-USDT": {
       "version": 1,
@@ -6150,8 +6550,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:16.342979+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:13.629156+00:00"
     },
     "IMX-USDT": {
       "version": 1,
@@ -6208,8 +6608,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:16.476775+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:13.714807+00:00"
     },
     "KAIA-USDT": {
       "version": 1,
@@ -6256,8 +6656,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:18.897406+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:15.120893+00:00"
     },
     "IO-USDT": {
       "version": 1,
@@ -6298,8 +6698,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:19.321626+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:16.203713+00:00"
     },
     "IOTA-USDT": {
       "version": 1,
@@ -6340,8 +6740,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:18.417907+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:15.555135+00:00"
     },
     "INIT-USDT": {
       "version": 1,
@@ -6402,8 +6802,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:19.908986+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:16.601862+00:00"
     },
     "INJ-USDT": {
       "version": 1,
@@ -6434,8 +6834,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:19.703234+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:16.739520+00:00"
     },
     "JTO-USDT": {
       "version": 1,
@@ -6471,8 +6871,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:19.354435+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:17.047470+00:00"
     },
     "IOST-USDT": {
       "version": 1,
@@ -6533,8 +6933,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:19.798406+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:16.574281+00:00"
     },
     "KAITO-USDT": {
       "version": 1,
@@ -6571,8 +6971,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:19.333364+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:16.417660+00:00"
     },
     "IOTX-USDT": {
       "version": 1,
@@ -6613,8 +7013,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:18.617417+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:16.531412+00:00"
     },
     "JUP-USDT": {
       "version": 1,
@@ -6655,8 +7055,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:19.826810+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:15.957740+00:00"
     },
     "JASMY-USDT": {
       "version": 1,
@@ -6718,8 +7118,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:19.678952+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:16.736253+00:00"
     },
     "JST-USDT": {
       "version": 1,
@@ -6765,8 +7165,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:19.048575+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:16.708696+00:00"
     },
     "KERNEL-USDT": {
       "version": 1,
@@ -6827,8 +7227,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:20.841727+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:17.973649+00:00"
     },
     "KAVA-USDT": {
       "version": 1,
@@ -6894,8 +7294,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:20.868551+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:17.765679+00:00"
     },
     "KSM-USDT": {
       "version": 1,
@@ -6936,8 +7336,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:21.512015+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:18.155908+00:00"
     },
     "LA-USDT": {
       "version": 1,
@@ -6968,8 +7368,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:21.752276+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:18.667595+00:00"
     },
     "KMNO-USDT": {
       "version": 1,
@@ -7025,8 +7425,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:21.825680+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:18.602005+00:00"
     },
     "KAT-USDT": {
       "version": 1,
@@ -7057,8 +7457,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:20.740296+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:17.266589+00:00"
     },
     "KITE-USDT": {
       "version": 1,
@@ -7069,12 +7469,12 @@
           "touch_count": 0
         },
         "DEMAND:ZID_0861878D180DAB7BF9B6481E": {
-          "state": "ARMED",
-          "visit_id": "KITE-USDT:DEMAND:ZID_0861878D180DAB7BF9B6481E:1791396300000",
+          "state": "LOCKED",
+          "visit_id": "KITE-USDT:DEMAND:ZID_0861878D180DAB7BF9B6481E:1791397800000",
           "touch_count": 0,
-          "first_touch_ts": null,
-          "last_touch_ts": null,
-          "lock_reason": "insufficient_structure_room=0.740R < 1.200R",
+          "first_touch_ts": "2026-10-07T18:30:00+00:00",
+          "last_touch_ts": "2026-10-07T18:30:00+00:00",
+          "lock_reason": "insufficient_structure_room=0.748R < 1.200R",
           "trigger_event_id": null,
           "rearm_ts": "2026-10-07T18:25:00+00:00",
           "pending_signal": null
@@ -7105,8 +7505,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:20.987936+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:17.970443+00:00"
     },
     "KNC-USDT": {
       "version": 1,
@@ -7152,8 +7552,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:21.356411+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:18.660454+00:00"
     },
     "LINEA-USDT": {
       "version": 1,
@@ -7189,8 +7589,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:22.159037+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:19.077906+00:00"
     },
     "LINK-USDT": {
       "version": 1,
@@ -7226,8 +7626,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:23.578806+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:19.306401+00:00"
     },
     "LAYER-USDT": {
       "version": 1,
@@ -7263,8 +7663,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:21.593408+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:19.064426+00:00"
     },
     "LDO-USDT": {
       "version": 1,
@@ -7301,8 +7701,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:22.142332+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:19.108025+00:00"
     },
     "LISTA-USDT": {
       "version": 1,
@@ -7333,8 +7733,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:22.748799+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:19.483969+00:00"
     },
     "LQTY-USDT": {
       "version": 1,
@@ -7370,8 +7770,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:23.056652+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:20.141553+00:00"
     },
     "LPT-USDT": {
       "version": 1,
@@ -7397,8 +7797,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:22.936341+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:20.233713+00:00"
     },
     "LTC-USDT": {
       "version": 1,
@@ -7449,8 +7849,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:24.290290+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:20.527845+00:00"
     },
     "LUNC-USDT": {
       "version": 1,
@@ -7492,8 +7892,8 @@
           "pending_signal": null
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:23.733631+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:20.893021+00:00"
     },
     "MANA-USDT": {
       "version": 1,
@@ -7524,8 +7924,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:24.077188+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:20.962591+00:00"
     },
     "LUNA-USDT": {
       "version": 1,
@@ -7567,8 +7967,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:23.419165+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:20.750624+00:00"
     },
     "LSK-USDT": {
       "version": 1,
@@ -7639,8 +8039,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:22.956234+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:19.912826+00:00"
     },
     "MAGIC-USDT": {
       "version": 1,
@@ -7686,8 +8086,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:23.632211+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:21.098043+00:00"
     },
     "MANTA-USDT": {
       "version": 1,
@@ -7718,8 +8118,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:24.189307+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:21.154662+00:00"
     },
     "LUMIA-USDT": {
       "version": 1,
@@ -7761,8 +8161,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:23.482406+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:20.467861+00:00"
     },
     "MANTRA-USDT": {
       "version": 1,
@@ -7803,8 +8203,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:24.822582+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:21.509472+00:00"
     },
     "ME-USDT": {
       "version": 1,
@@ -7830,8 +8230,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:25.508583+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:22.154805+00:00"
     },
     "MARSCOIN-USDT": {
       "version": 1,
@@ -7867,8 +8267,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:24.917412+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:21.552349+00:00"
     },
     "MASK-USDT": {
       "version": 1,
@@ -7899,8 +8299,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:25.156772+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:22.003915+00:00"
     },
     "MEME-USDT": {
       "version": 1,
@@ -7926,8 +8326,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:25.763557+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:23.033601+00:00"
     },
     "METIS-USDT": {
       "version": 1,
@@ -7958,8 +8358,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:25.589814+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:22.517591+00:00"
     },
     "MEGA-USDT": {
       "version": 1,
@@ -7990,8 +8390,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:25.634412+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:22.536427+00:00"
     },
     "MAV-USDT": {
       "version": 1,
@@ -8017,8 +8417,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:25.378145+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:22.497541+00:00"
     },
     "MINA-USDT": {
       "version": 1,
@@ -8064,8 +8464,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:26.166804+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:22.604759+00:00"
     },
     "MMT-USDT": {
       "version": 1,
@@ -8112,8 +8512,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:26.137968+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:22.783095+00:00"
     },
     "MOVE-USDT": {
       "version": 1,
@@ -8149,8 +8549,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:26.295211+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:23.101092+00:00"
     },
     "MORPHO-USDT": {
       "version": 1,
@@ -8176,8 +8576,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:26.251423+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:23.117863+00:00"
     },
     "MOVR-USDT": {
       "version": 1,
@@ -8223,8 +8623,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:26.420900+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:23.202606+00:00"
     },
     "MTL-USDT": {
       "version": 1,
@@ -8285,8 +8685,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:28.769583+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:24.405272+00:00"
     },
     "NMR-USDT": {
       "version": 1,
@@ -8332,8 +8732,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:27.998832+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:25.504366+00:00"
     },
     "NXPC-USDT": {
       "version": 1,
@@ -8384,8 +8784,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:28.917136+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:25.712949+00:00"
     },
     "OG-USDT": {
       "version": 1,
@@ -8416,8 +8816,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:28.208856+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:26.086081+00:00"
     },
     "NEO-USDT": {
       "version": 1,
@@ -8443,8 +8843,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:28.926265+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:25.884670+00:00"
     },
     "NIGHT-USDT": {
       "version": 1,
@@ -8500,8 +8900,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:28.827702+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:25.386206+00:00"
     },
     "NEAR-USDT": {
       "version": 1,
@@ -8557,8 +8957,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:29.397353+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:25.312855+00:00"
     },
     "NIL-USDT": {
       "version": 1,
@@ -8599,8 +8999,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:29.443047+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:25.981036+00:00"
     },
     "MUBARAK-USDT": {
       "version": 1,
@@ -8661,8 +9061,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:29.028354+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:25.828643+00:00"
     },
     "ONDO-USDT": {
       "version": 1,
@@ -8698,8 +9098,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:28.913605+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:25.914671+00:00"
     },
     "ONE-USDT": {
       "version": 1,
@@ -8745,8 +9145,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:29.131902+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:26.349047+00:00"
     },
     "NOT-USDT": {
       "version": 1,
@@ -8782,8 +9182,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:29.313585+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:26.094683+00:00"
     },
     "ONT-USDT": {
       "version": 1,
@@ -8819,8 +9219,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:30.430006+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:27.385491+00:00"
     },
     "OPN-USDT": {
       "version": 1,
@@ -8856,8 +9256,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:30.589350+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:27.468426+00:00"
     },
     "OPG-USDT": {
       "version": 1,
@@ -8903,8 +9303,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:31.084190+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:27.526599+00:00"
     },
     "ORCA-USDT": {
       "version": 1,
@@ -8960,8 +9360,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:30.785914+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:27.938259+00:00"
     },
     "OP-USDT": {
       "version": 1,
@@ -8992,8 +9392,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:30.547976+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:27.567647+00:00"
     },
     "PENDLE-USDT": {
       "version": 1,
@@ -9044,8 +9444,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:31.558707+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:27.887295+00:00"
     },
     "ORDI-USDT": {
       "version": 1,
@@ -9081,8 +9481,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:31.213919+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:27.760626+00:00"
     },
     "PARTI-USDT": {
       "version": 1,
@@ -9128,8 +9528,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:31.316710+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:28.202207+00:00"
     },
     "ONG-USDT": {
       "version": 1,
@@ -9175,8 +9575,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:30.129759+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:27.064177+00:00"
     },
     "PEOPLE-USDT": {
       "version": 1,
@@ -9208,8 +9608,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:31.693466+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:28.304563+00:00"
     },
     "PENGU-USDT": {
       "version": 1,
@@ -9245,8 +9645,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:31.387050+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:28.058089+00:00"
     },
     "PHA-USDT": {
       "version": 1,
@@ -9302,8 +9702,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:31.954440+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:28.517973+00:00"
     },
     "PIXEL-USDT": {
       "version": 1,
@@ -9350,8 +9750,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:32.348925+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:28.978919+00:00"
     },
     "PNUT-USDT": {
       "version": 1,
@@ -9377,8 +9777,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:32.606854+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:29.255631+00:00"
     },
     "POLYX-USDT": {
       "version": 1,
@@ -9424,8 +9824,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:32.812890+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:29.565541+00:00"
     },
     "POL-USDT": {
       "version": 1,
@@ -9461,8 +9861,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:33.028068+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:29.664510+00:00"
     },
     "PROM-USDT": {
       "version": 1,
@@ -9488,8 +9888,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:33.428004+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:30.185753+00:00"
     },
     "PLUME-USDT": {
       "version": 1,
@@ -9530,8 +9930,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:32.645506+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:29.306678+00:00"
     },
     "PROVE-USDT": {
       "version": 1,
@@ -9582,8 +9982,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:33.313121+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:30.102583+00:00"
     },
     "POWR-USDT": {
       "version": 1,
@@ -9644,8 +10044,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:33.308231+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:29.929503+00:00"
     },
     "PORTAL-USDT": {
       "version": 1,
@@ -9676,8 +10076,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:33.400977+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:29.854983+00:00"
     },
     "PUMP-USDT": {
       "version": 1,
@@ -9729,8 +10129,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:33.792796+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:30.415566+00:00"
     },
     "PUNDIX-USDT": {
       "version": 1,
@@ -9771,8 +10171,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:33.857592+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:30.571595+00:00"
     },
     "PYTH-USDT": {
       "version": 1,
@@ -9824,8 +10224,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:34.354969+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:30.893586+00:00"
     },
     "RE-USDT": {
       "version": 1,
@@ -9851,8 +10251,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:35.275472+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:31.784005+00:00"
     },
     "QNT-USDT": {
       "version": 1,
@@ -9908,8 +10308,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:34.903993+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:31.093467+00:00"
     },
     "QTUM-USDT": {
       "version": 1,
@@ -9950,8 +10350,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:34.532902+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:31.368657+00:00"
     },
     "RENDER-USDT": {
       "version": 1,
@@ -9987,8 +10387,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:35.626672+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:31.952723+00:00"
     },
     "RARE-USDT": {
       "version": 1,
@@ -10034,8 +10434,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:34.939043+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:31.388572+00:00"
     },
     "RESOLV-USDT": {
       "version": 1,
@@ -10066,8 +10466,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:35.415138+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:31.974985+00:00"
     },
     "REZ-USDT": {
       "version": 1,
@@ -10134,8 +10534,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:35.344933+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:32.303099+00:00"
     },
     "RAY-USDT": {
       "version": 1,
@@ -10186,8 +10586,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:35.214711+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:31.665951+00:00"
     },
     "RLC-USDT": {
       "version": 1,
@@ -10233,8 +10633,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:35.904069+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:32.371679+00:00"
     },
     "RIF-USDT": {
       "version": 1,
@@ -10290,8 +10690,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:35.655243+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:32.236271+00:00"
     },
     "ROSE-USDT": {
       "version": 1,
@@ -10337,8 +10737,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:36.005952+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:32.564450+00:00"
     },
     "ROBO-USDT": {
       "version": 1,
@@ -10384,8 +10784,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:35.816572+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:32.441646+00:00"
     },
     "RPL-USDT": {
       "version": 1,
@@ -10426,8 +10826,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:38.872822+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:34.801486+00:00"
     },
     "RUNE-USDT": {
       "version": 1,
@@ -10473,8 +10873,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:39.277371+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:34.639322+00:00"
     },
     "SENT-USDT": {
       "version": 1,
@@ -10535,8 +10935,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:39.373089+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:35.472121+00:00"
     },
     "SANTOS-USDT": {
       "version": 1,
@@ -10562,8 +10962,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:37.518972+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:33.781836+00:00"
     },
     "SAPIEN-USDT": {
       "version": 1,
@@ -10604,8 +11004,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:38.320089+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:34.461445+00:00"
     },
     "SAND-USDT": {
       "version": 1,
@@ -10631,8 +11031,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:39.094395+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:35.607870+00:00"
     },
     "SAHARA-USDT": {
       "version": 1,
@@ -10668,8 +11068,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:39.251359+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:35.086978+00:00"
     },
     "RSR-USDT": {
       "version": 1,
@@ -10700,8 +11100,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:38.392353+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:34.972878+00:00"
     },
     "SEI-USDT": {
       "version": 1,
@@ -10737,8 +11137,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:38.735879+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:35.431968+00:00"
     },
     "SAGA-USDT": {
       "version": 1,
@@ -10800,8 +11200,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:39.332454+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:35.516133+00:00"
     },
     "S-USDT": {
       "version": 1,
@@ -10832,8 +11232,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:39.423655+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:35.701722+00:00"
     },
     "RVN-USDT": {
       "version": 1,
@@ -10854,8 +11254,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:39.010382+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:35.629472+00:00"
     },
     "SFP-USDT": {
       "version": 1,
@@ -10886,8 +11286,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:39.588149+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:36.025158+00:00"
     },
     "SHELL-USDT": {
       "version": 1,
@@ -10918,8 +11318,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:40.633527+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:36.739703+00:00"
     },
     "SIGN-USDT": {
       "version": 1,
@@ -10981,8 +11381,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:40.543443+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:36.652906+00:00"
     },
     "SKY-USDT": {
       "version": 1,
@@ -11018,8 +11418,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:40.893724+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:37.090790+00:00"
     },
     "SLP-USDT": {
       "version": 1,
@@ -11045,8 +11445,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:41.044807+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:37.114954+00:00"
     },
     "SKL-USDT": {
       "version": 1,
@@ -11077,8 +11477,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:40.870984+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:36.965435+00:00"
     },
     "SOL-USDT": {
       "version": 1,
@@ -11120,8 +11520,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:41.357775+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:37.372769+00:00"
     },
     "SOLV-USDT": {
       "version": 1,
@@ -11172,8 +11572,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:41.312122+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:37.363279+00:00"
     },
     "STOCKER-USDT": {
       "version": 1,
@@ -11189,8 +11589,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:42.316377+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:37.865805+00:00"
     },
     "SNX-USDT": {
       "version": 1,
@@ -11221,8 +11621,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:40.824213+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:37.504434+00:00"
     },
     "SOMI-USDT": {
       "version": 1,
@@ -11268,8 +11668,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:41.542540+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:37.659997+00:00"
     },
     "SOPH-USDT": {
       "version": 1,
@@ -11310,8 +11710,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:41.883916+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:37.724662+00:00"
     },
     "SPK-USDT": {
       "version": 1,
@@ -11347,8 +11747,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:41.457665+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:37.956862+00:00"
     },
     "SSV-USDT": {
       "version": 1,
@@ -11384,8 +11784,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:41.816799+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:38.098089+00:00"
     },
     "STEEM-USDT": {
       "version": 1,
@@ -11431,8 +11831,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:42.537465+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:38.900909+00:00"
     },
     "STO-USDT": {
       "version": 1,
@@ -11473,8 +11873,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:42.503175+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:38.655207+00:00"
     },
     "STRK-USDT": {
       "version": 1,
@@ -11510,8 +11910,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:42.853911+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:39.194652+00:00"
     },
     "SUI-USDT": {
       "version": 1,
@@ -11542,8 +11942,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:43.366166+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:39.388593+00:00"
     },
     "STX-USDT": {
       "version": 1,
@@ -11574,8 +11974,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:42.979024+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:39.057230+00:00"
     },
     "SXT-USDT": {
       "version": 1,
@@ -11616,8 +12016,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:43.426864+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:39.668136+00:00"
     },
     "SUN-USDT": {
       "version": 1,
@@ -11668,8 +12068,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:43.208203+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:39.320694+00:00"
     },
     "SUPER-USDT": {
       "version": 1,
@@ -11720,8 +12120,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:43.612639+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:39.524500+00:00"
     },
     "SUSHI-USDT": {
       "version": 1,
@@ -11752,8 +12152,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:43.106323+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:39.703595+00:00"
     },
     "SYN-USDT": {
       "version": 1,
@@ -11794,19 +12194,19 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:43.782514+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:39.974319+00:00"
     },
     "TAO-USDT": {
       "version": 1,
       "zones": {
         "DEMAND:ZID_CCB1841E848822BAD9F0D13E": {
-          "state": "ARMED",
-          "visit_id": "TAO-USDT:DEMAND:ZID_CCB1841E848822BAD9F0D13E:1791397200000",
+          "state": "LOCKED",
+          "visit_id": "TAO-USDT:DEMAND:ZID_CCB1841E848822BAD9F0D13E:1791397800000",
           "touch_count": 0,
-          "first_touch_ts": null,
-          "last_touch_ts": null,
-          "lock_reason": "insufficient_structure_room=0.668R < 1.200R",
+          "first_touch_ts": "2026-10-07T18:30:00+00:00",
+          "last_touch_ts": "2026-10-07T18:30:00+00:00",
+          "lock_reason": "insufficient_structure_room=0.690R < 1.200R",
           "trigger_event_id": null,
           "rearm_ts": "2026-10-07T18:25:00+00:00",
           "pending_signal": null
@@ -11842,8 +12242,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:44.333222+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:40.184862+00:00"
     },
     "SYRUP-USDT": {
       "version": 1,
@@ -11884,8 +12284,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:43.935809+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:39.951726+00:00"
     },
     "TNSR-USDT": {
       "version": 1,
@@ -11926,8 +12326,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:44.914054+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:41.421310+00:00"
     },
     "THE-USDT": {
       "version": 1,
@@ -11958,8 +12358,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:44.639354+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:40.584277+00:00"
     },
     "TIA-USDT": {
       "version": 1,
@@ -12000,8 +12400,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:45.032999+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:41.044263+00:00"
     },
     "TLM-USDT": {
       "version": 1,
@@ -12037,8 +12437,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:45.211580+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:41.379709+00:00"
     },
     "TRB-USDT": {
       "version": 1,
@@ -12069,8 +12469,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:45.353051+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:41.711903+00:00"
     },
     "TRX-USDT": {
       "version": 1,
@@ -12116,8 +12516,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:45.498041+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:41.689315+00:00"
     },
     "TOWNS-USDT": {
       "version": 1,
@@ -12153,8 +12553,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:45.247701+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:41.188677+00:00"
     },
     "THETA-USDT": {
       "version": 1,
@@ -12180,8 +12580,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:44.691515+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:41.113813+00:00"
     },
     "TREE-USDT": {
       "version": 1,
@@ -12192,12 +12592,12 @@
           "touch_count": 0
         },
         "SUPPLY:ZID_2F75BA618884C9565095607B": {
-          "state": "ARMED",
-          "visit_id": "TREE-USDT:SUPPLY:ZID_2F75BA618884C9565095607B:1791396900000",
+          "state": "LOCKED",
+          "visit_id": "TREE-USDT:SUPPLY:ZID_2F75BA618884C9565095607B:1791397800000",
           "touch_count": 0,
-          "first_touch_ts": null,
-          "last_touch_ts": null,
-          "lock_reason": "insufficient_structure_room=0.107R < 1.200R",
+          "first_touch_ts": "2026-10-07T18:30:00+00:00",
+          "last_touch_ts": "2026-10-07T18:30:00+00:00",
+          "lock_reason": "insufficient_structure_room=0.086R < 1.200R",
           "trigger_event_id": null,
           "rearm_ts": "2026-10-07T18:25:00+00:00",
           "pending_signal": null
@@ -12239,8 +12639,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:45.519624+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:41.519836+00:00"
     },
     "TST-USDT": {
       "version": 1,
@@ -12271,8 +12671,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:45.600221+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:41.832395+00:00"
     },
     "TWT-USDT": {
       "version": 1,
@@ -12308,8 +12708,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:46.600299+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:43.809562+00:00"
     },
     "VANA-USDT": {
       "version": 1,
@@ -12340,8 +12740,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:48.629591+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:43.036623+00:00"
     },
     "UMA-USDT": {
       "version": 1,
@@ -12372,8 +12772,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:48.371196+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:43.838831+00:00"
     },
     "VIRTUAL-USDT": {
       "version": 1,
@@ -12404,8 +12804,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:48.253282+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:44.716236+00:00"
     },
     "VET-USDT": {
       "version": 1,
@@ -12441,8 +12841,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:48.405875+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:44.918547+00:00"
     },
     "VTHO-USDT": {
       "version": 1,
@@ -12503,8 +12903,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:48.499140+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:44.756972+00:00"
     },
     "USUAL-USDT": {
       "version": 1,
@@ -12540,8 +12940,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:47.781017+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:45.721741+00:00"
     },
     "UNI-USDT": {
       "version": 1,
@@ -12582,8 +12982,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:48.038623+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:44.732472+00:00"
     },
     "VELODROME-USDT": {
       "version": 1,
@@ -12624,8 +13024,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:48.225500+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:44.756147+00:00"
     },
     "TURBO-USDT": {
       "version": 1,
@@ -12656,8 +13056,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:48.207307+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:44.395462+00:00"
     },
     "TUT-USDT": {
       "version": 1,
@@ -12708,8 +13108,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:48.276019+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:44.953727+00:00"
     },
     "TURTLE-USDT": {
       "version": 1,
@@ -12740,8 +13140,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:48.109401+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:44.198058+00:00"
     },
     "W-USDT": {
       "version": 1,
@@ -12782,8 +13182,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:48.848117+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:45.903034+00:00"
     },
     "WAXP-USDT": {
       "version": 1,
@@ -12829,8 +13229,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:50.159816+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:46.474492+00:00"
     },
     "WAL-USDT": {
       "version": 1,
@@ -12877,8 +13277,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:50.300501+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:45.827553+00:00"
     },
     "WIF-USDT": {
       "version": 1,
@@ -12919,8 +13319,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:50.531674+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:46.527589+00:00"
     },
     "WLFI-USDT": {
       "version": 1,
@@ -12956,21 +13356,421 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:49.621345+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:46.672085+00:00"
     },
     "WLD-USDT": {
       "version": 1,
       "zones": {
         "DEMAND:ZID_4E6AB19CECA8A585D1F5ADD7": {
-          "state": "ARMED",
-          "visit_id": "WLD-USDT:DEMAND:ZID_4E6AB19CECA8A585D1F5ADD7:1791396900000",
+          "state": "LOCKED",
+          "visit_id": "WLD-USDT:DEMAND:ZID_4E6AB19CECA8A585D1F5ADD7:1791397800000",
           "touch_count": 0,
-          "first_touch_ts": null,
-          "last_touch_ts": null,
+          "first_touch_ts": "2026-10-07T18:30:00+00:00",
+          "last_touch_ts": "2026-10-07T18:30:00+00:00",
           "lock_reason": "zone_touch",
-          "trigger_event_id": null,
-          "pending_signal": null,
+          "trigger_event_id": "ZONE_6D325F5174EC115A3B8E5367",
+          "pending_signal": {
+            "event_id": "ZONE_6D325F5174EC115A3B8E5367",
+            "idx": 1791397800000,
+            "time": "2026-10-07T18:30:00+00:00",
+            "trigger_bar_time": "2026-10-07T18:30:00+00:00",
+            "trigger_bar_close_time": "2026-10-07T18:34:59.999000+00:00",
+            "decision_boundary_ts": "2026-10-07T18:34:59.999000+00:00",
+            "decision_boundary_kind": "CLOSED_5M_TRIGGER_CLOSE",
+            "decision_boundary_source": "PROVIDER_CLOSE_TIME",
+            "trigger_timeframe": "5m",
+            "type": "LONG",
+            "symbol": "WLD-USDT",
+            "entry": 0.5134,
+            "sl": 0.46205999999999997,
+            "tp1": 0.528802,
+            "tp2": 0.544204,
+            "risk_pct": 10.0,
+            "risk_abs": 0.05134,
+            "atr": 0.009106521063317484,
+            "tp1_rr": 0.3,
+            "tp2_rr": 0.6,
+            "strategy": "Demand/Supply Zone First",
+            "strategy_version": "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp3-tp6-be-on-tp1-zone-touch-test",
+            "entry_bar": {
+              "timestamp": "2026-10-07T18:30:00+00:00",
+              "open": 0.5146,
+              "high": 0.5149,
+              "low": 0.5133,
+              "close": 0.5134,
+              "volume": 54151.9
+            },
+            "previous_bar": {
+              "timestamp": "2026-10-07T18:25:00+00:00",
+              "open": 0.5146,
+              "high": 0.5151,
+              "low": 0.5144,
+              "close": 0.5146,
+              "volume": 74702.3
+            },
+            "trigger": {
+              "type": "ZONE_TOUCH_5M",
+              "alma_required": false,
+              "alternate_timeframe": "8h",
+              "zone_touch": true,
+              "zone_entry_rule": "fresh_zone_touch_5m",
+              "zone_trigger_mode": "zone",
+              "zone_midpoint": 0.5122430950928584,
+              "zone_midpoint_pct": 50.0,
+              "midpoint_touched_diagnostic": false,
+              "previous_bar_midpoint_touch": false,
+              "previous_bar_zone_touch": false,
+              "trigger_entry_reference": "trigger_bar_close",
+              "zone_visit_id": "WLD-USDT:DEMAND:ZID_4E6AB19CECA8A585D1F5ADD7:1791397800000",
+              "zone_visit_state": "TRIGGERED"
+            },
+            "zone": {
+              "top": 0.5133861901857167,
+              "btm": 0.5111,
+              "poi": 0.5122430950928584,
+              "start": 983,
+              "origin_ts_ms": 1791338400000,
+              "zone_id": "ZID_4E6AB19CECA8A585D1F5ADD7",
+              "kind": "DEMAND",
+              "age_bars": 15
+            },
+            "zone_counts": {
+              "demand": 5,
+              "supply": 2
+            },
+            "target": {
+              "source": "fixed_entry_percentage",
+              "obstacle_source": "pivot_high",
+              "obstacle_price": 0.5826,
+              "tp1_pct": 3.0,
+              "tp2_pct": 6.0,
+              "tp1_close_fraction": 0.5,
+              "tp2_close_fraction": 0.5,
+              "be_rule": "after_tp1_filled"
+            },
+            "risk_model": {
+              "sl_source": "fixed_percent_from_entry",
+              "fixed_stop_pct": 10.0,
+              "max_signal_risk_pct": 10.0,
+              "initial_risk_pct": 10.0
+            },
+            "confirmation": {
+              "alma_cross": false,
+              "directional_candle_required": false,
+              "directional_candle_ok": false,
+              "zone_age_bars": 15,
+              "minimum_structure_room_r": 1.2,
+              "zone_touch": true,
+              "midpoint_touch": false,
+              "trigger_timeframe": "5m",
+              "zone_trigger_mode": "zone",
+              "volume_ratio": 0.2218341501138555,
+              "volume_ratio_5m20": 0.2218341501138555,
+              "volume_ratio_semantics": "trigger_5m_volume_divided_by_mean_previous_20_closed_5m_volumes",
+              "volume_ratio_source": "5M_PREVIOUS_20_CLOSED_BARS",
+              "volume_ratio_baseline": 244109.84500000003,
+              "volume_ratio_baseline_count": 20,
+              "bullish_candle": false,
+              "bearish_candle": true
+            },
+            "source_bar_close": 0.5134,
+            "zone_midpoint": 0.5122430950928584,
+            "zone_width_abs": 0.002286190185716741,
+            "zone_width_pct_of_entry": 0.4453038928158826,
+            "signal_forensics": {
+              "range_atr": 0.175698,
+              "body_atr": 0.131774,
+              "body_to_range": 0.75,
+              "upper_wick_ratio": 0.1875,
+              "lower_wick_ratio": 0.0625,
+              "directional_wick_ratio": 0.0625,
+              "directional_wick_to_body": 0.083333,
+              "close_location": 0.0625,
+              "directional_close_location": 0.0625,
+              "zone_width_abs": 0.002286190186,
+              "zone_width_atr": 0.25105,
+              "zone_penetration_ratio_raw": 0.0377,
+              "zone_penetration_pct_capped": 3.77,
+              "zone_close_vs_entry_edge_atr": 0.001516,
+              "zone_close_to_poi_atr": 0.127041,
+              "directional_rejection_side": "lower_wick"
+            },
+            "zone_visit": {
+              "visit_id": "WLD-USDT:DEMAND:ZID_4E6AB19CECA8A585D1F5ADD7:1791397800000",
+              "first_touch_ts": "2026-10-07T18:30:00+00:00",
+              "touch_count_before_trigger": 0,
+              "state": "LOCKED"
+            },
+            "score": 65.0,
+            "market_snapshot": {
+              "analysis_provider": "binance",
+              "analysis_source": "binance_spot",
+              "asset_class": "CRYPTO",
+              "binance_symbol": "WLDUSDT",
+              "analysis_last_price": 0.5128,
+              "analysis_latest_closed_time": "2026-10-07T17:59:59.999000+00:00",
+              "trigger_timeframe": "5m",
+              "trigger_bar_time": "2026-10-07T18:30:00+00:00",
+              "zone_visit_id": "WLD-USDT:DEMAND:ZID_4E6AB19CECA8A585D1F5ADD7:1791397800000",
+              "bingx_live_price": null,
+              "binance_live_price": 0.514,
+              "market_spread_pct": null,
+              "venue_price_deviation_pct": null,
+              "market_spread_metric": "cross_venue_price_deviation",
+              "scan_time": "2026-10-07T18:37:48.580747+00:00",
+              "trigger_age_minutes_at_scan": 7.809679283333334
+            },
+            "shadow_experiments": {
+              "schema_version": 1,
+              "experiment_version": "counterfactual-v2",
+              "applied": false,
+              "decision_anchor": {
+                "event_id": "ZONE_6D325F5174EC115A3B8E5367",
+                "symbol": "WLD-USDT",
+                "direction": "LONG",
+                "entry": 0.5134,
+                "trigger_bar_time": "2026-10-07T18:30:00+00:00",
+                "decision_ts": "2026-10-07T18:34:59.999000+00:00",
+                "counterfactual_path_start_ts": "2026-10-07T18:34:59.999000+00:00",
+                "source": "closed_5m_signal_bar"
+              },
+              "experiments": {
+                "CF_STRUCTURAL_SL": {
+                  "version": 1,
+                  "rule": "far_zone_edge_plus_0.5x_ATR_5m",
+                  "far_zone_edge": 0.5111,
+                  "atr_5m": 0.0024499999999999917,
+                  "atr_multiplier": 0.5,
+                  "hypothetical_sl": 0.509875,
+                  "risk_pct": 0.6865991429684457,
+                  "min_risk_pct": 1.0,
+                  "max_risk_pct": 6.0,
+                  "would_pass": false
+                },
+                "CF_TP_RR_15_30": {
+                  "version": 1,
+                  "risk_pct": 0.6865991429684457,
+                  "tp1_rr": 1.5,
+                  "tp2_rr": 3.0,
+                  "hypothetical_tp1": 0.5186875,
+                  "hypothetical_tp2": 0.523975,
+                  "would_be_valid": true
+                },
+                "CF_VOLUME_5M": {
+                  "version": 1,
+                  "trigger_volume": 54151.9,
+                  "baseline_sma20_previous_bars": 244109.84500000003,
+                  "ratio": 0.2218341501138555,
+                  "threshold_grid": {
+                    "0.8": false,
+                    "1.0": false,
+                    "1.2": false,
+                    "1.5": false,
+                    "1.8": false,
+                    "2.0": false
+                  }
+                },
+                "CF_VOLUME_1H": {
+                  "version": 1,
+                  "current_closed_1h_volume": 2996065.5,
+                  "baseline_sma20_previous_bars": 3425295.2350000003,
+                  "ratio": 0.8746882515077564,
+                  "threshold_grid": {
+                    "0.8": true,
+                    "1.0": false,
+                    "1.2": false,
+                    "1.5": false,
+                    "1.8": false,
+                    "2.0": false
+                  }
+                },
+                "CF_DELTA_CONFIRM": {
+                  "version": 1,
+                  "bar_delta_usdt": 5196.773259999998,
+                  "rule": "LONG>0 / SHORT<0",
+                  "would_pass": true
+                },
+                "CF_EMA200_1H": {
+                  "version": 1,
+                  "ema200_1h": 0.5426610664291038,
+                  "distance_pct": -5.392144054419035,
+                  "ema200_trend_up": false,
+                  "rule": "LONG price>EMA200 / SHORT price<EMA200",
+                  "would_pass": false
+                },
+                "CF_ATR_MIN_5M": {
+                  "version": 1,
+                  "atr14_5m": 0.0024499999999999917,
+                  "atr_pct": 0.4772107518504074,
+                  "threshold_grid_pct": {
+                    "0.1": true,
+                    "0.2": true,
+                    "0.3": true,
+                    "0.4": true,
+                    "0.5": false,
+                    "0.75": false,
+                    "1.0": false
+                  }
+                },
+                "CF_SESSION": {
+                  "version": 1,
+                  "session_utc": "NEW_YORK",
+                  "utc_hour": 18,
+                  "trigger_session_utc": "NEW_YORK",
+                  "trigger_utc_hour": 18,
+                  "decision_session_utc": "NEW_YORK",
+                  "decision_utc_hour": 18,
+                  "asia_block_window": "00:00<=UTC<06:00",
+                  "asia_off_hours": false,
+                  "would_pass_if_asia_blocked": true
+                },
+                "CF_ZONE_INVALIDATION": {
+                  "version": 1,
+                  "zone_top": 0.5133861901857167,
+                  "zone_bottom": 0.5111,
+                  "body_close_invalid_before_entry": true,
+                  "invalidation_ts": "2026-10-07T14:49:59.999000+00:00",
+                  "would_pass": false
+                },
+                "CF_CORRELATION": {
+                  "version": 1,
+                  "threshold": 0.8,
+                  "open_position_symbols": [],
+                  "max_open_position_correlation": null,
+                  "would_pass": null,
+                  "status": "CONTEXT_UNAVAILABLE"
+                },
+                "CF_PRODUCTION_MANAGEMENT": {
+                  "version": 1,
+                  "stop": 0.46205999999999997,
+                  "tp1": 0.528802,
+                  "tp2": 0.544204,
+                  "tp1_fraction": 0.5,
+                  "management_baseline": "current_production_SL_TP1_TP2_BE_after_TP1"
+                },
+                "CF_COST_MODEL": {
+                  "version": 1,
+                  "taker_fee_rate": null,
+                  "maker_fee_rate": null,
+                  "roundtrip_taker_fee_pct": null,
+                  "roundtrip_cost_scenarios_pct": {
+                    "0.0": null,
+                    "0.1": null,
+                    "0.2": null,
+                    "0.5": null
+                  },
+                  "slippage_scenario_semantics": "roundtrip_pct_added_to_roundtrip_taker_fee"
+                },
+                "CF_DELAYED_BE": {
+                  "version": 2,
+                  "activation": "after_production_TP1_then_N_completed_closed_bars",
+                  "bars_grid": [
+                    1,
+                    2
+                  ],
+                  "production_sl": 0.46205999999999997,
+                  "production_tp1": 0.528802,
+                  "production_tp2": 0.544204,
+                  "tp1_fraction": 0.5,
+                  "standalone_management_only": true,
+                  "production_gate_applied": false
+                },
+                "CF_TRAIL_ATR": {
+                  "version": 2,
+                  "activation": "after_production_TP1",
+                  "atr_multiplier_grid": [
+                    0.75,
+                    1.0,
+                    1.5
+                  ],
+                  "production_sl": 0.46205999999999997,
+                  "production_tp1": 0.528802,
+                  "production_tp2": 0.544204,
+                  "tp1_fraction": 0.5,
+                  "standalone_management_only": true,
+                  "production_gate_applied": false
+                }
+              }
+            },
+            "trend_filter": {
+              "version": "trend-v1-2026-10-06",
+              "enabled": true,
+              "mode": "shadow",
+              "symbol": "WLD-USDT",
+              "event_direction": "LONG",
+              "event_type": "ZONE_TOUCH_5M",
+              "decision_ts": 1791398099999,
+              "trend_decision": "REJECT",
+              "trend_reject_reason": "TREND_4H_TRANSITION",
+              "trend_4h": "TRANSITION",
+              "trend_1h": "SHORT",
+              "trend_persistence": "TRANSITION",
+              "trend_4h_bars": 411,
+              "trend_1h_bars": 999,
+              "trend_4h_bar_close_ts": 1791388799999,
+              "trend_1h_bar_close_ts": 1791395999999,
+              "trend_persistence_1h_return_pct": -0.17519953280124817,
+              "trend_persistence_4h_return_pct": -0.01931620629710257,
+              "btc_regime": "BEARISH",
+              "btc_bar_close_ts": 1791395999999,
+              "btc_chg_1h_pct": -0.27234758219265504,
+              "btc_chg_4h_pct": -0.03969131170167607,
+              "btc_context_veto": false,
+              "require_persistence": false,
+              "min_bars_1h": 400,
+              "min_bars_4h": 400,
+              "persistence_lookback_1h": 6,
+              "persistence_lookback_4h": 3,
+              "slope_lookback_4h": 6,
+              "structure_1h": {
+                "pivot_span": 2,
+                "last_swing_high": 0.5298,
+                "last_swing_high_ts": 1791359999999,
+                "last_swing_high_confirmation_ts": 1791367199999,
+                "last_swing_low": 0.5088,
+                "last_swing_low_ts": 1791388799999,
+                "last_swing_low_confirmation_ts": 1791395999999,
+                "break_above_last_swing_high": false,
+                "break_below_last_swing_low": false,
+                "sweep_below_last_swing_low_reclaim": false,
+                "sweep_above_last_swing_high_reject": false,
+                "structure_state": "RANGE_OR_UNBROKEN"
+              },
+              "structure_4h": {
+                "pivot_span": 2,
+                "last_swing_high": 0.5826,
+                "last_swing_high_ts": 1791244799999,
+                "last_swing_high_confirmation_ts": 1791273599999,
+                "last_swing_low": 0.5111,
+                "last_swing_low_ts": 1791345599999,
+                "last_swing_low_confirmation_ts": 1791374399999,
+                "break_above_last_swing_high": false,
+                "break_below_last_swing_low": false,
+                "sweep_below_last_swing_low_reclaim": true,
+                "sweep_above_last_swing_high_reject": false,
+                "structure_state": "BULL_SWEEP_RECLAIM"
+              },
+              "btc_bars": 411,
+              "trend_4h_close": 0.5176,
+              "trend_4h_ema50": 0.5424861209391708,
+              "trend_4h_ema200": 0.47322774131057327,
+              "trend_4h_ema50_slope_pct": -0.6616109221705191,
+              "trend_4h_slope_lookback": 6,
+              "trend_1h_close": 0.5128,
+              "trend_1h_ema20": 0.5250308621920745,
+              "trend_1h_ema50": 0.5418551159661157,
+              "trend_1h_ema200": 0.5426610664291038,
+              "trend_1h_ema50_slope_pct": -1.3342374670381796,
+              "decision_boundary_ts": "2026-10-07T18:34:59.999000+00:00",
+              "history_1h_refetched": false,
+              "history_4h_refetched": true,
+              "source_1h": "binance",
+              "source_4h": "binance",
+              "source_btc": "binance_spot"
+            },
+            "code_commit_sha": "1bb191ed04917ac10a2d9a8ddfc6a08533dff550"
+          },
           "rearm_ts": "2026-10-07T18:20:00+00:00"
         },
         "SUPPLY:ZID_896B0232EE390EF03114A440": {
@@ -13004,8 +13804,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:50.090564+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:46.923753+00:00"
     },
     "WCT-USDT": {
       "version": 1,
@@ -13036,8 +13836,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:50.622920+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:45.992525+00:00"
     },
     "XLM-USDT": {
       "version": 1,
@@ -13078,8 +13878,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:50.694172+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:47.307536+00:00"
     },
     "WOO-USDT": {
       "version": 1,
@@ -13120,8 +13920,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:50.437327+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:46.566735+00:00"
     },
     "XAI-USDT": {
       "version": 1,
@@ -13168,8 +13968,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:50.482950+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:47.281403+00:00"
     },
     "XRP-USDT": {
       "version": 1,
@@ -13205,8 +14005,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:52.363022+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:47.907325+00:00"
     },
     "XTZ-USDT": {
       "version": 1,
@@ -13252,8 +14052,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:51.914760+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:48.349094+00:00"
     },
     "XVG-USDT": {
       "version": 1,
@@ -13299,8 +14099,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:51.808623+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:48.002310+00:00"
     },
     "YB-USDT": {
       "version": 1,
@@ -13341,8 +14141,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:51.797162+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:48.416216+00:00"
     },
     "YGG-USDT": {
       "version": 1,
@@ -13373,8 +14173,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:52.614735+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:48.691842+00:00"
     },
     "YFI-USDT": {
       "version": 1,
@@ -13415,8 +14215,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:52.438571+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:48.492350+00:00"
     },
     "XPL-USDT": {
       "version": 1,
@@ -13458,8 +14258,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:51.351350+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:47.979345+00:00"
     },
     "ZAMA-USDT": {
       "version": 1,
@@ -13495,8 +14295,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:52.756451+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:48.711018+00:00"
     },
     "ZEC-USDT": {
       "version": 1,
@@ -13542,8 +14342,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:52.920513+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:49.113261+00:00"
     },
     "ZEN-USDT": {
       "version": 1,
@@ -13589,8 +14389,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:52.532496+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:49.384581+00:00"
     },
     "ZIL-USDT": {
       "version": 1,
@@ -13642,8 +14442,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:53.176869+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:50.057978+00:00"
     },
     "ZBT-USDT": {
       "version": 1,
@@ -13674,8 +14474,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:52.576117+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:49.436994+00:00"
     },
     "ZK-USDT": {
       "version": 1,
@@ -13711,8 +14511,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:53.400463+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:49.891852+00:00"
     },
     "ZKC-USDT": {
       "version": 1,
@@ -13758,8 +14558,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:53.450184+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:50.086363+00:00"
     },
     "ZRO-USDT": {
       "version": 1,
@@ -13800,8 +14600,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:53.561347+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:50.348452+00:00"
     },
     "ZRX-USDT": {
       "version": 1,
@@ -13842,8 +14642,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:53.785858+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:50.445501+00:00"
     },
     "ZKP-USDT": {
       "version": 1,
@@ -13869,8 +14669,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-07T18:25:00+00:00",
-      "last_scan_ts": "2026-10-07T18:33:53.734820+00:00"
+      "last_processed_5m_ts": "2026-10-07T18:30:00+00:00",
+      "last_scan_ts": "2026-10-07T18:37:50.305793+00:00"
     }
   }
 }
