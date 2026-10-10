@@ -223,6 +223,37 @@ def test_update_active_trade_protection_requires_event_id_when_ambiguous(monkeyp
     assert tracker.update_active_trade_protection("AAA-USDT", "LONG", [], {}, event_id=None) is False
 
 
+def test_reconciled_filled_tp_identity_survives_protection_rebuild(tmp_path, monkeypatch):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", tmp_path / "active_trades.json")
+    state = {
+        "EVT_ACH": {
+            "event_id": "EVT_ACH", "symbol": "ACH-USDT", "direction": "LONG", "closed": False,
+            "tp_orders": [{"leg": "tp2", "order_id": "TP2_NEW", "status": "FILLED"}],
+            "sl_order": {}, "hit_legs": [], "tp_filled_qty": {},
+        }
+    }
+    (tmp_path / "active_trades.json").write_text(json.dumps(state), encoding="utf-8")
+    recovered = [{"leg": "tp1", "order_id": "TP1_ORIGINAL", "status": "FILLED", "qty": 898.0}]
+    assert tracker.merge_reconciled_tp_orders("EVT_ACH", recovered) is True
+    assert tracker.update_active_trade_protection(
+        "ACH-USDT", "LONG", [], {"order_id": "SL_REPAIRED", "stop_price": 0.005537}, event_id="EVT_ACH"
+    ) is True
+    updated = json.loads((tmp_path / "active_trades.json").read_text(encoding="utf-8"))["EVT_ACH"]
+    by_leg = {x["leg"]: x for x in updated["tp_orders"]}
+    assert by_leg["tp1"]["order_id"] == "TP1_ORIGINAL"
+    assert by_leg["tp1"]["recovered_execution_pending"] is True
+    assert by_leg["tp2"]["order_id"] == "TP2_NEW"
+    assert updated["sl_order"]["order_id"] == "SL_REPAIRED"
+    # Reprocessing the same recovery evidence must be idempotent and keep the
+    # durable pending marker even if the order ID was inserted by a prior pass.
+    assert tracker.merge_reconciled_tp_orders("EVT_ACH", recovered) is True
+    updated_again = json.loads((tmp_path / "active_trades.json").read_text(encoding="utf-8"))["EVT_ACH"]
+    assert sum(x.get("order_id") == "TP1_ORIGINAL" for x in updated_again["tp_orders"]) == 1
+    assert updated_again["tp_recovery_pending"] is True
+    assert next(x for x in updated_again["tp_orders"] if x.get("order_id") == "TP1_ORIGINAL")["recovered_execution_pending"] is True
+
+
 def test_update_active_trade_protection_updates_exact_event_id(tmp_path, monkeypatch):
     from event_engine import tracker
     monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", tmp_path / "active_trades.json")
@@ -2156,6 +2187,86 @@ def test_position_keys_normalizes_one_way_both_by_position_amount():
         ("BBB-USDT", "SHORT"),
         ("DDD-USDT", "LONG"),
     }
+
+
+def test_reconcile_recovers_original_filled_tp_and_defers_tp_recreation(monkeypatch):
+    import run_once
+    recovered = []
+    protection_calls = []
+    trade = {
+        "event_id": "EVT_ACH", "symbol": "ACH-USDT", "direction": "LONG", "closed": False,
+        "remaining_qty": 449.0, "planned_risk_pct": 10.0, "attempt_id": "A1", "position_id": "P1",
+        "hit_legs": [], "tp_orders": [{"leg": "tp1", "status": "error", "error": "price crossed"}],
+        "setup": {"tp_levels": [
+            {"leg": "tp1", "pnl_pct": 3.0, "close_fraction": 0.5},
+            {"leg": "tp2", "pnl_pct": 6.0, "close_fraction": 0.5},
+        ], "protection_result": {"tp_orders": [
+            {"leg": "tp1", "order_id": "TP1_ORIGINAL", "qty": 898.0, "pnl_pct": 3.0},
+            {"leg": "tp2", "order_id": "TP2_ORIGINAL", "qty": 897.0, "pnl_pct": 6.0},
+        ]}},
+    }
+    monkeypatch.setattr(run_once, "_load_active_trades_file", lambda: {"EVT_ACH": trade})
+    monkeypatch.setattr(run_once, "get_positions", lambda **kwargs: [
+        {"symbol": "ACH-USDT", "positionSide": "LONG", "positionAmt": "449", "avgPrice": "0.005537"}
+    ])
+    monkeypatch.setattr(run_once, "get_order", lambda symbol, order_id: {
+        "status": "ok", "order_id": order_id,
+        "order_status": "FILLED" if order_id == "TP1_ORIGINAL" else "NEW",
+        "executed_qty": 898.0 if order_id == "TP1_ORIGINAL" else 0.0,
+        "avg_price": 0.005703 if order_id == "TP1_ORIGINAL" else 0.0,
+        "update_time_ms": 123,
+    })
+    monkeypatch.setattr(run_once, "merge_reconciled_tp_orders", lambda event_id, orders: recovered.extend(orders) or True)
+    monkeypatch.setattr(run_once, "ensure_directional_protection", lambda symbol, side, avg, qty, risk, levels, trade_id=None: (
+        protection_calls.append({"qty": qty, "levels": levels}) or
+        {"status": "PROTECTED", "tp_orders": [], "sl_result": {"order_id": "SL_REPAIRED"}, "effective_tp_levels": []}
+    ))
+    monkeypatch.setattr(run_once, "update_active_trade_protection", lambda *args, **kwargs: True)
+    monkeypatch.setattr(run_once.telemetry, "record_position_reconciliation", lambda **kwargs: None)
+    run_once.reconcile_all_open_positions()
+    assert [x["order_id"] for x in recovered] == ["TP1_ORIGINAL"]
+    assert protection_calls == [{"qty": 449.0, "levels": []}]
+
+
+def test_reconcile_persists_tp_recovery_gate_across_cycles(monkeypatch):
+    """A persisted recovery must keep TP recreation disabled on later passes."""
+    import run_once
+    queried = []
+    protection_calls = []
+    trade = {
+        "event_id": "EVT_ACH", "symbol": "ACH-USDT", "direction": "LONG", "closed": False,
+        "remaining_qty": 449.0, "planned_risk_pct": 10.0, "attempt_id": "A1", "position_id": "P1",
+        "hit_legs": [], "tp_recovery_pending": True,
+        "tp_orders": [
+            {"leg": "tp1", "order_id": "TP1_ORIGINAL", "status": "FILLED", "executed_qty": 898.0, "avg_price": 0.005703, "recovered_execution_pending": True},
+            {"leg": "tp2", "order_id": "TP2_NEW", "status": "created", "qty": 448.0},
+        ],
+        "setup": {"tp_levels": [
+            {"leg": "tp1", "pnl_pct": 3.0, "close_fraction": 0.5},
+            {"leg": "tp2", "pnl_pct": 6.0, "close_fraction": 0.5},
+        ], "protection_result": {"tp_orders": [
+            {"leg": "tp1", "order_id": "TP1_ORIGINAL", "qty": 898.0, "pnl_pct": 3.0},
+            {"leg": "tp2", "order_id": "TP2_ORIGINAL", "qty": 897.0, "pnl_pct": 6.0},
+        ]}},
+    }
+    monkeypatch.setattr(run_once, "_load_active_trades_file", lambda: {"EVT_ACH": trade})
+    monkeypatch.setattr(run_once, "get_positions", lambda **kwargs: [
+        {"symbol": "ACH-USDT", "positionSide": "LONG", "positionAmt": "449", "avgPrice": "0.005537"}
+    ])
+    def fake_get_order(symbol, order_id):
+        queried.append(order_id)
+        return {"status": "ok", "order_id": order_id, "order_status": "NEW", "executed_qty": 0.0, "avg_price": 0.0}
+    monkeypatch.setattr(run_once, "get_order", fake_get_order)
+    monkeypatch.setattr(run_once, "merge_reconciled_tp_orders", lambda event_id, orders: True)
+    monkeypatch.setattr(run_once, "ensure_directional_protection", lambda symbol, side, avg, qty, risk, levels, trade_id=None: (
+        protection_calls.append({"qty": qty, "levels": levels}) or
+        {"status": "PROTECTED", "tp_orders": [], "sl_result": {"order_id": "SL_REPAIRED"}, "effective_tp_levels": []}
+    ))
+    monkeypatch.setattr(run_once, "update_active_trade_protection", lambda *args, **kwargs: True)
+    monkeypatch.setattr(run_once.telemetry, "record_position_reconciliation", lambda **kwargs: None)
+    run_once.reconcile_all_open_positions()
+    assert "TP1_ORIGINAL" not in queried
+    assert protection_calls == [{"qty": 449.0, "levels": []}]
 
 
 def test_reconcile_classifies_side_mismatch_and_orphan_local(monkeypatch):
@@ -4431,7 +4542,7 @@ def test_trade_close_uses_exchange_execution_timestamp_and_canonical_absolute_ac
     assert record["realized_pnl_abs_status"] == "CONFIRMED"
 
 
-def test_position_disappearance_without_exit_evidence_never_creates_canonical_pnl(monkeypatch, tmp_path):
+def test_position_disappearance_without_exit_evidence_keeps_state_and_protection(monkeypatch, tmp_path):
     from event_engine import tracker
     active = tmp_path / "active_trades.json"
     trades_path = tmp_path / "trades.jsonl"
@@ -4444,6 +4555,8 @@ def test_position_disappearance_without_exit_evidence_never_creates_canonical_pn
     monkeypatch.setattr(tracker, "get_all_orders", lambda *a, **k: [])
     monkeypatch.setattr(tracker, "get_fill_orders", lambda *a, **k: [])
     monkeypatch.setattr(tracker, "send_tg", lambda *a, **k: True)
+    monkeypatch.setattr(tracker.telemetry, "record_position_reconciliation", lambda **k: None)
+    monkeypatch.setattr(tracker.telemetry, "record_state_conflict", lambda **k: None)
     trade = {
         "event_id": "EVT_UNVERIFIED_DISAPPEAR", "symbol": "AAA-USDT", "direction": "LONG", "name": "AAA",
         "entry_price": 100.0, "initial_qty": 1.0, "remaining_qty": 1.0, "entry_ts": 1, "closed": False,
@@ -4456,14 +4569,80 @@ def test_position_disappearance_without_exit_evidence_never_creates_canonical_pn
     active.write_text(json.dumps({trade["event_id"]: trade}), encoding="utf-8")
 
     tracker.update_active_trades()
-    record = json.loads(trades_path.read_text(encoding="utf-8").strip())
-    assert record["exit_reason"] == "POSITION_CLOSED_UNVERIFIED"
-    assert record["realized_pnl_abs"] is None
-    assert record["net_realized_pnl_abs"] is None
-    assert record["execution_close_ts"] is None
-    assert record["closed_ts"] is None
-    assert record["realized_pnl_abs_status"] == "UNAVAILABLE"
-    assert record["observed_pnl_pct_estimate"] is not None
+    final_state = json.loads(active.read_text(encoding="utf-8"))
+    assert "EVT_UNVERIFIED_DISAPPEAR" in final_state
+    assert final_state["EVT_UNVERIFIED_DISAPPEAR"]["remaining_qty"] == pytest.approx(1.0)
+    assert final_state["EVT_UNVERIFIED_DISAPPEAR"]["position_absence_unverified"] is True
+    assert not trades_path.exists() or not trades_path.read_text(encoding="utf-8").strip()
+    assert not actions.exists() or not actions.read_text(encoding="utf-8").strip()
+
+
+def test_partial_tp_then_false_position_absence_does_not_close_trade_or_cancel_protection(monkeypatch, tmp_path):
+    from event_engine import tracker
+    active = tmp_path / "active_trades.json"
+    trades_path = tmp_path / "trades.jsonl"
+    actions = tmp_path / "actions.jsonl"
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", active)
+    monkeypatch.setattr(tracker, "TRADES_PATH", trades_path)
+    monkeypatch.setattr(tracker, "ACTIONS_PATH", actions)
+    monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: {"status": "not_found"})
+    monkeypatch.setattr(tracker, "fetch_klines", lambda *a, **k: [])
+    # The exchange exposes a distinct order ID for a second TAKE_PROFIT_MARKET
+    # record with the same execution time/qty/price as the known TP1. It must not
+    # be treated as evidence that the remaining half closed.
+    monkeypatch.setattr(tracker, "get_all_orders", lambda *a, **k: [{
+        "orderId": "TP1_DUPLICATE_ID", "status": "FILLED", "side": "SELL",
+        "positionSide": "LONG", "type": "TAKE_PROFIT_MARKET",
+        "executedQty": "0.5", "avgPrice": "103", "time": 2000, "updateTime": 2000,
+    }])
+    monkeypatch.setattr(tracker, "_get_filled_order", lambda *a, **k: None)
+    def fake_order_execution(symbol, order_id, *, entry_ts=None):
+        if order_id == "TP1":
+            return {
+                "status": "ok", "order_status": "FILLED", "executed_qty": 0.5,
+                "avg_price": 103.0, "time_ms": 2000, "update_time_ms": 2000,
+                "trigger_price": 103.0, "execution_evidence_source": "ORDER_STATUS",
+            }
+        return {"status": "ok", "order_status": "NEW", "executed_qty": 0.0, "avg_price": 0.0}
+    monkeypatch.setattr(tracker, "_get_order_execution_evidence", fake_order_execution)
+    cancelled = []
+    monkeypatch.setattr(tracker, "cancel_order", lambda *a, **k: cancelled.append(a) or {"code": 0})
+    monkeypatch.setattr(tracker.telemetry, "record_position_reconciliation", lambda **k: None)
+    monkeypatch.setattr(tracker.telemetry, "record_state_conflict", lambda **k: None)
+    monkeypatch.setattr(tracker, "send_tg", lambda *a, **k: True)
+    trade = {
+        "event_id": "EVT_TP1_FALSE_CLOSE", "attempt_id": "ATT_TP1_FALSE_CLOSE",
+        "symbol": "AAA-USDT", "direction": "LONG", "name": "AAA",
+        "entry_price": 100.0, "initial_qty": 1.0, "remaining_qty": 0.5, "entry_ts": 1000, "closed": False,
+        "tp_orders": [
+            {"leg": "tp1", "order_id": "TP1", "qty": 0.5},
+            {"leg": "tp2", "order_id": "TP2", "qty": 0.5},
+        ],
+        "sl_order": {"order_id": "BE1", "stop_price": 100.0},
+        "be_order_id": "BE1", "be_activated": True,
+        "hit_legs": ["tp1"], "tp_filled_qty": {"tp1": 0.5},
+        "tp_fill_events": [{
+            "leg": "tp1", "order_id": "TP1", "executed_qty_total": 0.5,
+            "delta_qty": 0.5, "avg_price": 103.0, "order_status": "FILLED",
+            "fill_evidence_status": "CONFIRMED", "order_time_ms": 2000,
+            "order_update_time_ms": 2000,
+        }],
+        "realized_pnl_qty": 0.5, "realized_pnl_weighted_sum": 1.5,
+        "peak_pnl_pct": 3.0, "mae_pct": -1.0, "max_drawdown_pct": -1.0,
+        "planned_risk_pct": 10.0, "planned_weighted_rr": 0.45, "effective_weighted_rr": 0.45,
+        "setup": {}, "tp_levels": [], "effective_tp_levels": [],
+    }
+    active.write_text(json.dumps({trade["event_id"]: trade}), encoding="utf-8")
+
+    tracker.update_active_trades()
+
+    final_state = json.loads(active.read_text(encoding="utf-8"))
+    assert "EVT_TP1_FALSE_CLOSE" in final_state
+    assert final_state["EVT_TP1_FALSE_CLOSE"]["remaining_qty"] == pytest.approx(0.5)
+    assert final_state["EVT_TP1_FALSE_CLOSE"]["position_absence_unverified"] is True
+    assert cancelled == []
+    assert not trades_path.exists() or not trades_path.read_text(encoding="utf-8").strip()
+    assert not actions.exists() or not actions.read_text(encoding="utf-8").strip()
 
 
 def test_build_5m_zone_signal_volume_ratio_uses_prior_5m_bars_not_1h(monkeypatch):
@@ -4656,6 +4835,62 @@ def test_historical_exit_order_is_preserved_as_normalized_evidence_and_timestamp
     assert record["close_timestamp_source"] == "EXCHANGE_HISTORICAL_ORDER_TIME"
     assert record["exit_price_semantics"] == "SINGLE_CONFIRMED_HISTORICAL_ORDER"
     assert record["realized_pnl_abs"] is None
+
+
+def test_historical_exit_reconciliation_rejects_duplicate_tp1_as_residual_close(monkeypatch):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "_get_filled_order", lambda *a, **k: None)
+    # This is a separate historical order ID, but its exchange execution time
+    # and quantity are exactly those of the already-accounted TP1. It is not a
+    # second close of the residual position.
+    monkeypatch.setattr(tracker, "get_all_orders", lambda *a, **k: [{
+        "orderId": "TP1_DUPLICATE_ID", "status": "FILLED", "side": "SELL",
+        "positionSide": "LONG", "type": "TAKE_PROFIT_MARKET",
+        "executedQty": "0.5", "avgPrice": "103", "time": 2000, "updateTime": 2000,
+    }])
+    out = tracker._reconcile_historical_exit_order(
+        "AAA-USDT", "LONG", 1000, 0.5,
+        [{"leg": "tp1", "order_id": "TP1"}, {"leg": "tp2", "order_id": "TP2"}],
+        {"order_id": "BE1"},
+        trade={
+            "hit_legs": ["tp1"],
+            "tp_filled_qty": {"tp1": 0.5},
+            "tp_fill_events": [{
+                "leg": "tp1", "order_id": "TP1", "executed_qty_total": 0.5,
+                "avg_price": 103, "fill_evidence_status": "CONFIRMED",
+                "order_time_ms": 2000, "order_update_time_ms": 2000,
+            }],
+        },
+    )
+    assert out == (None, None, None, None)
+
+
+def test_historical_exit_reconciliation_accepts_exact_residual_close_after_tp1(monkeypatch):
+    from event_engine import tracker
+    monkeypatch.setattr(tracker, "_get_filled_order", lambda *a, **k: None)
+    closing_order = {
+        "orderId": "MANUAL_RESIDUAL_CLOSE", "status": "FILLED", "side": "SELL",
+        "positionSide": "LONG", "type": "MARKET",
+        "executedQty": "0.5", "avgPrice": "101.5", "time": 3000, "updateTime": 3000,
+    }
+    monkeypatch.setattr(tracker, "get_all_orders", lambda *a, **k: [closing_order])
+    out = tracker._reconcile_historical_exit_order(
+        "AAA-USDT", "LONG", 1000, 0.5,
+        [{"leg": "tp1", "order_id": "TP1"}, {"leg": "tp2", "order_id": "TP2"}],
+        {"order_id": "BE1"},
+        trade={
+            "hit_legs": ["tp1"],
+            "tp_filled_qty": {"tp1": 0.5},
+            "tp_fill_events": [{
+                "leg": "tp1", "order_id": "TP1", "executed_qty_total": 0.5,
+                "avg_price": 103, "fill_evidence_status": "CONFIRMED",
+                "order_time_ms": 2000, "order_update_time_ms": 2000,
+            }],
+        },
+    )
+    assert out[0] == pytest.approx(101.5)
+    assert out[1] == "MANUAL_CLOSE_RECONCILED"
+    assert out[3]["orderId"] == "MANUAL_RESIDUAL_CLOSE"
 
 
 def test_register_active_trade_persists_explicit_protection_status(monkeypatch, tmp_path):

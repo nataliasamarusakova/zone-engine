@@ -26,6 +26,7 @@ from event_engine.bingx import (
     fetch_klines as fetch_bingx_klines,
     get_contract,
     get_positions,
+    get_order,
     get_position_mode,
     get_position_directional,
     get_open_protection_directional,
@@ -45,7 +46,7 @@ from event_engine.signals import STRATEGY_VERSION, SWING_LEN, TP1_PCT, TP2_PCT, 
 from event_engine.version import ENGINE_VERSION
 from event_engine.fundamental_assets import FUNDAMENTAL_ASSET_SYMBOLS
 from event_engine.telegram import format_signal, send as send_tg
-from event_engine.tracker import ActiveTradeStateCorrupt, register_active_trade, update_active_trades, update_active_trade_protection, has_active_trade_conflict, backfill_active_trade_provenance
+from event_engine.tracker import ActiveTradeStateCorrupt, register_active_trade, update_active_trades, update_active_trade_protection, merge_reconciled_tp_orders, has_active_trade_conflict, backfill_active_trade_provenance
 from event_engine import research, telemetry, shadow
 from event_engine.trend_filter import evaluate_trend_filter
 
@@ -1735,15 +1736,69 @@ def reconcile_all_open_positions() -> None:
             ]
 
         hit_legs = set(trade.get("hit_legs", []))
+
+        # Recover original TP identities from immutable setup provenance before
+        # rebuilding protection. A current tp_orders entry may have been replaced
+        # by an error record (no order_id) even though the original exchange order
+        # later filled. Never infer a TP fill from position-quantity deltas alone.
+        original_protection = setup.get("protection_result", {}) if isinstance(setup.get("protection_result"), dict) else {}
+        original_tp_orders = original_protection.get("tp_orders", []) if isinstance(original_protection.get("tp_orders"), list) else []
+        active_tp_orders = trade.get("tp_orders", []) if isinstance(trade.get("tp_orders"), list) else []
+        active_ids = {str(x.get("order_id")) for x in active_tp_orders if isinstance(x, dict) and x.get("order_id")}
+        recovered_filled_orders = []
+        for original_tp in original_tp_orders:
+            if not isinstance(original_tp, dict):
+                continue
+            original_id = str(original_tp.get("order_id") or "")
+            leg = str(original_tp.get("leg") or "")
+            if not original_id or original_id in active_ids or leg in hit_legs:
+                continue
+            try:
+                evidence = get_order(symbol, original_id)
+            except Exception as exc:
+                log.warning("[RECON_TP_IDENTITY] order lookup failed symbol=%s event=%s leg=%s id=%s error=%s", symbol, event_id, leg, original_id, exc)
+                continue
+            if (isinstance(evidence, dict) and evidence.get("status") == "ok"
+                    and str(evidence.get("order_status", "")).upper() == "FILLED"
+                    and float(evidence.get("executed_qty") or 0.0) > 0):
+                recovered = dict(original_tp)
+                recovered["status"] = "FILLED"
+                recovered["executed_qty"] = float(evidence.get("executed_qty") or 0.0)
+                recovered["avg_price"] = float(evidence.get("avg_price") or 0.0)
+                recovered["exchange_update_time_ms"] = evidence.get("update_time_ms")
+                recovered["recovered_execution_pending"] = True
+                recovered_filled_orders.append(recovered)
+
+        # The pending state is durable across reconciliation cycles/restarts.
+        # Once the recovered order has been merged into active_trades, its ID is
+        # now in active_ids and will not be re-discovered above; derive the gate
+        # from persisted state too, otherwise the next pass can recreate TPs before
+        # tracker has booked TP1 and moved the stop to break-even.
+        persisted_recovery_pending = bool(trade.get("tp_recovery_pending")) or any(
+            isinstance(x, dict) and x.get("recovered_execution_pending")
+            for x in active_tp_orders
+        )
+        tp_recovery_pending = bool(recovered_filled_orders) or persisted_recovery_pending
+        if recovered_filled_orders:
+            if not merge_reconciled_tp_orders(str(event_id), recovered_filled_orders):
+                log.error("[RECON_TP_IDENTITY] could not persist recovered TP identities event=%s symbol=%s", event_id, symbol)
+                continue
+            log.warning("[RECON_TP_IDENTITY] recovered exchange-filled TP order identity event=%s symbol=%s legs=%s; deferring TP recreation until tracker books execution", event_id, symbol, [x.get("leg") for x in recovered_filled_orders])
+
         remaining_levels = [x for x in tp_levels if str(x.get("leg", "")) not in hit_legs]
-        if remaining_levels:
-            share = 1.0 / len(remaining_levels)
+        # Keep the original strategy fractions. Renormalizing all remaining legs
+        # to 100% can turn a missed TP1 into a second TP allocation on only half
+        # the position (the ACHUSDT 449/448 failure mode).
+        if tp_recovery_pending:
+            # Repair/verify the stop for the actual exchange quantity now, but do
+            # not place any new TP until tracker has booked the recovered fill and
+            # activated BE where appropriate.
+            tp_levels = []
+        else:
             tp_levels = [
-                {"leg": str(x.get("leg")), "pnl_pct": float(x.get("pnl_pct", 0.0)), "close_fraction": share}
+                {"leg": str(x.get("leg")), "pnl_pct": float(x.get("pnl_pct", 0.0)), "close_fraction": float(x.get("close_fraction", 0.0))}
                 for x in remaining_levels
             ]
-        else:
-            tp_levels = []
 
         try:
             result = ensure_directional_protection(
