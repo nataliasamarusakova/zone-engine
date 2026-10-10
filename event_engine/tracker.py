@@ -614,7 +614,25 @@ def _update_active_trade_protection_locked(
         log.error("[TRACKER_STATE_CONFLICT] refusing protection ownership update event=%s orders=%s", owner_event_id, conflicting_order_ids)
         return False
 
-    trade["tp_orders"] = tp_orders if isinstance(tp_orders, list) else []
+    # Keep execution-bearing historical TP identities when protection is rebuilt.
+    # Replacing the list wholesale can erase a filled TP1 whose ID only survives
+    # in setup.protection_result, preventing TP1 accounting and BE activation.
+    new_tp_orders = tp_orders if isinstance(tp_orders, list) else []
+    new_ids = {str(x.get("order_id")) for x in new_tp_orders if isinstance(x, dict) and x.get("order_id")}
+    preserved_tp_orders = []
+    for old_tp in trade.get("tp_orders", []) if isinstance(trade.get("tp_orders"), list) else []:
+        if not isinstance(old_tp, dict):
+            continue
+        old_id = str(old_tp.get("order_id") or "")
+        old_leg = str(old_tp.get("leg") or "")
+        if old_id and old_id not in new_ids and (
+            trade.get("tp_recovery_pending")
+            or old_tp.get("recovered_execution_pending")
+            or old_leg in set(trade.get("hit_legs", []))
+            or str(old_tp.get("status", "")).upper() == "FILLED"
+        ):
+            preserved_tp_orders.append(old_tp)
+    trade["tp_orders"] = preserved_tp_orders + new_tp_orders
     trade["sl_order"] = sl_result if isinstance(sl_result, dict) else {}
     if effective_tp_levels is not None:
         trade["effective_tp_levels"] = effective_tp_levels
@@ -633,6 +651,56 @@ def _update_active_trade_protection_locked(
     trade["protection_last_updated_ts"] = int(time.time() * 1000)
     _write_active_trades_unlocked(trades)
     return True
+
+
+def merge_reconciled_tp_orders(event_id: str, recovered_orders: list[dict]) -> bool:
+    """Persist original TP order identities recovered from exchange order history.
+
+    This deliberately does not mark a leg filled or book PnL. The normal tracker
+    must independently re-query the order and apply its existing execution-evidence
+    path before mutating hit_legs, realized PnL, or break-even state.
+    """
+    if not recovered_orders:
+        return True
+    with _active_trades_lock():
+        trades = _load_active_trades_required()
+        trade = trades.get(str(event_id))
+        if not isinstance(trade, dict) or trade.get("closed"):
+            return False
+        current = trade.get("tp_orders") if isinstance(trade.get("tp_orders"), list) else []
+        by_id = {str(x.get("order_id")): x for x in current if isinstance(x, dict) and x.get("order_id")}
+        changed = False
+        valid_recovery_seen = False
+        for order in recovered_orders:
+            if not isinstance(order, dict) or not order.get("order_id"):
+                continue
+            valid_recovery_seen = True
+            oid = str(order["order_id"])
+            item = by_id.get(oid)
+            if item is None:
+                item = dict(order)
+                current.append(item)
+                by_id[oid] = item
+                changed = True
+            # Idempotently restore the marker even if another tracker/reconcile
+            # pass inserted the same order between our read and this locked write.
+            if not item.get("recovered_execution_pending"):
+                item["recovered_execution_pending"] = True
+                changed = True
+            # Keep the exchange-confirmed execution facts if this ID already
+            # existed, without overwriting unrelated local fields.
+            for key in ("status", "executed_qty", "avg_price", "exchange_update_time_ms"):
+                value = order.get(key)
+                if value is not None and item.get(key) != value:
+                    item[key] = value
+                    changed = True
+        if valid_recovery_seen and not trade.get("tp_recovery_pending"):
+            trade["tp_recovery_pending"] = True
+            changed = True
+        if changed:
+            trade["tp_orders"] = current
+            _write_active_trades_unlocked(trades)
+        return valid_recovery_seen
 
 
 def _extract_setup_metrics(setup: dict | None) -> dict[str, Any]:
@@ -2207,13 +2275,14 @@ def _reconcile_historical_exit_order(
     *,
     trade: dict | None = None,
 ) -> tuple[float | None, str | None, str | None, dict | None]:
-    """Recover an exchange-verified residual exit after a position disappears.
+    """Recover an exchange-verified exit for the still-open residual quantity.
 
-    TP fills already accounted for by the tracker are excluded. A residual
-    position must be closed by a protective SL or a separate closing order; a
-    previous TP1 fill must never be reused as the residual exit price.
+    A previously accounted TP fill must never be reused as evidence that the
+    residual position closed. Candidates are therefore filtered by order
+    identity, HEDGE position side (when available), execution chronology, and a
+    near-exact residual-quantity match. Ambiguous evidence fails closed.
     """
-    # First ask the known SL order directly.
+    # First ask the currently-owned stop order directly.
     sl_id = sl_order.get("order_id") if isinstance(sl_order, dict) else None
     sl_info = _get_filled_order(symbol, sl_id)
     if sl_info:
@@ -2221,7 +2290,32 @@ def _reconcile_historical_exit_order(
         if px > 0:
             return px, "STOP_LOSS", "historical_sl_order", sl_info
 
+    residual = max(0.0, float(remaining_qty))
+    if residual <= 0:
+        return None, None, None, None
+
     tp_ids = {str(x.get("order_id")) for x in tp_orders if x.get("order_id")}
+    trade_state = trade if isinstance(trade, dict) else {}
+    tp_fill_events = trade_state.get("tp_fill_events")
+    tp_fill_events = tp_fill_events if isinstance(tp_fill_events, list) else []
+    tp_filled_qty = trade_state.get("tp_filled_qty")
+    tp_filled_qty = tp_filled_qty if isinstance(tp_filled_qty, dict) else {}
+    hit_legs = {str(x).lower() for x in (trade_state.get("hit_legs") or [])}
+    prior_tp_fill_known = bool(tp_fill_events) or bool(hit_legs) or any(
+        _safe_float(qty, 0.0) > 0 for qty in tp_filled_qty.values()
+    )
+
+    # Use exchange execution/order timestamps, not the tracker observation time.
+    tp_execution_times: list[int] = []
+    for event in tp_fill_events:
+        if not isinstance(event, dict):
+            continue
+        for field in ("fill_time_ms", "order_update_time_ms", "order_time_ms"):
+            stamp = _optional_float(event.get(field))
+            if stamp is not None and stamp > 0:
+                tp_execution_times.append(int(stamp))
+    latest_tp_execution_ms = max(tp_execution_times) if tp_execution_times else None
+
     start = max(0, int(entry_ts) - 30_000)
     end = int(time.time() * 1000) + 30_000
     try:
@@ -2233,7 +2327,7 @@ def _reconcile_historical_exit_order(
     wanted_side = "SELL" if direction == "LONG" else "BUY"
     candidates: list[dict] = []
     for order in orders:
-        oid = str(order.get("orderId", ""))
+        oid = str(order.get("orderId", order.get("orderID", "")))
         if oid and oid in tp_ids:
             continue
         status = str(order.get("status", order.get("orderStatus", ""))).upper()
@@ -2241,6 +2335,14 @@ def _reconcile_historical_exit_order(
             continue
         side = str(order.get("side", "")).upper()
         if side != wanted_side:
+            continue
+        order_position_side = str(
+            order.get("positionSide", order.get("position_side", "")) or ""
+        ).upper()
+        if order_position_side and order_position_side not in {direction, "BOTH"}:
+            continue
+        # In HEDGE mode, a side-only order is ambiguous after a partial TP.
+        if prior_tp_fill_known and order_position_side not in {direction, "BOTH"}:
             continue
         try:
             created = int(float(order.get("updateTime") or order.get("time") or order.get("createTime") or 0))
@@ -2250,14 +2352,24 @@ def _reconcile_historical_exit_order(
             continue
         if entry_ts and created and created < entry_ts:
             continue
+        # A residual exit must happen strictly after the last already-accounted
+        # TP execution. Equal timestamps are ambiguous and fail closed.
+        if prior_tp_fill_known:
+            if not created or latest_tp_execution_ms is None or created <= latest_tp_execution_ms:
+                continue
         if px <= 0 or qty <= 0:
+            continue
+        # Requiring only >=95% of the residual wrongly accepted another half-size
+        # TP1. A separate order must closely match the residual quantity.
+        qty_tolerance = max(1e-8, residual * 1e-4)
+        if abs(qty - residual) > qty_tolerance:
             continue
         candidates.append({**order, "_ts": created, "_qty": qty, "_px": px})
 
     if not candidates:
         return None, None, None, None
 
-    # Prefer protective stop orders for a disappearing residual position.
+    # Prefer an explicitly identified stop over a manual/external close.
     stop_candidates = [
         o for o in candidates
         if str(o.get("type", "")).upper() in {"STOP", "STOP_MARKET"}
@@ -2265,28 +2377,22 @@ def _reconcile_historical_exit_order(
     pool = stop_candidates or candidates
     pool.sort(key=lambda o: int(o.get("_ts", 0)), reverse=True)
 
-    # Avoid mistaking a small unrelated close for the residual position.
-    residual = max(0.0, float(remaining_qty))
     for order in pool:
-        if residual <= 0 or order["_qty"] >= residual * 0.95:
-            order_id = str(order.get("orderId") or order.get("orderID") or "")
-            client_id = str(order.get("clientOrderId") or order.get("client_order_id") or "").upper()
-            trade_be_order_id = str((trade or {}).get("be_order_id") or "")
-            trade_be_client_id = str((trade or {}).get("be_client_order_id") or "").upper()
-            # Preserve BE semantics using durable order identity. This fallback is
-            # used specifically when the direct fill/order lookup is unavailable;
-            # a filled engine-owned BE order must remain BREAK_EVEN, not STOP_LOSS.
-            if trade_be_order_id and order_id and trade_be_order_id == order_id:
-                return order["_px"], "BREAK_EVEN", "historical_all_orders", order
-            if trade_be_client_id and client_id and trade_be_client_id == client_id:
-                return order["_px"], "BREAK_EVEN", "historical_all_orders", order
-            if client_id.startswith("EVT_BE_"):
-                return order["_px"], "BREAK_EVEN", "historical_all_orders", order
-            reason = "STOP_LOSS" if str(order.get("type", "")).upper() in {"STOP", "STOP_MARKET"} else "MANUAL_CLOSE_RECONCILED"
-            return order["_px"], reason, "historical_all_orders", order
+        order_id = str(order.get("orderId") or order.get("orderID") or "")
+        client_id = str(order.get("clientOrderId") or order.get("client_order_id") or "").upper()
+        trade_be_order_id = str(trade_state.get("be_order_id") or "")
+        trade_be_client_id = str(trade_state.get("be_client_order_id") or "").upper()
+        # Preserve BE semantics using durable order identity.
+        if trade_be_order_id and order_id and trade_be_order_id == order_id:
+            return order["_px"], "BREAK_EVEN", "historical_all_orders", order
+        if trade_be_client_id and client_id and client_id == trade_be_client_id:
+            return order["_px"], "BREAK_EVEN", "historical_all_orders", order
+        if client_id.startswith("EVT_BE_"):
+            return order["_px"], "BREAK_EVEN", "historical_all_orders", order
+        reason = "STOP_LOSS" if str(order.get("type", "")).upper() in {"STOP", "STOP_MARKET"} else "MANUAL_CLOSE_RECONCILED"
+        return order["_px"], reason, "historical_all_orders", order
 
     return None, None, None, None
-
 
 def _classify_tp_fill(direction: str, entry_price: float, exec_price: float) -> tuple[bool, str]:
     """Return whether an observed TP execution is economically favorable.
@@ -2718,6 +2824,15 @@ def update_active_trades() -> None:
 
             trade["hit_legs"] = sorted(hit_legs)
             trade["tp_filled_qty"] = filled_by_leg
+            pending_legs = {
+                str(x.get("leg", "")) for x in trade.get("tp_orders", [])
+                if isinstance(x, dict) and x.get("recovered_execution_pending")
+            }
+            if pending_legs and pending_legs.issubset(hit_legs):
+                trade["tp_recovery_pending"] = False
+                for x in trade.get("tp_orders", []):
+                    if isinstance(x, dict) and str(x.get("leg", "")) in pending_legs:
+                        x.pop("recovered_execution_pending", None)
 
             # Re-read the position after processing TP order status. A TP can
             # fill between the first position snapshot and the order query loop;
@@ -2772,7 +2887,7 @@ def update_active_trades() -> None:
                 status=_reconciliation_status(
                     residual_qty_before_position_disappeared,
                     rem_qty if final_pos_status in {"found", "not_found"} else 0.0,
-                    "CLOSED" if final_pos_status == "not_found" else "FOUND" if final_pos_status == "found" else "ERROR",
+                    "NOT_FOUND" if final_pos_status == "not_found" else "FOUND" if final_pos_status == "found" else "ERROR",
                 ),
                 internal_remaining_qty=residual_qty_before_position_disappeared,
                 exchange_position_qty=rem_qty if final_pos_status in {"found", "not_found"} else None,
@@ -2822,6 +2937,91 @@ def update_active_trades() -> None:
                     exit_reason = "POSITION_CLOSED_UNVERIFIED"
             else:
                 exit_reason = "POSITION_CLOSED_UNVERIFIED"
+
+            # A missing position response is not enough to close a local trade
+            # when a confirmed residual quantity remains and no unique residual
+            # exit order was found. Keep ownership and protection; do not cancel
+            # TP2/BE or emit a false TRADE_CLOSE. The next tracker cycle can
+            # reconcile again when the exchange position snapshot recovers.
+            expected_residual_qty = max(0.0, init_qty - realized_qty)
+            residual_qty_to_preserve = max(
+                0.0,
+                residual_qty_before_position_disappeared,
+                expected_residual_qty,
+            )
+            qty_tolerance_for_close = max(1e-12, init_qty * 1e-8)
+            if (
+                position_gone
+                and sl_exit_price is None
+                and not closed_by_tp
+                and historical_order is None
+                and residual_qty_to_preserve > qty_tolerance_for_close
+            ):
+                first_pending_observation = not bool(trade.get("position_absence_unverified"))
+                trade["remaining_qty"] = residual_qty_to_preserve
+                trade["current_position_qty"] = residual_qty_to_preserve
+                trade["position_absence_unverified"] = True
+                trade["position_absence_unverified_ts"] = now_ms
+                trade["position_absence_unverified_qty"] = residual_qty_to_preserve
+                trade["position_absence_unverified_reason"] = "no_confirmed_residual_exit_order"
+                if first_pending_observation:
+                    telemetry.record_state_conflict(
+                        event_id=event_id,
+                        attempt_id=trade.get("attempt_id") or ((trade.get("setup") or {}).get("attempt_id") if isinstance(trade.get("setup"), dict) else None),
+                        position_id=trade.get("position_id") or event_id,
+                        order_id=None,
+                        symbol=symbol,
+                        direction=direction,
+                        conflict_type="POSITION_ABSENCE_WITHOUT_EXIT_EVIDENCE",
+                        message=(
+                            "Exchange position lookup returned not_found, but a residual quantity remains after "
+                            "confirmed fills and no unique post-TP residual exit order was verified; retaining "
+                            "active state and protection rather than declaring the trade closed."
+                        ),
+                        owner_event_ids=[event_id],
+                        residual_qty=residual_qty_to_preserve,
+                    )
+                telemetry.record_position_reconciliation(
+                    event_id=event_id,
+                    attempt_id=trade.get("attempt_id") or ((trade.get("setup") or {}).get("attempt_id") if isinstance(trade.get("setup"), dict) else None),
+                    position_id=trade.get("position_id") or event_id,
+                    symbol=symbol,
+                    direction=direction,
+                    status="POSITION_ABSENCE_UNVERIFIED",
+                    internal_remaining_qty=residual_qty_to_preserve,
+                    exchange_position_qty=0.0,
+                    exchange_avg_price=None,
+                    local_tp_filled_qty=dict(filled_by_leg),
+                    local_be_activated=bool(trade.get("be_activated")),
+                    local_exit_reason=None,
+                    position_gone=False,
+                    close_evidence_status="MISSING",
+                )
+                log.error(
+                    "[TRACKER_POSITION_ABSENCE_UNVERIFIED] %s (%s) residual=%.12g; keeping active owner and protection",
+                    trade.get("name", symbol), symbol, residual_qty_to_preserve,
+                )
+                updated_trades[event_id] = trade
+                continue
+
+            if position_gone:
+                telemetry.record_position_reconciliation(
+                    event_id=event_id,
+                    attempt_id=trade.get("attempt_id") or ((trade.get("setup") or {}).get("attempt_id") if isinstance(trade.get("setup"), dict) else None),
+                    position_id=trade.get("position_id") or event_id,
+                    symbol=symbol,
+                    direction=direction,
+                    status="CLOSED",
+                    internal_remaining_qty=residual_qty_before_position_disappeared,
+                    exchange_position_qty=0.0,
+                    exchange_avg_price=None,
+                    local_realized_qty=realized_qty,
+                    local_tp_filled_qty=dict(filled_by_leg),
+                    local_be_activated=bool(trade.get("be_activated")),
+                    local_exit_reason=exit_reason,
+                    position_gone=True,
+                    close_evidence_status=("CONFIRMED" if sl_exit_price is not None or closed_by_tp or historical_order is not None else "NO_RESIDUAL_QTY"),
+                )
 
             if exit_price <= 0:
                 exit_price = cur_price
@@ -2923,7 +3123,9 @@ def update_active_trades() -> None:
             trade["effective_weighted_rr"] = effective_rr_at_close
             trade["realized_weighted_rr"] = final_weighted_rr
             trade["remaining_weighted_rr"] = None
-            planned_rr = effective_rr_at_close
+            # Keep the planned ratio separate from realized/effective R:R.
+            # The old assignment displayed the effective result as "Planned".
+            planned_rr = _safe_float(trade.get("planned_weighted_rr"), DEFAULT_PLANNED_WEIGHTED_RR)
 
             # For BE/SL exits, retain exchange-confirmed trigger/fill telemetry
             # so the next audit can measure actual stop degradation rather than
