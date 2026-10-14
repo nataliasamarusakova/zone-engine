@@ -51,19 +51,414 @@
           "touch_count": 0
         },
         "DEMAND:ZID_A811B79E32689D35607C0C08": {
-          "state": "ARMED",
-          "visit_id": "4STOCK-USDT:DEMAND:ZID_A811B79E32689D35607C0C08:1791983400000",
+          "state": "LOCKED",
+          "visit_id": "4STOCK-USDT:DEMAND:ZID_A811B79E32689D35607C0C08:1791986400000",
           "touch_count": 0,
-          "first_touch_ts": null,
-          "last_touch_ts": null,
+          "first_touch_ts": "2026-10-14T14:00:00+00:00",
+          "last_touch_ts": "2026-10-14T14:00:00+00:00",
           "lock_reason": "zone_touch",
-          "trigger_event_id": null,
-          "pending_signal": null,
+          "trigger_event_id": "ZONE_D8417A5AEF3842FAF4BEC79E",
+          "pending_signal": {
+            "event_id": "ZONE_D8417A5AEF3842FAF4BEC79E",
+            "idx": 1791986400000,
+            "time": "2026-10-14T14:00:00+00:00",
+            "trigger_bar_time": "2026-10-14T14:00:00+00:00",
+            "trigger_bar_close_time": "2026-10-14T14:05:00+00:00",
+            "decision_boundary_ts": "2026-10-14T14:05:00+00:00",
+            "decision_boundary_kind": "CLOSED_5M_TRIGGER_CLOSE",
+            "decision_boundary_source": "PROVIDER_CLOSE_TIME",
+            "trigger_timeframe": "5m",
+            "type": "LONG",
+            "symbol": "4STOCK-USDT",
+            "entry": 0.00404,
+            "sl": 0.0036360000000000003,
+            "tp1": 0.0041612,
+            "tp2": 0.0042824000000000004,
+            "risk_pct": 10.0,
+            "risk_abs": 0.00040400000000000006,
+            "atr": 0.0001777979064673672,
+            "tp1_rr": 0.3,
+            "tp2_rr": 0.6,
+            "strategy": "Demand/Supply Zone First",
+            "strategy_version": "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp3-tp6-be-on-tp1-zone-touch-test",
+            "entry_bar": {
+              "timestamp": "2026-10-14T14:00:00+00:00",
+              "open": 0.00413,
+              "high": 0.00414,
+              "low": 0.00403,
+              "close": 0.00404,
+              "volume": 3663961.0
+            },
+            "previous_bar": {
+              "timestamp": "2026-10-14T13:55:00+00:00",
+              "open": 0.00416,
+              "high": 0.00416,
+              "low": 0.00413,
+              "close": 0.00413,
+              "volume": 3563680.9
+            },
+            "trigger": {
+              "type": "ZONE_TOUCH_5M",
+              "alma_required": false,
+              "alternate_timeframe": "8h",
+              "zone_touch": true,
+              "zone_entry_rule": "fresh_zone_touch_5m",
+              "zone_trigger_mode": "zone",
+              "zone_midpoint": 0.004092880829550652,
+              "zone_midpoint_pct": 50.0,
+              "midpoint_touched_diagnostic": true,
+              "previous_bar_midpoint_touch": false,
+              "previous_bar_zone_touch": false,
+              "trigger_entry_reference": "trigger_bar_close",
+              "zone_visit_id": "4STOCK-USDT:DEMAND:ZID_A811B79E32689D35607C0C08:1791986400000",
+              "zone_visit_state": "TRIGGERED"
+            },
+            "zone": {
+              "top": 0.004115761659101304,
+              "btm": 0.00407,
+              "poi": 0.004092880829550652,
+              "start": 834,
+              "origin_ts_ms": 1791849600000,
+              "zone_id": "ZID_A811B79E32689D35607C0C08",
+              "kind": "DEMAND",
+              "age_bars": 37
+            },
+            "zone_counts": {
+              "demand": 1,
+              "supply": 9
+            },
+            "target": {
+              "source": "fixed_entry_percentage",
+              "obstacle_source": "pivot_high",
+              "obstacle_price": 0.00556,
+              "tp1_pct": 3.0,
+              "tp2_pct": 6.0,
+              "tp1_close_fraction": 0.5,
+              "tp2_close_fraction": 0.5,
+              "be_rule": "after_tp1_filled"
+            },
+            "risk_model": {
+              "sl_source": "fixed_percent_from_entry",
+              "fixed_stop_pct": 10.0,
+              "max_signal_risk_pct": 10.0,
+              "initial_risk_pct": 10.0
+            },
+            "confirmation": {
+              "alma_cross": false,
+              "directional_candle_required": false,
+              "directional_candle_ok": false,
+              "zone_age_bars": 37,
+              "minimum_structure_room_r": 1.2,
+              "zone_touch": true,
+              "midpoint_touch": true,
+              "trigger_timeframe": "5m",
+              "zone_trigger_mode": "zone",
+              "volume_ratio": 1.0257087063682189,
+              "volume_ratio_5m20": 1.0257087063682189,
+              "volume_ratio_semantics": "trigger_5m_volume_divided_by_mean_previous_20_closed_5m_volumes",
+              "volume_ratio_source": "5M_PREVIOUS_20_CLOSED_BARS",
+              "volume_ratio_baseline": 3572126.255,
+              "volume_ratio_baseline_count": 20,
+              "bullish_candle": false,
+              "bearish_candle": true
+            },
+            "source_bar_close": 0.00404,
+            "zone_midpoint": 0.004092880829550652,
+            "zone_width_abs": 4.576165910130398e-05,
+            "zone_width_pct_of_entry": 1.1327143341906927,
+            "signal_forensics": {
+              "range_atr": 0.61868,
+              "body_atr": 0.506193,
+              "body_to_range": 0.818182,
+              "upper_wick_ratio": 0.090909,
+              "lower_wick_ratio": 0.090909,
+              "directional_wick_ratio": 0.090909,
+              "directional_wick_to_body": 0.111111,
+              "close_location": 0.090909,
+              "directional_close_location": 0.090909,
+              "zone_width_abs": 4.5761659e-05,
+              "zone_width_atr": 0.25738,
+              "zone_penetration_ratio_raw": 1.874094,
+              "zone_penetration_pct_capped": 100.0,
+              "zone_close_vs_entry_edge_atr": -0.426111,
+              "zone_close_to_poi_atr": 0.297421,
+              "directional_rejection_side": "lower_wick"
+            },
+            "zone_visit": {
+              "visit_id": "4STOCK-USDT:DEMAND:ZID_A811B79E32689D35607C0C08:1791986400000",
+              "first_touch_ts": "2026-10-14T14:00:00+00:00",
+              "touch_count_before_trigger": 0,
+              "state": "LOCKED"
+            },
+            "score": 60.0,
+            "market_snapshot": {
+              "analysis_provider": "bingx",
+              "analysis_source": "bingx",
+              "asset_class": "EQUITY",
+              "binance_symbol": "4STOCKUSDT",
+              "analysis_last_price": 0.00413,
+              "analysis_latest_closed_time": "2026-10-14T14:00:00+00:00",
+              "trigger_timeframe": "5m",
+              "trigger_bar_time": "2026-10-14T14:00:00+00:00",
+              "zone_visit_id": "4STOCK-USDT:DEMAND:ZID_A811B79E32689D35607C0C08:1791986400000",
+              "bingx_live_price": null,
+              "binance_live_price": null,
+              "market_spread_pct": null,
+              "venue_price_deviation_pct": null,
+              "market_spread_metric": "cross_venue_price_deviation",
+              "scan_time": "2026-10-14T14:07:02.813984+00:00",
+              "trigger_age_minutes_at_scan": 7.0469
+            },
+            "shadow_experiments": {
+              "schema_version": 1,
+              "experiment_version": "counterfactual-v2",
+              "applied": false,
+              "decision_anchor": {
+                "event_id": "ZONE_D8417A5AEF3842FAF4BEC79E",
+                "symbol": "4STOCK-USDT",
+                "direction": "LONG",
+                "entry": 0.00404,
+                "trigger_bar_time": "2026-10-14T14:00:00+00:00",
+                "decision_ts": "2026-10-14T14:05:00+00:00",
+                "counterfactual_path_start_ts": "2026-10-14T14:05:00+00:00",
+                "source": "closed_5m_signal_bar"
+              },
+              "experiments": {
+                "CF_STRUCTURAL_SL": {
+                  "version": 1,
+                  "rule": "far_zone_edge_plus_0.5x_ATR_5m",
+                  "far_zone_edge": 0.00407,
+                  "atr_5m": 6.142857142857141e-05,
+                  "atr_multiplier": 0.5,
+                  "hypothetical_sl": 0.004039285714285714,
+                  "risk_pct": 0.017680339462529227,
+                  "min_risk_pct": 1.0,
+                  "max_risk_pct": 6.0,
+                  "would_pass": false
+                },
+                "CF_TP_RR_15_30": {
+                  "version": 1,
+                  "risk_pct": 0.017680339462529227,
+                  "tp1_rr": 1.5,
+                  "tp2_rr": 3.0,
+                  "hypothetical_tp1": 0.0040410714285714295,
+                  "hypothetical_tp2": 0.004042142857142859,
+                  "would_be_valid": true
+                },
+                "CF_VOLUME_5M": {
+                  "version": 1,
+                  "trigger_volume": 3663961.0,
+                  "baseline_sma20_previous_bars": 3572126.255,
+                  "ratio": 1.0257087063682189,
+                  "threshold_grid": {
+                    "0.8": true,
+                    "1.0": true,
+                    "1.2": false,
+                    "1.5": false,
+                    "1.8": false,
+                    "2.0": false
+                  }
+                },
+                "CF_VOLUME_1H": {
+                  "version": 1,
+                  "current_closed_1h_volume": 43237313.2,
+                  "baseline_sma20_previous_bars": 41920449.84500001,
+                  "ratio": 1.031413387973389,
+                  "threshold_grid": {
+                    "0.8": true,
+                    "1.0": true,
+                    "1.2": false,
+                    "1.5": false,
+                    "1.8": false,
+                    "2.0": false
+                  }
+                },
+                "CF_DELTA_CONFIRM": {
+                  "version": 1,
+                  "bar_delta_usdt": null,
+                  "rule": "LONG>0 / SHORT<0",
+                  "would_pass": null
+                },
+                "CF_EMA200_1H": {
+                  "version": 1,
+                  "ema200_1h": 0.0054461506947884744,
+                  "distance_pct": -25.81916611551066,
+                  "ema200_trend_up": false,
+                  "rule": "LONG price>EMA200 / SHORT price<EMA200",
+                  "would_pass": false
+                },
+                "CF_ATR_MIN_5M": {
+                  "version": 1,
+                  "atr14_5m": 6.142857142857141e-05,
+                  "atr_pct": 1.5205091937765198,
+                  "threshold_grid_pct": {
+                    "0.1": true,
+                    "0.2": true,
+                    "0.3": true,
+                    "0.4": true,
+                    "0.5": true,
+                    "0.75": true,
+                    "1.0": true
+                  }
+                },
+                "CF_SESSION": {
+                  "version": 1,
+                  "session_utc": "LONDON_NY_OVERLAP",
+                  "utc_hour": 14,
+                  "trigger_session_utc": "LONDON_NY_OVERLAP",
+                  "trigger_utc_hour": 14,
+                  "decision_session_utc": "LONDON_NY_OVERLAP",
+                  "decision_utc_hour": 14,
+                  "asia_block_window": "00:00<=UTC<06:00",
+                  "asia_off_hours": false,
+                  "would_pass_if_asia_blocked": true
+                },
+                "CF_ZONE_INVALIDATION": {
+                  "version": 1,
+                  "zone_top": 0.004115761659101304,
+                  "zone_bottom": 0.00407,
+                  "body_close_invalid_before_entry": false,
+                  "invalidation_ts": null,
+                  "would_pass": true
+                },
+                "CF_CORRELATION": {
+                  "version": 1,
+                  "threshold": 0.8,
+                  "open_position_symbols": [],
+                  "max_open_position_correlation": null,
+                  "would_pass": null,
+                  "status": "CONTEXT_UNAVAILABLE"
+                },
+                "CF_PRODUCTION_MANAGEMENT": {
+                  "version": 1,
+                  "stop": 0.0036360000000000003,
+                  "tp1": 0.0041612,
+                  "tp2": 0.0042824000000000004,
+                  "tp1_fraction": 0.5,
+                  "management_baseline": "current_production_SL_TP1_TP2_BE_after_TP1"
+                },
+                "CF_COST_MODEL": {
+                  "version": 1,
+                  "taker_fee_rate": null,
+                  "maker_fee_rate": null,
+                  "roundtrip_taker_fee_pct": null,
+                  "roundtrip_cost_scenarios_pct": {
+                    "0.0": null,
+                    "0.1": null,
+                    "0.2": null,
+                    "0.5": null
+                  },
+                  "slippage_scenario_semantics": "roundtrip_pct_added_to_roundtrip_taker_fee"
+                },
+                "CF_DELAYED_BE": {
+                  "version": 2,
+                  "activation": "after_production_TP1_then_N_completed_closed_bars",
+                  "bars_grid": [
+                    1,
+                    2
+                  ],
+                  "production_sl": 0.0036360000000000003,
+                  "production_tp1": 0.0041612,
+                  "production_tp2": 0.0042824000000000004,
+                  "tp1_fraction": 0.5,
+                  "standalone_management_only": true,
+                  "production_gate_applied": false
+                },
+                "CF_TRAIL_ATR": {
+                  "version": 2,
+                  "activation": "after_production_TP1",
+                  "atr_multiplier_grid": [
+                    0.75,
+                    1.0,
+                    1.5
+                  ],
+                  "production_sl": 0.0036360000000000003,
+                  "production_tp1": 0.0041612,
+                  "production_tp2": 0.0042824000000000004,
+                  "tp1_fraction": 0.5,
+                  "standalone_management_only": true,
+                  "production_gate_applied": false
+                }
+              }
+            },
+            "trend_filter": {
+              "version": "trend-v1-2026-10-06",
+              "enabled": true,
+              "mode": "shadow",
+              "symbol": "4STOCK-USDT",
+              "event_direction": "LONG",
+              "event_type": "ZONE_TOUCH_5M",
+              "decision_ts": 1791986700000,
+              "trend_decision": "REJECT",
+              "trend_reject_reason": "TREND_4H_UNKNOWN",
+              "trend_4h": "UNKNOWN",
+              "trend_1h": "SHORT",
+              "trend_persistence": "TRANSITION",
+              "trend_4h_bars": 218,
+              "trend_1h_bars": 872,
+              "trend_4h_bar_close_ts": null,
+              "trend_1h_bar_close_ts": 1791986400000,
+              "trend_persistence_1h_return_pct": -9.82532751091703,
+              "trend_persistence_4h_return_pct": null,
+              "btc_regime": "BEARISH",
+              "btc_bar_close_ts": 1791986399999,
+              "btc_chg_1h_pct": -0.5070957020922988,
+              "btc_chg_4h_pct": -1.114281946028331,
+              "btc_context_veto": false,
+              "require_persistence": false,
+              "min_bars_1h": 400,
+              "min_bars_4h": 400,
+              "persistence_lookback_1h": 6,
+              "persistence_lookback_4h": 3,
+              "slope_lookback_4h": 6,
+              "structure_1h": {
+                "pivot_span": 2,
+                "last_swing_high": 0.00474,
+                "last_swing_high_ts": 1791972000000,
+                "last_swing_high_confirmation_ts": 1791979200000,
+                "last_swing_low": 0.00449,
+                "last_swing_low_ts": 1791957600000,
+                "last_swing_low_confirmation_ts": 1791964800000,
+                "break_above_last_swing_high": false,
+                "break_below_last_swing_low": true,
+                "sweep_below_last_swing_low_reclaim": false,
+                "sweep_above_last_swing_high_reject": false,
+                "structure_state": "BEAR_BREAK"
+              },
+              "structure_4h": {
+                "pivot_span": 2,
+                "last_swing_high": 0.00563,
+                "last_swing_high_ts": 1791777600000,
+                "last_swing_high_confirmation_ts": 1791806400000,
+                "last_swing_low": 0.00392,
+                "last_swing_low_ts": 1791907200000,
+                "last_swing_low_confirmation_ts": 1791936000000,
+                "break_above_last_swing_high": false,
+                "break_below_last_swing_low": false,
+                "sweep_below_last_swing_low_reclaim": false,
+                "sweep_above_last_swing_high_reject": false,
+                "structure_state": "RANGE_OR_UNBROKEN"
+              },
+              "btc_bars": 411,
+              "trend_1h_close": 0.00413,
+              "trend_1h_ema20": 0.004432963772898488,
+              "trend_1h_ema50": 0.004546717811111788,
+              "trend_1h_ema200": 0.0054461506947884744,
+              "trend_1h_ema50_slope_pct": -0.8864429166058674,
+              "decision_boundary_ts": "2026-10-14T14:05:00+00:00",
+              "history_1h_refetched": false,
+              "history_4h_refetched": true,
+              "source_1h": "bingx",
+              "source_4h": "bingx",
+              "source_btc": "binance_spot"
+            },
+            "code_commit_sha": "74724ca053bade8e3663d918f0557d802057f659"
+          },
           "rearm_ts": "2026-10-14T13:15:00+00:00"
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:26.417004+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:01.901507+00:00"
     },
     "A-USDT": {
       "version": 1,
@@ -110,8 +505,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:27.803355+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:00.532617+00:00"
     },
     "ACH-USDT": {
       "version": 1,
@@ -163,8 +558,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:27.685924+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:00.080925+00:00"
     },
     "ADA-USDT": {
       "version": 1,
@@ -195,8 +590,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:28.705111+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:02.242433+00:00"
     },
     "1000CAT-USDT": {
       "version": 1,
@@ -237,8 +632,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:28.594839+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:00.994917+00:00"
     },
     "2Z-USDT": {
       "version": 1,
@@ -284,8 +679,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:28.756209+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:01.344212+00:00"
     },
     "1INCH-USDT": {
       "version": 1,
@@ -316,8 +711,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:28.367951+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:01.062724+00:00"
     },
     "ACE-USDT": {
       "version": 1,
@@ -353,8 +748,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:28.346216+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:01.960474+00:00"
     },
     "ACT-USDT": {
       "version": 1,
@@ -385,8 +780,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:27.982246+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:01.806360+00:00"
     },
     "1000CHEEMS-USDT": {
       "version": 1,
@@ -397,14 +792,414 @@
           "touch_count": 0
         },
         "DEMAND:ZID_FF37DBEA28663786FAC757B8": {
-          "state": "ARMED",
+          "state": "LOCKED",
           "visit_id": "1000CHEEMS-USDT:DEMAND:ZID_FF37DBEA28663786FAC757B8:1791984000000",
           "touch_count": 1,
           "first_touch_ts": "2026-10-14T13:20:00+00:00",
           "last_touch_ts": "2026-10-14T13:20:00+00:00",
           "lock_reason": "stale_zone_touch_ignored",
-          "trigger_event_id": null,
-          "pending_signal": null
+          "trigger_event_id": "ZONE_EB71D737D8A7316C5DC43662",
+          "pending_signal": {
+            "event_id": "ZONE_EB71D737D8A7316C5DC43662",
+            "idx": 1791986400000,
+            "time": "2026-10-14T14:00:00+00:00",
+            "trigger_bar_time": "2026-10-14T14:00:00+00:00",
+            "trigger_bar_close_time": "2026-10-14T14:04:59.999000+00:00",
+            "decision_boundary_ts": "2026-10-14T14:04:59.999000+00:00",
+            "decision_boundary_kind": "CLOSED_5M_TRIGGER_CLOSE",
+            "decision_boundary_source": "PROVIDER_CLOSE_TIME",
+            "trigger_timeframe": "5m",
+            "type": "LONG",
+            "symbol": "1000CHEEMS-USDT",
+            "entry": 0.000476,
+            "sl": 0.0004284,
+            "tp1": 0.0004902800000000001,
+            "tp2": 0.00050456,
+            "risk_pct": 10.0,
+            "risk_abs": 4.7600000000000005e-05,
+            "atr": 5.10379717783017e-06,
+            "tp1_rr": 0.3,
+            "tp2_rr": 0.6,
+            "strategy": "Demand/Supply Zone First",
+            "strategy_version": "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp3-tp6-be-on-tp1-zone-touch-test",
+            "entry_bar": {
+              "timestamp": "2026-10-14T14:00:00+00:00",
+              "open": 0.000477,
+              "high": 0.000477,
+              "low": 0.000475,
+              "close": 0.000476,
+              "volume": 7755619.0
+            },
+            "previous_bar": {
+              "timestamp": "2026-10-14T13:55:00+00:00",
+              "open": 0.00048,
+              "high": 0.00048,
+              "low": 0.000476,
+              "close": 0.000477,
+              "volume": 2001310.0
+            },
+            "trigger": {
+              "type": "ZONE_TOUCH_5M",
+              "alma_required": false,
+              "alternate_timeframe": "8h",
+              "zone_touch": true,
+              "zone_entry_rule": "fresh_zone_touch_5m",
+              "zone_trigger_mode": "zone",
+              "zone_midpoint": 0.0004746714251295024,
+              "zone_midpoint_pct": 50.0,
+              "midpoint_touched_diagnostic": false,
+              "previous_bar_midpoint_touch": false,
+              "previous_bar_zone_touch": false,
+              "trigger_entry_reference": "trigger_bar_close",
+              "zone_visit_id": "1000CHEEMS-USDT:DEMAND:ZID_FF37DBEA28663786FAC757B8:1791984000000",
+              "zone_visit_state": "TRIGGERED"
+            },
+            "zone": {
+              "top": 0.00047534285025900493,
+              "btm": 0.000474,
+              "poi": 0.0004746714251295024,
+              "start": 961,
+              "origin_ts_ms": 1791849600000,
+              "zone_id": "ZID_FF37DBEA28663786FAC757B8",
+              "kind": "DEMAND",
+              "age_bars": 37
+            },
+            "zone_counts": {
+              "demand": 1,
+              "supply": 4
+            },
+            "target": {
+              "source": "fixed_entry_percentage",
+              "obstacle_source": "pivot_high",
+              "obstacle_price": 0.000535,
+              "tp1_pct": 3.0,
+              "tp2_pct": 6.0,
+              "tp1_close_fraction": 0.5,
+              "tp2_close_fraction": 0.5,
+              "be_rule": "after_tp1_filled"
+            },
+            "risk_model": {
+              "sl_source": "fixed_percent_from_entry",
+              "fixed_stop_pct": 10.0,
+              "max_signal_risk_pct": 10.0,
+              "initial_risk_pct": 10.0
+            },
+            "confirmation": {
+              "alma_cross": false,
+              "directional_candle_required": false,
+              "directional_candle_ok": false,
+              "zone_age_bars": 37,
+              "minimum_structure_room_r": 1.2,
+              "zone_touch": true,
+              "midpoint_touch": false,
+              "trigger_timeframe": "5m",
+              "zone_trigger_mode": "zone",
+              "volume_ratio": 1.677152901308359,
+              "volume_ratio_5m20": 1.677152901308359,
+              "volume_ratio_semantics": "trigger_5m_volume_divided_by_mean_previous_20_closed_5m_volumes",
+              "volume_ratio_source": "5M_PREVIOUS_20_CLOSED_BARS",
+              "volume_ratio_baseline": 4624276.65,
+              "volume_ratio_baseline_count": 20,
+              "bullish_candle": false,
+              "bearish_candle": true
+            },
+            "source_bar_close": 0.000476,
+            "zone_midpoint": 0.0004746714251295024,
+            "zone_width_abs": 1.3428502590049555e-06,
+            "zone_width_pct_of_entry": 0.2821113989506209,
+            "signal_forensics": {
+              "range_atr": 0.391865,
+              "body_atr": 0.195933,
+              "body_to_range": 0.5,
+              "upper_wick_ratio": 0.0,
+              "lower_wick_ratio": 0.5,
+              "directional_wick_ratio": 0.5,
+              "directional_wick_to_body": 1.0,
+              "close_location": 0.5,
+              "directional_close_location": 0.5,
+              "zone_width_abs": 1.34285e-06,
+              "zone_width_atr": 0.263108,
+              "zone_penetration_ratio_raw": 0.255315,
+              "zone_penetration_pct_capped": 25.5315,
+              "zone_close_vs_entry_edge_atr": 0.128757,
+              "zone_close_to_poi_atr": 0.260311,
+              "directional_rejection_side": "lower_wick"
+            },
+            "zone_visit": {
+              "visit_id": "1000CHEEMS-USDT:DEMAND:ZID_FF37DBEA28663786FAC757B8:1791984000000",
+              "first_touch_ts": "2026-10-14T13:20:00+00:00",
+              "touch_count_before_trigger": 1,
+              "state": "LOCKED"
+            },
+            "score": 65.0,
+            "market_snapshot": {
+              "analysis_provider": "binance",
+              "analysis_source": "binance_spot",
+              "asset_class": "CRYPTO",
+              "binance_symbol": "1000CHEEMSUSDT",
+              "analysis_last_price": 0.000477,
+              "analysis_latest_closed_time": "2026-10-14T13:59:59.999000+00:00",
+              "trigger_timeframe": "5m",
+              "trigger_bar_time": "2026-10-14T14:00:00+00:00",
+              "zone_visit_id": "1000CHEEMS-USDT:DEMAND:ZID_FF37DBEA28663786FAC757B8:1791984000000",
+              "bingx_live_price": null,
+              "binance_live_price": 0.000475,
+              "market_spread_pct": null,
+              "venue_price_deviation_pct": null,
+              "market_spread_metric": "cross_venue_price_deviation",
+              "scan_time": "2026-10-14T14:07:03.626515+00:00",
+              "trigger_age_minutes_at_scan": 7.06044215
+            },
+            "shadow_experiments": {
+              "schema_version": 1,
+              "experiment_version": "counterfactual-v2",
+              "applied": false,
+              "decision_anchor": {
+                "event_id": "ZONE_EB71D737D8A7316C5DC43662",
+                "symbol": "1000CHEEMS-USDT",
+                "direction": "LONG",
+                "entry": 0.000476,
+                "trigger_bar_time": "2026-10-14T14:00:00+00:00",
+                "decision_ts": "2026-10-14T14:04:59.999000+00:00",
+                "counterfactual_path_start_ts": "2026-10-14T14:04:59.999000+00:00",
+                "source": "closed_5m_signal_bar"
+              },
+              "experiments": {
+                "CF_STRUCTURAL_SL": {
+                  "version": 1,
+                  "rule": "far_zone_edge_plus_0.5x_ATR_5m",
+                  "far_zone_edge": 0.000474,
+                  "atr_5m": 2.499999999999995e-06,
+                  "atr_multiplier": 0.5,
+                  "hypothetical_sl": 0.00047274999999999997,
+                  "risk_pct": 0.6827731092437084,
+                  "min_risk_pct": 1.0,
+                  "max_risk_pct": 6.0,
+                  "would_pass": false
+                },
+                "CF_TP_RR_15_30": {
+                  "version": 1,
+                  "risk_pct": 0.6827731092437084,
+                  "tp1_rr": 1.5,
+                  "tp2_rr": 3.0,
+                  "hypothetical_tp1": 0.0004808750000000001,
+                  "hypothetical_tp2": 0.0004857500000000002,
+                  "would_be_valid": true
+                },
+                "CF_VOLUME_5M": {
+                  "version": 1,
+                  "trigger_volume": 7755619.0,
+                  "baseline_sma20_previous_bars": 4624276.65,
+                  "ratio": 1.677152901308359,
+                  "threshold_grid": {
+                    "0.8": true,
+                    "1.0": true,
+                    "1.2": true,
+                    "1.5": true,
+                    "1.8": false,
+                    "2.0": false
+                  }
+                },
+                "CF_VOLUME_1H": {
+                  "version": 1,
+                  "current_closed_1h_volume": 47174373.0,
+                  "baseline_sma20_previous_bars": 27825571.25,
+                  "ratio": 1.6953604501470927,
+                  "threshold_grid": {
+                    "0.8": true,
+                    "1.0": true,
+                    "1.2": true,
+                    "1.5": true,
+                    "1.8": false,
+                    "2.0": false
+                  }
+                },
+                "CF_DELTA_CONFIRM": {
+                  "version": 1,
+                  "bar_delta_usdt": -265.91768,
+                  "rule": "LONG>0 / SHORT<0",
+                  "would_pass": false
+                },
+                "CF_EMA200_1H": {
+                  "version": 1,
+                  "ema200_1h": 0.0005112170720465134,
+                  "distance_pct": -6.888868539841941,
+                  "ema200_trend_up": false,
+                  "rule": "LONG price>EMA200 / SHORT price<EMA200",
+                  "would_pass": false
+                },
+                "CF_ATR_MIN_5M": {
+                  "version": 1,
+                  "atr14_5m": 2.499999999999995e-06,
+                  "atr_pct": 0.5252100840336124,
+                  "threshold_grid_pct": {
+                    "0.1": true,
+                    "0.2": true,
+                    "0.3": true,
+                    "0.4": true,
+                    "0.5": true,
+                    "0.75": false,
+                    "1.0": false
+                  }
+                },
+                "CF_SESSION": {
+                  "version": 1,
+                  "session_utc": "LONDON_NY_OVERLAP",
+                  "utc_hour": 14,
+                  "trigger_session_utc": "LONDON_NY_OVERLAP",
+                  "trigger_utc_hour": 14,
+                  "decision_session_utc": "LONDON_NY_OVERLAP",
+                  "decision_utc_hour": 14,
+                  "asia_block_window": "00:00<=UTC<06:00",
+                  "asia_off_hours": false,
+                  "would_pass_if_asia_blocked": true
+                },
+                "CF_ZONE_INVALIDATION": {
+                  "version": 1,
+                  "zone_top": 0.00047534285025900493,
+                  "zone_bottom": 0.000474,
+                  "body_close_invalid_before_entry": false,
+                  "invalidation_ts": null,
+                  "would_pass": true
+                },
+                "CF_CORRELATION": {
+                  "version": 1,
+                  "threshold": 0.8,
+                  "open_position_symbols": [],
+                  "max_open_position_correlation": null,
+                  "would_pass": null,
+                  "status": "CONTEXT_UNAVAILABLE"
+                },
+                "CF_PRODUCTION_MANAGEMENT": {
+                  "version": 1,
+                  "stop": 0.0004284,
+                  "tp1": 0.0004902800000000001,
+                  "tp2": 0.00050456,
+                  "tp1_fraction": 0.5,
+                  "management_baseline": "current_production_SL_TP1_TP2_BE_after_TP1"
+                },
+                "CF_COST_MODEL": {
+                  "version": 1,
+                  "taker_fee_rate": null,
+                  "maker_fee_rate": null,
+                  "roundtrip_taker_fee_pct": null,
+                  "roundtrip_cost_scenarios_pct": {
+                    "0.0": null,
+                    "0.1": null,
+                    "0.2": null,
+                    "0.5": null
+                  },
+                  "slippage_scenario_semantics": "roundtrip_pct_added_to_roundtrip_taker_fee"
+                },
+                "CF_DELAYED_BE": {
+                  "version": 2,
+                  "activation": "after_production_TP1_then_N_completed_closed_bars",
+                  "bars_grid": [
+                    1,
+                    2
+                  ],
+                  "production_sl": 0.0004284,
+                  "production_tp1": 0.0004902800000000001,
+                  "production_tp2": 0.00050456,
+                  "tp1_fraction": 0.5,
+                  "standalone_management_only": true,
+                  "production_gate_applied": false
+                },
+                "CF_TRAIL_ATR": {
+                  "version": 2,
+                  "activation": "after_production_TP1",
+                  "atr_multiplier_grid": [
+                    0.75,
+                    1.0,
+                    1.5
+                  ],
+                  "production_sl": 0.0004284,
+                  "production_tp1": 0.0004902800000000001,
+                  "production_tp2": 0.00050456,
+                  "tp1_fraction": 0.5,
+                  "standalone_management_only": true,
+                  "production_gate_applied": false
+                }
+              }
+            },
+            "trend_filter": {
+              "version": "trend-v1-2026-10-06",
+              "enabled": true,
+              "mode": "shadow",
+              "symbol": "1000CHEEMS-USDT",
+              "event_direction": "LONG",
+              "event_type": "ZONE_TOUCH_5M",
+              "decision_ts": 1791986699999,
+              "trend_decision": "REJECT",
+              "trend_reject_reason": "TREND_4H_DIRECTION_MISMATCH",
+              "trend_4h": "BEAR",
+              "trend_1h": "SHORT",
+              "trend_persistence": "TRANSITION",
+              "trend_4h_bars": 411,
+              "trend_1h_bars": 999,
+              "trend_4h_bar_close_ts": 1791979199999,
+              "trend_1h_bar_close_ts": 1791986399999,
+              "trend_persistence_1h_return_pct": -2.0533880903490815,
+              "trend_persistence_4h_return_pct": -0.6172839506172878,
+              "btc_regime": "BEARISH",
+              "btc_bar_close_ts": 1791986399999,
+              "btc_chg_1h_pct": -0.5070957020922988,
+              "btc_chg_4h_pct": -1.114281946028331,
+              "btc_context_veto": false,
+              "require_persistence": false,
+              "min_bars_1h": 400,
+              "min_bars_4h": 400,
+              "persistence_lookback_1h": 6,
+              "persistence_lookback_4h": 3,
+              "slope_lookback_4h": 6,
+              "structure_1h": {
+                "pivot_span": 2,
+                "last_swing_high": 0.000491,
+                "last_swing_high_ts": 1791968399999,
+                "last_swing_high_confirmation_ts": 1791975599999,
+                "last_swing_low": 0.000484,
+                "last_swing_low_ts": 1791953999999,
+                "last_swing_low_confirmation_ts": 1791961199999,
+                "break_above_last_swing_high": false,
+                "break_below_last_swing_low": true,
+                "sweep_below_last_swing_low_reclaim": false,
+                "sweep_above_last_swing_high_reject": false,
+                "structure_state": "BEAR_BREAK"
+              },
+              "structure_4h": {
+                "pivot_span": 2,
+                "last_swing_high": 0.000535,
+                "last_swing_high_ts": 1791748799999,
+                "last_swing_high_confirmation_ts": 1791777599999,
+                "last_swing_low": 0.000478,
+                "last_swing_low_ts": 1791907199999,
+                "last_swing_low_confirmation_ts": 1791935999999,
+                "break_above_last_swing_high": false,
+                "break_below_last_swing_low": false,
+                "sweep_below_last_swing_low_reclaim": false,
+                "sweep_above_last_swing_high_reject": false,
+                "structure_state": "RANGE_OR_UNBROKEN"
+              },
+              "btc_bars": 411,
+              "trend_4h_close": 0.000483,
+              "trend_4h_ema50": 0.0005114245163002381,
+              "trend_4h_ema200": 0.0005267053930454941,
+              "trend_4h_ema50_slope_pct": -1.3484053662380036,
+              "trend_4h_slope_lookback": 6,
+              "trend_1h_close": 0.000477,
+              "trend_1h_ema20": 0.00048404948285805455,
+              "trend_1h_ema50": 0.0004912492617810827,
+              "trend_1h_ema200": 0.0005112170720465134,
+              "trend_1h_ema50_slope_pct": -0.5887778028037305,
+              "decision_boundary_ts": "2026-10-14T14:04:59.999000+00:00",
+              "history_1h_refetched": false,
+              "history_4h_refetched": true,
+              "source_1h": "binance",
+              "source_4h": "binance",
+              "source_btc": "binance_spot"
+            },
+            "code_commit_sha": "74724ca053bade8e3663d918f0557d802057f659"
+          }
         },
         "SUPPLY:ZID_E210A592534819C6CD801FB9": {
           "state": "ARMED",
@@ -422,8 +1217,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:27.433659+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:00.990174+00:00"
     },
     "0G-USDT": {
       "version": 1,
@@ -474,8 +1269,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:28.741213+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:02.067808+00:00"
     },
     "AERO-USDT": {
       "version": 1,
@@ -516,8 +1311,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:29.397524+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:03.275798+00:00"
     },
     "AEVO-USDT": {
       "version": 1,
@@ -554,8 +1349,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:29.754312+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:03.759891+00:00"
     },
     "AAVE-USDT": {
       "version": 1,
@@ -596,8 +1391,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:28.776676+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:01.891737+00:00"
     },
     "AGLD-USDT": {
       "version": 1,
@@ -654,8 +1449,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:29.844431+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:03.657777+00:00"
     },
     "AIXBT-USDT": {
       "version": 1,
@@ -708,8 +1503,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:30.075777+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:03.457729+00:00"
     },
     "ALLO-USDT": {
       "version": 1,
@@ -775,8 +1570,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:30.495835+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:04.933969+00:00"
     },
     "ALPINE-USDT": {
       "version": 1,
@@ -812,8 +1607,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:30.776499+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:05.359647+00:00"
     },
     "ALGO-USDT": {
       "version": 1,
@@ -859,8 +1654,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:30.287446+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:04.567382+00:00"
     },
     "ALICE-USDT": {
       "version": 1,
@@ -871,14 +1666,414 @@
           "touch_count": 0
         },
         "DEMAND:ZID_500C90D29E3BB62D0C92D5FE": {
-          "state": "ARMED",
+          "state": "LOCKED",
           "visit_id": "ALICE-USDT:DEMAND:ZID_500C90D29E3BB62D0C92D5FE:1791984000000",
           "touch_count": 1,
           "first_touch_ts": "2026-10-14T13:20:00+00:00",
           "last_touch_ts": "2026-10-14T13:20:00+00:00",
           "lock_reason": "stale_zone_touch_ignored",
-          "trigger_event_id": null,
-          "pending_signal": null
+          "trigger_event_id": "ZONE_7048D2549DC924D9B1A05C76",
+          "pending_signal": {
+            "event_id": "ZONE_7048D2549DC924D9B1A05C76",
+            "idx": 1791986400000,
+            "time": "2026-10-14T14:00:00+00:00",
+            "trigger_bar_time": "2026-10-14T14:00:00+00:00",
+            "trigger_bar_close_time": "2026-10-14T14:04:59.999000+00:00",
+            "decision_boundary_ts": "2026-10-14T14:04:59.999000+00:00",
+            "decision_boundary_kind": "CLOSED_5M_TRIGGER_CLOSE",
+            "decision_boundary_source": "PROVIDER_CLOSE_TIME",
+            "trigger_timeframe": "5m",
+            "type": "LONG",
+            "symbol": "ALICE-USDT",
+            "entry": 0.1556,
+            "sl": 0.14004,
+            "tp1": 0.160268,
+            "tp2": 0.164936,
+            "risk_pct": 10.0,
+            "risk_abs": 0.015559999999999997,
+            "atr": 0.002272203483490045,
+            "tp1_rr": 0.3,
+            "tp2_rr": 0.6,
+            "strategy": "Demand/Supply Zone First",
+            "strategy_version": "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp3-tp6-be-on-tp1-zone-touch-test",
+            "entry_bar": {
+              "timestamp": "2026-10-14T14:00:00+00:00",
+              "open": 0.1569,
+              "high": 0.157,
+              "low": 0.1556,
+              "close": 0.1556,
+              "volume": 23712.27
+            },
+            "previous_bar": {
+              "timestamp": "2026-10-14T13:55:00+00:00",
+              "open": 0.1581,
+              "high": 0.1581,
+              "low": 0.157,
+              "close": 0.157,
+              "volume": 19080.19
+            },
+            "trigger": {
+              "type": "ZONE_TOUCH_5M",
+              "alma_required": false,
+              "alternate_timeframe": "8h",
+              "zone_touch": true,
+              "zone_entry_rule": "fresh_zone_touch_5m",
+              "zone_trigger_mode": "zone",
+              "zone_midpoint": 0.15604302790859095,
+              "zone_midpoint_pct": 50.0,
+              "midpoint_touched_diagnostic": true,
+              "previous_bar_midpoint_touch": false,
+              "previous_bar_zone_touch": false,
+              "trigger_entry_reference": "trigger_bar_close",
+              "zone_visit_id": "ALICE-USDT:DEMAND:ZID_500C90D29E3BB62D0C92D5FE:1791984000000",
+              "zone_visit_state": "TRIGGERED"
+            },
+            "zone": {
+              "top": 0.15648605581718192,
+              "btm": 0.1556,
+              "poi": 0.15604302790859095,
+              "start": 858,
+              "origin_ts_ms": 1791478800000,
+              "zone_id": "ZID_500C90D29E3BB62D0C92D5FE",
+              "kind": "DEMAND",
+              "age_bars": 140
+            },
+            "zone_counts": {
+              "demand": 4,
+              "supply": 4
+            },
+            "target": {
+              "source": "fixed_entry_percentage",
+              "obstacle_source": "supply_zone",
+              "obstacle_price": 0.17604293718692898,
+              "tp1_pct": 3.0,
+              "tp2_pct": 6.0,
+              "tp1_close_fraction": 0.5,
+              "tp2_close_fraction": 0.5,
+              "be_rule": "after_tp1_filled"
+            },
+            "risk_model": {
+              "sl_source": "fixed_percent_from_entry",
+              "fixed_stop_pct": 10.0,
+              "max_signal_risk_pct": 10.0,
+              "initial_risk_pct": 10.0
+            },
+            "confirmation": {
+              "alma_cross": false,
+              "directional_candle_required": false,
+              "directional_candle_ok": false,
+              "zone_age_bars": 140,
+              "minimum_structure_room_r": 1.2,
+              "zone_touch": true,
+              "midpoint_touch": true,
+              "trigger_timeframe": "5m",
+              "zone_trigger_mode": "zone",
+              "volume_ratio": 0.881787081523824,
+              "volume_ratio_5m20": 0.881787081523824,
+              "volume_ratio_semantics": "trigger_5m_volume_divided_by_mean_previous_20_closed_5m_volumes",
+              "volume_ratio_source": "5M_PREVIOUS_20_CLOSED_BARS",
+              "volume_ratio_baseline": 26891.151499999996,
+              "volume_ratio_baseline_count": 20,
+              "bullish_candle": false,
+              "bearish_candle": true
+            },
+            "source_bar_close": 0.1556,
+            "zone_midpoint": 0.15604302790859095,
+            "zone_width_abs": 0.0008860558171819299,
+            "zone_width_pct_of_entry": 0.569444612584788,
+            "signal_forensics": {
+              "range_atr": 0.616142,
+              "body_atr": 0.572132,
+              "body_to_range": 0.928571,
+              "upper_wick_ratio": 0.071429,
+              "lower_wick_ratio": 0.0,
+              "directional_wick_ratio": 0.0,
+              "directional_wick_to_body": 0.0,
+              "close_location": 0.0,
+              "directional_close_location": 0.0,
+              "zone_width_abs": 0.000886055817,
+              "zone_width_atr": 0.389954,
+              "zone_penetration_ratio_raw": 1.0,
+              "zone_penetration_pct_capped": 100.0,
+              "zone_close_vs_entry_edge_atr": -0.389954,
+              "zone_close_to_poi_atr": 0.194977,
+              "directional_rejection_side": "lower_wick"
+            },
+            "zone_visit": {
+              "visit_id": "ALICE-USDT:DEMAND:ZID_500C90D29E3BB62D0C92D5FE:1791984000000",
+              "first_touch_ts": "2026-10-14T13:20:00+00:00",
+              "touch_count_before_trigger": 1,
+              "state": "LOCKED"
+            },
+            "score": 60.0,
+            "market_snapshot": {
+              "analysis_provider": "binance",
+              "analysis_source": "binance_spot",
+              "asset_class": "CRYPTO",
+              "binance_symbol": "ALICEUSDT",
+              "analysis_last_price": 0.157,
+              "analysis_latest_closed_time": "2026-10-14T13:59:59.999000+00:00",
+              "trigger_timeframe": "5m",
+              "trigger_bar_time": "2026-10-14T14:00:00+00:00",
+              "zone_visit_id": "ALICE-USDT:DEMAND:ZID_500C90D29E3BB62D0C92D5FE:1791984000000",
+              "bingx_live_price": null,
+              "binance_live_price": 0.1556,
+              "market_spread_pct": null,
+              "venue_price_deviation_pct": null,
+              "market_spread_metric": "cross_venue_price_deviation",
+              "scan_time": "2026-10-14T14:07:07.189904+00:00",
+              "trigger_age_minutes_at_scan": 7.119831933333333
+            },
+            "shadow_experiments": {
+              "schema_version": 1,
+              "experiment_version": "counterfactual-v2",
+              "applied": false,
+              "decision_anchor": {
+                "event_id": "ZONE_7048D2549DC924D9B1A05C76",
+                "symbol": "ALICE-USDT",
+                "direction": "LONG",
+                "entry": 0.1556,
+                "trigger_bar_time": "2026-10-14T14:00:00+00:00",
+                "decision_ts": "2026-10-14T14:04:59.999000+00:00",
+                "counterfactual_path_start_ts": "2026-10-14T14:04:59.999000+00:00",
+                "source": "closed_5m_signal_bar"
+              },
+              "experiments": {
+                "CF_STRUCTURAL_SL": {
+                  "version": 1,
+                  "rule": "far_zone_edge_plus_0.5x_ATR_5m",
+                  "far_zone_edge": 0.1556,
+                  "atr_5m": 0.000878571428571427,
+                  "atr_multiplier": 0.5,
+                  "hypothetical_sl": 0.15516071428571426,
+                  "risk_pct": 0.2823172970987953,
+                  "min_risk_pct": 1.0,
+                  "max_risk_pct": 6.0,
+                  "would_pass": false
+                },
+                "CF_TP_RR_15_30": {
+                  "version": 1,
+                  "risk_pct": 0.2823172970987953,
+                  "tp1_rr": 1.5,
+                  "tp2_rr": 3.0,
+                  "hypothetical_tp1": 0.1562589285714286,
+                  "hypothetical_tp2": 0.15691785714285716,
+                  "would_be_valid": true
+                },
+                "CF_VOLUME_5M": {
+                  "version": 1,
+                  "trigger_volume": 23712.27,
+                  "baseline_sma20_previous_bars": 26891.151499999996,
+                  "ratio": 0.881787081523824,
+                  "threshold_grid": {
+                    "0.8": true,
+                    "1.0": false,
+                    "1.2": false,
+                    "1.5": false,
+                    "1.8": false,
+                    "2.0": false
+                  }
+                },
+                "CF_VOLUME_1H": {
+                  "version": 1,
+                  "current_closed_1h_volume": 259635.82,
+                  "baseline_sma20_previous_bars": 88010.4355,
+                  "ratio": 2.950057212249563,
+                  "threshold_grid": {
+                    "0.8": true,
+                    "1.0": true,
+                    "1.2": true,
+                    "1.5": true,
+                    "1.8": true,
+                    "2.0": true
+                  }
+                },
+                "CF_DELTA_CONFIRM": {
+                  "version": 1,
+                  "bar_delta_usdt": 2003.2729760000002,
+                  "rule": "LONG>0 / SHORT<0",
+                  "would_pass": true
+                },
+                "CF_EMA200_1H": {
+                  "version": 1,
+                  "ema200_1h": 0.16912867765271264,
+                  "distance_pct": -7.999044183679082,
+                  "ema200_trend_up": false,
+                  "rule": "LONG price>EMA200 / SHORT price<EMA200",
+                  "would_pass": false
+                },
+                "CF_ATR_MIN_5M": {
+                  "version": 1,
+                  "atr14_5m": 0.000878571428571427,
+                  "atr_pct": 0.5646345941975752,
+                  "threshold_grid_pct": {
+                    "0.1": true,
+                    "0.2": true,
+                    "0.3": true,
+                    "0.4": true,
+                    "0.5": true,
+                    "0.75": false,
+                    "1.0": false
+                  }
+                },
+                "CF_SESSION": {
+                  "version": 1,
+                  "session_utc": "LONDON_NY_OVERLAP",
+                  "utc_hour": 14,
+                  "trigger_session_utc": "LONDON_NY_OVERLAP",
+                  "trigger_utc_hour": 14,
+                  "decision_session_utc": "LONDON_NY_OVERLAP",
+                  "decision_utc_hour": 14,
+                  "asia_block_window": "00:00<=UTC<06:00",
+                  "asia_off_hours": false,
+                  "would_pass_if_asia_blocked": true
+                },
+                "CF_ZONE_INVALIDATION": {
+                  "version": 1,
+                  "zone_top": 0.15648605581718192,
+                  "zone_bottom": 0.1556,
+                  "body_close_invalid_before_entry": false,
+                  "invalidation_ts": null,
+                  "would_pass": true
+                },
+                "CF_CORRELATION": {
+                  "version": 1,
+                  "threshold": 0.8,
+                  "open_position_symbols": [],
+                  "max_open_position_correlation": null,
+                  "would_pass": null,
+                  "status": "CONTEXT_UNAVAILABLE"
+                },
+                "CF_PRODUCTION_MANAGEMENT": {
+                  "version": 1,
+                  "stop": 0.14004,
+                  "tp1": 0.160268,
+                  "tp2": 0.164936,
+                  "tp1_fraction": 0.5,
+                  "management_baseline": "current_production_SL_TP1_TP2_BE_after_TP1"
+                },
+                "CF_COST_MODEL": {
+                  "version": 1,
+                  "taker_fee_rate": null,
+                  "maker_fee_rate": null,
+                  "roundtrip_taker_fee_pct": null,
+                  "roundtrip_cost_scenarios_pct": {
+                    "0.0": null,
+                    "0.1": null,
+                    "0.2": null,
+                    "0.5": null
+                  },
+                  "slippage_scenario_semantics": "roundtrip_pct_added_to_roundtrip_taker_fee"
+                },
+                "CF_DELAYED_BE": {
+                  "version": 2,
+                  "activation": "after_production_TP1_then_N_completed_closed_bars",
+                  "bars_grid": [
+                    1,
+                    2
+                  ],
+                  "production_sl": 0.14004,
+                  "production_tp1": 0.160268,
+                  "production_tp2": 0.164936,
+                  "tp1_fraction": 0.5,
+                  "standalone_management_only": true,
+                  "production_gate_applied": false
+                },
+                "CF_TRAIL_ATR": {
+                  "version": 2,
+                  "activation": "after_production_TP1",
+                  "atr_multiplier_grid": [
+                    0.75,
+                    1.0,
+                    1.5
+                  ],
+                  "production_sl": 0.14004,
+                  "production_tp1": 0.160268,
+                  "production_tp2": 0.164936,
+                  "tp1_fraction": 0.5,
+                  "standalone_management_only": true,
+                  "production_gate_applied": false
+                }
+              }
+            },
+            "trend_filter": {
+              "version": "trend-v1-2026-10-06",
+              "enabled": true,
+              "mode": "shadow",
+              "symbol": "ALICE-USDT",
+              "event_direction": "LONG",
+              "event_type": "ZONE_TOUCH_5M",
+              "decision_ts": 1791986699999,
+              "trend_decision": "REJECT",
+              "trend_reject_reason": "TREND_4H_TRANSITION",
+              "trend_4h": "TRANSITION",
+              "trend_1h": "SHORT",
+              "trend_persistence": "TRANSITION",
+              "trend_4h_bars": 411,
+              "trend_1h_bars": 999,
+              "trend_4h_bar_close_ts": 1791979199999,
+              "trend_1h_bar_close_ts": 1791986399999,
+              "trend_persistence_1h_return_pct": -3.146206045650829,
+              "trend_persistence_4h_return_pct": -0.6207324643078839,
+              "btc_regime": "BEARISH",
+              "btc_bar_close_ts": 1791986399999,
+              "btc_chg_1h_pct": -0.5070957020922988,
+              "btc_chg_4h_pct": -1.114281946028331,
+              "btc_context_veto": false,
+              "require_persistence": false,
+              "min_bars_1h": 400,
+              "min_bars_4h": 400,
+              "persistence_lookback_1h": 6,
+              "persistence_lookback_4h": 3,
+              "slope_lookback_4h": 6,
+              "structure_1h": {
+                "pivot_span": 2,
+                "last_swing_high": 0.1643,
+                "last_swing_high_ts": 1791968399999,
+                "last_swing_high_confirmation_ts": 1791975599999,
+                "last_swing_low": 0.1606,
+                "last_swing_low_ts": 1791957599999,
+                "last_swing_low_confirmation_ts": 1791964799999,
+                "break_above_last_swing_high": false,
+                "break_below_last_swing_low": true,
+                "sweep_below_last_swing_low_reclaim": false,
+                "sweep_above_last_swing_high_reject": false,
+                "structure_state": "BEAR_BREAK"
+              },
+              "structure_4h": {
+                "pivot_span": 2,
+                "last_swing_high": 0.1775,
+                "last_swing_high_ts": 1791748799999,
+                "last_swing_high_confirmation_ts": 1791777599999,
+                "last_swing_low": 0.1552,
+                "last_swing_low_ts": 1791863999999,
+                "last_swing_low_confirmation_ts": 1791892799999,
+                "break_above_last_swing_high": false,
+                "break_below_last_swing_low": false,
+                "sweep_below_last_swing_low_reclaim": false,
+                "sweep_above_last_swing_high_reject": false,
+                "structure_state": "RANGE_OR_UNBROKEN"
+              },
+              "btc_bars": 411,
+              "trend_4h_close": 0.1601,
+              "trend_4h_ema50": 0.16918997236868227,
+              "trend_4h_ema200": 0.16007206958978004,
+              "trend_4h_ema50_slope_pct": -1.294221031909304,
+              "trend_4h_slope_lookback": 6,
+              "trend_1h_close": 0.157,
+              "trend_1h_ema20": 0.16040801217891687,
+              "trend_1h_ema50": 0.16294823452443719,
+              "trend_1h_ema200": 0.16912867765271264,
+              "trend_1h_ema50_slope_pct": -0.6688362666810832,
+              "decision_boundary_ts": "2026-10-14T14:04:59.999000+00:00",
+              "history_1h_refetched": false,
+              "history_4h_refetched": true,
+              "source_1h": "binance",
+              "source_4h": "binance",
+              "source_btc": "binance_spot"
+            },
+            "code_commit_sha": "74724ca053bade8e3663d918f0557d802057f659"
+          }
         },
         "SUPPLY:ZID_25E559FAA074E96128EF483E": {
           "state": "ARMED",
@@ -911,8 +2106,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:30.457044+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:04.628142+00:00"
     },
     "ANIME-USDT": {
       "version": 1,
@@ -959,8 +2154,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:31.065580+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:05.864078+00:00"
     },
     "ALT-USDT": {
       "version": 1,
@@ -986,8 +2181,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:31.112031+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:05.252331+00:00"
     },
     "ANKR-USDT": {
       "version": 1,
@@ -1028,8 +2223,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:31.684034+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:06.947892+00:00"
     },
     "APE-USDT": {
       "version": 1,
@@ -1070,8 +2265,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:31.420786+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:06.956615+00:00"
     },
     "API3-USDT": {
       "version": 1,
@@ -1127,8 +2322,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:31.892104+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:07.180737+00:00"
     },
     "APT-USDT": {
       "version": 1,
@@ -1159,8 +2354,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:32.230097+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:07.196981+00:00"
     },
     "AR-USDT": {
       "version": 1,
@@ -1196,8 +2391,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:32.284082+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:07.568159+00:00"
     },
     "ARK-USDT": {
       "version": 1,
@@ -1248,8 +2443,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:32.613796+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:09.677628+00:00"
     },
     "ARB-USDT": {
       "version": 1,
@@ -1260,12 +2455,12 @@
           "touch_count": 0
         },
         "DEMAND:ZID_9951534CA4B675014B2CE6CD": {
-          "state": "ARMED",
-          "visit_id": "ARB-USDT:DEMAND:ZID_9951534CA4B675014B2CE6CD:1791983400000",
+          "state": "LOCKED",
+          "visit_id": "ARB-USDT:DEMAND:ZID_9951534CA4B675014B2CE6CD:1791986400000",
           "touch_count": 0,
-          "first_touch_ts": null,
-          "last_touch_ts": null,
-          "lock_reason": "insufficient_structure_room=0.409R < 1.200R",
+          "first_touch_ts": "2026-10-14T14:00:00+00:00",
+          "last_touch_ts": "2026-10-14T14:00:00+00:00",
+          "lock_reason": "insufficient_structure_room=0.432R < 1.200R",
           "trigger_event_id": null,
           "rearm_ts": "2026-10-14T13:20:00+00:00",
           "pending_signal": null
@@ -1306,8 +2501,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:32.590299+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:07.628027+00:00"
     },
     "ARKM-USDT": {
       "version": 1,
@@ -1354,8 +2549,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:32.846136+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:07.953359+00:00"
     },
     "ARPA-USDT": {
       "version": 1,
@@ -1397,8 +2592,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:32.921712+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:08.415319+00:00"
     },
     "ASR-USDT": {
       "version": 1,
@@ -1439,8 +2634,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:33.227225+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:09.088073+00:00"
     },
     "ASTER-USDT": {
       "version": 1,
@@ -1497,8 +2692,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:33.576855+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:09.001415+00:00"
     },
     "ASTR-USDT": {
       "version": 1,
@@ -1539,8 +2734,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:33.757270+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:10.007687+00:00"
     },
     "ATOM-USDT": {
       "version": 1,
@@ -1571,8 +2766,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:33.977790+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:10.354198+00:00"
     },
     "AT-USDT": {
       "version": 1,
@@ -1619,8 +2814,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:34.102080+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:09.871544+00:00"
     },
     "AUCTION-USDT": {
       "version": 1,
@@ -1651,8 +2846,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:34.294655+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:10.369732+00:00"
     },
     "AVA-USDT": {
       "version": 1,
@@ -1673,8 +2868,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:34.555717+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:10.710848+00:00"
     },
     "AVAX-USDT": {
       "version": 1,
@@ -1720,8 +2915,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:34.419852+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:11.137986+00:00"
     },
     "AWE-USDT": {
       "version": 1,
@@ -1767,8 +2962,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:34.885183+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:11.241918+00:00"
     },
     "AVNT-USDT": {
       "version": 1,
@@ -1819,8 +3014,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:35.127299+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:11.226206+00:00"
     },
     "AXS-USDT": {
       "version": 1,
@@ -1871,8 +3066,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:35.488334+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:11.861781+00:00"
     },
     "BANANAS31-USDT": {
       "version": 1,
@@ -1935,8 +3130,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:35.671718+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:12.568896+00:00"
     },
     "AXL-USDT": {
       "version": 1,
@@ -1984,8 +3179,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:35.036667+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:11.823699+00:00"
     },
     "BABY-USDT": {
       "version": 1,
@@ -2016,8 +3211,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:35.518406+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:12.136169+00:00"
     },
     "BANANA-USDT": {
       "version": 1,
@@ -2063,8 +3258,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:35.651115+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:12.311023+00:00"
     },
     "BANK-USDT": {
       "version": 1,
@@ -2115,8 +3310,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:35.847689+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:12.649146+00:00"
     },
     "BARD-USDT": {
       "version": 1,
@@ -2161,8 +3356,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:35.970911+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:12.749553+00:00"
     },
     "BERA-USDT": {
       "version": 1,
@@ -2173,12 +3368,12 @@
           "touch_count": 0
         },
         "SUPPLY:ZID_832C6796CA40EFDB414B18E4": {
-          "state": "ARMED",
-          "visit_id": "BERA-USDT:SUPPLY:ZID_832C6796CA40EFDB414B18E4:1791985200000",
+          "state": "LOCKED",
+          "visit_id": "BERA-USDT:SUPPLY:ZID_832C6796CA40EFDB414B18E4:1791986400000",
           "touch_count": 0,
-          "first_touch_ts": null,
-          "last_touch_ts": null,
-          "lock_reason": "insufficient_structure_room=0.662R < 1.200R",
+          "first_touch_ts": "2026-10-14T14:00:00+00:00",
+          "last_touch_ts": "2026-10-14T14:00:00+00:00",
+          "lock_reason": "insufficient_structure_room=0.571R < 1.200R",
           "trigger_event_id": null,
           "rearm_ts": "2026-10-14T13:55:00+00:00",
           "pending_signal": null
@@ -2204,8 +3399,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:39.304749+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:16.195376+00:00"
     },
     "BIO-USDT": {
       "version": 1,
@@ -2246,8 +3441,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:38.938270+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:16.349150+00:00"
     },
     "BCH-USDT": {
       "version": 1,
@@ -2293,8 +3488,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:39.268031+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:16.498816+00:00"
     },
     "BOME-USDT": {
       "version": 1,
@@ -2320,8 +3515,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:39.717716+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:15.626323+00:00"
     },
     "BICO-USDT": {
       "version": 1,
@@ -2372,8 +3567,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:39.676021+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:16.865089+00:00"
     },
     "BLUR-USDT": {
       "version": 1,
@@ -2410,8 +3605,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:39.652646+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:15.895766+00:00"
     },
     "BAT-USDT": {
       "version": 1,
@@ -2462,8 +3657,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:38.368572+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:15.141719+00:00"
     },
     "BIGTIME-USDT": {
       "version": 1,
@@ -2920,8 +4115,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:38.319513+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:14.799722+00:00"
     },
     "BMT-USDT": {
       "version": 1,
@@ -2968,8 +4163,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:38.975832+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:15.933242+00:00"
     },
     "BNB-USDT": {
       "version": 1,
@@ -3005,8 +4200,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:38.699248+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:15.817586+00:00"
     },
     "BB-USDT": {
       "version": 1,
@@ -3047,8 +4242,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:39.422097+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:16.344752+00:00"
     },
     "BREV-USDT": {
       "version": 1,
@@ -3089,8 +4284,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:40.074377+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:18.788461+00:00"
     },
     "BTC-USDT": {
       "version": 1,
@@ -3126,8 +4321,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:40.475041+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:17.679183+00:00"
     },
     "CELR-USDT": {
       "version": 1,
@@ -3174,8 +4369,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:41.744248+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:18.953348+00:00"
     },
     "CELO-USDT": {
       "version": 1,
@@ -3216,8 +4411,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:41.979927+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:18.223235+00:00"
     },
     "CAKE-USDT": {
       "version": 1,
@@ -3268,8 +4463,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:40.950231+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:18.195712+00:00"
     },
     "CATI-USDT": {
       "version": 1,
@@ -3305,8 +4500,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:40.799324+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:19.095328+00:00"
     },
     "CGPT-USDT": {
       "version": 1,
@@ -3348,8 +4543,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:42.427520+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:19.766986+00:00"
     },
     "CETUS-USDT": {
       "version": 1,
@@ -3397,8 +4592,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:41.776034+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:19.044743+00:00"
     },
     "CFG-USDT": {
       "version": 1,
@@ -3439,8 +4634,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:42.284773+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:19.149808+00:00"
     },
     "CHIP-USDT": {
       "version": 1,
@@ -3481,8 +4676,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:42.661242+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:19.916441+00:00"
     },
     "C-USDT": {
       "version": 1,
@@ -3528,8 +4723,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:40.943576+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:18.640884+00:00"
     },
     "CFX-USDT": {
       "version": 1,
@@ -3565,8 +4760,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:42.209781+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:19.577342+00:00"
     },
     "CHR-USDT": {
       "version": 1,
@@ -3612,8 +4807,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:43.042395+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:20.803999+00:00"
     },
     "COOKIE-USDT": {
       "version": 1,
@@ -3665,8 +4860,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:43.869911+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:22.147631+00:00"
     },
     "CHZ-USDT": {
       "version": 1,
@@ -3707,8 +4902,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:43.149007+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:20.708832+00:00"
     },
     "COW-USDT": {
       "version": 1,
@@ -3760,8 +4955,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:44.324454+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:22.153082+00:00"
     },
     "CKB-USDT": {
       "version": 1,
@@ -3813,8 +5008,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:43.178325+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:21.179132+00:00"
     },
     "COMP-USDT": {
       "version": 1,
@@ -3855,8 +5050,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:43.534936+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:22.065313+00:00"
     },
     "CRV-USDT": {
       "version": 1,
@@ -3892,8 +5087,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:44.419020+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:22.251519+00:00"
     },
     "CTK-USDT": {
       "version": 1,
@@ -3914,8 +5109,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:44.938869+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:21.780302+00:00"
     },
     "CTSI-USDT": {
       "version": 1,
@@ -3967,8 +5162,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:45.288907+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:22.451621+00:00"
     },
     "COTI-USDT": {
       "version": 1,
@@ -4019,8 +5214,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:43.969316+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:21.712138+00:00"
     },
     "CVX-USDT": {
       "version": 1,
@@ -4046,8 +5241,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:45.222840+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:23.015959+00:00"
     },
     "CVC-USDT": {
       "version": 1,
@@ -4103,8 +5298,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:44.875548+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:22.605105+00:00"
     },
     "CYBER-USDT": {
       "version": 1,
@@ -4130,8 +5325,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:45.433572+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:23.782138+00:00"
     },
     "DOGE-USDT": {
       "version": 1,
@@ -4172,8 +5367,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:46.173614+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:24.712094+00:00"
     },
     "DIA-USDT": {
       "version": 1,
@@ -4219,8 +5414,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:45.939991+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:24.690383+00:00"
     },
     "DOT-USDT": {
       "version": 1,
@@ -4267,16 +5462,20 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:46.645930+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:24.910529+00:00"
     },
     "DEXE-USDT": {
       "version": 1,
       "zones": {
         "DEMAND:ZID_7835490BBDF6213064AD1F0E": {
-          "state": "ARMED",
-          "visit_id": "DEXE-USDT:DEMAND:ZID_7835490BBDF6213064AD1F0E",
-          "touch_count": 0
+          "state": "LOCKED",
+          "visit_id": "DEXE-USDT:DEMAND:ZID_7835490BBDF6213064AD1F0E:1791986400000",
+          "touch_count": 0,
+          "first_touch_ts": "2026-10-14T14:00:00+00:00",
+          "last_touch_ts": "2026-10-14T14:00:00+00:00",
+          "lock_reason": "insufficient_structure_room=0.536R < 1.200R",
+          "trigger_event_id": null
         },
         "DEMAND:ZID_DB22347E5925E2DA0B9F5647": {
           "state": "ARMED",
@@ -4299,8 +5498,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:45.679415+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:23.962654+00:00"
     },
     "DASH-USDT": {
       "version": 1,
@@ -4341,8 +5540,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:45.715456+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:23.788004+00:00"
     },
     "DUSK-USDT": {
       "version": 1,
@@ -4368,8 +5567,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:47.009777+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:25.484243+00:00"
     },
     "DOLO-USDT": {
       "version": 1,
@@ -4415,8 +5614,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:46.699327+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:25.375822+00:00"
     },
     "DYDX-USDT": {
       "version": 1,
@@ -4452,8 +5651,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:46.947823+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:25.067905+00:00"
     },
     "DOGS-USDT": {
       "version": 1,
@@ -4500,8 +5699,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:46.679811+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:25.059933+00:00"
     },
     "DYM-USDT": {
       "version": 1,
@@ -4547,8 +5746,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:46.875632+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:25.574936+00:00"
     },
     "EDU-USDT": {
       "version": 1,
@@ -4594,8 +5793,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:47.160004+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:25.713298+00:00"
     },
     "ETC-USDT": {
       "version": 1,
@@ -4646,8 +5845,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:50.122678+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:27.566222+00:00"
     },
     "ENJ-USDT": {
       "version": 1,
@@ -4704,8 +5903,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:50.160060+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:29.326454+00:00"
     },
     "ETHFI-USDT": {
       "version": 1,
@@ -4745,8 +5944,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:50.414281+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:27.854665+00:00"
     },
     "EPIC-USDT": {
       "version": 1,
@@ -4782,8 +5981,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:50.348215+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:28.103757+00:00"
     },
     "ENSO-USDT": {
       "version": 1,
@@ -4799,9 +5998,13 @@
           "touch_count": 0
         },
         "DEMAND:ZID_B1C041022F78FD8152332C3A": {
-          "state": "ARMED",
-          "visit_id": "ENSO-USDT:DEMAND:ZID_B1C041022F78FD8152332C3A",
-          "touch_count": 0
+          "state": "LOCKED",
+          "visit_id": "ENSO-USDT:DEMAND:ZID_B1C041022F78FD8152332C3A:1791986400000",
+          "touch_count": 0,
+          "first_touch_ts": "2026-10-14T14:00:00+00:00",
+          "last_touch_ts": "2026-10-14T14:00:00+00:00",
+          "lock_reason": "insufficient_structure_room=1.001R < 1.200R",
+          "trigger_event_id": null
         },
         "SUPPLY:ZID_5C3F02C290B1657732C89B37": {
           "state": "ARMED",
@@ -4829,8 +6032,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:50.190597+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:29.013996+00:00"
     },
     "ETH-USDT": {
       "version": 1,
@@ -4866,8 +6069,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:50.516623+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:29.380243+00:00"
     },
     "ENA-USDT": {
       "version": 1,
@@ -4913,8 +6116,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:49.841728+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:29.599580+00:00"
     },
     "ENS-USDT": {
       "version": 1,
@@ -4960,8 +6163,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:48.478335+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:28.195102+00:00"
     },
     "ESP-USDT": {
       "version": 1,
@@ -4992,8 +6195,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:50.619671+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:29.267097+00:00"
     },
     "ERA-USDT": {
       "version": 1,
@@ -5024,8 +6227,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:49.785389+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:29.774004+00:00"
     },
     "EIGEN-USDT": {
       "version": 1,
@@ -5051,8 +6254,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:50.305831+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:29.053279+00:00"
     },
     "EGLD-USDT": {
       "version": 1,
@@ -5093,8 +6296,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:50.302164+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:29.393404+00:00"
     },
     "FET-USDT": {
       "version": 1,
@@ -5130,8 +6333,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:52.153343+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:31.019419+00:00"
     },
     "F-USDT": {
       "version": 1,
@@ -5182,8 +6385,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:51.720757+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:30.895052+00:00"
     },
     "EUL-USDT": {
       "version": 1,
@@ -5219,8 +6422,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:50.833704+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:31.152019+00:00"
     },
     "FIDA-USDT": {
       "version": 1,
@@ -5251,8 +6454,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:52.630778+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:31.491415+00:00"
     },
     "FF-USDT": {
       "version": 1,
@@ -5293,8 +6496,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:51.981608+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:31.125299+00:00"
     },
     "FIL-USDT": {
       "version": 1,
@@ -5330,8 +6533,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:52.800824+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:31.930771+00:00"
     },
     "FLOKI-USDT": {
       "version": 1,
@@ -5378,8 +6581,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:52.748456+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:32.731722+00:00"
     },
     "FLUX-USDT": {
       "version": 1,
@@ -5441,8 +6644,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:52.770093+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:32.856567+00:00"
     },
     "FLOW-USDT": {
       "version": 1,
@@ -5473,8 +6676,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:52.192941+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:32.027953+00:00"
     },
     "FOGO-USDT": {
       "version": 1,
@@ -5537,8 +6740,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:53.341900+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:32.622097+00:00"
     },
     "FORM-USDT": {
       "version": 1,
@@ -5585,8 +6788,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:53.033988+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:32.542043+00:00"
     },
     "FRAX-USDT": {
       "version": 1,
@@ -5622,8 +6825,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:52.922306+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:32.880837+00:00"
     },
     "GENIUS-USDT": {
       "version": 1,
@@ -5669,8 +6872,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:54.827521+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:34.038998+00:00"
     },
     "G-USDT": {
       "version": 1,
@@ -5736,8 +6939,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:53.421044+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:33.884850+00:00"
     },
     "GAS-USDT": {
       "version": 1,
@@ -5778,8 +6981,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:54.286275+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:33.883846+00:00"
     },
     "GALA-USDT": {
       "version": 1,
@@ -5820,8 +7023,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:54.060144+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:33.787857+00:00"
     },
     "GSTOCK-USDT": {
       "version": 1,
@@ -5877,16 +7080,20 @@
           "pending_signal": null
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:55.744772+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:35.934055+00:00"
     },
     "GIGGLE-USDT": {
       "version": 1,
       "zones": {
         "DEMAND:ZID_34ECB4E1F51F8B86C288E89B": {
-          "state": "ARMED",
-          "visit_id": "GIGGLE-USDT:DEMAND:ZID_34ECB4E1F51F8B86C288E89B",
-          "touch_count": 0
+          "state": "LOCKED",
+          "visit_id": "GIGGLE-USDT:DEMAND:ZID_34ECB4E1F51F8B86C288E89B:1791986400000",
+          "touch_count": 0,
+          "first_touch_ts": "2026-10-14T14:00:00+00:00",
+          "last_touch_ts": "2026-10-14T14:00:00+00:00",
+          "lock_reason": "insufficient_structure_room=0.402R < 1.200R",
+          "trigger_event_id": null
         },
         "DEMAND:ZID_B83A4A0FB3266884D5AA0E49": {
           "state": "ARMED",
@@ -5929,8 +7136,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:54.706939+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:34.823329+00:00"
     },
     "GLM-USDT": {
       "version": 1,
@@ -5966,8 +7173,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:54.618212+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:34.844685+00:00"
     },
     "GMX-USDT": {
       "version": 1,
@@ -5998,8 +7205,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:55.486902+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:35.455718+00:00"
     },
     "GRT-USDT": {
       "version": 1,
@@ -6066,8 +7273,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:55.426784+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:35.635025+00:00"
     },
     "GPS-USDT": {
       "version": 1,
@@ -6103,8 +7310,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:55.093789+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:35.439233+00:00"
     },
     "GMT-USDT": {
       "version": 1,
@@ -6152,8 +7359,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:55.343337+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:34.587853+00:00"
     },
     "GUN-USDT": {
       "version": 1,
@@ -6190,8 +7397,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:56.038714+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:36.724214+00:00"
     },
     "HYPE-USDT": {
       "version": 1,
@@ -6217,8 +7424,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:56.708878+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:37.410716+00:00"
     },
     "HAEDAL-USDT": {
       "version": 1,
@@ -6259,8 +7466,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:56.283486+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:37.206546+00:00"
     },
     "HEI-USDT": {
       "version": 1,
@@ -6321,8 +7528,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:56.892098+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:37.128732+00:00"
     },
     "HEMI-USDT": {
       "version": 1,
@@ -6368,16 +7575,20 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:57.054668+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:37.555954+00:00"
     },
     "HBAR-USDT": {
       "version": 1,
       "zones": {
         "DEMAND:ZID_FAA662589E99931C65D3FCA0": {
-          "state": "ARMED",
-          "visit_id": "HBAR-USDT:DEMAND:ZID_FAA662589E99931C65D3FCA0",
-          "touch_count": 0
+          "state": "LOCKED",
+          "visit_id": "HBAR-USDT:DEMAND:ZID_FAA662589E99931C65D3FCA0:1791986400000",
+          "touch_count": 0,
+          "first_touch_ts": "2026-10-14T14:00:00+00:00",
+          "last_touch_ts": "2026-10-14T14:00:00+00:00",
+          "lock_reason": "insufficient_structure_room=0.508R < 1.200R",
+          "trigger_event_id": null
         },
         "SUPPLY:ZID_28D5EEE75CB417C26D6B25BC": {
           "state": "ARMED",
@@ -6425,8 +7636,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:56.566111+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:36.924232+00:00"
     },
     "HMSTR-USDT": {
       "version": 1,
@@ -6463,8 +7674,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:57.368920+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:38.312585+00:00"
     },
     "HIVE-USDT": {
       "version": 1,
@@ -6514,8 +7725,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:57.123472+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:37.904155+00:00"
     },
     "HOLO-USDT": {
       "version": 1,
@@ -6551,8 +7762,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:57.625418+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:38.334478+00:00"
     },
     "HOME-USDT": {
       "version": 1,
@@ -6593,8 +7804,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:57.601129+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:38.366395+00:00"
     },
     "HUMA-USDT": {
       "version": 1,
@@ -6635,8 +7846,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:57.746786+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:38.568314+00:00"
     },
     "ID-USDT": {
       "version": 1,
@@ -6667,8 +7878,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:57.885733+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:38.650242+00:00"
     },
     "IMX-USDT": {
       "version": 1,
@@ -6719,8 +7930,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:00.974020+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:41.902866+00:00"
     },
     "KAIA-USDT": {
       "version": 1,
@@ -6781,8 +7992,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:59.400068+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:40.895788+00:00"
     },
     "IO-USDT": {
       "version": 1,
@@ -6818,8 +8029,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:00.506281+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:42.166570+00:00"
     },
     "IOTA-USDT": {
       "version": 1,
@@ -6860,8 +8071,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:59.989709+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:40.555617+00:00"
     },
     "INIT-USDT": {
       "version": 1,
@@ -6907,8 +8118,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:01.113334+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:41.216309+00:00"
     },
     "INJ-USDT": {
       "version": 1,
@@ -6944,8 +8155,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:00.927009+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:42.454827+00:00"
     },
     "JTO-USDT": {
       "version": 1,
@@ -6986,8 +8197,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:00.836233+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:42.445000+00:00"
     },
     "IOST-USDT": {
       "version": 1,
@@ -7038,8 +8249,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:01.304949+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:41.952423+00:00"
     },
     "KAITO-USDT": {
       "version": 1,
@@ -7075,8 +8286,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:01.753031+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:43.494059+00:00"
     },
     "IOTX-USDT": {
       "version": 1,
@@ -7123,8 +8334,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:00.918871+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:42.579728+00:00"
     },
     "JUP-USDT": {
       "version": 1,
@@ -7160,8 +8371,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:01.452159+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:41.106278+00:00"
     },
     "JASMY-USDT": {
       "version": 1,
@@ -7218,8 +8429,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:00.642032+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:42.329289+00:00"
     },
     "JST-USDT": {
       "version": 1,
@@ -7271,8 +8482,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:01.374674+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:41.522411+00:00"
     },
     "KERNEL-USDT": {
       "version": 1,
@@ -7333,8 +8544,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:02.657240+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:44.203491+00:00"
     },
     "KAVA-USDT": {
       "version": 1,
@@ -7395,8 +8606,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:02.668601+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:43.889733+00:00"
     },
     "KSM-USDT": {
       "version": 1,
@@ -7432,8 +8643,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:03.404312+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:45.019976+00:00"
     },
     "LA-USDT": {
       "version": 1,
@@ -7474,8 +8685,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:03.271427+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:45.242308+00:00"
     },
     "KMNO-USDT": {
       "version": 1,
@@ -7538,8 +8749,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:03.292918+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:45.108446+00:00"
     },
     "KAT-USDT": {
       "version": 1,
@@ -7592,8 +8803,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:02.271476+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:43.785707+00:00"
     },
     "KITE-USDT": {
       "version": 1,
@@ -7629,8 +8840,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:02.491810+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:44.631624+00:00"
     },
     "KNC-USDT": {
       "version": 1,
@@ -7671,8 +8882,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:03.369127+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:45.294669+00:00"
     },
     "LINEA-USDT": {
       "version": 1,
@@ -7715,8 +8926,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:04.093462+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:45.803823+00:00"
     },
     "LINK-USDT": {
       "version": 1,
@@ -7762,8 +8973,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:04.280699+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:46.605211+00:00"
     },
     "LAYER-USDT": {
       "version": 1,
@@ -7809,8 +9020,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:03.511251+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:45.374760+00:00"
     },
     "LDO-USDT": {
       "version": 1,
@@ -7846,8 +9057,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:04.047388+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:45.265289+00:00"
     },
     "LISTA-USDT": {
       "version": 1,
@@ -7888,8 +9099,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:04.776514+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:47.091228+00:00"
     },
     "LQTY-USDT": {
       "version": 1,
@@ -7925,8 +9136,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:04.971110+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:47.135543+00:00"
     },
     "LPT-USDT": {
       "version": 1,
@@ -7962,8 +9173,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:05.035436+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:46.792532+00:00"
     },
     "LTC-USDT": {
       "version": 1,
@@ -8009,8 +9220,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:05.590064+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:48.206832+00:00"
     },
     "LUNC-USDT": {
       "version": 1,
@@ -8057,8 +9268,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:05.952153+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:47.718004+00:00"
     },
     "MANA-USDT": {
       "version": 1,
@@ -8094,8 +9305,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:06.491185+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:48.124230+00:00"
     },
     "LUNA-USDT": {
       "version": 1,
@@ -8147,8 +9358,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:05.846902+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:48.247302+00:00"
     },
     "LSK-USDT": {
       "version": 1,
@@ -8224,8 +9435,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:05.260110+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:47.993862+00:00"
     },
     "MAGIC-USDT": {
       "version": 1,
@@ -8286,8 +9497,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:06.131476+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:48.386759+00:00"
     },
     "MANTA-USDT": {
       "version": 1,
@@ -8323,8 +9534,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:06.557280+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:48.821763+00:00"
     },
     "LUMIA-USDT": {
       "version": 1,
@@ -8360,8 +9571,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:05.634071+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:48.180049+00:00"
     },
     "MANTRA-USDT": {
       "version": 1,
@@ -8403,8 +9614,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:06.643076+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:49.380698+00:00"
     },
     "ME-USDT": {
       "version": 1,
@@ -8435,8 +9646,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:07.434430+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:50.800044+00:00"
     },
     "MARSCOIN-USDT": {
       "version": 1,
@@ -8477,8 +9688,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:07.073991+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:49.721889+00:00"
     },
     "MASK-USDT": {
       "version": 1,
@@ -8514,8 +9725,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:07.284644+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:49.948297+00:00"
     },
     "MEME-USDT": {
       "version": 1,
@@ -8552,8 +9763,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:08.298706+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:50.775967+00:00"
     },
     "METIS-USDT": {
       "version": 1,
@@ -8584,8 +9795,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:08.156882+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:50.803736+00:00"
     },
     "MEGA-USDT": {
       "version": 1,
@@ -8631,8 +9842,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:07.684335+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:50.732317+00:00"
     },
     "MAV-USDT": {
       "version": 1,
@@ -8679,8 +9890,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:07.515313+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:50.455830+00:00"
     },
     "MINA-USDT": {
       "version": 1,
@@ -8711,8 +9922,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:08.185524+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:51.077904+00:00"
     },
     "MMT-USDT": {
       "version": 1,
@@ -8753,8 +9964,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:08.488690+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:51.292371+00:00"
     },
     "MOVE-USDT": {
       "version": 1,
@@ -8765,12 +9976,12 @@
           "touch_count": 0
         },
         "DEMAND:ZID_8938BB561AF1485211AEFB05": {
-          "state": "ARMED",
-          "visit_id": "MOVE-USDT:DEMAND:ZID_8938BB561AF1485211AEFB05:1791983700000",
+          "state": "LOCKED",
+          "visit_id": "MOVE-USDT:DEMAND:ZID_8938BB561AF1485211AEFB05:1791986400000",
           "touch_count": 0,
-          "first_touch_ts": null,
-          "last_touch_ts": null,
-          "lock_reason": "insufficient_structure_room=1.144R < 1.200R",
+          "first_touch_ts": "2026-10-14T14:00:00+00:00",
+          "last_touch_ts": "2026-10-14T14:00:00+00:00",
+          "lock_reason": "insufficient_structure_room=1.163R < 1.200R",
           "trigger_event_id": null,
           "rearm_ts": "2026-10-14T13:20:00+00:00",
           "pending_signal": null
@@ -8801,8 +10012,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:08.556706+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:51.409536+00:00"
     },
     "MORPHO-USDT": {
       "version": 1,
@@ -8838,8 +10049,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:08.537732+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:51.228714+00:00"
     },
     "MOVR-USDT": {
       "version": 1,
@@ -8900,8 +10111,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:11.822514+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:55.416596+00:00"
     },
     "MTL-USDT": {
       "version": 1,
@@ -8962,8 +10173,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:10.947625+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:53.356558+00:00"
     },
     "NMR-USDT": {
       "version": 1,
@@ -9034,8 +10245,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:10.731313+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:54.963128+00:00"
     },
     "NXPC-USDT": {
       "version": 1,
@@ -9081,8 +10292,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:10.506102+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:54.836963+00:00"
     },
     "OG-USDT": {
       "version": 1,
@@ -9113,8 +10324,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:10.818211+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:53.664356+00:00"
     },
     "NEO-USDT": {
       "version": 1,
@@ -9135,8 +10346,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:11.773744+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:55.120223+00:00"
     },
     "NIGHT-USDT": {
       "version": 1,
@@ -9202,8 +10413,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:11.352330+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:54.247341+00:00"
     },
     "NEAR-USDT": {
       "version": 1,
@@ -9265,8 +10476,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:11.925951+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:55.188205+00:00"
     },
     "NIL-USDT": {
       "version": 1,
@@ -9312,8 +10523,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:11.878992+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:54.837268+00:00"
     },
     "MUBARAK-USDT": {
       "version": 1,
@@ -9354,8 +10565,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:11.727850+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:55.036224+00:00"
     },
     "ONDO-USDT": {
       "version": 1,
@@ -9391,8 +10602,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:12.751689+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:56.720086+00:00"
     },
     "ONE-USDT": {
       "version": 1,
@@ -9449,8 +10660,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:13.180415+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:56.470936+00:00"
     },
     "NOT-USDT": {
       "version": 1,
@@ -9491,8 +10702,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:12.078235+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:54.849607+00:00"
     },
     "ONT-USDT": {
       "version": 1,
@@ -9513,8 +10724,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:13.142483+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:56.896029+00:00"
     },
     "OPN-USDT": {
       "version": 1,
@@ -9530,12 +10741,12 @@
           "touch_count": 0
         },
         "DEMAND:ZID_B5C44AC68AFE31D417EA9E9D": {
-          "state": "ARMED",
-          "visit_id": "OPN-USDT:DEMAND:ZID_B5C44AC68AFE31D417EA9E9D:1791983700000",
+          "state": "LOCKED",
+          "visit_id": "OPN-USDT:DEMAND:ZID_B5C44AC68AFE31D417EA9E9D:1791986400000",
           "touch_count": 0,
-          "first_touch_ts": null,
-          "last_touch_ts": null,
-          "lock_reason": "insufficient_structure_room=0.323R < 1.200R",
+          "first_touch_ts": "2026-10-14T14:00:00+00:00",
+          "last_touch_ts": "2026-10-14T14:00:00+00:00",
+          "lock_reason": "insufficient_structure_room=0.191R < 1.200R",
           "trigger_event_id": null,
           "rearm_ts": "2026-10-14T13:35:00+00:00",
           "pending_signal": null
@@ -9566,8 +10777,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:14.238678+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:57.792586+00:00"
     },
     "OPG-USDT": {
       "version": 1,
@@ -9623,8 +10834,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:13.768562+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:58.099123+00:00"
     },
     "ORCA-USDT": {
       "version": 1,
@@ -9690,8 +10901,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:14.167816+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:57.581814+00:00"
     },
     "OP-USDT": {
       "version": 1,
@@ -9722,8 +10933,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:13.395512+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:57.143837+00:00"
     },
     "PENDLE-USDT": {
       "version": 1,
@@ -9774,8 +10985,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:14.275440+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:58.706862+00:00"
     },
     "ORDI-USDT": {
       "version": 1,
@@ -9821,8 +11032,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:14.458437+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:58.135508+00:00"
     },
     "PARTI-USDT": {
       "version": 1,
@@ -9873,8 +11084,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:14.066382+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:57.980273+00:00"
     },
     "ONG-USDT": {
       "version": 1,
@@ -9910,8 +11121,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:13.598307+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:57.353162+00:00"
     },
     "PEOPLE-USDT": {
       "version": 1,
@@ -9942,8 +11153,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:15.265632+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:59.561475+00:00"
     },
     "PENGU-USDT": {
       "version": 1,
@@ -9994,8 +11205,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:14.824177+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:58.750756+00:00"
     },
     "PHA-USDT": {
       "version": 1,
@@ -10051,8 +11262,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:15.691218+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:59.753415+00:00"
     },
     "PIXEL-USDT": {
       "version": 1,
@@ -10093,8 +11304,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:15.987006+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:00.131600+00:00"
     },
     "PNUT-USDT": {
       "version": 1,
@@ -10141,8 +11352,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:15.901367+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:00.262395+00:00"
     },
     "POLYX-USDT": {
       "version": 1,
@@ -10188,8 +11399,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:16.528970+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:00.905964+00:00"
     },
     "POL-USDT": {
       "version": 1,
@@ -10230,8 +11441,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:16.675030+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:01.075185+00:00"
     },
     "PROM-USDT": {
       "version": 1,
@@ -10277,8 +11488,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:16.794645+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:01.921607+00:00"
     },
     "PLUME-USDT": {
       "version": 1,
@@ -10324,8 +11535,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:15.802383+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:00.108068+00:00"
     },
     "PROVE-USDT": {
       "version": 1,
@@ -10371,8 +11582,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:17.140178+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:01.657715+00:00"
     },
     "POWR-USDT": {
       "version": 1,
@@ -10418,8 +11629,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:16.632917+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:01.237559+00:00"
     },
     "PORTAL-USDT": {
       "version": 1,
@@ -10455,8 +11666,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:16.443210+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:00.858261+00:00"
     },
     "PUMP-USDT": {
       "version": 1,
@@ -10497,8 +11708,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:17.352163+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:01.780658+00:00"
     },
     "PUNDIX-USDT": {
       "version": 1,
@@ -10544,8 +11755,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:17.701107+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:02.424707+00:00"
     },
     "PYTH-USDT": {
       "version": 1,
@@ -10581,8 +11792,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:18.294465+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:02.894058+00:00"
     },
     "RE-USDT": {
       "version": 1,
@@ -10618,8 +11829,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:18.944081+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:03.847515+00:00"
     },
     "QNT-USDT": {
       "version": 1,
@@ -10680,8 +11891,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:18.085161+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:02.868515+00:00"
     },
     "QTUM-USDT": {
       "version": 1,
@@ -10717,8 +11928,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:18.305385+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:03.163916+00:00"
     },
     "RENDER-USDT": {
       "version": 1,
@@ -10754,8 +11965,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:18.982921+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:03.964383+00:00"
     },
     "RARE-USDT": {
       "version": 1,
@@ -11211,8 +12422,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:18.758783+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:03.373693+00:00"
     },
     "RESOLV-USDT": {
       "version": 1,
@@ -11248,8 +12459,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:19.322884+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:04.202201+00:00"
     },
     "REZ-USDT": {
       "version": 1,
@@ -11306,8 +12517,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:19.358168+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:04.307150+00:00"
     },
     "RAY-USDT": {
       "version": 1,
@@ -11348,8 +12559,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:19.026072+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:03.970032+00:00"
     },
     "RLC-USDT": {
       "version": 1,
@@ -11815,8 +13026,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:19.591187+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:04.529910+00:00"
     },
     "RIF-USDT": {
       "version": 1,
@@ -11852,8 +13063,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:19.572363+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:04.357844+00:00"
     },
     "ROSE-USDT": {
       "version": 1,
@@ -11884,8 +13095,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:23.609302+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:07.950577+00:00"
     },
     "ROBO-USDT": {
       "version": 1,
@@ -11926,8 +13137,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:23.353309+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:08.811521+00:00"
     },
     "RPL-USDT": {
       "version": 1,
@@ -11973,8 +13184,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:21.526450+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:07.296270+00:00"
     },
     "RUNE-USDT": {
       "version": 1,
@@ -12030,8 +13241,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:22.172889+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:06.790064+00:00"
     },
     "SENT-USDT": {
       "version": 1,
@@ -12088,8 +13299,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:24.461192+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:09.761590+00:00"
     },
     "SANTOS-USDT": {
       "version": 1,
@@ -12130,8 +13341,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:22.337477+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:06.703919+00:00"
     },
     "SAPIEN-USDT": {
       "version": 1,
@@ -12182,8 +13393,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:23.124395+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:07.089446+00:00"
     },
     "SAND-USDT": {
       "version": 1,
@@ -12230,19 +13441,19 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:23.548934+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:08.386009+00:00"
     },
     "SAHARA-USDT": {
       "version": 1,
       "zones": {
         "DEMAND:ZID_8F5C0984799488BD1C4E38B9": {
-          "state": "ARMED",
-          "visit_id": "SAHARA-USDT:DEMAND:ZID_8F5C0984799488BD1C4E38B9:1791852600000",
+          "state": "LOCKED",
+          "visit_id": "SAHARA-USDT:DEMAND:ZID_8F5C0984799488BD1C4E38B9:1791986400000",
           "touch_count": 0,
-          "first_touch_ts": null,
-          "last_touch_ts": null,
-          "lock_reason": "insufficient_structure_room=0.395R < 1.200R",
+          "first_touch_ts": "2026-10-14T14:00:00+00:00",
+          "last_touch_ts": "2026-10-14T14:00:00+00:00",
+          "lock_reason": "insufficient_structure_room=0.560R < 1.200R",
           "trigger_event_id": null,
           "rearm_ts": "2026-10-13T00:55:00+00:00",
           "pending_signal": null
@@ -12288,8 +13499,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:22.740848+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:08.303653+00:00"
     },
     "RSR-USDT": {
       "version": 1,
@@ -12341,8 +13552,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:23.118592+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:07.847382+00:00"
     },
     "SEI-USDT": {
       "version": 1,
@@ -12389,8 +13600,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:23.942932+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:09.426973+00:00"
     },
     "SAGA-USDT": {
       "version": 1,
@@ -12862,8 +14073,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:23.456370+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:07.694481+00:00"
     },
     "S-USDT": {
       "version": 1,
@@ -12899,8 +14110,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:23.420338+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:08.270072+00:00"
     },
     "RVN-USDT": {
       "version": 1,
@@ -12921,15 +14132,415 @@
           "touch_count": 0
         },
         "DEMAND:ZID_BEA4F6E1F4AF532913C1DBDD": {
-          "state": "ARMED",
-          "visit_id": "RVN-USDT:DEMAND:ZID_BEA4F6E1F4AF532913C1DBDD:1791984300000",
+          "state": "LOCKED",
+          "visit_id": "RVN-USDT:DEMAND:ZID_BEA4F6E1F4AF532913C1DBDD:1791986400000",
           "touch_count": 0,
-          "first_touch_ts": null,
-          "last_touch_ts": null,
+          "first_touch_ts": "2026-10-14T14:00:00+00:00",
+          "last_touch_ts": "2026-10-14T14:00:00+00:00",
           "lock_reason": "zone_touch",
-          "trigger_event_id": null,
+          "trigger_event_id": "ZONE_2C8615FC23E9D53E3D6A725B",
           "rearm_ts": "2026-10-14T13:30:00+00:00",
-          "pending_signal": null
+          "pending_signal": {
+            "event_id": "ZONE_2C8615FC23E9D53E3D6A725B",
+            "idx": 1791986400000,
+            "time": "2026-10-14T14:00:00+00:00",
+            "trigger_bar_time": "2026-10-14T14:00:00+00:00",
+            "trigger_bar_close_time": "2026-10-14T14:04:59.999000+00:00",
+            "decision_boundary_ts": "2026-10-14T14:04:59.999000+00:00",
+            "decision_boundary_kind": "CLOSED_5M_TRIGGER_CLOSE",
+            "decision_boundary_source": "PROVIDER_CLOSE_TIME",
+            "trigger_timeframe": "5m",
+            "type": "LONG",
+            "symbol": "RVN-USDT",
+            "entry": 0.00154,
+            "sl": 0.0013859999999999999,
+            "tp1": 0.0015861999999999998,
+            "tp2": 0.0016324,
+            "risk_pct": 10.0,
+            "risk_abs": 0.00015399999999999998,
+            "atr": 3.442196959083183e-05,
+            "tp1_rr": 0.3,
+            "tp2_rr": 0.6,
+            "strategy": "Demand/Supply Zone First",
+            "strategy_version": "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp3-tp6-be-on-tp1-zone-touch-test",
+            "entry_bar": {
+              "timestamp": "2026-10-14T14:00:00+00:00",
+              "open": 0.001549,
+              "high": 0.001553,
+              "low": 0.001539,
+              "close": 0.00154,
+              "volume": 4547282.8
+            },
+            "previous_bar": {
+              "timestamp": "2026-10-14T13:55:00+00:00",
+              "open": 0.001557,
+              "high": 0.001557,
+              "low": 0.00155,
+              "close": 0.001551,
+              "volume": 2018434.4
+            },
+            "trigger": {
+              "type": "ZONE_TOUCH_5M",
+              "alma_required": false,
+              "alternate_timeframe": "8h",
+              "zone_touch": true,
+              "zone_entry_rule": "fresh_zone_touch_5m",
+              "zone_trigger_mode": "zone",
+              "zone_midpoint": 0.0015379254992079064,
+              "zone_midpoint_pct": 50.0,
+              "midpoint_touched_diagnostic": false,
+              "previous_bar_midpoint_touch": false,
+              "previous_bar_zone_touch": false,
+              "trigger_entry_reference": "trigger_bar_close",
+              "zone_visit_id": "RVN-USDT:DEMAND:ZID_BEA4F6E1F4AF532913C1DBDD:1791986400000",
+              "zone_visit_state": "TRIGGERED"
+            },
+            "zone": {
+              "top": 0.0015428509984158128,
+              "btm": 0.001533,
+              "poi": 0.0015379254992079064,
+              "start": 961,
+              "origin_ts_ms": 1791849600000,
+              "zone_id": "ZID_BEA4F6E1F4AF532913C1DBDD",
+              "kind": "DEMAND",
+              "age_bars": 37
+            },
+            "zone_counts": {
+              "demand": 1,
+              "supply": 5
+            },
+            "target": {
+              "source": "fixed_entry_percentage",
+              "obstacle_source": "supply_zone",
+              "obstacle_price": 0.001747616760815893,
+              "tp1_pct": 3.0,
+              "tp2_pct": 6.0,
+              "tp1_close_fraction": 0.5,
+              "tp2_close_fraction": 0.5,
+              "be_rule": "after_tp1_filled"
+            },
+            "risk_model": {
+              "sl_source": "fixed_percent_from_entry",
+              "fixed_stop_pct": 10.0,
+              "max_signal_risk_pct": 10.0,
+              "initial_risk_pct": 10.0
+            },
+            "confirmation": {
+              "alma_cross": false,
+              "directional_candle_required": false,
+              "directional_candle_ok": false,
+              "zone_age_bars": 37,
+              "minimum_structure_room_r": 1.2,
+              "zone_touch": true,
+              "midpoint_touch": false,
+              "trigger_timeframe": "5m",
+              "zone_trigger_mode": "zone",
+              "volume_ratio": 0.5369833123700661,
+              "volume_ratio_5m20": 0.5369833123700661,
+              "volume_ratio_semantics": "trigger_5m_volume_divided_by_mean_previous_20_closed_5m_volumes",
+              "volume_ratio_source": "5M_PREVIOUS_20_CLOSED_BARS",
+              "volume_ratio_baseline": 8468201.33,
+              "volume_ratio_baseline_count": 20,
+              "bullish_candle": false,
+              "bearish_candle": true
+            },
+            "source_bar_close": 0.00154,
+            "zone_midpoint": 0.0015379254992079064,
+            "zone_width_abs": 9.850998415812749e-06,
+            "zone_width_pct_of_entry": 0.6396752218060227,
+            "signal_forensics": {
+              "range_atr": 0.406717,
+              "body_atr": 0.261461,
+              "body_to_range": 0.642857,
+              "upper_wick_ratio": 0.285714,
+              "lower_wick_ratio": 0.071429,
+              "directional_wick_ratio": 0.071429,
+              "directional_wick_to_body": 0.111111,
+              "close_location": 0.071429,
+              "directional_close_location": 0.071429,
+              "zone_width_abs": 9.850998e-06,
+              "zone_width_atr": 0.286183,
+              "zone_penetration_ratio_raw": 0.390925,
+              "zone_penetration_pct_capped": 39.0925,
+              "zone_close_vs_entry_edge_atr": -0.082825,
+              "zone_close_to_poi_atr": 0.060267,
+              "directional_rejection_side": "lower_wick"
+            },
+            "zone_visit": {
+              "visit_id": "RVN-USDT:DEMAND:ZID_BEA4F6E1F4AF532913C1DBDD:1791986400000",
+              "first_touch_ts": "2026-10-14T14:00:00+00:00",
+              "touch_count_before_trigger": 0,
+              "state": "LOCKED"
+            },
+            "score": 60.0,
+            "market_snapshot": {
+              "analysis_provider": "binance",
+              "analysis_source": "binance_spot",
+              "asset_class": "CRYPTO",
+              "binance_symbol": "RVNUSDT",
+              "analysis_last_price": 0.001551,
+              "analysis_latest_closed_time": "2026-10-14T13:59:59.999000+00:00",
+              "trigger_timeframe": "5m",
+              "trigger_bar_time": "2026-10-14T14:00:00+00:00",
+              "zone_visit_id": "RVN-USDT:DEMAND:ZID_BEA4F6E1F4AF532913C1DBDD:1791986400000",
+              "bingx_live_price": null,
+              "binance_live_price": 0.00154,
+              "market_spread_pct": null,
+              "venue_price_deviation_pct": null,
+              "market_spread_metric": "cross_venue_price_deviation",
+              "scan_time": "2026-10-14T14:08:10.514625+00:00",
+              "trigger_age_minutes_at_scan": 8.175243933333332
+            },
+            "shadow_experiments": {
+              "schema_version": 1,
+              "experiment_version": "counterfactual-v2",
+              "applied": false,
+              "decision_anchor": {
+                "event_id": "ZONE_2C8615FC23E9D53E3D6A725B",
+                "symbol": "RVN-USDT",
+                "direction": "LONG",
+                "entry": 0.00154,
+                "trigger_bar_time": "2026-10-14T14:00:00+00:00",
+                "decision_ts": "2026-10-14T14:04:59.999000+00:00",
+                "counterfactual_path_start_ts": "2026-10-14T14:04:59.999000+00:00",
+                "source": "closed_5m_signal_bar"
+              },
+              "experiments": {
+                "CF_STRUCTURAL_SL": {
+                  "version": 1,
+                  "rule": "far_zone_edge_plus_0.5x_ATR_5m",
+                  "far_zone_edge": 0.001533,
+                  "atr_5m": 9.357142857142845e-06,
+                  "atr_multiplier": 0.5,
+                  "hypothetical_sl": 0.0015283214285714286,
+                  "risk_pct": 0.7583487940630739,
+                  "min_risk_pct": 1.0,
+                  "max_risk_pct": 6.0,
+                  "would_pass": false
+                },
+                "CF_TP_RR_15_30": {
+                  "version": 1,
+                  "risk_pct": 0.7583487940630739,
+                  "tp1_rr": 1.5,
+                  "tp2_rr": 3.0,
+                  "hypothetical_tp1": 0.001557517857142857,
+                  "hypothetical_tp2": 0.001575035714285714,
+                  "would_be_valid": true
+                },
+                "CF_VOLUME_5M": {
+                  "version": 1,
+                  "trigger_volume": 4547282.8,
+                  "baseline_sma20_previous_bars": 8468201.33,
+                  "ratio": 0.5369833123700661,
+                  "threshold_grid": {
+                    "0.8": false,
+                    "1.0": false,
+                    "1.2": false,
+                    "1.5": false,
+                    "1.8": false,
+                    "2.0": false
+                  }
+                },
+                "CF_VOLUME_1H": {
+                  "version": 1,
+                  "current_closed_1h_volume": 48140860.0,
+                  "baseline_sma20_previous_bars": 40834845.265,
+                  "ratio": 1.1789161851254049,
+                  "threshold_grid": {
+                    "0.8": true,
+                    "1.0": true,
+                    "1.2": false,
+                    "1.5": false,
+                    "1.8": false,
+                    "2.0": false
+                  }
+                },
+                "CF_DELTA_CONFIRM": {
+                  "version": 1,
+                  "bar_delta_usdt": -735.0519803999996,
+                  "rule": "LONG>0 / SHORT<0",
+                  "would_pass": false
+                },
+                "CF_EMA200_1H": {
+                  "version": 1,
+                  "ema200_1h": 0.0019479003925265772,
+                  "distance_pct": -20.94051595715831,
+                  "ema200_trend_up": false,
+                  "rule": "LONG price>EMA200 / SHORT price<EMA200",
+                  "would_pass": false
+                },
+                "CF_ATR_MIN_5M": {
+                  "version": 1,
+                  "atr14_5m": 9.357142857142845e-06,
+                  "atr_pct": 0.6076066790352497,
+                  "threshold_grid_pct": {
+                    "0.1": true,
+                    "0.2": true,
+                    "0.3": true,
+                    "0.4": true,
+                    "0.5": true,
+                    "0.75": false,
+                    "1.0": false
+                  }
+                },
+                "CF_SESSION": {
+                  "version": 1,
+                  "session_utc": "LONDON_NY_OVERLAP",
+                  "utc_hour": 14,
+                  "trigger_session_utc": "LONDON_NY_OVERLAP",
+                  "trigger_utc_hour": 14,
+                  "decision_session_utc": "LONDON_NY_OVERLAP",
+                  "decision_utc_hour": 14,
+                  "asia_block_window": "00:00<=UTC<06:00",
+                  "asia_off_hours": false,
+                  "would_pass_if_asia_blocked": true
+                },
+                "CF_ZONE_INVALIDATION": {
+                  "version": 1,
+                  "zone_top": 0.0015428509984158128,
+                  "zone_bottom": 0.001533,
+                  "body_close_invalid_before_entry": false,
+                  "invalidation_ts": null,
+                  "would_pass": true
+                },
+                "CF_CORRELATION": {
+                  "version": 1,
+                  "threshold": 0.8,
+                  "open_position_symbols": [],
+                  "max_open_position_correlation": null,
+                  "would_pass": null,
+                  "status": "CONTEXT_UNAVAILABLE"
+                },
+                "CF_PRODUCTION_MANAGEMENT": {
+                  "version": 1,
+                  "stop": 0.0013859999999999999,
+                  "tp1": 0.0015861999999999998,
+                  "tp2": 0.0016324,
+                  "tp1_fraction": 0.5,
+                  "management_baseline": "current_production_SL_TP1_TP2_BE_after_TP1"
+                },
+                "CF_COST_MODEL": {
+                  "version": 1,
+                  "taker_fee_rate": null,
+                  "maker_fee_rate": null,
+                  "roundtrip_taker_fee_pct": null,
+                  "roundtrip_cost_scenarios_pct": {
+                    "0.0": null,
+                    "0.1": null,
+                    "0.2": null,
+                    "0.5": null
+                  },
+                  "slippage_scenario_semantics": "roundtrip_pct_added_to_roundtrip_taker_fee"
+                },
+                "CF_DELAYED_BE": {
+                  "version": 2,
+                  "activation": "after_production_TP1_then_N_completed_closed_bars",
+                  "bars_grid": [
+                    1,
+                    2
+                  ],
+                  "production_sl": 0.0013859999999999999,
+                  "production_tp1": 0.0015861999999999998,
+                  "production_tp2": 0.0016324,
+                  "tp1_fraction": 0.5,
+                  "standalone_management_only": true,
+                  "production_gate_applied": false
+                },
+                "CF_TRAIL_ATR": {
+                  "version": 2,
+                  "activation": "after_production_TP1",
+                  "atr_multiplier_grid": [
+                    0.75,
+                    1.0,
+                    1.5
+                  ],
+                  "production_sl": 0.0013859999999999999,
+                  "production_tp1": 0.0015861999999999998,
+                  "production_tp2": 0.0016324,
+                  "tp1_fraction": 0.5,
+                  "standalone_management_only": true,
+                  "production_gate_applied": false
+                }
+              }
+            },
+            "trend_filter": {
+              "version": "trend-v1-2026-10-06",
+              "enabled": true,
+              "mode": "shadow",
+              "symbol": "RVN-USDT",
+              "event_direction": "LONG",
+              "event_type": "ZONE_TOUCH_5M",
+              "decision_ts": 1791986699999,
+              "trend_decision": "REJECT",
+              "trend_reject_reason": "TREND_4H_DIRECTION_MISMATCH",
+              "trend_4h": "BEAR",
+              "trend_1h": "SHORT",
+              "trend_persistence": "TRANSITION",
+              "trend_4h_bars": 411,
+              "trend_1h_bars": 999,
+              "trend_4h_bar_close_ts": 1791979199999,
+              "trend_1h_bar_close_ts": 1791986399999,
+              "trend_persistence_1h_return_pct": -4.612546125461253,
+              "trend_persistence_4h_return_pct": -0.876095118898631,
+              "btc_regime": "BEARISH",
+              "btc_bar_close_ts": 1791986399999,
+              "btc_chg_1h_pct": -0.5070957020922988,
+              "btc_chg_4h_pct": -1.114281946028331,
+              "btc_context_veto": false,
+              "require_persistence": false,
+              "min_bars_1h": 400,
+              "min_bars_4h": 400,
+              "persistence_lookback_1h": 6,
+              "persistence_lookback_4h": 3,
+              "slope_lookback_4h": 6,
+              "structure_1h": {
+                "pivot_span": 2,
+                "last_swing_high": 0.00166,
+                "last_swing_high_ts": 1791968399999,
+                "last_swing_high_confirmation_ts": 1791975599999,
+                "last_swing_low": 0.001581,
+                "last_swing_low_ts": 1791943199999,
+                "last_swing_low_confirmation_ts": 1791950399999,
+                "break_above_last_swing_high": false,
+                "break_below_last_swing_low": true,
+                "sweep_below_last_swing_low_reclaim": false,
+                "sweep_above_last_swing_high_reject": false,
+                "structure_state": "BEAR_BREAK"
+              },
+              "structure_4h": {
+                "pivot_span": 2,
+                "last_swing_high": 0.001758,
+                "last_swing_high_ts": 1791835199999,
+                "last_swing_high_confirmation_ts": 1791863999999,
+                "last_swing_low": 0.001557,
+                "last_swing_low_ts": 1791907199999,
+                "last_swing_low_confirmation_ts": 1791935999999,
+                "break_above_last_swing_high": false,
+                "break_below_last_swing_low": false,
+                "sweep_below_last_swing_low_reclaim": false,
+                "sweep_above_last_swing_high_reject": false,
+                "structure_state": "RANGE_OR_UNBROKEN"
+              },
+              "btc_bars": 411,
+              "trend_4h_close": 0.001584,
+              "trend_4h_ema50": 0.0019514231638503013,
+              "trend_4h_ema200": 0.0023029075327471497,
+              "trend_4h_ema50_slope_pct": -4.645047316587425,
+              "trend_4h_slope_lookback": 6,
+              "trend_1h_close": 0.001551,
+              "trend_1h_ema20": 0.001593895562975689,
+              "trend_1h_ema50": 0.0016482516472411369,
+              "trend_1h_ema200": 0.0019479003925265772,
+              "trend_1h_ema50_slope_pct": -1.120259173977567,
+              "decision_boundary_ts": "2026-10-14T14:04:59.999000+00:00",
+              "history_1h_refetched": false,
+              "history_4h_refetched": true,
+              "source_1h": "binance",
+              "source_4h": "binance",
+              "source_btc": "binance_spot"
+            },
+            "code_commit_sha": "74724ca053bade8e3663d918f0557d802057f659"
+          }
         },
         "SUPPLY:ZID_1D2763EDFE72A7BCD64859AD": {
           "state": "ARMED",
@@ -12942,8 +14553,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:23.558606+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:08.023358+00:00"
     },
     "SFP-USDT": {
       "version": 1,
@@ -12990,8 +14601,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:24.764885+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:10.553700+00:00"
     },
     "SHELL-USDT": {
       "version": 1,
@@ -13032,8 +14643,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:25.324072+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:10.480091+00:00"
     },
     "SIGN-USDT": {
       "version": 1,
@@ -13074,8 +14685,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:25.495635+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:10.673621+00:00"
     },
     "SKY-USDT": {
       "version": 1,
@@ -13133,8 +14744,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:25.772387+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:10.724565+00:00"
     },
     "SLP-USDT": {
       "version": 1,
@@ -13170,8 +14781,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:25.359635+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:11.144835+00:00"
     },
     "SKL-USDT": {
       "version": 1,
@@ -13203,8 +14814,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:26.051090+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:10.489848+00:00"
     },
     "SOL-USDT": {
       "version": 1,
@@ -13240,8 +14851,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:26.523613+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:12.080017+00:00"
     },
     "SOLV-USDT": {
       "version": 1,
@@ -13282,8 +14893,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:26.232148+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:12.126003+00:00"
     },
     "STOCKER-USDT": {
       "version": 1,
@@ -13309,19 +14920,19 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:27.207018+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:12.932434+00:00"
     },
     "SNX-USDT": {
       "version": 1,
       "zones": {
         "DEMAND:ZID_E8F26A7910AE597F5DE64DDA": {
-          "state": "ARMED",
-          "visit_id": "SNX-USDT:DEMAND:ZID_E8F26A7910AE597F5DE64DDA:1791983400000",
+          "state": "LOCKED",
+          "visit_id": "SNX-USDT:DEMAND:ZID_E8F26A7910AE597F5DE64DDA:1791986400000",
           "touch_count": 0,
-          "first_touch_ts": null,
-          "last_touch_ts": null,
-          "lock_reason": "insufficient_structure_room=0.445R < 1.200R",
+          "first_touch_ts": "2026-10-14T14:00:00+00:00",
+          "last_touch_ts": "2026-10-14T14:00:00+00:00",
+          "lock_reason": "insufficient_structure_room=0.477R < 1.200R",
           "trigger_event_id": null,
           "rearm_ts": "2026-10-14T13:25:00+00:00",
           "pending_signal": null
@@ -13357,8 +14968,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:26.092950+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:11.094941+00:00"
     },
     "SOMI-USDT": {
       "version": 1,
@@ -13389,8 +15000,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:26.364447+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:12.649940+00:00"
     },
     "SOPH-USDT": {
       "version": 1,
@@ -13447,8 +15058,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:27.358425+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:13.484534+00:00"
     },
     "SPK-USDT": {
       "version": 1,
@@ -13484,8 +15095,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:27.409011+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:13.193958+00:00"
     },
     "SSV-USDT": {
       "version": 1,
@@ -13521,8 +15132,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:27.703749+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:13.413193+00:00"
     },
     "STEEM-USDT": {
       "version": 1,
@@ -13573,8 +15184,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:27.976478+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:13.634818+00:00"
     },
     "STO-USDT": {
       "version": 1,
@@ -13615,8 +15226,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:28.096145+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:13.743971+00:00"
     },
     "STRK-USDT": {
       "version": 1,
@@ -13669,8 +15280,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:28.378785+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:13.988141+00:00"
     },
     "SUI-USDT": {
       "version": 1,
@@ -13711,8 +15322,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:28.624843+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:14.878270+00:00"
     },
     "STX-USDT": {
       "version": 1,
@@ -13759,8 +15370,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:28.732564+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:14.540538+00:00"
     },
     "SXT-USDT": {
       "version": 1,
@@ -13795,8 +15406,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:29.487890+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:15.491171+00:00"
     },
     "SUN-USDT": {
       "version": 1,
@@ -13837,8 +15448,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:28.310981+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:14.546877+00:00"
     },
     "SUPER-USDT": {
       "version": 1,
@@ -13904,8 +15515,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:29.167564+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:15.078541+00:00"
     },
     "SUSHI-USDT": {
       "version": 1,
@@ -13941,8 +15552,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:28.930130+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:15.779212+00:00"
     },
     "SYN-USDT": {
       "version": 1,
@@ -13988,8 +15599,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:29.682385+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:15.882580+00:00"
     },
     "TAO-USDT": {
       "version": 1,
@@ -14030,8 +15641,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:30.248142+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:16.619130+00:00"
     },
     "SYRUP-USDT": {
       "version": 1,
@@ -14057,8 +15668,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:29.939597+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:16.766314+00:00"
     },
     "TNSR-USDT": {
       "version": 1,
@@ -14094,8 +15705,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:31.041781+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:17.403090+00:00"
     },
     "THE-USDT": {
       "version": 1,
@@ -14106,12 +15717,12 @@
           "touch_count": 0
         },
         "DEMAND:ZID_6446D1B416668F7F069489B5": {
-          "state": "ARMED",
-          "visit_id": "THE-USDT:DEMAND:ZID_6446D1B416668F7F069489B5:1791983700000",
+          "state": "LOCKED",
+          "visit_id": "THE-USDT:DEMAND:ZID_6446D1B416668F7F069489B5:1791986400000",
           "touch_count": 0,
-          "first_touch_ts": null,
-          "last_touch_ts": null,
-          "lock_reason": "insufficient_structure_room=0.420R < 1.200R",
+          "first_touch_ts": "2026-10-14T14:00:00+00:00",
+          "last_touch_ts": "2026-10-14T14:00:00+00:00",
+          "lock_reason": "insufficient_structure_room=0.402R < 1.200R",
           "trigger_event_id": null,
           "rearm_ts": "2026-10-14T13:25:00+00:00",
           "pending_signal": null
@@ -14142,8 +15753,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:30.602540+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:16.083666+00:00"
     },
     "TIA-USDT": {
       "version": 1,
@@ -14184,8 +15795,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:30.408085+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:17.052680+00:00"
     },
     "TLM-USDT": {
       "version": 1,
@@ -14231,8 +15842,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:30.799638+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:17.104153+00:00"
     },
     "TRB-USDT": {
       "version": 1,
@@ -14268,8 +15879,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:31.091402+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:17.583144+00:00"
     },
     "TRX-USDT": {
       "version": 1,
@@ -14305,8 +15916,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:34.241601+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:20.736058+00:00"
     },
     "TOWNS-USDT": {
       "version": 1,
@@ -14347,8 +15958,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:31.069293+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:17.673716+00:00"
     },
     "THETA-USDT": {
       "version": 1,
@@ -14390,8 +16001,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:30.378598+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:16.789115+00:00"
     },
     "TREE-USDT": {
       "version": 1,
@@ -14422,8 +16033,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:31.207046+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:17.820286+00:00"
     },
     "TST-USDT": {
       "version": 1,
@@ -14460,8 +16071,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:33.924417+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:21.074531+00:00"
     },
     "TWT-USDT": {
       "version": 1,
@@ -14497,8 +16108,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:33.154092+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:21.481015+00:00"
     },
     "VANA-USDT": {
       "version": 1,
@@ -14529,8 +16140,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:33.761353+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:19.867004+00:00"
     },
     "UMA-USDT": {
       "version": 1,
@@ -14571,8 +16182,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:33.560334+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:21.434629+00:00"
     },
     "VIRTUAL-USDT": {
       "version": 1,
@@ -14608,8 +16219,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:35.554359+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:22.728138+00:00"
     },
     "VET-USDT": {
       "version": 1,
@@ -14661,8 +16272,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:34.559144+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:21.117478+00:00"
     },
     "VTHO-USDT": {
       "version": 1,
@@ -14724,8 +16335,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:36.139421+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:23.260863+00:00"
     },
     "USUAL-USDT": {
       "version": 1,
@@ -14771,8 +16382,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:34.622122+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:21.614672+00:00"
     },
     "UNI-USDT": {
       "version": 1,
@@ -14813,8 +16424,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:34.453420+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:21.519793+00:00"
     },
     "VELODROME-USDT": {
       "version": 1,
@@ -14861,8 +16472,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:34.279004+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:21.327276+00:00"
     },
     "TURBO-USDT": {
       "version": 1,
@@ -14909,8 +16520,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:34.702501+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:20.935383+00:00"
     },
     "TUT-USDT": {
       "version": 1,
@@ -14951,8 +16562,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:34.424726+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:20.848918+00:00"
     },
     "TURTLE-USDT": {
       "version": 1,
@@ -14983,8 +16594,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:33.486686+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:20.607556+00:00"
     },
     "W-USDT": {
       "version": 1,
@@ -15030,8 +16641,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:35.781798+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:23.120606+00:00"
     },
     "WAXP-USDT": {
       "version": 1,
@@ -15077,8 +16688,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:36.660508+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:23.487934+00:00"
     },
     "WAL-USDT": {
       "version": 1,
@@ -15099,8 +16710,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:36.047592+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:23.568181+00:00"
     },
     "WIF-USDT": {
       "version": 1,
@@ -15157,8 +16768,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:36.535464+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:23.968352+00:00"
     },
     "WLFI-USDT": {
       "version": 1,
@@ -15194,8 +16805,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:36.892545+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:24.500577+00:00"
     },
     "WLD-USDT": {
       "version": 1,
@@ -15242,8 +16853,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:36.748446+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:24.554881+00:00"
     },
     "WCT-USDT": {
       "version": 1,
@@ -15285,8 +16896,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:36.402130+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:24.190868+00:00"
     },
     "XLM-USDT": {
       "version": 1,
@@ -15322,8 +16933,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:38.330852+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:25.711908+00:00"
     },
     "WOO-USDT": {
       "version": 1,
@@ -15374,8 +16985,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:37.355823+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:24.695466+00:00"
     },
     "XAI-USDT": {
       "version": 1,
@@ -15422,8 +17033,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:37.167233+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:24.689594+00:00"
     },
     "XRP-USDT": {
       "version": 1,
@@ -15469,8 +17080,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:38.645463+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:26.456891+00:00"
     },
     "XTZ-USDT": {
       "version": 1,
@@ -15516,8 +17127,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:38.423667+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:26.234884+00:00"
     },
     "XVG-USDT": {
       "version": 1,
@@ -15569,8 +17180,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:38.902136+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:26.584326+00:00"
     },
     "YB-USDT": {
       "version": 1,
@@ -15616,8 +17227,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:38.727545+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:27.354633+00:00"
     },
     "YGG-USDT": {
       "version": 1,
@@ -15664,8 +17275,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:39.153342+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:27.454048+00:00"
     },
     "YFI-USDT": {
       "version": 1,
@@ -15711,8 +17322,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:39.091686+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:26.863576+00:00"
     },
     "XPL-USDT": {
       "version": 1,
@@ -15753,8 +17364,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:38.115803+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:26.290036+00:00"
     },
     "ZAMA-USDT": {
       "version": 1,
@@ -15795,8 +17406,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:39.417116+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:27.556930+00:00"
     },
     "ZEC-USDT": {
       "version": 1,
@@ -15852,8 +17463,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:39.797203+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:27.654454+00:00"
     },
     "ZEN-USDT": {
       "version": 1,
@@ -15894,8 +17505,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:40.233487+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:29.003536+00:00"
     },
     "ZIL-USDT": {
       "version": 1,
@@ -15936,8 +17547,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:40.421023+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:28.988479+00:00"
     },
     "ZBT-USDT": {
       "version": 1,
@@ -15963,9 +17574,13 @@
           "touch_count": 0
         },
         "DEMAND:ZID_296D6156967139C5521EFCAB": {
-          "state": "ARMED",
-          "visit_id": "ZBT-USDT:DEMAND:ZID_296D6156967139C5521EFCAB",
-          "touch_count": 0
+          "state": "LOCKED",
+          "visit_id": "ZBT-USDT:DEMAND:ZID_296D6156967139C5521EFCAB:1791986400000",
+          "touch_count": 0,
+          "first_touch_ts": "2026-10-14T14:00:00+00:00",
+          "last_touch_ts": "2026-10-14T14:00:00+00:00",
+          "lock_reason": "insufficient_structure_room=0.434R < 1.200R",
+          "trigger_event_id": null
         },
         "SUPPLY:ZID_D930E4FC5535343AE4002C7D": {
           "state": "ARMED",
@@ -15978,8 +17593,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:39.749995+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:27.902096+00:00"
     },
     "ZK-USDT": {
       "version": 1,
@@ -16016,8 +17631,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:40.727337+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:28.963937+00:00"
     },
     "ZKC-USDT": {
       "version": 1,
@@ -16053,8 +17668,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:40.695793+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:28.947596+00:00"
     },
     "ZRO-USDT": {
       "version": 1,
@@ -16095,8 +17710,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:40.726071+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:29.205021+00:00"
     },
     "ZRX-USDT": {
       "version": 1,
@@ -16127,8 +17742,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:40.841862+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:29.372826+00:00"
     },
     "ZKP-USDT": {
       "version": 1,
@@ -16159,8 +17774,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:40.906539+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:08:29.121103+00:00"
     },
     "GTC-USDT": {
       "version": 1,
@@ -16206,8 +17821,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:01:55.884918+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:36.153878+00:00"
     },
     "OGN-USDT": {
       "version": 1,
@@ -16264,8 +17879,8 @@
           "touch_count": 0
         }
       },
-      "last_processed_5m_ts": "2026-10-14T13:55:00+00:00",
-      "last_scan_ts": "2026-10-14T14:02:11.176512+00:00"
+      "last_processed_5m_ts": "2026-10-14T14:00:00+00:00",
+      "last_scan_ts": "2026-10-14T14:07:54.350234+00:00"
     }
   }
 }
