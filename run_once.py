@@ -48,7 +48,7 @@ from event_engine.version import ENGINE_VERSION
 from event_engine.fundamental_assets import FUNDAMENTAL_ASSET_SYMBOLS
 from event_engine.telegram import format_signal, send as send_tg
 from event_engine.tracker import ActiveTradeStateCorrupt, register_active_trade, update_active_trades, update_active_trade_protection, merge_reconciled_tp_orders, has_active_trade_conflict, backfill_active_trade_provenance
-from event_engine import research, telemetry, shadow
+from event_engine import research, telemetry, shadow, request_metrics
 from event_engine.trend_filter import evaluate_trend_filter
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -3344,6 +3344,7 @@ def _research_persistence_batch_size(raw_value: str | None = None) -> int:
 
 
 def main() -> None:
+    request_metrics.reset()
     started = time.time()
     run_started_perf = time.perf_counter()
     fresh_runtime_start = not DATA.exists()
@@ -3421,7 +3422,8 @@ def main() -> None:
                 pass
     if private_ready:
         try:
-            mode = get_position_mode(timeout_sec=float(os.environ.get("PRIVATE_PREFLIGHT_TIMEOUT_SEC", "5")))
+            with request_metrics.phase("private_preflight"):
+                mode = get_position_mode(timeout_sec=float(os.environ.get("PRIVATE_PREFLIGHT_TIMEOUT_SEC", "5")))
             log.info("[AUTH] BingX private preflight OK | position_mode=%s", mode)
         except Exception as exc:
             log.error("[AUTH] BingX private preflight failed: %s; execution/reconciliation disabled for this run", exc)
@@ -3440,7 +3442,8 @@ def main() -> None:
             if private_ready:
                 tracker_started = time.perf_counter()
                 try:
-                    _update_active_trades_with_snapshot()
+                    with request_metrics.phase("pre_scan_tracker"):
+                        _update_active_trades_with_snapshot()
                 except ActiveTradeStateCorrupt as exc:
                     private_ready = False
                     log.critical("[LIVE_BLOCKED_STATE] tracker update found untrusted active state: %s", exc)
@@ -3452,7 +3455,8 @@ def main() -> None:
             if private_ready:
                 reconcile_started = time.perf_counter()
                 try:
-                    reconcile_all_open_positions()
+                    with request_metrics.phase("pre_scan_reconcile"):
+                        reconcile_all_open_positions()
                 except Exception as exc:
                     private_ready = False
                     log.exception("[LIVE_BLOCKED_RECON] reconciliation failed; execution disabled for this run: %s", exc)
@@ -3466,11 +3470,13 @@ def main() -> None:
     # TradFi/equity contracts are analyzed from BingX candles because Binance
     # public Spot market data does not expose the corresponding stock universe.
     universe_setup_started = time.perf_counter()
-    bingx_symbols = get_scan_symbols()
+    with request_metrics.phase("universe_setup"):
+        bingx_symbols = get_scan_symbols()
+        bingx_contract_map = contracts()
     log.info("[SCAN] %s symbols selected from BingX | count=%d", "WATCHLIST" if WATCHLIST_ONLY else "FULL_UNIVERSE", len(bingx_symbols))
-    bingx_contract_map = contracts()
     try:
-        mapped = analysis_symbols_for_bingx(bingx_symbols)
+        with request_metrics.phase("universe_setup"):
+            mapped = analysis_symbols_for_bingx(bingx_symbols)
     except Exception as exc:
         log.exception("[SCAN] Binance public exchangeInfo failed: %s", exc)
         mapped = []
@@ -3503,7 +3509,8 @@ def main() -> None:
     research_account_context = None
     if research.RESEARCH_ENABLED and not RESEARCH_DEFER_UNTIL_AFTER_EXECUTION:
         try:
-            research_account_context = fetch_research_account_snapshot()
+            with request_metrics.phase("research_preload_account"):
+                research_account_context = fetch_research_account_snapshot()
             if research_account_context is not None:
                 research_account_context["scan_id"] = scan_id
                 research_account_context["strategy_version"] = _effective_strategy_version()
@@ -3520,14 +3527,16 @@ def main() -> None:
     btc_research_df_1h = pd.DataFrame()
     if research.RESEARCH_ENABLED and not RESEARCH_DEFER_UNTIL_AFTER_EXECUTION:
         try:
-            btc_raw_5m = fetch_binance_klines("BTCUSDT", interval="5m", limit=288, retryable=False)
+            with request_metrics.phase("research_preload_btc_5m"):
+                btc_raw_5m = fetch_binance_klines("BTCUSDT", interval="5m", limit=288, retryable=False)
             if btc_raw_5m:
                 btc_research_df_5m = pd.DataFrame(btc_raw_5m)
                 research.persist_market_bars("BTC-USDT", "5m", btc_raw_5m, provider="binance", source="binance_spot_btc_context", scan_id=scan_id, code_commit_sha=CODE_COMMIT_SHA)
         except Exception as exc:
             log.warning("[RESEARCH_BTC] 5m context unavailable: %s", exc)
         try:
-            btc_raw_1h = fetch_binance_klines("BTCUSDT", interval="1h", limit=300, retryable=False)
+            with request_metrics.phase("research_preload_btc_1h"):
+                btc_raw_1h = fetch_binance_klines("BTCUSDT", interval="1h", limit=300, retryable=False)
             if btc_raw_1h:
                 btc_research_df_1h = pd.DataFrame(btc_raw_1h)
                 research.persist_market_bars("BTC-USDT", "1h", btc_raw_1h, provider="binance", source="binance_spot_btc_context", scan_id=scan_id, code_commit_sha=CODE_COMMIT_SHA)
@@ -3536,7 +3545,8 @@ def main() -> None:
 
     if TREND_FILTER_ENABLED and (btc_research_df_1h is None or btc_research_df_1h.empty):
         try:
-            btc_trend_rows = fetch_binance_klines("BTCUSDT", interval="1h", limit=max(12, TREND_FILTER_MIN_1H_BARS + TREND_FILTER_HISTORY_BUFFER_BARS), retryable=False)
+            with request_metrics.phase("trend_preload_btc_1h"):
+                btc_trend_rows = fetch_binance_klines("BTCUSDT", interval="1h", limit=max(12, TREND_FILTER_MIN_1H_BARS + TREND_FILTER_HISTORY_BUFFER_BARS), retryable=False)
             if btc_trend_rows:
                 btc_research_df_1h = pd.DataFrame(btc_trend_rows)
         except Exception as exc:
@@ -3565,7 +3575,8 @@ def main() -> None:
     failed_ids = _load_failed_signal_ids()
     if private_ready:
         try:
-            open_keys = _position_keys(get_positions())
+            with request_metrics.phase("execution_state_load"):
+                open_keys = _position_keys(get_positions())
         except Exception as exc:
             log.exception("[POSITIONS] initial positions fetch failed; no new entries will be executed: %s", exc)
             open_keys = set()
@@ -3584,6 +3595,7 @@ def main() -> None:
     deferred_research_rows: list[dict[str, Any]] = []
     deferred_research_lock = threading.Lock()
 
+    @request_metrics.instrument_scan_symbol
     def scan_one(symbol: str) -> dict[str, Any]:
         """Public-market scan for one symbol. Safe to run concurrently."""
         source_name = "unknown"
@@ -4378,14 +4390,16 @@ def main() -> None:
     if private_ready:
         tracker_started = time.perf_counter()
         try:
-            _update_active_trades_with_snapshot()
+            with request_metrics.phase("final_tracker"):
+                _update_active_trades_with_snapshot()
         except Exception as exc:
             log.exception("[TRACKER_FINAL] active trade update failed: %s", exc)
         finally:
             log.info("[PERF_STAGE] stage=final_update_active_trades seconds=%.3f", time.perf_counter() - tracker_started)
         reconcile_started = time.perf_counter()
         try:
-            reconcile_all_open_positions()
+            with request_metrics.phase("final_reconcile"):
+                reconcile_all_open_positions()
         except Exception as exc:
             log.exception("[RECON_FINAL] reconciliation failed: %s", exc)
         finally:
@@ -4401,7 +4415,8 @@ def main() -> None:
         log.info("[RESEARCH_DEFERRED_FLUSH] rows=%d | live execution path complete", len(deferred_research_rows))
         account_started = time.perf_counter()
         try:
-            post_account = fetch_research_account_snapshot()
+            with request_metrics.phase("research_post_account"):
+                post_account = fetch_research_account_snapshot()
             if post_account is not None:
                 post_account.update({
                     "scan_id": scan_id,
@@ -4420,7 +4435,8 @@ def main() -> None:
             log.info("[PERF_STAGE] stage=research_post_account seconds=%.3f", time.perf_counter() - account_started)
         btc5_started = time.perf_counter()
         try:
-            btc_raw_5m = fetch_binance_klines("BTCUSDT", interval="5m", limit=288, retryable=False)
+            with request_metrics.phase("research_post_btc_5m"):
+                btc_raw_5m = fetch_binance_klines("BTCUSDT", interval="5m", limit=288, retryable=False)
             if btc_raw_5m:
                 research.persist_market_bars("BTC-USDT", "5m", btc_raw_5m, provider="binance", source="binance_spot_btc_context_post_execution", scan_id=scan_id, code_commit_sha=CODE_COMMIT_SHA)
         except Exception as exc:
@@ -4429,7 +4445,8 @@ def main() -> None:
             log.info("[PERF_STAGE] stage=research_post_btc_5m seconds=%.3f", time.perf_counter() - btc5_started)
         btc1h_started = time.perf_counter()
         try:
-            btc_raw_1h = fetch_binance_klines("BTCUSDT", interval="1h", limit=300, retryable=False)
+            with request_metrics.phase("research_post_btc_1h"):
+                btc_raw_1h = fetch_binance_klines("BTCUSDT", interval="1h", limit=300, retryable=False)
             if btc_raw_1h:
                 research.persist_market_bars("BTC-USDT", "1h", btc_raw_1h, provider="binance", source="binance_spot_btc_context_post_execution", scan_id=scan_id, code_commit_sha=CODE_COMMIT_SHA)
         except Exception as exc:
@@ -4459,10 +4476,11 @@ def main() -> None:
                         meta = analysis_meta.get(payload["symbol"], {})
                         try:
                             pending_limit = max(12, int(os.environ.get("RESEARCH_PENDING_5M_FETCH_LIMIT", "24")))
-                            if str(payload.get("provider") or "binance").lower() == "bingx":
-                                bars_5m = fetch_bingx_klines(payload["symbol"], "5m", limit=pending_limit, retryable=False)
-                            else:
-                                bars_5m = fetch_binance_klines(str(meta.get("binance_symbol") or payload["symbol"].replace("-", "")), "5m", limit=pending_limit, retryable=False)
+                            with request_metrics.phase("research_deferred_bars"):
+                                if str(payload.get("provider") or "binance").lower() == "bingx":
+                                    bars_5m = fetch_bingx_klines(payload["symbol"], "5m", limit=pending_limit, retryable=False)
+                                else:
+                                    bars_5m = fetch_binance_klines(str(meta.get("binance_symbol") or payload["symbol"].replace("-", "")), "5m", limit=pending_limit, retryable=False)
                         except Exception as exc:
                             log.warning("[RESEARCH_PENDING_BARS_POST] %s | unavailable: %s", payload["symbol"], exc)
                     try:
@@ -4492,6 +4510,7 @@ def main() -> None:
         log.info("[PERF_STAGE] stage=research_deferred_total seconds=%.3f rows=%d queued_observations=%d queued_bars1h=%d queued_bars5m=%d persisted_observations=%d persisted_bars1h=%d persisted_bars5m=%d persistence_errors=%d batch_size=%d", time.perf_counter() - research_flush_started, len(deferred_rows), queued_observation_count, queued_bar1h_count, queued_bar5m_count, persisted_observation_count, persisted_bar1h_count, persisted_bar5m_count, persistence_error_count, research_batch_size)
 
     total_duration_sec = time.perf_counter() - run_started_perf
+    request_metrics.log_summary(log)
     log.info("[DONE] symbols=%d fresh_signals=%d executed=%d duration=%.1fs", len(scan_rows), len(fresh_signals), executed, total_duration_sec)
 
 
