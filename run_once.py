@@ -8,6 +8,7 @@ import time
 import uuid
 import fcntl
 import hashlib
+import inspect
 import re
 import shutil
 import threading
@@ -1585,6 +1586,52 @@ def _signal_matches_latest_bar(signal: dict[str, Any], latest_closed_idx: int, l
     except Exception:
         return False, "invalid_signal_time"
     return True, "ok"
+
+def _update_active_trades_with_snapshot() -> None:
+    """Reduce per-position HTTP reads without weakening the later live checks.
+
+    The bulk positions response is used only for each trade's first state read.
+    TP-fill reconciliation and the final per-trade position read remain fresh
+    targeted exchange queries inside the tracker. If bulk retrieval fails, keep
+    the original per-symbol behavior.
+    """
+    snapshot_started = time.perf_counter()
+    try:
+        snapshot = get_positions(
+            timeout_sec=float(os.environ.get("TRACKER_POSITION_SNAPSHOT_TIMEOUT_SEC", "5")),
+            retryable=False,
+        )
+        if not isinstance(snapshot, list) or any(not isinstance(row, dict) for row in snapshot):
+            raise RuntimeError("bulk positions response has an invalid shape")
+        log.info(
+            "[PERF_STAGE] stage=tracker_positions_snapshot seconds=%.3f positions=%d outcome=bulk",
+            time.perf_counter() - snapshot_started, len(snapshot),
+        )
+    except Exception as exc:
+        log.warning(
+            "[PERF_STAGE] stage=tracker_positions_snapshot seconds=%.3f outcome=fallback error=%s",
+            time.perf_counter() - snapshot_started, exc,
+        )
+        log.warning("[TRACKER_POSITION_SNAPSHOT] bulk fetch failed; using per-symbol queries: %s", exc)
+        update_active_trades()
+        return
+
+    # A few test/integration wrappers replace the tracker with a zero-argument
+    # callable. Detect that signature explicitly rather than catching TypeError
+    # around the call, which could otherwise hide a genuine tracker failure.
+    try:
+        parameters = inspect.signature(update_active_trades).parameters.values()
+        supports_snapshot = any(
+            parameter.name == "position_snapshot" or parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+    except (TypeError, ValueError):
+        supports_snapshot = True
+    if supports_snapshot:
+        update_active_trades(position_snapshot=snapshot)
+    else:
+        update_active_trades()
+
 
 def _private_layer_ready() -> bool:
     ready = credentials_available()
@@ -3287,12 +3334,12 @@ def _send_signal(signal: dict[str, Any], execution: dict[str, Any] | None = None
 
 def _research_persistence_batch_size(raw_value: str | None = None) -> int:
     """Return a bounded batch size; a malformed optional env var must not abort a run."""
-    raw = os.environ.get("RESEARCH_PERSISTENCE_BATCH_SIZE", "8") if raw_value is None else raw_value
+    raw = os.environ.get("RESEARCH_PERSISTENCE_BATCH_SIZE", "32") if raw_value is None else raw_value
     try:
         configured = int(raw)
     except (TypeError, ValueError):
-        log.warning("[CONFIG] invalid RESEARCH_PERSISTENCE_BATCH_SIZE=%r; using default 8", raw)
-        configured = 8
+        log.warning("[CONFIG] invalid RESEARCH_PERSISTENCE_BATCH_SIZE=%r; using default 32", raw)
+        configured = 32
     return max(4, min(32, configured))
 
 
@@ -3393,7 +3440,7 @@ def main() -> None:
             if private_ready:
                 tracker_started = time.perf_counter()
                 try:
-                    update_active_trades()
+                    _update_active_trades_with_snapshot()
                 except ActiveTradeStateCorrupt as exc:
                     private_ready = False
                     log.critical("[LIVE_BLOCKED_STATE] tracker update found untrusted active state: %s", exc)
@@ -4320,9 +4367,33 @@ def main() -> None:
         if str(execution.get("status")) == "opened_protected":
             executed += 1
 
-    # Persist the complete scan for analytics/backtesting, but do not dump the
-    # full inactive-symbol table into runtime logs. Runtime logs contain active
-    # symbols only.
+    # Persist the scan summary and run the final position/protection checkpoint
+    # before slow deferred research I/O. This does not skip tracker/reconciliation;
+    # it prevents research writes from delaying TP1->BE and close-state observation.
+    scan_saved_started = time.perf_counter()
+    save_scan(scan_rows, fresh_signals, duration_sec=scan_duration_sec, scan_id=scan_id)
+    log.info("[PERF_STAGE] stage=save_scan seconds=%.3f", time.perf_counter() - scan_saved_started)
+    # Final tracking checkpoint: orders/positions can change during scan/execution.
+    # This remains a full pass with existing error handling and protection checks.
+    if private_ready:
+        tracker_started = time.perf_counter()
+        try:
+            _update_active_trades_with_snapshot()
+        except Exception as exc:
+            log.exception("[TRACKER_FINAL] active trade update failed: %s", exc)
+        finally:
+            log.info("[PERF_STAGE] stage=final_update_active_trades seconds=%.3f", time.perf_counter() - tracker_started)
+        reconcile_started = time.perf_counter()
+        try:
+            reconcile_all_open_positions()
+        except Exception as exc:
+            log.exception("[RECON_FINAL] reconciliation failed: %s", exc)
+        finally:
+            log.info("[PERF_STAGE] stage=final_reconcile seconds=%.3f", time.perf_counter() - reconcile_started)
+
+    # Deferred research persistence is deliberately last: decision-boundary
+    # observations remain pre-entry data, while the live tracker/protection
+    # checkpoint above is not delayed by the slow write phase.
     if research.RESEARCH_ENABLED and RESEARCH_DEFER_UNTIL_AFTER_EXECUTION and deferred_research_rows:
         # Post-execution research phase: never attach post-trade context to earlier
         # decision-time observations, because that would create a lookahead artifact.
@@ -4419,30 +4490,6 @@ def main() -> None:
             persistence_error_count += int(actual.get("persistence_errors", 0))
             log.info("[RESEARCH_BATCH_DONE] batch=%d rows=%d/%d queued_observations=%d queued_bars1h=%d queued_bars5m=%d seconds=%.3f", batch_offset // research_batch_size + 1, min(batch_offset + len(payload_batch), len(deferred_rows)), len(deferred_rows), batch_observations, batch_bars1h, batch_bars5m, time.perf_counter() - research_batch_started)
         log.info("[PERF_STAGE] stage=research_deferred_total seconds=%.3f rows=%d queued_observations=%d queued_bars1h=%d queued_bars5m=%d persisted_observations=%d persisted_bars1h=%d persisted_bars5m=%d persistence_errors=%d batch_size=%d", time.perf_counter() - research_flush_started, len(deferred_rows), queued_observation_count, queued_bar1h_count, queued_bar5m_count, persisted_observation_count, persisted_bar1h_count, persisted_bar5m_count, persistence_error_count, research_batch_size)
-
-    scan_saved_started = time.perf_counter()
-    save_scan(scan_rows, fresh_signals, duration_sec=scan_duration_sec, scan_id=scan_id)
-    log.info("[PERF_STAGE] stage=save_scan seconds=%.3f", time.perf_counter() - scan_saved_started)
-    # Final tracking checkpoint: orders/positions can change during the scan or
-    # execution phase. Reconcile once more before this process exits so a TP,
-    # close, or BE transition that happened during this run is not deferred to
-    # the next invocation. Long-lived monitoring is provided by the scheduled
-    # tracker workflow; this checkpoint is deliberately only one pass.
-    if private_ready:
-        tracker_started = time.perf_counter()
-        try:
-            update_active_trades()
-        except Exception as exc:
-            log.exception("[TRACKER_FINAL] active trade update failed: %s", exc)
-        finally:
-            log.info("[PERF_STAGE] stage=final_update_active_trades seconds=%.3f", time.perf_counter() - tracker_started)
-        reconcile_started = time.perf_counter()
-        try:
-            reconcile_all_open_positions()
-        except Exception as exc:
-            log.exception("[RECON_FINAL] reconciliation failed: %s", exc)
-        finally:
-            log.info("[PERF_STAGE] stage=final_reconcile seconds=%.3f", time.perf_counter() - reconcile_started)
 
     total_duration_sec = time.perf_counter() - run_started_perf
     log.info("[DONE] symbols=%d fresh_signals=%d executed=%d duration=%.1fs", len(scan_rows), len(fresh_signals), executed, total_duration_sec)

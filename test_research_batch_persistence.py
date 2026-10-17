@@ -192,4 +192,72 @@ def test_research_persistence_batch_size_has_safe_fallback():
     assert run_once._research_persistence_batch_size("12") == 12
     assert run_once._research_persistence_batch_size("1") == 4
     assert run_once._research_persistence_batch_size("999") == 32
-    assert run_once._research_persistence_batch_size("not-an-int") == 8
+    assert run_once._research_persistence_batch_size("not-an-int") == 32
+
+
+def test_research_persistence_batch_size_defaults_to_32(monkeypatch):
+    import run_once
+
+    monkeypatch.delenv("RESEARCH_PERSISTENCE_BATCH_SIZE", raising=False)
+    assert run_once._research_persistence_batch_size() == 32
+
+
+def test_tracker_position_snapshot_handles_hedge_and_one_way_rows():
+    from event_engine import tracker
+
+    snapshot = [
+        {"symbol": "BTC-USDT", "positionSide": "LONG", "positionAmt": "0.25", "avgPrice": "60000"},
+        {"symbol": "ETH-USDT", "positionSide": "BOTH", "positionAmt": "-2", "entryPrice": "2500"},
+        {"symbol": "SOL-USDT", "positionSide": "BOTH", "positionAmt": "3", "avgPrice": "150"},
+    ]
+
+    long_btc = tracker._position_from_snapshot(snapshot, "BTCUSDT", "LONG")
+    short_eth = tracker._position_from_snapshot(snapshot, "ETH-USDT", "SHORT")
+    long_sol = tracker._position_from_snapshot(snapshot, "SOL-USDT", "LONG")
+    absent = tracker._position_from_snapshot(snapshot, "XRP-USDT", "SHORT")
+
+    assert long_btc["status"] == "found" and long_btc["positionAmt"] == 0.25
+    assert short_eth["status"] == "found" and short_eth["positionAmt"] == 2.0
+    assert long_sol["status"] == "found" and long_sol["avgPrice"] == 150.0
+    assert absent["status"] == "not_found"
+
+
+def test_tracker_snapshot_wrapper_passes_successful_bulk_snapshot(monkeypatch):
+    import run_once
+
+    snapshot = [{"symbol": "BTC-USDT", "positionSide": "LONG", "positionAmt": "1", "avgPrice": "60000"}]
+    calls = []
+    monkeypatch.setattr(run_once, "get_positions", lambda **kwargs: snapshot)
+    monkeypatch.setattr(run_once, "update_active_trades", lambda **kwargs: calls.append(kwargs))
+
+    run_once._update_active_trades_with_snapshot()
+
+    assert calls == [{"position_snapshot": snapshot}]
+
+
+def test_tracker_snapshot_wrapper_falls_back_when_bulk_fetch_fails(monkeypatch):
+    import run_once
+
+    calls = []
+
+    def fail_bulk(**kwargs):
+        raise RuntimeError("bulk endpoint unavailable")
+
+    monkeypatch.setattr(run_once, "get_positions", fail_bulk)
+    monkeypatch.setattr(run_once, "update_active_trades", lambda: calls.append("per_symbol_fallback"))
+
+    run_once._update_active_trades_with_snapshot()
+
+    assert calls == ["per_symbol_fallback"]
+
+
+def test_tracker_snapshot_wrapper_supports_legacy_zero_arg_callable(monkeypatch):
+    import run_once
+
+    calls = []
+    monkeypatch.setattr(run_once, "get_positions", lambda **kwargs: [])
+    monkeypatch.setattr(run_once, "update_active_trades", lambda: calls.append("legacy_call"))
+
+    run_once._update_active_trades_with_snapshot()
+
+    assert calls == ["legacy_call"]
