@@ -27,6 +27,7 @@ import requests
 from requests.adapters import HTTPAdapter
 
 from event_engine import telemetry
+from event_engine.request_metrics import timed_request
 from urllib3.util.retry import Retry
 
 log = logging.getLogger("event_engine.bingx")
@@ -248,12 +249,10 @@ def _request(
                         else:
                             body = urlencode(wire_params, doseq=False)
                             headers["Content-Type"] = "application/x-www-form-urlencoded"
-                        response = session.request(
-                            method=method,
-                            url=base_url + path,
-                            data=body,
-                            headers=headers,
-                            timeout=request_timeout,
+                        response = timed_request(
+                            "bingx", path, method, session.request,
+                            method=method, url=base_url + path, data=body,
+                            headers=headers, timeout=request_timeout,
                         )
                     else:
                         if signed:
@@ -264,7 +263,9 @@ def _request(
                             request_kwargs = {"method": method, "url": url, "headers": headers, "timeout": request_timeout}
                         else:
                             request_kwargs = {"method": method, "url": base_url + path, "params": wire_params, "headers": headers, "timeout": request_timeout}
-                        response = session.request(**request_kwargs)
+                        response = timed_request(
+                            "bingx", path, method, session.request, **request_kwargs
+                        )
                     payload = response.json()
                 except Exception as exc:
                     last_error = exc

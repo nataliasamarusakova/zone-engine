@@ -10,6 +10,8 @@ from typing import Any
 
 import requests
 from requests.adapters import HTTPAdapter
+
+from event_engine.request_metrics import timed_request
 from urllib3.util.retry import Retry
 
 log = logging.getLogger("event_engine.binance")
@@ -50,7 +52,10 @@ def _session() -> requests.Session:
 
 
 def _get(path: str, params: dict[str, Any] | None = None, timeout: float = 8.0) -> Any:
-    response = _session().get(BASE_URL + path, params=params or {}, timeout=timeout)
+    response = timed_request(
+        "binance", path, "GET", _session().get,
+        BASE_URL + path, params=params or {}, timeout=timeout,
+    )
     response.raise_for_status()
     payload = response.json()
     if isinstance(payload, dict) and payload.get("code") not in (None, 0):
