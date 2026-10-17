@@ -429,6 +429,53 @@ def _normalize_direction(direction: str) -> str:
     return d
 
 
+def _position_snapshot_symbol_key(symbol: Any) -> str:
+    """Normalize exchange/local symbol spellings to the same position key."""
+    return str(symbol or "").upper().replace("-", "")
+
+
+def _position_from_snapshot(positions: list[dict], symbol: str, direction: str) -> dict:
+    """Look up a position from a successful all-positions response.
+
+    The caller may only use this result when the bulk endpoint completed
+    successfully. An absent matching position is therefore authoritative for
+    this first snapshot; later tracker checks still query the exchange again.
+    """
+    target_symbol = _position_snapshot_symbol_key(symbol)
+    target_direction = _normalize_direction(direction)
+    for row in positions:
+        if not isinstance(row, dict):
+            continue
+        if _position_snapshot_symbol_key(row.get("symbol")) != target_symbol:
+            continue
+
+        raw_side = str(row.get("positionSide", "")).upper()
+        amount = _safe_float(row.get("positionAmt"), 0.0)
+        if raw_side == "BOTH":
+            row_direction = "LONG" if amount > 0 else "SHORT" if amount < 0 else None
+        elif raw_side in {"LONG", "SHORT"}:
+            row_direction = raw_side
+        else:
+            continue
+        if row_direction != target_direction:
+            continue
+
+        qty = abs(amount)
+        avg_price = _safe_float(row.get("avgPrice") or row.get("entryPrice"), 0.0)
+        if qty <= 0 or avg_price <= 0:
+            continue
+        return {
+            "status": "found",
+            "symbol": row.get("symbol", symbol),
+            "positionSide": target_direction,
+            "avgPrice": avg_price,
+            "positionAmt": qty,
+            "entryPrice": _safe_float(row.get("entryPrice"), avg_price) or avg_price,
+        }
+
+    return {"status": "not_found", "symbol": symbol, "positionSide": target_direction}
+
+
 def _normalized_symbol(symbol: str) -> str:
     return str(symbol or "").upper().replace("-USDT", "")
 
@@ -2434,7 +2481,7 @@ def _reconciliation_status(local_qty: float, exchange_qty: float, base_status: s
     return "FOUND" if math.isclose(local, exchange, rel_tol=rel_tol, abs_tol=abs_tol) else "FOUND_QTY_MISMATCH"
 
 
-def update_active_trades() -> None:
+def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None:
     # Reconciliation is a live-state operation. Once the engine has reached this
     # stage, missing state must fail closed rather than be interpreted as an empty
     # portfolio. Fresh-start bootstrap happens only in the top-level run preflight.
@@ -2445,6 +2492,17 @@ def update_active_trades() -> None:
     original_trades = copy.deepcopy(trades)
     now_ms = int(time.time() * 1000)
     updated_trades: dict[str, dict] = {}
+    # Only consume a bulk snapshot when its caller confirms it came from a
+    # successful get_positions request. Malformed inputs fall back to the
+    # original symbol-by-symbol query path instead of being treated as flat.
+    if position_snapshot is not None and not isinstance(position_snapshot, list):
+        log.warning("[TRACKER_POSITION_SNAPSHOT] invalid payload type=%s; falling back to per-symbol queries", type(position_snapshot).__name__)
+        position_snapshot = None
+    elif position_snapshot is not None and any(not isinstance(row, dict) for row in position_snapshot):
+        log.warning("[TRACKER_POSITION_SNAPSHOT] malformed rows; falling back to per-symbol queries")
+        position_snapshot = None
+    if position_snapshot is not None:
+        log.info("[TRACKER_POSITION_SNAPSHOT] active_trades=%d exchange_positions=%d initial_symbol_queries=0", len(trades), len(position_snapshot))
 
     for event_id, trade in trades.items():
         if trade.get("closed", False):
@@ -2467,7 +2525,11 @@ def update_active_trades() -> None:
             realized_qty = max(0.0, _safe_float(trade.get("realized_pnl_qty", 0.0)))
             realized_weighted = _safe_float(trade.get("realized_pnl_weighted_sum", 0.0))
 
-            pos = get_position_directional(symbol, direction)
+            pos = (
+                _position_from_snapshot(position_snapshot, symbol, direction)
+                if position_snapshot is not None
+                else get_position_directional(symbol, direction)
+            )
             pos_status = str(pos.get("status", "")).lower()
 
             if pos_status not in {"found", "not_found"}:
