@@ -8,6 +8,7 @@ import os
 import tempfile
 import logging
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -52,9 +53,14 @@ SHADOW_SHORT_BTC_EMA50_GT_025 = 0.25
 SHADOW_SHORT_BTC_EMA50_GT_050 = 0.50
 
 _OBSERVATION_SEEN_IDS: set[str] | None = None
+_OBSERVATION_SEEN_IDS_PATH: str | None = None
 _OBSERVATION_SEEN_LOCK = threading.RLock()
 _COUNTERFACTUAL_SEEN_IDS: set[str] | None = None
 _COUNTERFACTUAL_SEEN_LOCK = threading.RLock()
+
+# Enabled only around the single-threaded post-execution research flush. This
+# batches fsync-heavy research writes without changing the live signal/order path.
+_PERSISTENCE_BATCH: dict[str, Any] | None = None
 
 
 def _now_iso() -> str:
@@ -216,22 +222,27 @@ def _fsync_parent_directory(path: Path) -> None:
         os.close(fd)
 
 
+def _write_json_atomic_unlocked(path: Path, payload: Any) -> None:
+    """Atomically write JSON. Caller must hold _FileLock for shared state files."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(sanitize(payload), fh, ensure_ascii=False, indent=2, allow_nan=False)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+        _fsync_parent_directory(path)
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+
+
 def _atomic_json_locked(path: Path, payload: Any) -> None:
     with _FileLock(path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(sanitize(payload), fh, ensure_ascii=False, indent=2, allow_nan=False)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp_name, path)
-            _fsync_parent_directory(path)
-        finally:
-            try:
-                os.unlink(tmp_name)
-            except FileNotFoundError:
-                pass
+        _write_json_atomic_unlocked(path, payload)
 
 
 def _record_error(kind: str, path: Path, exc: Exception, *, symbol: str | None = None) -> None:
@@ -250,38 +261,206 @@ def _record_error(kind: str, path: Path, exc: Exception, *, symbol: str | None =
         logging.getLogger(__name__).error("research persistence error: %s", payload)
 
 
-def _load_existing_observation_ids() -> set[str]:
-    ids: set[str] = set()
-    path = ZONE_OBSERVATIONS_PATH
-    if not path.exists():
-        return ids
+def _apply_manifest_deltas(deltas: dict[str, int]) -> None:
+    """Apply multiple research counters using a single atomic manifest rewrite."""
+    deltas = {str(k): int(v) for k, v in deltas.items() if int(v) != 0}
+    if not deltas:
+        return
+    with _FileLock(RESEARCH_MANIFEST_PATH):
+        current = _load_json(RESEARCH_MANIFEST_PATH, {})
+        if not isinstance(current, dict):
+            current = {}
+        current.setdefault("schema_version", RESEARCH_SCHEMA_VERSION)
+        current.setdefault("created_at", _now_iso())
+        current["updated_at"] = _now_iso()
+        for key, amount in deltas.items():
+            current[key] = int(current.get(key, 0) or 0) + amount
+        current["research_enabled"] = RESEARCH_ENABLED
+        _write_json_atomic_unlocked(RESEARCH_MANIFEST_PATH, current)
+
+
+def _flush_persistence_batch(state: dict[str, Any]) -> dict[str, Any]:
+    """Durably flush buffered research data and report what was actually written.
+
+    Observations are written before market bars/cursors. If the observation journal
+    cannot be committed, the batch does not commit bars or advance their cursors;
+    this avoids widening the crash window in which an event observation could be
+    lost while its source bars have already been marked as consumed.
+    """
+    global _OBSERVATION_SEEN_IDS, _OBSERVATION_SEEN_IDS_PATH
+    errors: list[tuple[str, Path, Exception, str | None]] = []
+    manifest_deltas: dict[str, int] = dict(state.get("manifest_deltas") or {})
+    successful_timeframes: set[str] = set()
+    result: dict[str, Any] = {
+        "observations_written": 0,
+        "bars_1h_written": 0,
+        "bars_5m_written": 0,
+        "cursor_updates_written": 0,
+        "persistence_errors": 0,
+        "bar_cursor_commit_skipped_observation_failure": False,
+    }
+
+    observations = state.get("observations", [])
+    observations_ok = True
+    # Commit observations first. If this fails, don't commit the corresponding
+    # bars/cursors: the next run must be allowed to revisit the same source bars.
+    if observations:
+        try:
+            written = _append_jsonl_locked(ZONE_OBSERVATIONS_PATH, observations)
+            result["observations_written"] = written
+            if written:
+                manifest_deltas["zone_observations_written"] = manifest_deltas.get("zone_observations_written", 0) + written
+                with _OBSERVATION_SEEN_LOCK:
+                    current_path = str(ZONE_OBSERVATIONS_PATH.resolve())
+                    if _OBSERVATION_SEEN_IDS is None or _OBSERVATION_SEEN_IDS_PATH != current_path:
+                        _OBSERVATION_SEEN_IDS = _load_existing_observation_ids()
+                    _OBSERVATION_SEEN_IDS_PATH = current_path
+                    _OBSERVATION_SEEN_IDS.update(str(r["observation_id"]) for r in observations if r.get("observation_id"))
+        except Exception as exc:
+            observations_ok = False
+            manifest_deltas["persistence_errors"] = manifest_deltas.get("persistence_errors", 0) + 1
+            errors.append(("zone_observation_batch_write", ZONE_OBSERVATIONS_PATH, exc, None))
+
+    if not observations_ok:
+        result["bar_cursor_commit_skipped_observation_failure"] = True
+        log.error(
+            "[RESEARCH_BATCH_ABORTED] reason=observation_write_failed bars_and_cursors_not_committed observations=%d",
+            len(observations),
+        )
+    else:
+        # Write bars before their cursors. If a bar append fails, its cursor must
+        # not advance or the missing historical candles would be skipped later.
+        for timeframe, path in (("1h", MARKET_BARS_1H_PATH), ("5m", MARKET_BARS_5M_PATH)):
+            rows = state.get("market_bars", {}).get(timeframe, [])
+            if not rows:
+                continue
+            try:
+                written = _append_jsonl_locked(path, rows)
+                if written:
+                    successful_timeframes.add(timeframe)
+                    result["bars_1h_written" if timeframe == "1h" else "bars_5m_written"] = written
+                    counter = "market_bars_1h_written" if timeframe == "1h" else "market_bars_5m_written"
+                    manifest_deltas[counter] = manifest_deltas.get(counter, 0) + written
+            except Exception as exc:
+                manifest_deltas["persistence_errors"] = manifest_deltas.get("persistence_errors", 0) + 1
+                errors.append(("market_bar_batch_write", path, exc, None))
+
+        cursor_updates = {
+            key: value for key, value in (state.get("cursor_updates") or {}).items()
+            if len(key.split("|")) >= 3 and key.split("|")[1].lower() in successful_timeframes
+        }
+        if cursor_updates:
+            try:
+                with _FileLock(RESEARCH_BAR_CURSORS_PATH):
+                    existing = _load_json(RESEARCH_BAR_CURSORS_PATH, {})
+                    if not isinstance(existing, dict):
+                        existing = {}
+                    for key, value in cursor_updates.items():
+                        old_value = existing.get(key) if isinstance(existing.get(key), dict) else {}
+                        old_ts = str(old_value.get("last_timestamp") or "")
+                        new_ts = str(value.get("last_timestamp") or "")
+                        if not old_ts or new_ts >= old_ts:
+                            existing[key] = value
+                    _write_json_atomic_unlocked(RESEARCH_BAR_CURSORS_PATH, existing)
+                result["cursor_updates_written"] = len(cursor_updates)
+            except Exception as exc:
+                manifest_deltas["persistence_errors"] = manifest_deltas.get("persistence_errors", 0) + 1
+                errors.append(("bar_cursor_batch_write", RESEARCH_BAR_CURSORS_PATH, exc, None))
+
+    if manifest_deltas:
+        try:
+            _apply_manifest_deltas(manifest_deltas)
+        except Exception as exc:
+            errors.append(("manifest_batch_write", RESEARCH_MANIFEST_PATH, exc, None))
+
+    # Error logging occurs outside the batch so it is not itself buffered.
+    for kind, path, exc, symbol in errors:
+        log.error("[RESEARCH_BATCH_WRITE_FAILED] kind=%s path=%s error=%s", kind, path, exc)
+        _record_error(kind, path, exc, symbol=symbol)
+    result["persistence_errors"] = len(errors)
+    state["flush_result"] = result
+    log.info(
+        "[RESEARCH_BATCH_PERSISTED] observations=%d bars_1h=%d bars_5m=%d cursors=%d errors=%d skipped_bar_cursor_commit=%s",
+        result["observations_written"], result["bars_1h_written"], result["bars_5m_written"],
+        result["cursor_updates_written"], result["persistence_errors"], result["bar_cursor_commit_skipped_observation_failure"],
+    )
+    return result
+
+
+@contextmanager
+def batch_persistence():
+    """Batch research-only append/cursor/manifest I/O for a small group of symbols.
+
+    Intended for the single-threaded deferred research phase after all live order
+    decisions are finished. It must not wrap signal generation or execution.
+    The yielded state exposes the actual flush result after the context exits.
+    """
+    global _PERSISTENCE_BATCH
+    if _PERSISTENCE_BATCH is not None:
+        # Nested callers share the outer transaction-like batch.
+        yield _PERSISTENCE_BATCH
+        return
+    state: dict[str, Any] = {
+        "observations": [],
+        "observation_ids": set(),
+        "manifest_deltas": {},
+        "cursor_cache": None,
+        "cursor_updates": {},
+        "market_bars": {"1h": [], "5m": []},
+        "flush_result": {},
+    }
+    _PERSISTENCE_BATCH = state
     try:
-        with path.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                text = line.strip()
-                if not text:
-                    continue
-                try:
-                    row = json.loads(text)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(row, dict) and row.get("observation_id"):
-                    ids.add(str(row["observation_id"]))
-    except OSError as exc:
-        log.warning("[RESEARCH_OBSERVATION_INDEX_LOAD_FAILED] path=%s error=%s", path, exc)
-    return ids
+        yield state
+    finally:
+        _PERSISTENCE_BATCH = None
+        _flush_persistence_batch(state)
+
+
+def _load_existing_observation_ids() -> set[str]:
+    """Load existing observation IDs, reusing the current journal's in-process index."""
+    global _OBSERVATION_SEEN_IDS, _OBSERVATION_SEEN_IDS_PATH
+    path_key = str(ZONE_OBSERVATIONS_PATH.resolve())
+    with _OBSERVATION_SEEN_LOCK:
+        if _OBSERVATION_SEEN_IDS is not None and _OBSERVATION_SEEN_IDS_PATH == path_key:
+            return set(_OBSERVATION_SEEN_IDS)
+        ids: set[str] = set()
+        path = ZONE_OBSERVATIONS_PATH
+        if path.exists():
+            try:
+                with path.open("r", encoding="utf-8") as fh:
+                    for line in fh:
+                        text = line.strip()
+                        if not text:
+                            continue
+                        try:
+                            row = json.loads(text)
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(row, dict) and row.get("observation_id"):
+                            ids.add(str(row["observation_id"]))
+            except OSError as exc:
+                # Preserve the pre-optimization best-effort behavior: keep any IDs
+                # read before the error and let the append path decide whether writes work.
+                log.warning("[RESEARCH_OBSERVATION_INDEX_LOAD_FAILED] path=%s error=%s", path, exc)
+        _OBSERVATION_SEEN_IDS = ids
+        _OBSERVATION_SEEN_IDS_PATH = path_key
+        return set(ids)
 
 
 def pending_forward_symbols(*, horizon_hours: float = 24.0) -> set[str]:
     """Return symbols with observations whose 24h forward path is still maturing.
 
-    This is intentionally read-only and is used by the scan to keep persisting fresh
-    5m bars even when a symbol has no new observation in the current scan.
+    While scanning the journal, also seed the observation-ID cache. The deferred
+    research flush needs that index for deduplication; reusing it avoids parsing a
+    large zone_observations.jsonl a second time in the same process.
     """
+    global _OBSERVATION_SEEN_IDS, _OBSERVATION_SEEN_IDS_PATH
     if not RESEARCH_ENABLED or not ZONE_OBSERVATIONS_PATH.exists():
         return set()
     cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=max(1.0, float(horizon_hours)))
     out: set[str] = set()
+    ids: set[str] = set()
     try:
         with ZONE_OBSERVATIONS_PATH.open("r", encoding="utf-8") as fh:
             for line in fh:
@@ -294,6 +473,9 @@ def pending_forward_symbols(*, horizon_hours: float = 24.0) -> set[str]:
                     continue
                 if not isinstance(row, dict):
                     continue
+                oid = row.get("observation_id")
+                if oid:
+                    ids.add(str(oid))
                 try:
                     ts = _parse_timestamp(row.get("observation_ts"))
                 except Exception:
@@ -302,12 +484,18 @@ def pending_forward_symbols(*, horizon_hours: float = 24.0) -> set[str]:
                 if symbol and ts is not None and ts >= cutoff:
                     out.add(symbol)
     except OSError as exc:
+        # Preserve the partial result as before, but never cache a partial ID set.
+        # A later observation write can attempt to load the complete journal again.
         log.warning("[RESEARCH_PENDING_SYMBOLS_FAILED] path=%s error=%s", ZONE_OBSERVATIONS_PATH, exc)
+        return out
+    with _OBSERVATION_SEEN_LOCK:
+        _OBSERVATION_SEEN_IDS = ids
+        _OBSERVATION_SEEN_IDS_PATH = str(ZONE_OBSERVATIONS_PATH.resolve())
     return out
 
 
 def record_zone_observations(records: Iterable[dict[str, Any]]) -> int:
-    global _OBSERVATION_SEEN_IDS
+    global _OBSERVATION_SEEN_IDS, _OBSERVATION_SEEN_IDS_PATH
     if not RESEARCH_ENABLED:
         return 0
     rows = []
@@ -330,8 +518,10 @@ def record_zone_observations(records: Iterable[dict[str, Any]]) -> int:
     # Cross-scan idempotency: observation_id is the logical research boundary ID.
     # Keep only the first occurrence so repeated cron scans cannot overweight one event.
     with _OBSERVATION_SEEN_LOCK:
-        if _OBSERVATION_SEEN_IDS is None:
+        current_path = str(ZONE_OBSERVATIONS_PATH.resolve())
+        if _OBSERVATION_SEEN_IDS is None or _OBSERVATION_SEEN_IDS_PATH != current_path:
             _OBSERVATION_SEEN_IDS = _load_existing_observation_ids()
+        _OBSERVATION_SEEN_IDS_PATH = current_path
         unique_rows: list[dict[str, Any]] = []
         batch_seen: set[str] = set()
         skipped = 0
@@ -343,6 +533,22 @@ def record_zone_observations(records: Iterable[dict[str, Any]]) -> int:
             if oid:
                 batch_seen.add(oid)
             unique_rows.append(row)
+        if _PERSISTENCE_BATCH is not None:
+            batch = _PERSISTENCE_BATCH
+            prior_ids = batch["observation_ids"]
+            buffered_unique = []
+            for row in unique_rows:
+                oid = str(row.get("observation_id", ""))
+                if oid and oid in prior_ids:
+                    skipped += 1
+                    continue
+                if oid:
+                    prior_ids.add(oid)
+                buffered_unique.append(row)
+            batch["observations"].extend(buffered_unique)
+            if skipped:
+                _bump_manifest("observation_duplicates_skipped", skipped)
+            return len(buffered_unique)
         try:
             count = _append_jsonl_locked(ZONE_OBSERVATIONS_PATH, unique_rows)
             if count:
@@ -479,6 +685,13 @@ def _cursor_key(symbol: str, timeframe: str, provider: str) -> str:
 
 
 def _load_cursors() -> dict[str, Any]:
+    if _PERSISTENCE_BATCH is not None:
+        cache = _PERSISTENCE_BATCH.get("cursor_cache")
+        if cache is None:
+            raw = _load_json(RESEARCH_BAR_CURSORS_PATH, {})
+            cache = raw if isinstance(raw, dict) else {}
+            _PERSISTENCE_BATCH["cursor_cache"] = cache
+        return cache
     raw = _load_json(RESEARCH_BAR_CURSORS_PATH, {})
     return raw if isinstance(raw, dict) else {}
 
@@ -489,6 +702,11 @@ def _save_cursors(cursors: dict[str, Any]) -> None:
 
 def _update_cursor(key: str, value: dict[str, Any]) -> None:
     """Atomically update one cursor key without losing concurrent workers' keys."""
+    if _PERSISTENCE_BATCH is not None:
+        cache = _load_cursors()
+        cache[key] = value
+        _PERSISTENCE_BATCH["cursor_updates"][key] = value
+        return
     with _FileLock(RESEARCH_BAR_CURSORS_PATH):
         cursors = _load_json(RESEARCH_BAR_CURSORS_PATH, {})
         if not isinstance(cursors, dict):
@@ -585,6 +803,11 @@ def persist_market_bars(
         if not fresh:
             return 0
         path = MARKET_BARS_1H_PATH if tf == "1h" else MARKET_BARS_5M_PATH
+        if _PERSISTENCE_BATCH is not None:
+            # Actual append and cursor advancement happen together at batch flush.
+            _PERSISTENCE_BATCH["market_bars"][tf].extend(fresh)
+            _update_cursor(key, {"last_timestamp": fresh[-1]["timestamp"], "last_bar_id": fresh[-1]["bar_id"], "updated_at": _now_iso(), "scan_id": scan_id})
+            return len(fresh)
         written = _append_jsonl_locked(path, fresh)
         if written:
             _update_cursor(key, {"last_timestamp": fresh[-1]["timestamp"], "last_bar_id": fresh[-1]["bar_id"], "updated_at": _now_iso(), "scan_id": scan_id})
@@ -598,30 +821,12 @@ def persist_market_bars(
 
 
 def _bump_manifest(key: str, amount: int) -> None:
+    if _PERSISTENCE_BATCH is not None:
+        deltas = _PERSISTENCE_BATCH["manifest_deltas"]
+        deltas[key] = int(deltas.get(key, 0)) + int(amount)
+        return
     try:
-        with _FileLock(RESEARCH_MANIFEST_PATH):
-            current = _load_json(RESEARCH_MANIFEST_PATH, {})
-            if not isinstance(current, dict):
-                current = {}
-            current.setdefault("schema_version", RESEARCH_SCHEMA_VERSION)
-            current.setdefault("created_at", _now_iso())
-            current["updated_at"] = _now_iso()
-            current[key] = int(current.get(key, 0) or 0) + int(amount)
-            current["research_enabled"] = RESEARCH_ENABLED
-            RESEARCH_MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
-            fd, tmp_name = tempfile.mkstemp(prefix=RESEARCH_MANIFEST_PATH.name + ".", suffix=".tmp", dir=str(RESEARCH_MANIFEST_PATH.parent))
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    json.dump(current, fh, ensure_ascii=False, indent=2, allow_nan=False)
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                os.replace(tmp_name, RESEARCH_MANIFEST_PATH)
-                _fsync_parent_directory(RESEARCH_MANIFEST_PATH)
-            finally:
-                try:
-                    os.unlink(tmp_name)
-                except FileNotFoundError:
-                    pass
+        _apply_manifest_deltas({key: amount})
     except Exception as exc:
         _record_error("manifest_update", RESEARCH_MANIFEST_PATH, exc)
 
