@@ -3285,8 +3285,20 @@ def _send_signal(signal: dict[str, Any], execution: dict[str, Any] | None = None
         log.warning("[TG] signal send failed: %s", exc)
 
 
+def _research_persistence_batch_size(raw_value: str | None = None) -> int:
+    """Return a bounded batch size; a malformed optional env var must not abort a run."""
+    raw = os.environ.get("RESEARCH_PERSISTENCE_BATCH_SIZE", "8") if raw_value is None else raw_value
+    try:
+        configured = int(raw)
+    except (TypeError, ValueError):
+        log.warning("[CONFIG] invalid RESEARCH_PERSISTENCE_BATCH_SIZE=%r; using default 8", raw)
+        configured = 8
+    return max(4, min(32, configured))
+
+
 def main() -> None:
     started = time.time()
+    run_started_perf = time.perf_counter()
     fresh_runtime_start = not DATA.exists()
     DATA.mkdir(parents=True, exist_ok=True)
     _write_runtime_version_metadata()
@@ -3336,6 +3348,7 @@ def main() -> None:
 
     # 1) Private account layer is optional for a scan. Never let missing credentials
     #    prevent public market analysis from running.
+    private_preflight_started = time.perf_counter()
     private_ready = _private_layer_ready()
     if private_ready:
         try:
@@ -3378,6 +3391,7 @@ def main() -> None:
                 private_ready = False
                 log.critical("[LIVE_BLOCKED_STATE] tracker provenance/backfill failed; execution disabled for this run: %s", exc)
             if private_ready:
+                tracker_started = time.perf_counter()
                 try:
                     update_active_trades()
                 except ActiveTradeStateCorrupt as exc:
@@ -3386,18 +3400,25 @@ def main() -> None:
                 except Exception as exc:
                     private_ready = False
                     log.exception("[LIVE_BLOCKED_STATE] active trade update failed; execution disabled for this run: %s", exc)
+                finally:
+                    log.info("[PERF_STAGE] stage=pre_scan_update_active_trades seconds=%.3f", time.perf_counter() - tracker_started)
             if private_ready:
+                reconcile_started = time.perf_counter()
                 try:
                     reconcile_all_open_positions()
                 except Exception as exc:
                     private_ready = False
                     log.exception("[LIVE_BLOCKED_RECON] reconciliation failed; execution disabled for this run: %s", exc)
+                finally:
+                    log.info("[PERF_STAGE] stage=pre_scan_reconcile seconds=%.3f", time.perf_counter() - reconcile_started)
     else:
         log.info("[PRIVATE] BingX private layer unavailable | reconciliation/execution disabled")
+    log.info("[PERF_STAGE] stage=private_preflight_total seconds=%.3f", time.perf_counter() - private_preflight_started)
 
     # 2) Dynamic universe. Crypto uses Binance public Spot/Vision candles.
     # TradFi/equity contracts are analyzed from BingX candles because Binance
     # public Spot market data does not expose the corresponding stock universe.
+    universe_setup_started = time.perf_counter()
     bingx_symbols = get_scan_symbols()
     log.info("[SCAN] %s symbols selected from BingX | count=%d", "WATCHLIST" if WATCHLIST_ONLY else "FULL_UNIVERSE", len(bingx_symbols))
     bingx_contract_map = contracts()
@@ -3428,6 +3449,8 @@ def main() -> None:
         elif asset_class == "EQUITY":
             item["market_provider"] = "bingx"
         analysis_universe.append(item)
+
+    log.info("[PERF_STAGE] stage=universe_setup seconds=%.3f bingx_symbols=%d eligible_symbols=%d", time.perf_counter() - universe_setup_started, len(bingx_symbols), len(analysis_universe))
 
     # Research-only account context is fetched once per scan and reused by all observations.
     research_account_context = None
@@ -3473,11 +3496,13 @@ def main() -> None:
             log.warning("[TREND_BTC] 1h context unavailable: %s", exc)
 
     research_pending_forward_symbols: set[str] = set()
+    pending_symbols_started = time.perf_counter()
     if research.RESEARCH_ENABLED:
         try:
             research_pending_forward_symbols = research.pending_forward_symbols(horizon_hours=24.0)
         except Exception as exc:
             log.warning("[RESEARCH_PENDING_SYMBOLS] unable to load pending symbols: %s", exc)
+    log.info("[PERF_STAGE] stage=research_pending_forward_symbols seconds=%.3f count=%d", time.perf_counter() - pending_symbols_started, len(research_pending_forward_symbols))
 
     symbols = [str(item["bingx_symbol"]) for item in analysis_universe]
     analysis_meta = {str(item["bingx_symbol"]): item for item in analysis_universe}
@@ -3487,6 +3512,7 @@ def main() -> None:
     if not symbols:
         log.error("[SCAN] No eligible symbols for signal scan")
 
+    execution_state_load_started = time.perf_counter()
     successful_ids = _load_successful_trade_ids()
     terminal_event_ids = _load_terminal_event_ids()
     failed_ids = _load_failed_signal_ids()
@@ -3502,6 +3528,7 @@ def main() -> None:
     if open_keys:
         log.info("[POSITIONS] open=%s", json.dumps([f"{_display_symbol(sym)}:{direction}" for sym, direction in sorted(open_keys)], ensure_ascii=False))
     zone_visit_state = _load_zone_visit_state()
+    log.info("[PERF_STAGE] stage=execution_state_load seconds=%.3f successful_ids=%d terminal_ids=%d failed_ids=%d open_positions=%d", time.perf_counter() - execution_state_load_started, len(successful_ids), len(terminal_event_ids), len(failed_ids), len(open_keys))
     if RESET_ZONE_VISIT_STATE_ON_START:
         log.warning("[ZONE_STATE] RESET_ZONE_VISIT_STATE_ON_START=true | starting the 5m visit state empty for this test run")
         zone_visit_state = {"version": ZONE_VISIT_STATE_VERSION, "trigger_mode": ZONE_TRIGGER_MODE, "symbols": {}}
@@ -3904,7 +3931,9 @@ def main() -> None:
     # Parallel public-market scan. Work is submitted in bounded batches so the
     # engine is much faster than serial I/O without opening hundreds of sockets at once.
     total = len(symbols)
+    scan_started_perf = time.perf_counter()
     for batch_start in range(0, total, SCAN_BATCH_SIZE):
+        batch_started_perf = time.perf_counter()
         batch = symbols[batch_start: batch_start + SCAN_BATCH_SIZE]
         batch_results: dict[str, dict[str, Any]] = {}
         with ThreadPoolExecutor(max_workers=min(SCAN_WORKERS, len(batch))) as executor:
@@ -3935,6 +3964,7 @@ def main() -> None:
                 log.error("[COIN_ERROR] %s | %s", symbol, result.get("error", "unknown error"))
 
         scanned = min(batch_start + len(batch), total)
+        log.info("[SCAN_BATCH_DONE] batch=%d scanned=%d/%d symbols=%d seconds=%.3f", batch_start // max(1, SCAN_BATCH_SIZE) + 1, scanned, total, len(batch), time.perf_counter() - batch_started_perf)
         if scanned < total and SCAN_BATCH_PAUSE_SEC > 0:
             time.sleep(SCAN_BATCH_PAUSE_SEC)
 
@@ -3948,7 +3978,7 @@ def main() -> None:
         or "DATA_STALE_REJECT" in str(row.get("fresh_signal", ""))
     )
     scan_skips = scan_insufficient_data + scan_contract_not_found + scan_stale_rejects
-    scan_duration_sec = time.time() - started
+    scan_duration_sec = time.perf_counter() - scan_started_perf
     log.info(
         "[SCAN_DONE] symbols=%d errors=%d skipped=%d insufficient_data=%d contract_not_found=%d stale_rejects=%d fresh_signals=%d duration=%.1fs",
         total, scan_errors, scan_skips, scan_insufficient_data, scan_contract_not_found, scan_stale_rejects, len(fresh_signals), scan_duration_sec,
@@ -4296,7 +4326,9 @@ def main() -> None:
     if research.RESEARCH_ENABLED and RESEARCH_DEFER_UNTIL_AFTER_EXECUTION and deferred_research_rows:
         # Post-execution research phase: never attach post-trade context to earlier
         # decision-time observations, because that would create a lookahead artifact.
+        research_flush_started = time.perf_counter()
         log.info("[RESEARCH_DEFERRED_FLUSH] rows=%d | live execution path complete", len(deferred_research_rows))
+        account_started = time.perf_counter()
         try:
             post_account = fetch_research_account_snapshot()
             if post_account is not None:
@@ -4313,62 +4345,106 @@ def main() -> None:
                 research.record_account_context(post_account)
         except Exception as exc:
             log.warning("[RESEARCH_ACCOUNT_POST] account context unavailable: %s", exc)
+        finally:
+            log.info("[PERF_STAGE] stage=research_post_account seconds=%.3f", time.perf_counter() - account_started)
+        btc5_started = time.perf_counter()
         try:
             btc_raw_5m = fetch_binance_klines("BTCUSDT", interval="5m", limit=288, retryable=False)
             if btc_raw_5m:
                 research.persist_market_bars("BTC-USDT", "5m", btc_raw_5m, provider="binance", source="binance_spot_btc_context_post_execution", scan_id=scan_id, code_commit_sha=CODE_COMMIT_SHA)
         except Exception as exc:
             log.warning("[RESEARCH_BTC_POST] 5m context unavailable: %s", exc)
+        finally:
+            log.info("[PERF_STAGE] stage=research_post_btc_5m seconds=%.3f", time.perf_counter() - btc5_started)
+        btc1h_started = time.perf_counter()
         try:
             btc_raw_1h = fetch_binance_klines("BTCUSDT", interval="1h", limit=300, retryable=False)
             if btc_raw_1h:
                 research.persist_market_bars("BTC-USDT", "1h", btc_raw_1h, provider="binance", source="binance_spot_btc_context_post_execution", scan_id=scan_id, code_commit_sha=CODE_COMMIT_SHA)
         except Exception as exc:
             log.warning("[RESEARCH_BTC_POST] 1h context unavailable: %s", exc)
+        finally:
+            log.info("[PERF_STAGE] stage=research_post_btc_1h seconds=%.3f", time.perf_counter() - btc1h_started)
 
-        for payload in list(deferred_research_rows):
-            bars_5m = list(payload.get("bars_5m") or [])
-            if payload.get("persist_bars_for_forward") and not bars_5m:
-                meta = analysis_meta.get(payload["symbol"], {})
-                try:
-                    pending_limit = max(12, int(os.environ.get("RESEARCH_PENDING_5M_FETCH_LIMIT", "24")))
-                    if str(payload.get("provider") or "binance").lower() == "bingx":
-                        bars_5m = fetch_bingx_klines(payload["symbol"], "5m", limit=pending_limit, retryable=False)
-                    else:
-                        bars_5m = fetch_binance_klines(str(meta.get("binance_symbol") or payload["symbol"].replace("-", "")), "5m", limit=pending_limit, retryable=False)
-                except Exception as exc:
-                    log.warning("[RESEARCH_PENDING_BARS_POST] %s | unavailable: %s", payload["symbol"], exc)
-            try:
-                counts = research.record_scan_symbol(
-                    scan_id=scan_id, symbol=payload["symbol"], strategy_version=payload["strategy_version"],
-                    code_commit_sha=payload["code_commit_sha"], provider=payload["provider"], source=payload["source"],
-                    bars_1h=payload["bars_1h"], bars_5m=bars_5m, df_1h=payload["df_1h"],
-                    demand=payload["demand"], supply=payload["supply"], diagnostics=payload["diagnostics"],
-                    symbol_state=payload["symbol_state"], signals=payload["signals"], decision_ts=payload["decision_ts"],
-                    market_context=None, account_context=None, btc_df_5m=None, btc_df_1h=None,
-                    persist_bars_for_forward=bool(payload.get("persist_bars_for_forward")),
-                )
-                log.debug("[RESEARCH_DEFERRED_FLUSH] %s | obs=%d bars1h=%d bars5m=%d", payload["symbol"], counts.get("observations", 0), counts.get("bars_1h", 0), counts.get("bars_5m", 0))
-            except Exception as exc:
-                log.warning("[RESEARCH_DEFERRED_FLUSH] %s | persistence failed: %s", payload["symbol"], exc)
+        deferred_rows = list(deferred_research_rows)
+        research_batch_size = _research_persistence_batch_size()
+        queued_observation_count = 0
+        queued_bar1h_count = 0
+        queued_bar5m_count = 0
+        persisted_observation_count = 0
+        persisted_bar1h_count = 0
+        persisted_bar5m_count = 0
+        persistence_error_count = 0
+        for batch_offset in range(0, len(deferred_rows), research_batch_size):
+            payload_batch = deferred_rows[batch_offset:batch_offset + research_batch_size]
+            research_batch_started = time.perf_counter()
+            batch_observations = 0
+            batch_bars1h = 0
+            batch_bars5m = 0
+            with research.batch_persistence() as persistence_result:
+                for payload in payload_batch:
+                    bars_5m = list(payload.get("bars_5m") or [])
+                    if payload.get("persist_bars_for_forward") and not bars_5m:
+                        meta = analysis_meta.get(payload["symbol"], {})
+                        try:
+                            pending_limit = max(12, int(os.environ.get("RESEARCH_PENDING_5M_FETCH_LIMIT", "24")))
+                            if str(payload.get("provider") or "binance").lower() == "bingx":
+                                bars_5m = fetch_bingx_klines(payload["symbol"], "5m", limit=pending_limit, retryable=False)
+                            else:
+                                bars_5m = fetch_binance_klines(str(meta.get("binance_symbol") or payload["symbol"].replace("-", "")), "5m", limit=pending_limit, retryable=False)
+                        except Exception as exc:
+                            log.warning("[RESEARCH_PENDING_BARS_POST] %s | unavailable: %s", payload["symbol"], exc)
+                    try:
+                        counts = research.record_scan_symbol(
+                            scan_id=scan_id, symbol=payload["symbol"], strategy_version=payload["strategy_version"],
+                            code_commit_sha=payload["code_commit_sha"], provider=payload["provider"], source=payload["source"],
+                            bars_1h=payload["bars_1h"], bars_5m=bars_5m, df_1h=payload["df_1h"],
+                            demand=payload["demand"], supply=payload["supply"], diagnostics=payload["diagnostics"],
+                            symbol_state=payload["symbol_state"], signals=payload["signals"], decision_ts=payload["decision_ts"],
+                            market_context=None, account_context=None, btc_df_5m=None, btc_df_1h=None,
+                            persist_bars_for_forward=bool(payload.get("persist_bars_for_forward")),
+                        )
+                        batch_observations += int(counts.get("observations", 0))
+                        batch_bars1h += int(counts.get("bars_1h", 0))
+                        batch_bars5m += int(counts.get("bars_5m", 0))
+                    except Exception as exc:
+                        log.warning("[RESEARCH_DEFERRED_FLUSH] %s | persistence failed: %s", payload["symbol"], exc)
+            queued_observation_count += batch_observations
+            queued_bar1h_count += batch_bars1h
+            queued_bar5m_count += batch_bars5m
+            actual = persistence_result.get("flush_result", {}) if isinstance(persistence_result, dict) else {}
+            persisted_observation_count += int(actual.get("observations_written", 0))
+            persisted_bar1h_count += int(actual.get("bars_1h_written", 0))
+            persisted_bar5m_count += int(actual.get("bars_5m_written", 0))
+            persistence_error_count += int(actual.get("persistence_errors", 0))
+            log.info("[RESEARCH_BATCH_DONE] batch=%d rows=%d/%d queued_observations=%d queued_bars1h=%d queued_bars5m=%d seconds=%.3f", batch_offset // research_batch_size + 1, min(batch_offset + len(payload_batch), len(deferred_rows)), len(deferred_rows), batch_observations, batch_bars1h, batch_bars5m, time.perf_counter() - research_batch_started)
+        log.info("[PERF_STAGE] stage=research_deferred_total seconds=%.3f rows=%d queued_observations=%d queued_bars1h=%d queued_bars5m=%d persisted_observations=%d persisted_bars1h=%d persisted_bars5m=%d persistence_errors=%d batch_size=%d", time.perf_counter() - research_flush_started, len(deferred_rows), queued_observation_count, queued_bar1h_count, queued_bar5m_count, persisted_observation_count, persisted_bar1h_count, persisted_bar5m_count, persistence_error_count, research_batch_size)
 
-    save_scan(scan_rows, fresh_signals, duration_sec=time.time() - started, scan_id=scan_id)
+    scan_saved_started = time.perf_counter()
+    save_scan(scan_rows, fresh_signals, duration_sec=scan_duration_sec, scan_id=scan_id)
+    log.info("[PERF_STAGE] stage=save_scan seconds=%.3f", time.perf_counter() - scan_saved_started)
     # Final tracking checkpoint: orders/positions can change during the scan or
     # execution phase. Reconcile once more before this process exits so a TP,
     # close, or BE transition that happened during this run is not deferred to
     # the next invocation. Long-lived monitoring is provided by the scheduled
     # tracker workflow; this checkpoint is deliberately only one pass.
     if private_ready:
+        tracker_started = time.perf_counter()
         try:
             update_active_trades()
         except Exception as exc:
             log.exception("[TRACKER_FINAL] active trade update failed: %s", exc)
+        finally:
+            log.info("[PERF_STAGE] stage=final_update_active_trades seconds=%.3f", time.perf_counter() - tracker_started)
+        reconcile_started = time.perf_counter()
         try:
             reconcile_all_open_positions()
         except Exception as exc:
             log.exception("[RECON_FINAL] reconciliation failed: %s", exc)
+        finally:
+            log.info("[PERF_STAGE] stage=final_reconcile seconds=%.3f", time.perf_counter() - reconcile_started)
 
-    total_duration_sec = time.time() - started
+    total_duration_sec = time.perf_counter() - run_started_perf
     log.info("[DONE] symbols=%d fresh_signals=%d executed=%d duration=%.1fs", len(scan_rows), len(fresh_signals), executed, total_duration_sec)
 
 
