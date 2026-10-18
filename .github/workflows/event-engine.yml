@@ -142,7 +142,7 @@ jobs:
             exit 1
           fi
 
-      - name: Restore cumulative retention archive from previous successful runs
+      - name: Restore cumulative retention archive from previous runs
         id: restore_retention_archive
         env:
           GH_TOKEN: ${{ github.token }}
@@ -153,10 +153,11 @@ jobs:
           tmp_dir="$(mktemp -d)"
           trap 'rm -rf "$tmp_dir"' EXIT
           found_archive=false
-          # Query artifacts directly instead of checking up to 100 past runs one by one.
-          # The previous run-list/download loop added ~36 seconds when no archive existed.
-          artifact_runs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=zone-engine-retention-archive&per_page=100" \
-            --jq '[.artifacts[] | select(.expired == false) | select(.workflow_run.id != null) | {created_at: .created_at, run_id: .workflow_run.id}] | sort_by(.created_at) | reverse | .[:3][] | [.created_at, (.run_id | tostring)] | @tsv' 2>/dev/null || true)"
+          # Query every page of the Artifacts API, then select the three newest
+          # unexpired candidates globally. A single per_page=100 request can miss
+          # the last usable archive in repositories with frequent workflow runs.
+          artifact_runs="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=zone-engine-retention-archive&per_page=100" \
+            --jq '[.[].artifacts[] | select(.expired == false) | select(.workflow_run.id != null) | {created_at: .created_at, run_id: .workflow_run.id}] | sort_by(.created_at) | reverse | .[:3][] | [.created_at, (.run_id | tostring)] | @tsv' 2>/dev/null || true)"
           if [ -z "$artifact_runs" ]; then
             echo "::warning::No previous retention archive artifact was available; this may be the first run or older artifacts may have expired."
           else
@@ -227,6 +228,7 @@ jobs:
           python -m event_engine.data_retention --size-guard --archive-dir data/retention_archive
 
       - name: Upload cumulative retention archive for next clean runner
+        id: retention_upload
         if: ${{ always() && steps.size_guard.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
@@ -235,6 +237,14 @@ jobs:
           if-no-files-found: warn
           retention-days: 90
           compression-level: 1
+
+      - name: Restore pre-compaction journals if retention upload failed
+        id: retention_recovery
+        if: ${{ always() && steps.size_guard.outcome == 'success' && steps.retention_upload.outcome != 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m event_engine.data_retention --restore-size-guard-snapshots
 
       - name: Upload diagnostic log
         if: always()
@@ -246,7 +256,10 @@ jobs:
           retention-days: 14
 
       - name: Commit state
-        if: ${{ !cancelled() && steps.size_guard.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.size_guard.outcome == 'success' && (steps.retention_upload.outcome == 'success' || steps.retention_recovery.outcome == 'success') }}
+        env:
+          RETENTION_UPLOAD_OUTCOME: ${{ steps.retention_upload.outcome }}
+          RETENTION_RESTORED_ANY: ${{ steps.retention_recovery.outputs.restored_any }}
         shell: bash
         run: |
           set -euo pipefail
@@ -257,7 +270,14 @@ jobs:
           # Keep the unbounded scan journal local-only.
           git add data/
           git reset -- data/scan_history.jsonl data/scan_history.jsonl.* data/zone_engine_diagnostic.log 2>/dev/null || true
-          python -m event_engine.data_retention --check-staged
+          staged_limit=90000000
+          # When compaction had to be rolled back because artifact upload failed,
+          # allow the restored full journal up to GitHub's hard 100 MB blob limit.
+          # Never stage a file that GitHub cannot accept.
+          if [ "${RETENTION_UPLOAD_OUTCOME:-}" != "success" ] && [ "${RETENTION_RESTORED_ANY:-false}" = "true" ]; then
+            staged_limit=100000000
+          fi
+          python -m event_engine.data_retention --check-staged --limit-bytes "$staged_limit"
           if git diff --cached --quiet; then
             echo "No state changes"
             exit 0
