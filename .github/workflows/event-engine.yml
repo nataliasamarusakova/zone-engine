@@ -105,6 +105,29 @@ jobs:
         with:
           python-version: "3.11"
 
+      # Retention snapshots live in a cumulative Actions artifact rather than
+      # Git. Enumerate every artifact page so older snapshots cannot disappear
+      # merely because the repository has accumulated more than 100 artifacts.
+      - name: Restore retention archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/retention_archive
+          artifacts=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.name | startswith("zone-engine-retention-state-")) | select(.expired == false) | [.created_at, (.id|tostring)] | @tsv' \
+            | sort -r)
+          artifact_id=$(printf '%s\n' "$artifacts" | awk 'NF {print $2; exit}')
+          if [ -z "${artifact_id:-}" ]; then
+            echo "No previous retention artifact found; starting with an empty archive."
+            exit 0
+          fi
+          echo "Restoring retention artifact id=$artifact_id"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > /tmp/zone-engine-retention.zip
+          unzip -q -o /tmp/zone-engine-retention.zip -d data/retention_archive
+          rm -f /tmp/zone-engine-retention.zip
+
       - name: Cache pip
         uses: actions/cache@v4
         with:
@@ -142,41 +165,6 @@ jobs:
             exit 1
           fi
 
-      - name: Restore cumulative retention archive from previous successful runs
-        id: restore_retention_archive
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p data/retention_archive
-          tmp_dir="$(mktemp -d)"
-          trap 'rm -rf "$tmp_dir"' EXIT
-          found_archive=false
-          # `gh run download` without a run ID can open an interactive selector
-          # on hosted runners. Search successful runs explicitly so this step is
-          # deterministic and skips runs created before the archive artifact existed.
-          run_ids="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow event-engine.yml --status success --limit 100 --json databaseId --jq '.[].databaseId' || true)"
-          while IFS= read -r run_id; do
-            [ -n "$run_id" ] || continue
-            if gh run download "$run_id" --name zone-engine-retention-archive --repo "$GITHUB_REPOSITORY" --dir "$tmp_dir"; then
-              if find "$tmp_dir" -type f -print -quit | grep -q .; then
-                found_archive=true
-                echo "Retention archive found in successful workflow run $run_id."
-                break
-              fi
-            fi
-            rm -rf "$tmp_dir"/* "$tmp_dir"/.[!.]* "$tmp_dir"/..?* 2>/dev/null || true
-          done <<< "$run_ids"
-
-          if [ "$found_archive" = true ]; then
-            cp -a "$tmp_dir"/. data/retention_archive/
-            echo "Restored cumulative retention archive from a previous workflow run."
-            find data/retention_archive -type f | wc -l
-          else
-            echo "::warning::No previous retention archive artifact was available; this may be the first run or older artifacts may have expired."
-          fi
-
       - name: Run engine
         env:
           FUNDAMENTAL_WHITELIST_ENABLED: "false"
@@ -209,17 +197,25 @@ jobs:
           DATA_RETENTION_ARCHIVE_DIR: data/retention_archive
         run: |
           set -euo pipefail
-          python -m event_engine.data_retention --size-guard --archive-dir data/retention_archive
+          python -m event_engine.data_retention --size-guard --archive-dir data/retention_archive | tee /tmp/size-guard-result.json
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          from pathlib import Path
+          result = json.loads(Path('/tmp/size-guard-result.json').read_text(encoding='utf-8'))
+          changed = any(bool(item.get('triggered')) for item in result.get('files', {}).values())
+          print(f"archive_changed={'true' if changed else 'false'}")
+          PY
 
-      - name: Upload cumulative retention archive for next clean runner
-        if: ${{ always() && steps.size_guard.outcome == 'success' }}
+      - name: Upload updated retention archive
+        id: retention_upload
+        if: ${{ steps.size_guard.outcome == 'success' && steps.size_guard.outputs.archive_changed == 'true' }}
         uses: actions/upload-artifact@v4
         with:
-          name: zone-engine-retention-archive
+          name: zone-engine-retention-state-${{ github.run_id }}
           path: data/retention_archive/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 90
-          compression-level: 1
+          compression-level: 6
 
       - name: Upload diagnostic log
         if: always()
@@ -231,7 +227,7 @@ jobs:
           retention-days: 14
 
       - name: Commit state
-        if: ${{ !cancelled() && steps.size_guard.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.size_guard.outcome == 'success' && (steps.size_guard.outputs.archive_changed != 'true' || steps.retention_upload.outcome == 'success') }}
         shell: bash
         run: |
           set -euo pipefail
