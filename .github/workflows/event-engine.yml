@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 concurrency:
   group: zone-engine
@@ -141,6 +142,41 @@ jobs:
             exit 1
           fi
 
+      - name: Restore cumulative retention archive from previous successful runs
+        id: restore_retention_archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/retention_archive
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "$tmp_dir"' EXIT
+          found_archive=false
+          # `gh run download` without a run ID can open an interactive selector
+          # on hosted runners. Search successful runs explicitly so this step is
+          # deterministic and skips runs created before the archive artifact existed.
+          run_ids="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow event-engine.yml --status success --limit 100 --json databaseId --jq '.[].databaseId' || true)"
+          while IFS= read -r run_id; do
+            [ -n "$run_id" ] || continue
+            if gh run download "$run_id" --name zone-engine-retention-archive --repo "$GITHUB_REPOSITORY" --dir "$tmp_dir"; then
+              if find "$tmp_dir" -type f -print -quit | grep -q .; then
+                found_archive=true
+                echo "Retention archive found in successful workflow run $run_id."
+                break
+              fi
+            fi
+            rm -rf "$tmp_dir"/* "$tmp_dir"/.[!.]* "$tmp_dir"/..?* 2>/dev/null || true
+          done <<< "$run_ids"
+
+          if [ "$found_archive" = true ]; then
+            cp -a "$tmp_dir"/. data/retention_archive/
+            echo "Restored cumulative retention archive from a previous workflow run."
+            find data/retention_archive -type f | wc -l
+          else
+            echo "::warning::No previous retention archive artifact was available; this may be the first run or older artifacts may have expired."
+          fi
+
       - name: Run engine
         env:
           FUNDAMENTAL_WHITELIST_ENABLED: "false"
@@ -174,6 +210,16 @@ jobs:
         run: |
           set -euo pipefail
           python -m event_engine.data_retention --size-guard --archive-dir data/retention_archive
+
+      - name: Upload cumulative retention archive for next clean runner
+        if: ${{ always() && steps.size_guard.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: zone-engine-retention-archive
+          path: data/retention_archive/
+          if-no-files-found: warn
+          retention-days: 90
+          compression-level: 1
 
       - name: Upload diagnostic log
         if: always()
