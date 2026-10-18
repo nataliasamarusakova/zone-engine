@@ -22,9 +22,7 @@ data/retention_archive/<UTC_RUN>/snapshots_before/<file>.before.jsonl.gz
 
 When the command is run without `--archive-dir`, the implementation defaults to the external sibling directory `../zone-engine-data-archive`, keeping large recovery snapshots outside the repository working tree.
 
-In GitHub Actions, `data/retention_archive/` is ignored by Git and is uploaded as a cumulative `zone-engine-retention-archive` artifact after the size guard. The next run looks back through successful `event-engine.yml` runs and restores the most recent available archive before the engine can compact more data. The artifact is configured for 90-day retention; because each uploaded archive contains previous generations too, successful workflow cycles refresh the cumulative copy. If no prior artifact is available, the workflow warns explicitly. This mechanism must still be verified on the first real Actions run after deployment; local tests cannot prove GitHub's artifact round trip.
-
-The manifest records the original SHA-256, byte count, and row count. Therefore the exact pre-migration file can be restored while its archive remains available.
+The manifest records the original SHA-256, byte count, and row count. Therefore the exact pre-migration file can be restored even if a later analyst needs the full historical chain.
 
 Pruned rows are also written to a smaller `*.pruned.jsonl.gz` delta archive for convenience.
 
@@ -153,9 +151,9 @@ The engine uses a **split runtime-data policy**. Persistent engine/reconciliatio
 - `data/retention_archive/`;
 - Python caches, locks and temporary files via the repository-wide ignore rules.
 
-The persistent `data/` state remains subject to the 90 MB pre-commit guard. Retention creates byte-faithful snapshots and pruned deltas under `data/retention_archive/` before compaction, and that archive is deliberately **not committed**; the workflow carries it between clean runners with the cumulative Actions artifact described in section 1.
+The persistent `data/` state remains subject to the 90 MB pre-commit guard. Retention creates byte-faithful external snapshots under `data/retention_archive/` before compaction, and that archive is deliberately **not committed**.
 
-This policy is required for the GitHub Actions workflow: every run starts from a fresh runner, so persistent engine state survives through Git while full historical retention archives survive through the cumulative artifact. A clean source release still contains no runtime `data/`; the directory is created on the first run.
+This policy is required for the GitHub Actions workflow: every run starts from a fresh runner, so persistent state must survive through the repository between runs. A clean source release still contains no runtime `data/`; the directory is created on the first run.
 
 Verify the policy before pushing:
 
@@ -216,3 +214,17 @@ Do not delete `active_trades.json`, research cursors, research outcome state, tr
 ### Counterfactual experiment journal
 
 `data/counterfactual_experiments.jsonl` is persistent audit telemetry. It contains observational experiment snapshots and matured counterfactual outcomes and is compacted with a 90-day working window while references linked to active/trade state are protected.
+
+## 7. GitHub Actions archive durability
+
+The workflow restores the most recent non-expired `zone-engine-retention-state-*`
+artifact before running the engine. Artifact enumeration uses the paginated
+GitHub Actions API (`gh api --paginate`), not only the first 100 entries. When
+the size guard actually compacts a journal, the workflow uploads the cumulative
+`data/retention_archive` directory as a new artifact before it is allowed to
+commit the compacted journals. If that upload fails, the commit step is skipped.
+
+Retention artifacts currently use GitHub's 90-day artifact retention window;
+this is an operational recovery layer, not a permanent archival guarantee. For
+long-term preservation, periodically export the cumulative archive to durable
+external storage before the artifact expires.
