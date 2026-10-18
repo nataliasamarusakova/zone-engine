@@ -119,14 +119,16 @@ jobs:
           pip install -r requirements.txt
 
       - name: Syntax check
-        run: python -m compileall -q event_engine run_once.py research_forward.py restore_research_history_seed.py pine_r541_sr.py pine_sr_diagnostic.py test_all.py test_pine_sr_diagnostic.py test_research_layer.py test_restore_research_history_seed.py
+        run: python -m compileall -q event_engine run_once.py research_forward.py restore_research_history_seed.py pine_r541_sr.py pine_sr_diagnostic.py test_all.py test_pine_sr_diagnostic.py test_research_layer.py test_restore_research_history_seed.py test_research_cursor_portability.py test_workflow_rollback.py
 
       - name: Run tests
+        id: tests
         env:
           ZONE_ENGINE_TESTS_ISOLATED: "1"
         run: python -m pytest -q
 
       - name: Verify tests did not mutate runtime data
+        id: verify_tests_data
         shell: bash
         run: |
           set -euo pipefail
@@ -295,14 +297,15 @@ jobs:
 
       - name: Restore immutable research outcome seed
         id: restore_research_history_seed
-        # Research history restoration must not prevent the tracker from managing
-        # existing VST positions. A failed seed verification is reported below.
+        # Only attempt recovery after the test suite and its data-isolation guard
+        # succeeded. A skipped step must not be reported as a failed restoration.
+        if: ${{ success() && steps.tests.outcome == 'success' && steps.verify_tests_data.outcome == 'success' }}
         continue-on-error: true
         run: python restore_research_history_seed.py
 
       - name: Report research seed restore status
-        if: ${{ always() && steps.restore_research_history_seed.outcome != 'success' }}
-        run: echo "::warning::Research outcome recovery seed could not be restored. Existing trading-state management continues, but historical research data may remain incomplete."
+        if: ${{ always() && steps.tests.outcome == 'success' && steps.verify_tests_data.outcome == 'success' && steps.restore_research_history_seed.outcome == 'failure' }}
+        run: echo "::warning::Research outcome seed restoration actually failed. Existing trading-state management continues, but historical research data may remain incomplete."
 
       - name: Run engine
         env:
@@ -316,7 +319,10 @@ jobs:
 
       - name: Update research outcomes
         id: research_outcomes
-        if: always()
+        # This writes persistent research state. Never run it after tests or the
+        # runtime-data isolation guard failed; the runner is ephemeral but state
+        # can otherwise be committed by an always()-conditioned cleanup step.
+        if: ${{ always() && steps.tests.outcome == 'success' && steps.verify_tests_data.outcome == 'success' }}
         continue-on-error: true
         timeout-minutes: 3
         env:
@@ -388,6 +394,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          tests_outcome="${{ steps.tests.outcome }}"
+          verify_tests_data_outcome="${{ steps.verify_tests_data.outcome }}"
+          if [ "$tests_outcome" != "success" ]; then
+            echo "::error::Tests did not pass (outcome=$tests_outcome); refusing to commit persistent state."
+            exit 1
+          fi
+          if [ "$verify_tests_data_outcome" != "success" ]; then
+            echo "::error::Runtime-data isolation verification did not pass (outcome=$verify_tests_data_outcome); refusing to commit persistent state."
+            exit 1
+          fi
           rollback_outcome="${{ steps.restore_pre_compaction_snapshots.outcome }}"
           rollback_restored="${{ steps.restore_pre_compaction_snapshots.outputs.restored_any }}"
           size_guard_outcome="${{ steps.size_guard.outcome }}"
@@ -476,7 +492,9 @@ jobs:
           retention-days: 14
 
       - name: Commit state
-        if: ${{ !cancelled() && (steps.size_guard.outcome == 'success' || steps.restore_retention_archive.outputs.recovery_safe != 'true' || steps.retention_archive_restore_verification.outcome != 'success') && steps.retention_archive_commit_gate.outcome == 'success' }}
+        # Do not persist anything after failed tests/verification, even when the
+        # always()-conditioned commit gate or archive steps were skipped/passed.
+        if: ${{ !cancelled() && steps.tests.outcome == 'success' && steps.verify_tests_data.outcome == 'success' && (steps.size_guard.outcome == 'success' || steps.restore_retention_archive.outputs.recovery_safe != 'true' || steps.retention_archive_restore_verification.outcome != 'success') && steps.retention_archive_commit_gate.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
