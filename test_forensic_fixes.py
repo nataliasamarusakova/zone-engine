@@ -25,12 +25,12 @@ def _bar(ts_ms: int, close: float, *, symbol: str = "TEST-USDT", provider: str =
 
 
 def test_observation_cursor_survives_inode_change_when_bytes_match(tmp_path):
-    from research_forward import _cursor_is_valid, _journal_signature
+    from research_forward import OBS_CURSOR_SCHEMA_VERSION, _cursor_is_valid, _journal_signature
 
     path = tmp_path / "zone_observations.jsonl"
     payload = b'{"row":"' + b"x" * 80_000 + b'"}\n'
     path.write_bytes(payload)
-    cursor = {"offset": len(payload), "size": len(payload), **_journal_signature(path, len(payload))}
+    cursor = {"schema_version": OBS_CURSOR_SCHEMA_VERSION, "offset": len(payload), "size": len(payload), **_journal_signature(path, len(payload))}
     old_inode = path.stat().st_ino
 
     replacement = tmp_path / "replacement.jsonl"
@@ -41,12 +41,12 @@ def test_observation_cursor_survives_inode_change_when_bytes_match(tmp_path):
 
 
 def test_observation_cursor_rejects_content_change_and_truncation(tmp_path):
-    from research_forward import _cursor_is_valid, _journal_signature
+    from research_forward import OBS_CURSOR_SCHEMA_VERSION, _cursor_is_valid, _journal_signature
 
     path = tmp_path / "zone_observations.jsonl"
     payload = b'{"row":"' + b"x" * 80_000 + b'"}\n'
     path.write_bytes(payload)
-    cursor = {"offset": len(payload), "size": len(payload), **_journal_signature(path, len(payload))}
+    cursor = {"schema_version": OBS_CURSOR_SCHEMA_VERSION, "offset": len(payload), "size": len(payload), **_journal_signature(path, len(payload))}
 
     changed = bytearray(payload)
     changed[9] = ord("y")
@@ -54,6 +54,25 @@ def test_observation_cursor_rejects_content_change_and_truncation(tmp_path):
     assert _cursor_is_valid(path, cursor) is False
 
     path.write_bytes(payload[:100])
+    assert _cursor_is_valid(path, cursor) is False
+
+
+def test_observation_cursor_rejects_same_size_middle_rewrite(tmp_path):
+    from research_forward import OBS_CURSOR_SCHEMA_VERSION, _cursor_is_valid, _journal_signature
+
+    path = tmp_path / "zone_observations.jsonl"
+    # The edit is outside both sampled 64 KiB windows and preserves file size.
+    payload = bytearray(b"x" * (64 * 1024 * 3 + 17))
+    path.write_bytes(payload)
+    offset = len(payload)
+    cursor = {
+        "schema_version": OBS_CURSOR_SCHEMA_VERSION,
+        "offset": offset,
+        **_journal_signature(path, offset),
+    }
+    payload[64 * 1024 * 2] = ord("y")
+    path.write_bytes(payload)
+    assert path.stat().st_size == offset
     assert _cursor_is_valid(path, cursor) is False
 
 
@@ -94,6 +113,82 @@ def test_forward_bars_merge_recovery_seed_pruned_deltas_and_live_values(monkeypa
     assert len(df) == 3
     assert list(df["close"]) == pytest.approx([100.5, 102.0, 103.0])
     assert df["timestamp"].is_monotonic_increasing
+
+
+def test_bootstrap_recovery_seed_wins_over_legacy_data_seed(monkeypatch, tmp_path):
+    from event_engine import research
+    import research_forward
+
+    repo = tmp_path / "repo"
+    data_dir = repo / "data"
+    bootstrap = repo / "bootstrap" / "research_history_seed" / "2026-10-16"
+    legacy = data_dir / "research_history_seed" / "2026-10-15"
+    bootstrap.mkdir(parents=True)
+    legacy.mkdir(parents=True)
+    bars_path = data_dir / "market_bars_5m.jsonl"
+    bars_path.parent.mkdir(parents=True, exist_ok=True)
+    bars_path.write_text("", encoding="utf-8")
+    t0 = 1_760_000_000_000
+    with gzip.open(bootstrap / "market_bars_5m.jsonl.before.jsonl.gz", "wt", encoding="utf-8") as fh:
+        fh.write(json.dumps(_bar(t0, 101.0)) + "\n")
+    with gzip.open(legacy / "market_bars_5m.jsonl.legacy.jsonl.gz", "wt", encoding="utf-8") as fh:
+        fh.write(json.dumps(_bar(t0, 99.0)) + "\n")
+    raw = (bootstrap / "market_bars_5m.jsonl.before.jsonl.gz")
+    import hashlib
+    uncompressed = gzip.decompress(raw.read_bytes())
+    manifest = {
+        "record_type": "RESEARCH_HISTORY_RECOVERY_SEED",
+        "files": {
+            "market_bars_5m.jsonl": {
+                "archive_path": "bootstrap/research_history_seed/2026-10-16/market_bars_5m.jsonl.before.jsonl.gz",
+                "compressed_bytes": raw.stat().st_size,
+                "source_bytes": len(uncompressed),
+                "source_rows": 1,
+                "source_sha256": hashlib.sha256(uncompressed).hexdigest(),
+            }
+        },
+    }
+    (bootstrap / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(research_forward, "PROJECT_ROOT", repo)
+    monkeypatch.setattr(research, "MARKET_BARS_5M_PATH", bars_path)
+
+    bars = research_forward._load_bars(symbols={"TEST-USDT"})
+    assert list(bars["TEST-USDT|binance"]["close"]) == pytest.approx([101.0])
+
+
+def test_bootstrap_recovery_seed_checksum_mismatch_fails_closed(monkeypatch, tmp_path):
+    from event_engine import research
+    import research_forward
+
+    repo = tmp_path / "repo"
+    data_dir = repo / "data"
+    seed_dir = repo / "bootstrap" / "research_history_seed" / "2026-10-16"
+    seed_dir.mkdir(parents=True)
+    bars_path = data_dir / "market_bars_5m.jsonl"
+    bars_path.parent.mkdir(parents=True, exist_ok=True)
+    bars_path.write_text("", encoding="utf-8")
+    archive = seed_dir / "market_bars_5m.jsonl.before.jsonl.gz"
+    with gzip.open(archive, "wt", encoding="utf-8") as fh:
+        fh.write(json.dumps(_bar(1_760_000_000_000, 101.0)) + "\n")
+    uncompressed = gzip.decompress(archive.read_bytes())
+    manifest = {
+        "record_type": "RESEARCH_HISTORY_RECOVERY_SEED",
+        "files": {
+            "market_bars_5m.jsonl": {
+                "archive_path": "bootstrap/research_history_seed/2026-10-16/market_bars_5m.jsonl.before.jsonl.gz",
+                "compressed_bytes": archive.stat().st_size,
+                "source_bytes": len(uncompressed),
+                "source_rows": 1,
+                "source_sha256": "0" * 64,
+            }
+        },
+    }
+    (seed_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(research_forward, "PROJECT_ROOT", repo)
+    monkeypatch.setattr(research, "MARKET_BARS_5M_PATH", bars_path)
+
+    with pytest.raises(ValueError, match="source SHA-256 mismatch"):
+        research_forward._load_bars(symbols={"TEST-USDT"})
 
 
 def test_stale_five_minute_trigger_is_rejected_inside_market_submitter(monkeypatch):
@@ -186,6 +281,13 @@ def test_be_close_accounting_includes_prior_tp_fill_from_event_ledger(monkeypatc
     assert evidence["authority"] == "EXCHANGE_FILL_HISTORY"
 
 
+def test_archive_chain_markers_are_protected_from_retention_rewrites():
+    from event_engine.data_retention import NEVER_REWRITE_STATE_FILES
+
+    assert "retention_archive_state.json" in NEVER_REWRITE_STATE_FILES
+    assert "research_outcomes_restore_state.json" in NEVER_REWRITE_STATE_FILES
+
+
 def test_retention_archive_generation_names_never_overwrite(monkeypatch, tmp_path):
     from event_engine import data_retention
 
@@ -200,10 +302,29 @@ def test_retention_archive_generation_names_never_overwrite(monkeypatch, tmp_pat
 def test_workflow_persists_cumulative_archives_across_clean_runners():
     workflow = Path(".github/workflows/event-engine.yml").read_text(encoding="utf-8")
     assert "actions: read" in workflow
-    assert "Restore cumulative retention archive from previous runs" in workflow
+    assert "Restore cumulative retention archive from previous successful runs" in workflow
     assert 'repos/${GITHUB_REPOSITORY}/actions/artifacts?name=zone-engine-retention-archive&per_page=100' in workflow
+    assert 'repos/${GITHUB_REPOSITORY}/actions/workflows/event-engine.yml' in workflow
+    assert 'repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}' in workflow
+    assert '.workflow_id == $expected_workflow_id' in workflow
+    assert '.event == "repository_dispatch"' in workflow
+    assert '.conclusion == "success"' in workflow
+    assert 'actions/workflows/event-engine.yml/runs?branch=main&event=repository_dispatch&status=success&per_page=100' not in workflow
     assert 'gh run download "$run_id" --name zone-engine-retention-archive' in workflow
     assert 'gh run download --name zone-engine-retention-archive' not in workflow
+    assert "recovery_safe=false" in workflow
+    assert "recovery_safe=true" in workflow
+    assert "data/retention_archive_state.json" in workflow
+    archive_policy = Path("event_engine/retention_archive.py").read_text(encoding="utf-8")
+    assert "invalid retention archive-chain state" in archive_policy
+    assert "Decide whether retention archive upload is needed" in workflow
+    assert "event_engine.retention_archive --decide-upload" in workflow
+    assert "event_engine.retention_archive --mark-upload" in workflow
+    assert "event_engine.retention_archive --verify-upload" in workflow
+    assert "archive_upload_required == 'true'" in workflow
+    assert "--refresh-days 45" in workflow
+    assert "Verify retention archive is durable before commit" in workflow
+    assert "steps.retention_archive_commit_gate.outcome == 'success'" in workflow
     assert "Upload cumulative retention archive for next clean runner" in workflow
     assert "name: zone-engine-retention-archive" in workflow
     assert "retention-days: 90" in workflow

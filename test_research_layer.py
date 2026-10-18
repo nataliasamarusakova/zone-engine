@@ -1147,6 +1147,10 @@ def test_forward_state_bootstrap_preserves_unknown_keys(tmp_path: Path, monkeypa
 def test_update_outcomes_scales_without_per_observation_dataframe_rescans(tmp_path: Path, monkeypatch):
     import time
     import research_forward
+    # This benchmark measures the fixture's 3,000-row bar set, not the separately
+    # tested immutable 141k-row packaged recovery seed. Keep the project root
+    # isolated so the benchmark remains stable across source-only distributions.
+    monkeypatch.setattr(research_forward, "PROJECT_ROOT", tmp_path / "isolated_project")
     monkeypatch.setattr(research_forward.research, "ZONE_OBSERVATIONS_PATH", tmp_path / "zone_observations.jsonl")
     monkeypatch.setattr(research_forward.research, "MARKET_BARS_5M_PATH", tmp_path / "market_bars_5m.jsonl")
     monkeypatch.setattr(research_forward.research, "RESEARCH_OUTCOMES_PATH", tmp_path / "research_outcomes.jsonl")

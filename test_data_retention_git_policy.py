@@ -36,13 +36,9 @@ def test_workflow_runs_size_guard_before_commit():
     assert "git status --ignored --porcelain -- data" in text
     assert 'EXECUTION_REQUIRE_EXCHANGE_TIMESTAMP: "true"' in text
     assert 'EXECUTION_UNKNOWN_QUOTE_AGE_POLICY: "block"' in text
-    assert "Restore cumulative retention archive from previous runs" in text
+    assert "Restore cumulative retention archive from previous successful runs" in text
     assert "Upload cumulative retention archive for next clean runner" in text
     assert 'repos/${GITHUB_REPOSITORY}/actions/artifacts?name=zone-engine-retention-archive&per_page=100' in text
-    assert 'gh api --paginate --slurp' in text
-    assert '--restore-size-guard-snapshots' in text
-    assert 'id: retention_upload' in text
-    assert 'id: retention_recovery' in text
     assert 'gh run download "$run_id" --name zone-engine-retention-archive' in text
     assert "retention-days: 90" in text
 

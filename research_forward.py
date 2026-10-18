@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import hashlib
 import json
 import logging
 import math
 import time
+import zlib
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -93,7 +95,7 @@ ADVERSE_THRESHOLDS = (3, 5, 7, 10)
 
 OBS_CURSOR_STATE_KEY = "observation_journal_cursor_v1"
 PENDING_OBSERVATIONS_STATE_KEY = "pending_observations_v1"
-OBS_CURSOR_SCHEMA_VERSION = 1
+OBS_CURSOR_SCHEMA_VERSION = 2
 OBS_SIGNATURE_BYTES = 64 * 1024
 PENDING_META_SCHEMA_VERSION = 2
 PENDING_REPLAY_FIELDS = (
@@ -136,25 +138,52 @@ def _observation_from_pending_meta(meta: dict[str, Any], oid: str) -> dict[str, 
 
 
 def _sha256_bytes(data: bytes) -> str:
-    import hashlib
     return hashlib.sha256(data).hexdigest()
 
 
+def _sha256_file_prefix(path: Path, length: int) -> str:
+    """Hash every byte before the cursor using bounded memory.
+
+    Sampling the first and last 64 KiB alone can miss a same-size rewrite in the
+    middle of a large JSONL journal. The complete processed prefix is the cursor's
+    identity; streaming it keeps memory usage bounded and the cost small compared
+    with loading/replaying the research journal.
+    """
+    digest = hashlib.sha256()
+    remaining = max(0, int(length))
+    with path.open("rb") as fh:
+        while remaining:
+            chunk = fh.read(min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            digest.update(chunk)
+            remaining -= len(chunk)
+    return digest.hexdigest()
+
+
 def _journal_signature(path: Path, offset: int) -> dict[str, Any]:
-    """Return a cheap append-only journal signature around the resume offset."""
+    """Return a content-verified append-only journal signature at a byte offset."""
     if not path.exists():
-        return {"size": 0, "prefix_sha256": "", "window_sha256": "", "window_start": 0}
-    size = path.stat().st_size
+        return {
+            "size": 0, "prefix_sha256": "", "processed_prefix_sha256": _sha256_bytes(b""),
+            "window_sha256": "", "window_start": 0,
+        }
+    stat = path.stat()
+    size = int(stat.st_size)
+    safe_offset = max(0, min(int(offset), size))
     with path.open("rb") as fh:
         prefix = fh.read(min(OBS_SIGNATURE_BYTES, size))
-        window_start = max(0, min(int(offset) - OBS_SIGNATURE_BYTES, size))
+        window_start = max(0, min(safe_offset - OBS_SIGNATURE_BYTES, size))
         fh.seek(window_start)
-        window_len = max(0, min(OBS_SIGNATURE_BYTES, int(offset) - window_start))
+        window_len = max(0, min(OBS_SIGNATURE_BYTES, safe_offset - window_start))
         window = fh.read(window_len)
     return {
-        "size": int(size),
-        "inode": int(path.stat().st_ino),
+        "size": size,
+        "inode": int(stat.st_ino),
+        # Keep the original sampled fields for diagnostics; the full processed-prefix
+        # digest below is the authoritative content check for cursor validity.
         "prefix_sha256": _sha256_bytes(prefix),
+        "processed_prefix_sha256": _sha256_file_prefix(path, safe_offset),
         "window_start": int(window_start),
         "window_sha256": _sha256_bytes(window),
     }
@@ -177,8 +206,13 @@ def _cursor_is_valid(path: Path, cursor: dict[str, Any]) -> bool:
     # inode is runner-local metadata, not journal identity. GitHub-hosted
     # runners receive a fresh inode after every checkout even when the append-only
     # journal bytes are unchanged, so content signatures—not inode—decide validity.
+    # Old sampled-only cursors are intentionally invalidated once. They do not
+    # prove that bytes between the sampled prefix and end window remained intact.
     return (
-        sig.get("prefix_sha256") == cursor.get("prefix_sha256")
+        cursor.get("schema_version") == OBS_CURSOR_SCHEMA_VERSION
+        and bool(cursor.get("processed_prefix_sha256"))
+        and sig.get("processed_prefix_sha256") == cursor.get("processed_prefix_sha256")
+        and sig.get("prefix_sha256") == cursor.get("prefix_sha256")
         and sig.get("window_sha256") == cursor.get("window_sha256")
         and int(cursor.get("window_start", -1)) == int(sig.get("window_start", -2))
     )
@@ -255,35 +289,113 @@ def _load_bars(*, symbols: set[str] | None = None) -> dict[str, pd.DataFrame]:
         grouped[(symbol, provider)].append(row_copy)
         providers_by_symbol[symbol].add(provider)
 
-    def read_gzip_jsonl(path: Path, priority: int) -> int:
+    def read_gzip_jsonl(path: Path, priority: int, expected: dict[str, Any] | None = None) -> int:
         count = 0
+        source_rows = 0
+        source_bytes = 0
+        digest = hashlib.sha256()
+        if expected is not None:
+            try:
+                expected_compressed_bytes = int(expected["compressed_bytes"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"{path}: invalid compressed_bytes in recovery-seed manifest") from exc
+            if path.stat().st_size != expected_compressed_bytes:
+                raise ValueError(
+                    f"{path}: compressed byte-count mismatch "
+                    f"(expected {expected_compressed_bytes}, got {path.stat().st_size})"
+                )
         try:
-            with gzip.open(path, "rt", encoding="utf-8") as fh:
-                for line_no, line in enumerate(fh, 1):
-                    line = line.strip()
-                    if not line:
+            # Binary mode is deliberate: seed SHA-256 and source-byte counts are
+            # defined over the exact uncompressed JSONL bytes, not normalized text.
+            with gzip.open(path, "rb") as fh:
+                for line_no, raw_line in enumerate(fh, 1):
+                    digest.update(raw_line)
+                    source_bytes += len(raw_line)
+                    if not raw_line.strip():
                         continue
                     try:
-                        row = json.loads(line)
-                    except json.JSONDecodeError:
+                        row = json.loads(raw_line)
+                    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                        if expected is not None:
+                            raise ValueError(f"{path}:{line_no}: invalid JSON/UTF-8 in verified recovery seed") from exc
                         log.error("[RESEARCH_ARCHIVE_CORRUPT] path=%s line=%d reason=invalid_json", path, line_no)
                         continue
                     if not isinstance(row, dict):
+                        if expected is not None:
+                            raise ValueError(f"{path}:{line_no}: non-object row in verified recovery seed")
                         continue
+                    source_rows += 1
                     if row.get("record_type") not in (None, "", "MARKET_BAR"):
                         continue
                     add_row(row, priority)
                     count += 1
-        except (OSError, EOFError) as exc:
+        except (OSError, EOFError, gzip.BadGzipFile, zlib.error) as exc:
+            if expected is not None:
+                raise ValueError(f"{path}: recovery seed cannot be read: {exc}") from exc
             log.error("[RESEARCH_ARCHIVE_UNREADABLE] path=%s error=%s", path, exc)
+            return count
+
+        if expected is not None:
+            expected_sha = str(expected.get("source_sha256", "")).lower()
+            if digest.hexdigest() != expected_sha:
+                raise ValueError(
+                    f"{path}: source SHA-256 mismatch "
+                    f"(expected {expected_sha}, got {digest.hexdigest()})"
+                )
+            try:
+                expected_source_bytes = int(expected["source_bytes"])
+                expected_source_rows = int(expected["source_rows"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"{path}: invalid source byte/row count in recovery-seed manifest") from exc
+            if source_bytes != expected_source_bytes:
+                raise ValueError(
+                    f"{path}: source byte-count mismatch "
+                    f"(expected {expected_source_bytes}, got {source_bytes})"
+                )
+            if source_rows != expected_source_rows:
+                raise ValueError(
+                    f"{path}: source row-count mismatch "
+                    f"(expected {expected_source_rows}, got {source_rows})"
+                )
         return count
 
+    def _expected_seed_metadata(archive: Path, seed_root: Path) -> dict[str, Any] | None:
+        """Return manifest checks for packaged bootstrap bars; legacy fallback is optional."""
+        bootstrap_root = (PROJECT_ROOT / "bootstrap" / "research_history_seed").resolve()
+        is_bootstrap_seed = archive.resolve().is_relative_to(bootstrap_root)
+        manifest_path = archive.parent / "manifest.json"
+        if not manifest_path.is_file():
+            if is_bootstrap_seed:
+                raise ValueError(f"{archive}: packaged recovery seed has no manifest.json")
+            return None
+        if not is_bootstrap_seed:
+            # A legacy runtime seed is a migration fallback; don't break older
+            # deployments that predate the manifest format.
+            return None
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"{manifest_path}: cannot read recovery-seed manifest") from exc
+        if not isinstance(manifest, dict) or manifest.get("record_type") != "RESEARCH_HISTORY_RECOVERY_SEED":
+            raise ValueError(f"{manifest_path}: unexpected recovery-seed manifest record_type")
+        files = manifest.get("files")
+        meta = files.get(bar_path.name) if isinstance(files, dict) else None
+        if not isinstance(meta, dict):
+            raise ValueError(f"{manifest_path}: missing metadata for {bar_path.name}")
+        archive_rel = Path(str(meta.get("archive_path", "")))
+        if archive_rel.is_absolute():
+            raise ValueError(f"{manifest_path}: absolute archive path is not allowed")
+        expected_path = (PROJECT_ROOT / archive_rel).resolve()
+        if not expected_path.is_relative_to(seed_root.resolve()) or expected_path != archive.resolve():
+            raise ValueError(f"{manifest_path}: archive_path does not identify {archive}")
+        return meta
+
     # Immutable recovery seed is shipped separately from runtime data so a source-only
-    # checkout has no stale active positions or journals. Retain the older data/ path as
-    # a migration fallback for already-provisioned runners and tests, but prefer bootstrap.
-    seed_roots = [PROJECT_ROOT / "bootstrap" / "research_history_seed", bar_path.parent / "research_history_seed"]
+    # checkout has no stale active positions or journals. Read any legacy data/ fallback
+    # first, then bootstrap last so the packaged, manifest-verified source wins conflicts.
+    seed_roots = [bar_path.parent / "research_history_seed", PROJECT_ROOT / "bootstrap" / "research_history_seed"]
     seen_seed_paths: set[str] = set()
-    seed_files: list[Path] = []
+    seed_files: list[tuple[Path, Path]] = []
     for seed_root in seed_roots:
         if not seed_root.exists():
             continue
@@ -291,10 +403,11 @@ def _load_bars(*, symbols: set[str] | None = None) -> dict[str, pd.DataFrame]:
             normalized = str(archive.resolve())
             if normalized not in seen_seed_paths:
                 seen_seed_paths.add(normalized)
-                seed_files.append(archive)
-    for archive in seed_files:
+                seed_files.append((archive, seed_root))
+    for archive, seed_root in seed_files:
         source_priority += 1
-        read_gzip_jsonl(archive, source_priority)
+        expected = _expected_seed_metadata(archive, seed_root)
+        read_gzip_jsonl(archive, source_priority, expected=expected)
 
     # Size-guard and time-retention compaction write deleted rows as gzip deltas.
     # Read these rows on later clean runners; snapshots themselves duplicate rows
