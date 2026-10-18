@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import logging
 import math
@@ -12,6 +13,8 @@ from typing import Any
 
 import pandas as pd
 import numpy as np
+
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 def _timestamp_series_to_utc(series: pd.Series) -> pd.Series:
@@ -171,9 +174,9 @@ def _cursor_is_valid(path: Path, cursor: dict[str, Any]) -> bool:
     if current_size < offset or current_size < recorded_size:
         return False
     sig = _journal_signature(path, offset)
-    # inode is filesystem-local and changes across GitHub-hosted runners and
-    # clean checkouts. It is diagnostic metadata only; content signatures are
-    # the durable validity check for this append-only journal.
+    # inode is runner-local metadata, not journal identity. GitHub-hosted
+    # runners receive a fresh inode after every checkout even when the append-only
+    # journal bytes are unchanged, so content signatures—not inode—decide validity.
     return (
         sig.get("prefix_sha256") == cursor.get("prefix_sha256")
         and sig.get("window_sha256") == cursor.get("window_sha256")
@@ -230,17 +233,104 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def _load_bars(*, symbols: set[str] | None = None) -> dict[str, pd.DataFrame]:
-    rows = _read_jsonl(research.MARKET_BARS_5M_PATH)
+    """Load live 5m bars plus immutable recovery/pruned journals.
+
+    The working JSONL is retained as the highest-priority source. Older bars that
+    were safely compacted are read from gzip *pruned deltas* and the one-time
+    recovery seed; full snapshots are intentionally skipped because they duplicate
+    kept and pruned rows. All sources are deduplicated by symbol/provider/timestamp.
+    """
+    bar_path = Path(research.MARKET_BARS_5M_PATH)
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     providers_by_symbol: dict[str, set[str]] = defaultdict(set)
-    for row in rows:
+    source_priority = 0
+
+    def add_row(row: dict[str, Any], priority: int) -> None:
         symbol = str(row.get("symbol", "")).upper()
         provider = str(row.get("provider", "")).lower()
-        if symbols is not None and symbol not in symbols:
+        if not symbol or (symbols is not None and symbol not in symbols):
+            return
+        row_copy = dict(row)
+        row_copy["_archive_source_priority"] = priority
+        grouped[(symbol, provider)].append(row_copy)
+        providers_by_symbol[symbol].add(provider)
+
+    def read_gzip_jsonl(path: Path, priority: int) -> int:
+        count = 0
+        try:
+            with gzip.open(path, "rt", encoding="utf-8") as fh:
+                for line_no, line in enumerate(fh, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        log.error("[RESEARCH_ARCHIVE_CORRUPT] path=%s line=%d reason=invalid_json", path, line_no)
+                        continue
+                    if not isinstance(row, dict):
+                        continue
+                    if row.get("record_type") not in (None, "", "MARKET_BAR"):
+                        continue
+                    add_row(row, priority)
+                    count += 1
+        except (OSError, EOFError) as exc:
+            log.error("[RESEARCH_ARCHIVE_UNREADABLE] path=%s error=%s", path, exc)
+        return count
+
+    # Immutable recovery seed is shipped separately from runtime data so a source-only
+    # checkout has no stale active positions or journals. Retain the older data/ path as
+    # a migration fallback for already-provisioned runners and tests, but prefer bootstrap.
+    seed_roots = [PROJECT_ROOT / "bootstrap" / "research_history_seed", bar_path.parent / "research_history_seed"]
+    seen_seed_paths: set[str] = set()
+    seed_files: list[Path] = []
+    for seed_root in seed_roots:
+        if not seed_root.exists():
             continue
-        if symbol:
-            grouped[(symbol, provider)].append(row)
-            providers_by_symbol[symbol].add(provider)
+        for archive in sorted(p for p in seed_root.rglob("*.gz") if p.name.startswith(bar_path.name + ".")):
+            normalized = str(archive.resolve())
+            if normalized not in seen_seed_paths:
+                seen_seed_paths.add(normalized)
+                seed_files.append(archive)
+    for archive in seed_files:
+        source_priority += 1
+        read_gzip_jsonl(archive, source_priority)
+
+    # Size-guard and time-retention compaction write deleted rows as gzip deltas.
+    # Read these rows on later clean runners; snapshots themselves duplicate rows
+    # and are kept only as integrity/recovery evidence.
+    retention_root = bar_path.parent / "retention_archive"
+    delta_files = sorted(
+        p for p in retention_root.rglob("*.gz")
+        if p.name.startswith(bar_path.name + ".pruned")
+    ) if retention_root.exists() else []
+    for archive in delta_files:
+        source_priority += 1
+        read_gzip_jsonl(archive, source_priority)
+
+    # The current working file wins any overlapping timestamp because it can
+    # contain a provider correction or a newly reconciled row.
+    source_priority += 1
+    if bar_path.exists():
+        with bar_path.open("r", encoding="utf-8") as fh:
+            for line_no, line in enumerate(fh, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    log.error("[RESEARCH_JOURNAL_CORRUPT] path=%s line=%d reason=invalid_json", bar_path, line_no)
+                    continue
+                if isinstance(row, dict):
+                    add_row(row, source_priority)
+
+    if seed_files or delta_files:
+        log.info(
+            "[RESEARCH_BARS_ARCHIVE_LOAD] seed_files=%d pruned_delta_files=%d candidate_symbols=%d rows_loaded=%d",
+            len(seed_files), len(delta_files), len(grouped), sum(len(v) for v in grouped.values()),
+        )
+
     out: dict[str, pd.DataFrame] = {}
     for (symbol, provider), items in grouped.items():
         df = pd.DataFrame(items)
@@ -257,7 +347,12 @@ def _load_bars(*, symbols: set[str] | None = None) -> dict[str, pd.DataFrame]:
         df = df.dropna(subset=["timestamp", "close_time", "open", "high", "low", "close", "volume"])
         df = df.loc[(df["open"] > 0) & (df["high"] > 0) & (df["low"] > 0) & (df["close"] > 0) & (df["volume"] >= 0)]
         df = df.loc[(df["high"] >= df[["open", "close"]].max(axis=1)) & (df["low"] <= df[["open", "close"]].min(axis=1)) & (df["high"] >= df["low"])]
-        df = df.sort_values(["close_time", "timestamp"]).drop_duplicates("timestamp", keep="last").reset_index(drop=True)
+        # Select the winning source by timestamp + source priority first. Sorting
+        # close_time ahead of priority could otherwise let an older archived row
+        # override a live correction when the corrected close_time changed.
+        df = df.sort_values(["timestamp", "_archive_source_priority", "close_time"]).drop_duplicates("timestamp", keep="last")
+        df = df.sort_values(["close_time", "timestamp"]).reset_index(drop=True)
+        df = df.drop(columns=["_archive_source_priority"], errors="ignore")
         key = f"{symbol}|{provider}" if provider else symbol
         out[key] = df
         if len(providers_by_symbol[symbol]) == 1:

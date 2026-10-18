@@ -201,7 +201,7 @@ def test_workflow_persists_cumulative_archives_across_clean_runners():
     workflow = Path(".github/workflows/event-engine.yml").read_text(encoding="utf-8")
     assert "actions: read" in workflow
     assert "Restore cumulative retention archive from previous successful runs" in workflow
-    assert 'gh run list --repo "$GITHUB_REPOSITORY" --workflow event-engine.yml --status success' in workflow
+    assert 'repos/${GITHUB_REPOSITORY}/actions/artifacts?name=zone-engine-retention-archive&per_page=100' in workflow
     assert 'gh run download "$run_id" --name zone-engine-retention-archive' in workflow
     assert 'gh run download --name zone-engine-retention-archive' not in workflow
     assert "Upload cumulative retention archive for next clean runner" in workflow

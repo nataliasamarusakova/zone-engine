@@ -22,7 +22,9 @@ data/retention_archive/<UTC_RUN>/snapshots_before/<file>.before.jsonl.gz
 
 When the command is run without `--archive-dir`, the implementation defaults to the external sibling directory `../zone-engine-data-archive`, keeping large recovery snapshots outside the repository working tree.
 
-The manifest records the original SHA-256, byte count, and row count. Therefore the exact pre-migration file can be restored even if a later analyst needs the full historical chain.
+In GitHub Actions, `data/retention_archive/` is ignored by Git and is uploaded as a cumulative `zone-engine-retention-archive` artifact after the size guard. The next run looks back through successful `event-engine.yml` runs and restores the most recent available archive before the engine can compact more data. The artifact is configured for 90-day retention; because each uploaded archive contains previous generations too, successful workflow cycles refresh the cumulative copy. If no prior artifact is available, the workflow warns explicitly. This mechanism must still be verified on the first real Actions run after deployment; local tests cannot prove GitHub's artifact round trip.
+
+The manifest records the original SHA-256, byte count, and row count. Therefore the exact pre-migration file can be restored while its archive remains available.
 
 Pruned rows are also written to a smaller `*.pruned.jsonl.gz` delta archive for convenience.
 
@@ -151,9 +153,9 @@ The engine uses a **split runtime-data policy**. Persistent engine/reconciliatio
 - `data/retention_archive/`;
 - Python caches, locks and temporary files via the repository-wide ignore rules.
 
-The persistent `data/` state remains subject to the 90 MB pre-commit guard. Retention creates byte-faithful external snapshots under `data/retention_archive/` before compaction, and that archive is deliberately **not committed**.
+The persistent `data/` state remains subject to the 90 MB pre-commit guard. Retention creates byte-faithful snapshots and pruned deltas under `data/retention_archive/` before compaction, and that archive is deliberately **not committed**; the workflow carries it between clean runners with the cumulative Actions artifact described in section 1.
 
-This policy is required for the GitHub Actions workflow: every run starts from a fresh runner, so persistent state must survive through the repository between runs. A clean source release still contains no runtime `data/`; the directory is created on the first run.
+This policy is required for the GitHub Actions workflow: every run starts from a fresh runner, so persistent engine state survives through Git while full historical retention archives survive through the cumulative artifact. A clean source release still contains no runtime `data/`; the directory is created on the first run.
 
 Verify the policy before pushing:
 
@@ -215,16 +217,16 @@ Do not delete `active_trades.json`, research cursors, research outcome state, tr
 
 `data/counterfactual_experiments.jsonl` is persistent audit telemetry. It contains observational experiment snapshots and matured counterfactual outcomes and is compacted with a 90-day working window while references linked to active/trade state are protected.
 
-## 7. GitHub Actions archive durability
+## Workflow performance profile (run 39127233428)
 
-The workflow restores the most recent non-expired `zone-engine-retention-state-*`
-artifact before running the engine. Artifact enumeration uses the paginated
-GitHub Actions API (`gh api --paginate`), not only the first 100 entries. When
-the size guard actually compacts a journal, the workflow uploads the cumulative
-`data/retention_archive` directory as a new artifact before it is allowed to
-commit the compacted journals. If that upload fails, the commit step is skipped.
+Measured runtime was about 6m32s. The production engine itself took about 254.8s: tracker update of the 20 active trades took 41.1s before scanning and 39.1s after; reconciliation took 21.7s and 20.2s respectively; scanning 330 symbols took 69.6s; deferred research persistence took 56.7s. The follow-up `research_forward.py --write` took about 26s, including 17.2s to evaluate 6,694 matured candidates (none had a complete enough price path to become ready outcomes). GitHub checkout/fetch took about 24s; commit/push took about 14s.
 
-Retention artifacts currently use GitHub's 90-day artifact retention window;
-this is an operational recovery layer, not a permanent archival guarantee. For
-long-term preservation, periodically export the cumulative archive to durable
-external storage before the artifact expires.
+The old retention-artifact discovery consumed about 36s even though there was no artifact. The workflow now queries the artifacts endpoint directly and tries only the newest three candidates. Deferred 5m bar requests are fetched with concurrency capped at two while persistence remains serial. Verified existing SL orders reuse the already-successful `openOrders` snapshot; after any SL create/cleanup, the exchange re-query remains mandatory. These are conservative optimizations; expected savings are based on code-path counts, not yet measured in a new live workflow run.
+
+The checked-out Git repository still contains tracked runtime state under `data/`, so checkout/push cost will remain until runtime persistence is migrated to a separate durable store. Do not delete remote `data/` while it contains active positions, execution claims, order IDs, journals, or cursors. The delivered source ZIP omits `data/`, but that does not mean the live repo's runtime directory can safely be deleted.
+
+## One-time research outcome seed restoration
+
+`bootstrap/research_history_seed/` contains immutable, hash-verified source journals from the pre-compaction snapshot. This directory is source recovery material and may ship with the source bundle even when the runtime `data/` directory is excluded. Before `run_once.py`, the workflow runs `restore_research_history_seed.py` to merge the recovery seed for `research_outcomes.jsonl` into the live outcome journal. The step verifies the decompressed byte count, SHA-256, row count, JSONL validity, and unique `outcome_id` values before changing the target. Conflicting IDs fail without rewriting the live journal.
+
+The step writes `data/research_outcomes_restore_state.json` only after a verified merge or after confirming that every seed outcome is already present. This marker is committed with normal runtime state and survives size-guard compaction. It prevents the immutable old seed from being added back to `research_outcomes.jsonl` on every clean runner after a later compaction. The step has `continue-on-error: true` intentionally so a damaged/missing research seed cannot stop tracker/reconciliation work for existing VST positions; a warning is emitted and the data restore must be investigated.
