@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import numpy as np
 
 from event_engine.analytics import save_scan
 from event_engine.binance import analysis_symbols_for_bingx, classify_bingx_contract, fetch_24h_ticker, fetch_klines as fetch_binance_klines
@@ -1170,29 +1171,73 @@ def _process_5m_zone_visits(
     # touched a midpoint in the fetched window even if that touch was already
     # processed on an earlier cron run.
     if diagnostics is not None and not x.empty:
+        # This is a diagnostic-only historical-window pass. Cache normalized
+        # columns once and use NumPy masks/arrays rather than allocating a pandas
+        # Series per candle through iterrows(). The entry state machine below is
+        # intentionally unchanged and still processes every unprocessed closed bar.
+        window_timestamps = x["timestamp"].tolist()
+        window_timestamp_ns = x["timestamp"].astype("int64").to_numpy(copy=False)
+        window_opens = x["open"].to_numpy(dtype=float, copy=False)
+        window_highs = x["high"].to_numpy(dtype=float, copy=False)
+        window_lows = x["low"].to_numpy(dtype=float, copy=False)
+        window_closes = x["close"].to_numpy(dtype=float, copy=False)
+        window_volumes = x["volume"].to_numpy(dtype=float, copy=False)
         for zone_key, (direction, zone) in active_zone_map.items():
             zdiag = diagnostics["zones"][zone_key]
             midpoint = float(zdiag["midpoint"])
             activation_ts = _zone_activation_timestamp(zone, df_1h)
-            for _, wbar in x.iterrows():
-                low = float(wbar["low"]); high = float(wbar["high"]); ts = _coerce_utc_timestamp(wbar["timestamp"])
-                if ts is None:
-                    continue
-                if activation_ts is not None and ts < activation_ts:
-                    continue
-                zone_touched = low <= float(zone["top"]) and high >= float(zone["btm"])
-                if zone_touched:
-                    zdiag["window_bars_in_zone"] += 1
-                    zdiag["window_zone_touches"] += 1
-                    zdiag["window_last_zone_touch"] = ts.isoformat()
-                touched = low <= midpoint <= high
-                distance_pct = 0.0 if touched else ((midpoint - high) if high < midpoint else (low - midpoint)) / midpoint * 100.0 if midpoint else None
-                if distance_pct is not None and (zdiag["window_closest_midpoint_distance_pct"] is None or distance_pct < zdiag["window_closest_midpoint_distance_pct"]):
-                    zdiag["window_closest_midpoint_distance_pct"] = distance_pct
-                    zdiag["window_closest_midpoint_bar"] = {"timestamp": ts.isoformat(), "open": float(wbar["open"]), "high": high, "low": low, "close": float(wbar["close"]), "volume": float(wbar["volume"]), "distance_pct": distance_pct}
-                if touched:
-                    zdiag["window_midpoint_touches"] += 1
-                    zdiag["window_last_midpoint_touch"] = ts.isoformat()
+            if activation_ts is None:
+                active_mask = np.ones(len(window_timestamps), dtype=bool)
+            else:
+                active_mask = window_timestamp_ns >= activation_ts.value
+            active_indices = np.flatnonzero(active_mask)
+            if active_indices.size == 0:
+                continue
+
+            top = float(zone["top"])
+            bottom = float(zone["btm"])
+            zone_touch_mask = active_mask & (window_lows <= top) & (window_highs >= bottom)
+            zone_touch_indices = np.flatnonzero(zone_touch_mask)
+            if zone_touch_indices.size:
+                zdiag["window_bars_in_zone"] += int(zone_touch_indices.size)
+                zdiag["window_zone_touches"] += int(zone_touch_indices.size)
+                zdiag["window_last_zone_touch"] = window_timestamps[int(zone_touch_indices[-1])].isoformat()
+
+            midpoint_touch_mask = active_mask & (window_lows <= midpoint) & (window_highs >= midpoint)
+            midpoint_touch_indices = np.flatnonzero(midpoint_touch_mask)
+            if midpoint_touch_indices.size:
+                zdiag["window_midpoint_touches"] += int(midpoint_touch_indices.size)
+                zdiag["window_last_midpoint_touch"] = window_timestamps[int(midpoint_touch_indices[-1])].isoformat()
+
+            # Preserve the original chronological iteration and strict '<' tie
+            # break for the closest bar: the earliest bar wins equal distances.
+            # The source feeds validated finite OHLC values, so this loop operates
+            # on numeric arrays and does not construct pandas row objects.
+            closest_idx = None
+            closest_distance = None
+            if midpoint:
+                for raw_idx in active_indices:
+                    i = int(raw_idx)
+                    low = float(window_lows[i])
+                    high = float(window_highs[i])
+                    touched = low <= midpoint <= high
+                    distance_pct = 0.0 if touched else ((midpoint - high) if high < midpoint else (low - midpoint)) / midpoint * 100.0
+                    if distance_pct is not None and (closest_distance is None or distance_pct < closest_distance):
+                        closest_distance = distance_pct
+                        closest_idx = i
+            if closest_idx is not None and (
+                zdiag["window_closest_midpoint_distance_pct"] is None
+                or closest_distance < zdiag["window_closest_midpoint_distance_pct"]
+            ):
+                i = int(closest_idx)
+                ts = window_timestamps[i]
+                zdiag["window_closest_midpoint_distance_pct"] = closest_distance
+                zdiag["window_closest_midpoint_bar"] = {
+                    "timestamp": ts.isoformat(), "open": float(window_opens[i]),
+                    "high": float(window_highs[i]), "low": float(window_lows[i]),
+                    "close": float(window_closes[i]), "volume": float(window_volumes[i]),
+                    "distance_pct": closest_distance,
+                }
 
     # Drop stale state entries for zones that no longer exist; a broken 1H zone
     # cannot be resurrected by an old 5m visit.
