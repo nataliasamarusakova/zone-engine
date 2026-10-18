@@ -1888,6 +1888,16 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
             if tp.get(key):
                 order_roles[str(tp[key])] = str(tp.get("leg") or "TP").upper()
 
+    # Filled TP orders may be removed from ``tp_orders`` once the tracker sees
+    # them complete. Keep their IDs from the immutable TP-fill event ledger so the
+    # exchange fill-history query can still account for every closed leg.
+    for tp_event in trade.get("tp_fill_events", []) if isinstance(trade.get("tp_fill_events"), list) else []:
+        if not isinstance(tp_event, dict):
+            continue
+        order_id = str(tp_event.get("order_id") or tp_event.get("orderId") or "")
+        if order_id:
+            order_roles.setdefault(order_id, str(tp_event.get("leg") or "TP").upper())
+
     sl_order = trade.get("sl_order") if isinstance(trade.get("sl_order"), dict) else {}
     for key in ("order_id", "orderId", "orderID"):
         if sl_order.get(key):
@@ -2167,7 +2177,10 @@ def _close_execution_evidence(trade: dict, fill_accounting: dict[str, Any]) -> d
         if reason == "TAKE_PROFIT_FULL":
             return role.startswith("TP")
         if reason in {"STOP_LOSS", "BREAK_EVEN"}:
-            return role in {"SL", "BE_SL", "EXIT"} or role.startswith("BE")
+            # A final SL/BE close only exits the remaining quantity. Earlier TP
+            # fills are part of the same logical trade's exit accounting and must
+            # be included in its total realized exit quantity/VWAP.
+            return role in {"SL", "BE_SL", "EXIT"} or role.startswith("BE") or role.startswith("TP")
         return True
 
     rows: list[dict[str, Any]] = []
@@ -2219,24 +2232,52 @@ def _close_execution_evidence(trade: dict, fill_accounting: dict[str, Any]) -> d
             "trade_id": None,
         })
 
-    if not rows and reason == "TAKE_PROFIT_FULL":
-        for event in trade.get("tp_fill_events", []) if isinstance(trade.get("tp_fill_events"), list) else []:
-            qty = _optional_float(event.get("delta_qty"))
-            px = _optional_float(event.get("avg_price"))
-            if qty is None or px is None or qty <= 0 or px <= 0:
-                continue
-            rows.append({
-                "order_id": str(event.get("order_id") or ""),
-                "leg": str(event.get("leg") or "TP").upper(),
-                "status": str(event.get("order_status") or "FILLED").upper(),
-                "executed_qty": float(qty),
-                "avg_price": float(px),
-                "trigger_price": event.get("trigger_price"),
-                "fill_time_ms": event.get("fill_time_ms"),
-                "order_update_time_ms": event.get("order_update_time_ms"),
-                "evidence_source": "TP_FILL_EVENT",
-                "trade_id": (event.get("fill_trade_ids") or [None])[0],
-            })
+    # If the exchange fill/order query did not return a TP order, retain its
+    # previously recorded tracker TP-fill event as lower-authority evidence.
+    # Never add an event whose order ID is already represented by exchange rows;
+    # that would double-count a leg that the aggregate endpoint already returned.
+    represented_order_ids = {str(row.get("order_id") or "") for row in rows if row.get("order_id")}
+    # Tracker snapshots can emit several events for one partially-filled TP order.
+    # Those events contain cumulative ``executed_qty_total`` as well as the latest
+    # incremental delta. Collapse to the highest cumulative quantity/latest event
+    # per order before using local fallback evidence.
+    tp_events_by_order: dict[str, dict[str, Any]] = {}
+    for event in trade.get("tp_fill_events", []) if isinstance(trade.get("tp_fill_events"), list) else []:
+        if not isinstance(event, dict):
+            continue
+        order_id = str(event.get("order_id") or "")
+        if not order_id:
+            continue
+        prior = tp_events_by_order.get(order_id)
+        current_total = _optional_float(event.get("executed_qty_total")) or _optional_float(event.get("delta_qty")) or 0.0
+        prior_total = (_optional_float(prior.get("executed_qty_total")) or _optional_float(prior.get("delta_qty")) or 0.0) if prior else -1.0
+        current_ts = _optional_float(event.get("fill_time_ms") or event.get("order_update_time_ms") or event.get("ts")) or 0.0
+        prior_ts = (_optional_float(prior.get("fill_time_ms") or prior.get("order_update_time_ms") or prior.get("ts")) or 0.0) if prior else -1.0
+        if prior is None or current_total > prior_total or (current_total == prior_total and current_ts >= prior_ts):
+            tp_events_by_order[order_id] = event
+
+    for order_id, event in tp_events_by_order.items():
+        if order_id in represented_order_ids:
+            continue
+        qty = _optional_float(event.get("executed_qty_total")) or _optional_float(event.get("delta_qty"))
+        px = _optional_float(event.get("avg_price"))
+        # An orderless event cannot be deduplicated against exchange execution
+        # evidence, so do not use it for cross-leg quantity reconciliation.
+        if qty is None or px is None or qty <= 0 or px <= 0:
+            continue
+        rows.append({
+            "order_id": order_id,
+            "leg": str(event.get("leg") or "TP").upper(),
+            "status": str(event.get("order_status") or "FILLED").upper(),
+            "executed_qty": float(qty),
+            "avg_price": float(px),
+            "trigger_price": event.get("trigger_price"),
+            "fill_time_ms": event.get("fill_time_ms"),
+            "order_update_time_ms": event.get("order_update_time_ms"),
+            "evidence_source": "TP_FILL_EVENT",
+            "trade_id": (event.get("fill_trade_ids") or [None])[0],
+        })
+        represented_order_ids.add(order_id)
 
     if not rows:
         return {

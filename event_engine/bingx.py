@@ -851,7 +851,17 @@ def _signal_price_displacement_pct(signal_price: float, executable_price: float)
     return abs(delta_pct), "UP" if delta_pct > 0 else "DOWN"
 
 
-def open_market(symbol: str, direction: str, price: float, trade_id: str, *, execution_quote: dict[str, Any] | None = None, attempt_id: str | None = None) -> dict:
+def open_market(
+    symbol: str,
+    direction: str,
+    price: float,
+    trade_id: str,
+    *,
+    execution_quote: dict[str, Any] | None = None,
+    attempt_id: str | None = None,
+    trigger_bar_time_ms: int | None = None,
+    max_trigger_age_minutes: float | None = None,
+) -> dict:
     direction = str(direction).upper()
     if direction not in {"LONG", "SHORT"}:
         return {"status": "error", "error": f"invalid direction={direction}"}
@@ -1019,6 +1029,34 @@ def open_market(symbol: str, direction: str, price: float, trade_id: str, *, exe
         "quantity": f"{qty:.{prec}f}",
         "clientOrderId": client_order_id,
     }
+
+    # Last trigger-age micro-check immediately before the network POST. Unlike
+    # an earlier run_once check, this is inside the function that actually submits
+    # MARKET, after idempotency/position/contract/quote work has completed.
+    if max_trigger_age_minutes is not None:
+        try:
+            trigger_ms = int(trigger_bar_time_ms or 0)
+            max_trigger_age = max(0.0, float(max_trigger_age_minutes))
+        except (TypeError, ValueError, OverflowError):
+            trigger_ms = 0
+            max_trigger_age = 0.0
+        if trigger_ms <= 0:
+            return {
+                "status": "skipped_stale_signal",
+                "error": "invalid_5m_trigger_time_at_post",
+                "symbol": bx,
+                "order_submitted": False,
+            }
+        trigger_age_minutes = max(0.0, (time.time() * 1000.0 - trigger_ms) / 60_000.0)
+        if trigger_age_minutes > max_trigger_age:
+            return {
+                "status": "skipped_stale_signal",
+                "error": f"5m_trigger_too_old_at_post age_min={trigger_age_minutes:.3f} limit={max_trigger_age:.2f}",
+                "symbol": bx,
+                "trigger_age_minutes": trigger_age_minutes,
+                "max_trigger_age_minutes": max_trigger_age,
+                "order_submitted": False,
+            }
 
     # Last micro-check immediately before the network POST. This prevents a slow Python/network
     # path from turning a freshly-read quote into a stale order reference.
