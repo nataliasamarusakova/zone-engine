@@ -1,3 +1,3 @@
 from __future__ import annotations
 
-ENGINE_VERSION = "5.48.5"
+ENGINE_VERSION = "5.48.7"
