@@ -8,7 +8,6 @@ import json
 import logging
 import os
 import tempfile
-import uuid
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -466,9 +465,7 @@ def _compact_reconciliation_size_guard(path: Path, *, now: datetime, run_root: P
                 return True
             return line_no in last_healthy
         applied.append(_compact_jsonl(
-            path, keep,
-            archive_root=run_root / "reconciliation" / f"cutoff_{cutoff_hours}h",
-            snapshot=False, lock_held=True,
+            path, keep, archive_root=run_root / "reconciliation", snapshot=False, lock_held=True,
         ))
     return applied
 
@@ -491,16 +488,7 @@ def _apply_size_guard_to_file(path: Path, *, now: datetime, archive_root: Path, 
         for name, policy in _size_guard_plan(path, now=now, pending_ids=pending_ids, pending_bar_cutoffs=pending_bar_cutoffs, protected_observation_ids=protected_observation_ids, protected_refs=protected_refs):
             if current["bytes"] < GITHUB_SIZE_GUARD_BYTES:
                 break
-            # Each escalation pass must have its own immutable delta directory.
-            # Otherwise a later pass writes the same ``*.pruned.jsonl.gz`` name
-            # and overwrites the rows removed by an earlier pass in this run.
-            result = _compact_jsonl(
-                path,
-                lambda _line, row, policy=policy: policy(row),
-                archive_root=run_root / "pruned" / f"policy-{len(applied) + 1:02d}-{name}",
-                snapshot=False,
-                lock_held=True,
-            )
+            result = _compact_jsonl(path, lambda _line, row, policy=policy: policy(row), archive_root=run_root / "pruned", snapshot=False, lock_held=True)
             applied.append({"policy": name, **result})
             current = _file_meta(path)
             if current["bytes"] <= GITHUB_SIZE_TARGET_BYTES:
@@ -537,9 +525,9 @@ def apply_size_guard(*, now: datetime | None = None, archive_root: Path | None =
     now = now or _utc_now()
     archive_base = archive_root or REPO_RETENTION_ARCHIVE_ROOT
     archive_base.mkdir(parents=True, exist_ok=True)
-    stamp = now.strftime("%Y%m%dT%H%M%S.%fZ")
-    run_root = archive_base / f"{stamp}-{uuid.uuid4().hex[:8]}"
-    run_root.mkdir(parents=True, exist_ok=False)
+    stamp = now.strftime("%Y%m%dT%H%M%SZ")
+    run_root = archive_base / stamp
+    run_root.mkdir(parents=True, exist_ok=True)
     state_before = _validate_state_before()
     pending = _pending_observations()
     pending_ids = {str(row["observation_id"]) for row in pending}
@@ -903,11 +891,10 @@ def _validate_state_unchanged(before: dict[str, Any]) -> None:
 
 
 def _safe_archive_dir(now: datetime, archive_base: Path | None = None) -> Path:
-    """Create a non-overwriting archive generation for this compaction pass."""
     base = archive_base or ARCHIVE_ROOT
-    stamp = now.strftime("%Y%m%dT%H%M%S.%fZ")
-    target = base / f"{stamp}-{uuid.uuid4().hex[:8]}"
-    target.mkdir(parents=True, exist_ok=False)
+    stamp = now.strftime("%Y%m%dT%H%M%SZ")
+    target = base / stamp
+    target.mkdir(parents=True, exist_ok=True)
     return target
 
 
