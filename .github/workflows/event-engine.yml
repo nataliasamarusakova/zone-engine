@@ -142,7 +142,7 @@ jobs:
             exit 1
           fi
 
-      - name: Restore cumulative retention archive from previous runs
+      - name: Restore cumulative retention archive from previous successful runs
         id: restore_retention_archive
         env:
           GH_TOKEN: ${{ github.token }}
@@ -150,37 +150,148 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p data/retention_archive
+          echo "recovery_safe=false" >> "$GITHUB_OUTPUT"
+          echo "status=not_checked" >> "$GITHUB_OUTPUT"
           tmp_dir="$(mktemp -d)"
           trap 'rm -rf "$tmp_dir"' EXIT
           found_archive=false
-          # Query every page of the Artifacts API, then select the three newest
-          # unexpired candidates globally. A single per_page=100 request can miss
-          # the last usable archive in repositories with frequent workflow runs.
-          artifact_runs="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=zone-engine-retention-archive&per_page=100" \
-            --jq '[.[].artifacts[] | select(.expired == false) | select(.workflow_run.id != null) | {created_at: .created_at, run_id: .workflow_run.id}] | sort_by(.created_at) | reverse | .[:3][] | [.created_at, (.run_id | tostring)] | @tsv' 2>/dev/null || true)"
-          if [ -z "$artifact_runs" ]; then
-            echo "::warning::No previous retention archive artifact was available; this may be the first run or older artifacts may have expired."
-          else
-            while IFS=$'\t' read -r created_at run_id; do
-              [ -n "$run_id" ] || continue
-              if gh run download "$run_id" --name zone-engine-retention-archive --repo "$GITHUB_REPOSITORY" --dir "$tmp_dir"; then
-                if find "$tmp_dir" -type f -print -quit | grep -q .; then
-                  found_archive=true
-                  echo "Retention archive found in workflow run $run_id created at $created_at."
-                  break
-                fi
-              fi
-              rm -rf "$tmp_dir"/* "$tmp_dir"/.[!.]* "$tmp_dir"/..?* 2>/dev/null || true
-            done <<< "$artifact_runs"
+
+          # Query archive artifacts directly first. Do not intersect them with only
+          # the latest 100 workflow runs: a frequently triggered workflow can have
+          # more than 100 runs since the last archive upload, even while its 90-day
+          # artifact is still valid. Validate only artifact-owned run IDs below.
+          artifact_json=""
+          for api_attempt in 1 2 3; do
+            if artifact_json="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=zone-engine-retention-archive&per_page=100" 2>/dev/null)"; then
+              break
+            fi
+            artifact_json=""
+            sleep "$api_attempt"
+          done
+          if [ -z "$artifact_json" ] || ! jq -e 'type == "array" and length > 0 and all(.[]; .artifacts | type == "array")' >/dev/null <<< "$artifact_json"; then
+            echo "::warning::GitHub artifacts API unavailable after retries; retention restore/compaction is paused for safety. Position management will continue."
+            echo "status=artifacts_api_error" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+
+          total_named_artifacts="$(jq '[.[].artifacts[] | select(.name == "zone-engine-retention-archive")] | length' <<< "$artifact_json")"
+          available_named_artifacts="$(jq '[.[].artifacts[] | select(.name == "zone-engine-retention-archive") | select(.expired == false)] | length' <<< "$artifact_json")"
+          if [ "$available_named_artifacts" -eq 0 ]; then
+            if [ -f data/retention_archive_state.json ] || [ "$total_named_artifacts" -gt 0 ]; then
+              echo "::warning::The retention archive chain was previously initialized but no unexpired archive is available; compaction/upload is paused to avoid replacing historical archives with an incomplete chain."
+              echo "status=archive_missing" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::warning::No previous retention archive exists; treating this as the initial archive generation."
+            echo "status=no_prior_archive" >> "$GITHUB_OUTPUT"
+            echo "recovery_safe=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          workflow_id=""
+          for api_attempt in 1 2 3; do
+            if workflow_id="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/event-engine.yml" --jq '.id' 2>/dev/null)" && [[ "$workflow_id" =~ ^[0-9]+$ ]]; then
+              break
+            fi
+            workflow_id=""
+            sleep "$api_attempt"
+          done
+          if [ -z "$workflow_id" ]; then
+            echo "::warning::Could not identify event-engine.yml through the GitHub API; retention restore/compaction is paused for safety. Position management will continue."
+            echo "status=workflow_api_error" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          artifact_candidates="$(jq -r '
+            [ .[].artifacts[]
+              | select(.name == "zone-engine-retention-archive")
+              | select(.expired == false)
+              | select(.workflow_run.id != null)
+              | select(.workflow_run.head_branch == "main")
+              | {created_at: .created_at, run_id: .workflow_run.id}
+            ]
+            | group_by(.run_id)
+            | map(max_by(.created_at))
+            | sort_by(.created_at)
+            | reverse
+            | .[]
+            | [.created_at, (.run_id | tostring)]
+            | @tsv
+          ' <<< "$artifact_json")"
+
+          if [ -z "$artifact_candidates" ]; then
+            echo "::warning::Named archive artifacts exist, but no unexpired main-branch artifact has a run ID; retention compaction is paused."
+            echo "status=no_suitable_archive" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          artifact_runs=""
+          eligible_count=0
+          run_api_errors=0
+          while IFS=$'\t' read -r created_at run_id; do
+            [ -n "$run_id" ] || continue
+            run_json=""
+            if ! run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" 2>/dev/null)"; then
+              run_api_errors=$((run_api_errors + 1))
+              continue
+            fi
+            if jq -e --argjson expected_workflow_id "$workflow_id" '
+              .workflow_id == $expected_workflow_id
+              and .head_branch == "main"
+              and .event == "repository_dispatch"
+              and .status == "completed"
+              and .conclusion == "success"
+            ' >/dev/null <<< "$run_json"; then
+              printf -v candidate_line '%s\t%s\n' "$created_at" "$run_id"
+              artifact_runs+="$candidate_line"
+              eligible_count=$((eligible_count + 1))
+              [ "$eligible_count" -ge 3 ] && break
+            fi
+          done <<< "$artifact_candidates"
+
+          if [ -z "$artifact_runs" ]; then
+            if [ "$run_api_errors" -gt 0 ]; then
+              echo "::warning::GitHub run-details API failed for archive candidates; retention restore/compaction is paused for safety."
+              echo "status=run_details_api_error" >> "$GITHUB_OUTPUT"
+            else
+              echo "::warning::Named artifacts exist, but none belongs to a successful event-engine.yml repository_dispatch run on main; retention compaction is paused."
+              echo "status=no_suitable_archive" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          while IFS=$'\t' read -r created_at run_id; do
+            [ -n "$run_id" ] || continue
+            if gh run download "$run_id" --name zone-engine-retention-archive --repo "$GITHUB_REPOSITORY" --dir "$tmp_dir"; then
+              if find "$tmp_dir" -type f -print -quit | grep -q .; then
+                found_archive=true
+                echo "Retention archive found in successful event-engine.yml run $run_id created at $created_at."
+                break
+              fi
+            fi
+            rm -rf "$tmp_dir"/* "$tmp_dir"/.[!.]* "$tmp_dir"/..?* 2>/dev/null || true
+          done <<< "$artifact_runs"
 
           if [ "$found_archive" = true ]; then
             cp -a "$tmp_dir"/. data/retention_archive/
-            echo "Restored cumulative retention archive from a previous workflow run."
+            echo "Restored cumulative retention archive from a previous successful workflow run."
             find data/retention_archive -type f | wc -l
-          elif [ -n "$artifact_runs" ]; then
-            echo "::warning::The three newest retention artifacts could not be downloaded; research retention restore was skipped."
+            echo "status=restored" >> "$GITHUB_OUTPUT"
+            echo "recovery_safe=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::The three newest eligible retention archives could not be downloaded; compaction/upload is paused to avoid losing older pruned rows. Position management will continue."
+            echo "status=download_failed" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Verify restored retention archive fingerprint
+        id: retention_archive_restore_verification
+        if: ${{ always() && steps.restore_retention_archive.outputs.recovery_safe == 'true' }}
+        continue-on-error: true
+        run: >-
+          python -m event_engine.retention_archive --verify-restored
+          --archive-dir data/retention_archive
+          --state-file data/retention_archive_state.json
+          --github-output "$GITHUB_OUTPUT"
 
       - name: Restore immutable research outcome seed
         id: restore_research_history_seed
@@ -218,7 +329,7 @@ jobs:
 
       - name: Pre-commit data size guard
         id: size_guard
-        if: always()
+        if: ${{ always() && steps.restore_retention_archive.outputs.recovery_safe == 'true' && steps.retention_archive_restore_verification.outcome == 'success' }}
         env:
           DATA_RETENTION_SIZE_GUARD_BYTES: "90000000"
           DATA_RETENTION_SIZE_TARGET_BYTES: "80000000"
@@ -227,24 +338,133 @@ jobs:
           set -euo pipefail
           python -m event_engine.data_retention --size-guard --archive-dir data/retention_archive
 
+      - name: Decide whether retention archive upload is needed
+        id: retention_archive_upload_decision
+        if: ${{ always() && steps.size_guard.outcome == 'success' && steps.restore_retention_archive.outputs.recovery_safe == 'true' && steps.retention_archive_restore_verification.outcome == 'success' }}
+        run: >-
+          python -m event_engine.retention_archive --decide-upload
+          --archive-dir data/retention_archive
+          --state-file data/retention_archive_state.json
+          --refresh-days 45
+          --github-output "$GITHUB_OUTPUT"
+
       - name: Upload cumulative retention archive for next clean runner
-        id: retention_upload
-        if: ${{ always() && steps.size_guard.outcome == 'success' }}
+        id: upload_retention_archive
+        if: ${{ always() && steps.retention_archive_upload_decision.outcome == 'success' && steps.retention_archive_upload_decision.outputs.archive_upload_required == 'true' && steps.restore_retention_archive.outputs.recovery_safe == 'true' && steps.retention_archive_restore_verification.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: zone-engine-retention-archive
           path: data/retention_archive/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 90
           compression-level: 1
 
-      - name: Restore pre-compaction journals if retention upload failed
-        id: retention_recovery
-        if: ${{ always() && steps.size_guard.outcome == 'success' && steps.retention_upload.outcome != 'success' }}
+      - name: Mark retention archive upload durable
+        id: mark_retention_archive
+        if: ${{ always() && steps.upload_retention_archive.outcome == 'success' && steps.restore_retention_archive.outputs.recovery_safe == 'true' && steps.retention_archive_restore_verification.outcome == 'success' }}
+        run: >-
+          python -m event_engine.retention_archive --mark-upload
+          --archive-dir data/retention_archive
+          --state-file data/retention_archive_state.json
+          --expected-sha256 "${{ steps.retention_archive_upload_decision.outputs.archive_sha256 }}"
+          --run-id "$GITHUB_RUN_ID"
+          --github-output "$GITHUB_OUTPUT"
+
+      - name: Restore pre-compaction journals if retention archive upload failed
+        id: restore_pre_compaction_snapshots
+        if: ${{ always() && steps.size_guard.outcome == 'success' && (steps.retention_archive_upload_decision.outcome != 'success' || (steps.retention_archive_upload_decision.outputs.archive_upload_required == 'true' && steps.upload_retention_archive.outcome != 'success')) }}
         shell: bash
         run: |
           set -euo pipefail
-          python -m event_engine.data_retention --restore-size-guard-snapshots
+          python -m event_engine.data_retention \
+            --restore-pre-compaction-snapshots \
+            --manifest data/data_retention_manifest.json \
+            --archive-dir data/retention_archive \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Verify retention archive is durable before commit
+        id: retention_archive_commit_gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rollback_outcome="${{ steps.restore_pre_compaction_snapshots.outcome }}"
+          rollback_restored="${{ steps.restore_pre_compaction_snapshots.outputs.restored_any }}"
+          size_guard_outcome="${{ steps.size_guard.outcome }}"
+          compaction_triggered=false
+
+          # The size-guard manifest is rewritten each time that step succeeds.
+          # If it is absent or malformed, we cannot prove whether compaction
+          # occurred, so fail closed rather than commit unverifiable state.
+          if [ "$size_guard_outcome" = "success" ]; then
+            if [ ! -f data/data_retention_manifest.json ]; then
+              echo "::error::Size guard succeeded without a retention manifest; refusing to commit unverifiable state."
+              exit 1
+            fi
+            if ! jq -e '.mode == "size_guard" and (.files | type == "object") and (.files | length > 0)' data/data_retention_manifest.json >/dev/null; then
+              echo "::error::Size-guard retention manifest is malformed; refusing to commit unverifiable state."
+              exit 1
+            fi
+            if jq -e '[.files[] | select(.triggered == true)] | length > 0' data/data_retention_manifest.json >/dev/null; then
+              compaction_triggered=true
+            fi
+          fi
+
+          # A rollback attempt must never fail open, regardless of whether the
+          # archive directory currently contains files.
+          if [ "$rollback_outcome" = "failure" ]; then
+            echo "::error::Pre-compaction snapshot restoration failed; refusing to commit state."
+            exit 1
+          fi
+          if [ "$compaction_triggered" = "true" ]; then
+            if [ "$rollback_outcome" = "success" ] && [ "$rollback_restored" = "true" ]; then
+              echo "::warning::Retention archive upload did not complete; full pre-compaction journals were restored and will be committed only if every staged file is below GitHub's 100,000,000-byte hard limit."
+              exit 0
+            fi
+            if [ "$rollback_outcome" = "success" ] && [ "$rollback_restored" != "true" ]; then
+              echo "::error::The size guard compacted journals, but rollback reported no restored files; refusing to commit."
+              exit 1
+            fi
+            if ! find data/retention_archive -type f -print -quit | grep -q .; then
+              echo "::error::The size guard compacted journals, but no retention archive is available and rollback did not restore the journals; refusing to commit."
+              exit 1
+            fi
+          fi
+          if find data/retention_archive -type f -print -quit | grep -q .; then
+            if [ "${{ steps.retention_archive_restore_verification.outcome }}" != "success" ]; then
+              if [ "${{ steps.size_guard.outcome }}" = "skipped" ]; then
+                echo "::warning::Restored retention archive failed its fingerprint check; no compaction was run, so ordinary state may still be committed subject to the staged-size guard."
+                exit 0
+              fi
+              echo "::error::Retention archive fingerprint check failed after the size guard; refusing to commit compacted journals."
+              exit 1
+            fi
+            if [ "${{ steps.restore_retention_archive.outputs.recovery_safe }}" != "true" ]; then
+              echo "::error::Retention archive files are present but the prior archive chain was not safely restored; refusing to commit compaction."
+              exit 1
+            fi
+            if [ "${{ steps.retention_archive_upload_decision.outcome }}" != "success" ]; then
+              echo "::error::Retention archive upload decision did not complete; refusing to commit compacted journals."
+              exit 1
+            fi
+            if [ "${{ steps.retention_archive_upload_decision.outputs.archive_upload_required }}" = "true" ]; then
+              if [ "${{ steps.upload_retention_archive.outcome }}" != "success" ]; then
+                echo "::error::Retention archive changed or needs refresh, but artifact upload did not succeed; refusing to commit compacted journals."
+                exit 1
+              fi
+              if [ "${{ steps.mark_retention_archive.outcome }}" != "success" ]; then
+                echo "::error::Retention archive uploaded, but its persistent fingerprint marker was not written; refusing to commit compacted journals."
+                exit 1
+              fi
+            else
+              python -m event_engine.retention_archive --verify-upload \
+                --archive-dir data/retention_archive \
+                --state-file data/retention_archive_state.json \
+                --expected-sha256 "${{ steps.retention_archive_upload_decision.outputs.archive_sha256 }}" \
+                --refresh-days 45
+            fi
+          fi
+          echo "Retention archive commit gate passed."
 
       - name: Upload diagnostic log
         if: always()
@@ -256,10 +476,7 @@ jobs:
           retention-days: 14
 
       - name: Commit state
-        if: ${{ !cancelled() && steps.size_guard.outcome == 'success' && (steps.retention_upload.outcome == 'success' || steps.retention_recovery.outcome == 'success') }}
-        env:
-          RETENTION_UPLOAD_OUTCOME: ${{ steps.retention_upload.outcome }}
-          RETENTION_RESTORED_ANY: ${{ steps.retention_recovery.outputs.restored_any }}
+        if: ${{ !cancelled() && (steps.size_guard.outcome == 'success' || steps.restore_retention_archive.outputs.recovery_safe != 'true' || steps.retention_archive_restore_verification.outcome != 'success') && steps.retention_archive_commit_gate.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -270,14 +487,13 @@ jobs:
           # Keep the unbounded scan journal local-only.
           git add data/
           git reset -- data/scan_history.jsonl data/scan_history.jsonl.* data/zone_engine_diagnostic.log 2>/dev/null || true
-          staged_limit=90000000
-          # When compaction had to be rolled back because artifact upload failed,
-          # allow the restored full journal up to GitHub's hard 100 MB blob limit.
-          # Never stage a file that GitHub cannot accept.
-          if [ "${RETENTION_UPLOAD_OUTCOME:-}" != "success" ] && [ "${RETENTION_RESTORED_ANY:-false}" = "true" ]; then
-            staged_limit=100000000
+          if [ "${{ steps.restore_pre_compaction_snapshots.outputs.restored_any }}" = "true" ]; then
+            # Exact rollback restores the original full journals. Permit them only
+            # when each staged file remains strictly below GitHub's hard 100 MB limit.
+            python -m event_engine.data_retention --check-staged --limit-bytes 100000000
+          else
+            python -m event_engine.data_retention --check-staged
           fi
-          python -m event_engine.data_retention --check-staged --limit-bytes "$staged_limit"
           if git diff --cached --quiet; then
             echo "No state changes"
             exit 0
