@@ -1106,15 +1106,136 @@ def _compact_data_locked(*, apply: bool, archive_root: Path, now: datetime) -> d
     return results
 
 
+def restore_size_guard_snapshots(*, manifest_path: Path | None = None) -> dict[str, Any]:
+    """Restore every file compacted by the latest size guard from verified snapshots.
+
+    This is used only when the cumulative retention artifact failed to upload.
+    The manifest is written after the size-guard operation and snapshots contain
+    the full pre-compaction bytes, including all trading/research updates made
+    earlier in the same workflow run.
+    """
+    manifest_path = manifest_path or (DATA_DIR / "data_retention_manifest.json")
+    if not manifest_path.exists():
+        raise RuntimeError(f"size-guard manifest is missing: {manifest_path}")
+    manifest = _read_json(manifest_path)
+    if not isinstance(manifest, dict) or manifest.get("mode") != "size_guard":
+        raise RuntimeError("refusing rollback: manifest is not a size_guard result")
+    files = manifest.get("files")
+    if not isinstance(files, dict):
+        raise RuntimeError("refusing rollback: size_guard manifest has no files map")
+
+    archive_root = (DATA_DIR / "retention_archive").resolve()
+    staged: list[dict[str, Any]] = []
+    result: dict[str, Any] = {"restored": [], "restored_any": False, "mode": "restore_size_guard_snapshots"}
+
+    # Prepare and verify every restore candidate before replacing any live file.
+    for name, meta in files.items():
+        if not isinstance(meta, dict) or not meta.get("triggered"):
+            continue
+        if Path(name).name != name or not name.endswith(".jsonl"):
+            raise RuntimeError(f"refusing rollback: unsafe data filename {name!r}")
+        snapshot = meta.get("snapshot")
+        chunks = snapshot.get("chunks") if isinstance(snapshot, dict) else None
+        if not isinstance(chunks, list) or not chunks:
+            raise RuntimeError(f"refusing rollback: snapshot chunks missing for {name}")
+
+        target = DATA_DIR / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(prefix=target.name + ".restore.", suffix=".tmp", dir=str(target.parent))
+        temp_path = Path(temp_name)
+        digest = hashlib.sha256()
+        raw_bytes = 0
+        rows = 0
+        try:
+            with os.fdopen(fd, "wb") as out:
+                for chunk in chunks:
+                    raw_chunk_path = Path(str(chunk.get("path", "")))
+                    chunk_path = (raw_chunk_path if raw_chunk_path.is_absolute() else PROJECT_ROOT / raw_chunk_path).resolve()
+                    try:
+                        chunk_path.relative_to(archive_root)
+                    except ValueError as exc:
+                        raise RuntimeError(f"refusing rollback: snapshot path escapes retention archive: {chunk_path}") from exc
+                    if not chunk_path.is_file():
+                        raise RuntimeError(f"refusing rollback: snapshot chunk is missing: {chunk_path}")
+                    with gzip.open(chunk_path, "rb") as src:
+                        while True:
+                            block = src.read(1024 * 1024)
+                            if not block:
+                                break
+                            out.write(block)
+                            digest.update(block)
+                            raw_bytes += len(block)
+                out.flush()
+                os.fsync(out.fileno())
+            with temp_path.open("rb") as restored_file:
+                rows = sum(1 for line in restored_file if line.strip())
+            expected_sha = str(snapshot.get("source_sha256", ""))
+            expected_bytes = int(snapshot.get("source_bytes", -1))
+            expected_rows = int(snapshot.get("source_rows", -1))
+            if digest.hexdigest() != expected_sha or raw_bytes != expected_bytes or rows != expected_rows:
+                raise RuntimeError(
+                    f"refusing rollback: snapshot verification failed for {name} "
+                    f"(sha256={digest.hexdigest()}, bytes={raw_bytes}, rows={rows})"
+                )
+            staged.append({"name": name, "target": target, "temp": temp_path, "bytes": raw_bytes, "rows": rows, "sha256": expected_sha})
+        except Exception:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+            for item in staged:
+                try:
+                    item["temp"].unlink()
+                except FileNotFoundError:
+                    pass
+            raise
+
+    for item in staged:
+        os.replace(item["temp"], item["target"])
+        result["restored"].append({"file": item["name"], "bytes": item["bytes"], "rows": item["rows"], "sha256": item["sha256"]})
+    result["restored_any"] = bool(staged)
+
+    # Keep the persisted manifest truthful: after recovery, the live journals
+    # are back at their pre-compaction sizes even though the size-guard attempt
+    # itself completed successfully.
+    manifest["retention_upload_recovery"] = {
+        "status": "restored_pre_compaction_snapshots" if staged else "no_compaction_to_rollback",
+        "restored_at": _utc_now().isoformat(),
+        "restored_files": result["restored"],
+    }
+    for item in staged:
+        meta = files.get(item["name"])
+        if isinstance(meta, dict):
+            meta["bytes_after"] = item["bytes"]
+            meta["rows_after"] = item["rows"]
+            meta["restored_after_upload_failure"] = True
+    manifest_tmp = manifest_path.with_name(manifest_path.name + ".restore.tmp")
+    manifest_tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(manifest_tmp, manifest_path)
+
+    output_path = os.environ.get("GITHUB_OUTPUT")
+    if output_path:
+        with open(output_path, "a", encoding="utf-8") as output:
+            output.write(f"restored_any={'true' if staged else 'false'}\n")
+            output.write(f"restored_count={len(staged)}\n")
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Safe one-time compaction and GitHub pre-commit data size guard")
     parser.add_argument("--apply", action="store_true", help="apply standard retention compaction")
     parser.add_argument("--size-guard", action="store_true", help="compact files that reach 90 MB before they can be staged")
-    parser.add_argument("--check-staged", action="store_true", help="fail if any staged data file is >= 90 MB")
+    parser.add_argument("--check-staged", action="store_true", help="fail if any staged data file reaches the selected byte limit")
+    parser.add_argument("--limit-bytes", type=int, default=GITHUB_SIZE_GUARD_BYTES, help="byte limit for --check-staged")
+    parser.add_argument("--restore-size-guard-snapshots", action="store_true", help="restore full pre-compaction snapshots after retention artifact upload failure")
     parser.add_argument("--archive-dir", type=Path, default=None, help="archive root")
     args = parser.parse_args(argv)
-    if args.check_staged:
-        result = check_staged_size_guard()
+    if args.restore_size_guard_snapshots:
+        result = restore_size_guard_snapshots()
+    elif args.check_staged:
+        if args.limit_bytes < 1:
+            parser.error("--limit-bytes must be positive")
+        result = check_staged_size_guard(limit_bytes=args.limit_bytes)
     elif args.size_guard:
         result = apply_size_guard(now=_utc_now(), archive_root=args.archive_dir)
     else:
