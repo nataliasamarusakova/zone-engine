@@ -39,6 +39,8 @@ def test_commit_gate_blocks_compaction_when_archive_is_empty_and_rollback_was_sk
     gate = next(step for step in steps if step.get("id") == "retention_archive_commit_gate")
     script = gate["run"]
     substitutions = {
+        "${{ steps.tests.outcome }}": "success",
+        "${{ steps.verify_tests_data.outcome }}": "success",
         "${{ steps.restore_pre_compaction_snapshots.outcome }}": "skipped",
         "${{ steps.restore_pre_compaction_snapshots.outputs.restored_any }}": "",
         "${{ steps.size_guard.outcome }}": "success",
@@ -79,6 +81,8 @@ def test_commit_gate_allows_empty_archive_when_size_guard_did_not_compact(tmp_pa
     gate = next(step for step in steps if step.get("id") == "retention_archive_commit_gate")
     script = gate["run"]
     substitutions = {
+        "${{ steps.tests.outcome }}": "success",
+        "${{ steps.verify_tests_data.outcome }}": "success",
         "${{ steps.restore_pre_compaction_snapshots.outcome }}": "skipped",
         "${{ steps.restore_pre_compaction_snapshots.outputs.restored_any }}": "",
         "${{ steps.size_guard.outcome }}": "success",
@@ -104,3 +108,61 @@ def test_commit_gate_allows_empty_archive_when_size_guard_did_not_compact(tmp_pa
                             text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Retention archive commit gate passed." in result.stdout
+
+
+def test_workflow_does_not_write_research_or_commit_state_after_test_failure(tmp_path):
+    import subprocess
+
+    import yaml
+
+    workflow_path = Path(__file__).parent / ".github" / "workflows" / "event-engine.yml"
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    steps = workflow["jobs"]["run"]["steps"]
+    by_id = {step.get("id"): step for step in steps if step.get("id")}
+
+    assert by_id["tests"]["name"] == "Run tests"
+    assert "steps.tests.outcome == 'success'" in by_id["restore_research_history_seed"]["if"]
+    assert "steps.verify_tests_data.outcome == 'success'" in by_id["restore_research_history_seed"]["if"]
+    seed_warning = next(step for step in steps if step.get("name") == "Report research seed restore status")
+    assert "steps.tests.outcome == 'success'" in seed_warning["if"]
+    assert "steps.restore_research_history_seed.outcome == 'failure'" in seed_warning["if"]
+    assert "steps.tests.outcome == 'success'" in by_id["research_outcomes"]["if"]
+    assert '${{ steps.tests.outcome }}' in by_id["retention_archive_commit_gate"]["run"]
+    commit_step = next(step for step in steps if step.get("name") == "Commit state")
+    assert "steps.tests.outcome == 'success'" in commit_step["if"]
+
+    script = by_id["retention_archive_commit_gate"]["run"]
+    script = script.replace("${{ steps.tests.outcome }}", "failure")
+    script = script.replace("${{ steps.verify_tests_data.outcome }}", "success")
+    result = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", script],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "Tests did not pass (outcome=failure); refusing to commit persistent state." in result.stdout + result.stderr
+
+
+def test_workflow_blocks_state_commit_when_runtime_data_isolation_check_is_skipped(tmp_path):
+    import subprocess
+
+    import yaml
+
+    workflow_path = Path(__file__).parent / ".github" / "workflows" / "event-engine.yml"
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    steps = workflow["jobs"]["run"]["steps"]
+    gate = next(step for step in steps if step.get("id") == "retention_archive_commit_gate")
+    script = gate["run"]
+    script = script.replace("${{ steps.tests.outcome }}", "success")
+    script = script.replace("${{ steps.verify_tests_data.outcome }}", "skipped")
+    result = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", script],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "Runtime-data isolation verification did not pass (outcome=skipped); refusing to commit persistent state." in result.stdout + result.stderr

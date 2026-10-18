@@ -6,10 +6,12 @@ import research_forward
 def _cursor_for(path: Path, offset: int) -> dict:
     sig = research_forward._journal_signature(path, offset)
     return {
+        "schema_version": research_forward.OBS_CURSOR_SCHEMA_VERSION,
         "offset": offset,
         "size": sig["size"],
         "inode": sig["inode"],
         "prefix_sha256": sig["prefix_sha256"],
+        "processed_prefix_sha256": sig["processed_prefix_sha256"],
         "window_start": sig["window_start"],
         "window_sha256": sig["window_sha256"],
     }

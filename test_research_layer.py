@@ -1224,6 +1224,11 @@ def test_forward_observation_cursor_only_scans_appended_rows(tmp_path: Path, mon
 
 def test_forward_cursor_resets_safely_after_journal_rewrite(tmp_path: Path, monkeypatch):
     import research_forward
+    # This is a cursor-integrity test, not a seed-ingestion test. Keep the packaged
+    # 141k-bar bootstrap out of the hot path so repeated CI runs remain deterministic.
+    isolated_project = tmp_path / "isolated_project"
+    isolated_project.mkdir()
+    monkeypatch.setattr(research_forward, "PROJECT_ROOT", isolated_project)
     monkeypatch.setattr(research_forward.research, "ZONE_OBSERVATIONS_PATH", tmp_path / "zone_observations.jsonl")
     monkeypatch.setattr(research_forward.research, "MARKET_BARS_5M_PATH", tmp_path / "market_bars_5m.jsonl")
     monkeypatch.setattr(research_forward.research, "RESEARCH_OUTCOMES_PATH", tmp_path / "research_outcomes.jsonl")
