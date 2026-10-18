@@ -1,1 +1,47 @@
-
+{
+  "schema_version": 1,
+  "record_type": "RESEARCH_HISTORY_RECOVERY_SEED",
+  "created_at": "2026-10-18",
+  "source_archive": "zone-engine-main (1).zip extracted under /mnt/data/zone_audit_prev/zone-engine-main",
+  "source_runtime_version": {
+    "schema_version": 1,
+    "record_type": "RUNTIME_VERSION",
+    "engine_version": "5.48.5",
+    "strategy_version": "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp3-tp6-be-on-tp1-zone-touch-test",
+    "zone_trigger_mode": "zone",
+    "execution_quote_max_future_skew_sec": "1.0",
+    "code_commit_sha": "bd6adf1ccf9f9c548dac058a27f44a023d091d9d",
+    "written_ts": 1792161869892
+  },
+  "note": "Minimal immutable research recovery seed. research_outcomes.jsonl restores the previously archived outcome journal; market_bars_5m.jsonl supplies historical 5m paths for forward outcome calculation. Other archival logs are intentionally not bundled in the source distribution. Runtime data is created by the workflow and is not included in the source ZIP.",
+  "files": {
+    "market_bars_5m.jsonl": {
+      "archive_path": "bootstrap/research_history_seed/2026-10-16/market_bars_5m.jsonl.before_2026-10-16.jsonl.gz",
+      "source_bytes": 89625514,
+      "source_rows": 141478,
+      "source_sha256": "e38eb4169cef1341104cdf99e026f321424a079defd9dc1b7ca1d73cc83c653e",
+      "compressed_bytes": 11516926,
+      "verification": "sha256_and_byte_count_match"
+    },
+    "research_outcomes.jsonl": {
+      "archive_path": "bootstrap/research_history_seed/2026-10-16/research_outcomes.jsonl.before_2026-10-16.jsonl.gz",
+      "source_bytes": 86455674,
+      "source_rows": 26667,
+      "source_sha256": "66e0e3e851d090b939b2b1193c4f8a0d8ef2e42b76e7f27f423075c741fe01e3",
+      "compressed_bytes": 7006991,
+      "verification": "sha256_and_byte_count_match"
+    }
+  },
+  "outcome_history_restore": {
+    "target": "data/research_outcomes.jsonl",
+    "prior_rows": 26667,
+    "current_rows_before_merge": 104,
+    "overlap_observation_ids": 0,
+    "merged_rows": 26771,
+    "merged_unique_observation_ids": 26771,
+    "merged_bytes": 86729921,
+    "below_size_guard_bytes": 90000000,
+    "method": "exact line concatenation; original row bytes preserved; no runtime/trade state merged",
+    "note": "Recorded result from the historical seed-generation test only; actual live target row count must be read from restore_research_history_seed.py output."
+  }
+}
