@@ -200,7 +200,7 @@ def test_retention_archive_generation_names_never_overwrite(monkeypatch, tmp_pat
 def test_workflow_persists_cumulative_archives_across_clean_runners():
     workflow = Path(".github/workflows/event-engine.yml").read_text(encoding="utf-8")
     assert "actions: read" in workflow
-    assert "Restore cumulative retention archive from previous successful runs" in workflow
+    assert "Restore cumulative retention archive from previous runs" in workflow
     assert 'repos/${GITHUB_REPOSITORY}/actions/artifacts?name=zone-engine-retention-archive&per_page=100' in workflow
     assert 'gh run download "$run_id" --name zone-engine-retention-archive' in workflow
     assert 'gh run download --name zone-engine-retention-archive' not in workflow
