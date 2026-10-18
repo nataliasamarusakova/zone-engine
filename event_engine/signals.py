@@ -823,24 +823,40 @@ def generate_zone_signals(
     # Keep ALMA columns available for diagnostics/backward-compatible analytics,
     # but they are deliberately NOT an entry condition in this version.
     df = _attach_exact_alternate_series(df, mode=mode)
+
+    # Columns are immutable during the zone walk. Cache their values once rather
+    # than doing tens of thousands of DataFrame.loc scalar lookups. Both
+    # normalization helpers reset to a RangeIndex, so array index i is the same
+    # row as df.loc[i, ...]. Entry comparisons and formulas remain unchanged.
+    timestamps = df["timestamp"].array
+    opens = df["open"].to_numpy(dtype=float, copy=False)
+    highs = df["high"].to_numpy(dtype=float, copy=False)
+    lows = df["low"].to_numpy(dtype=float, copy=False)
+    closes = df["close"].to_numpy(dtype=float, copy=False)
+    volumes = df["volume"].to_numpy(dtype=float, copy=False)
+    atr50_values = df["atr50"].to_numpy(dtype=float, copy=False)
+    vol_sma20_values = df["vol_sma20"].to_numpy(dtype=float, copy=False)
+    body_atr_values = df["body_atr"].to_numpy(dtype=float, copy=False)
+    range_atr_values = df["range_atr"].to_numpy(dtype=float, copy=False)
+
     active_supply: list[dict[str, Any]] = []
     active_demand: list[dict[str, Any]] = []
     signals: list[dict[str, Any]] = []
 
     for i in range(SWING_LEN * 2, len(df)):
         p = i - SWING_LEN
-        h = float(df.loc[p, "high"])
-        l = float(df.loc[p, "low"])
-        atr_raw = float(df.loc[i, "atr50"])
+        h = float(highs[p])
+        l = float(lows[p])
+        atr_raw = float(atr50_values[i])
         atr_valid = math.isfinite(atr_raw) and atr_raw > 0
         atr = atr_raw if atr_valid else 0.0
-        origin_ts_ms = int(pd.Timestamp(df.loc[p, "timestamp"]).timestamp() * 1000)
+        origin_ts_ms = int(pd.Timestamp(timestamps[p]).timestamp() * 1000)
 
-        is_ph = all(h >= float(df.loc[p-k, "high"]) for k in range(1, SWING_LEN+1)) and all(
-            h >= float(df.loc[p+k, "high"]) for k in range(1, SWING_LEN+1)
+        is_ph = all(h >= float(highs[p-k]) for k in range(1, SWING_LEN+1)) and all(
+            h >= float(highs[p+k]) for k in range(1, SWING_LEN+1)
         )
-        is_pl = all(l <= float(df.loc[p-k, "low"]) for k in range(1, SWING_LEN+1)) and all(
-            l <= float(df.loc[p+k, "low"]) for k in range(1, SWING_LEN+1)
+        is_pl = all(l <= float(lows[p-k]) for k in range(1, SWING_LEN+1)) and all(
+            l <= float(lows[p+k]) for k in range(1, SWING_LEN+1)
         )
         if is_ph and atr_valid:
             zone = _build_zone(h, 1, atr, p, origin_ts_ms=origin_ts_ms, symbol=symbol or "")
@@ -853,10 +869,10 @@ def generate_zone_signals(
                 active_demand.insert(0, zone)
                 del active_demand[ZONE_HISTORY:]
 
-        close = float(df.loc[i, "close"])
+        close = float(closes[i])
         active_supply = [z for z in active_supply if close < float(z["top"])]
         active_demand = [z for z in active_demand if close > float(z["btm"])]
-        cur_l, cur_h, cur_c, cur_o = map(float, [df.loc[i, "low"], df.loc[i, "high"], df.loc[i, "close"], df.loc[i, "open"]])
+        cur_l, cur_h, cur_c, cur_o = float(lows[i]), float(highs[i]), float(closes[i]), float(opens[i])
 
         demand_zone = _find_directional_zone("LONG", cur_l, cur_h, cur_c, active_demand, active_supply) if atr_valid else None
         supply_zone = _find_directional_zone("SHORT", cur_l, cur_h, cur_c, active_demand, active_supply) if atr_valid else None
@@ -872,8 +888,8 @@ def generate_zone_signals(
         # level of the selected zone, while the previous candle must not have
         # touched that midpoint. This creates one deterministic event per touch.
         midpoint = (float(trade_zone["top"]) + float(trade_zone["btm"])) / 2.0
-        prev_l = float(df.loc[i - 1, "low"])
-        prev_h = float(df.loc[i - 1, "high"])
+        prev_l = float(lows[i - 1])
+        prev_h = float(highs[i - 1])
         prev_midpoint_touch = prev_l <= midpoint <= prev_h
         current_midpoint_touch = cur_l <= midpoint <= cur_h
         if not current_midpoint_touch or prev_midpoint_touch:
@@ -920,9 +936,9 @@ def generate_zone_signals(
         tp2 = float(targets["tp2"])
         tp1_rr = float(targets["tp1_rr"])
         tp2_rr = float(targets["tp2_rr"])
-        avg_vol = _safe_num(df.loc[i, "vol_sma20"], 0.0)
-        vol_ratio = (_safe_num(df.loc[i, "volume"]) / avg_vol) if avg_vol > 0 else None
-        event_ts = int(df.loc[i, "timestamp"].timestamp() * 1000)
+        avg_vol = _safe_num(vol_sma20_values[i], 0.0)
+        vol_ratio = (_safe_num(volumes[i]) / avg_vol) if avg_vol > 0 else None
+        event_ts = int(timestamps[i].timestamp() * 1000)
         zone_origin_ts_ms = int(trade_zone.get("origin_ts_ms", -1) or -1)
         event_id = _make_event_id(symbol or "UNKNOWN", direction, event_ts, zone_origin_ts_ms, cur_c)
         zone_ctx = {
@@ -931,20 +947,20 @@ def generate_zone_signals(
             "kind": "DEMAND" if direction == "LONG" else "SUPPLY",
         }
         entry_bar = {
-            "timestamp": df.loc[i, "timestamp"].isoformat(),
+            "timestamp": timestamps[i].isoformat(),
             "open": round(cur_o, 12),
             "high": round(cur_h, 12),
             "low": round(cur_l, 12),
             "close": round(cur_c, 12),
-            "volume": round(_safe_num(df.loc[i, "volume"]), 12),
+            "volume": round(_safe_num(volumes[i]), 12),
         }
         previous_bar = {
-            "timestamp": df.loc[i - 1, "timestamp"].isoformat(),
-            "open": round(_safe_num(df.loc[i - 1, "open"]), 12),
+            "timestamp": timestamps[i - 1].isoformat(),
+            "open": round(_safe_num(opens[i - 1]), 12),
             "high": round(prev_h, 12),
             "low": round(prev_l, 12),
-            "close": round(_safe_num(df.loc[i - 1, "close"]), 12),
-            "volume": round(_safe_num(df.loc[i - 1, "volume"]), 12),
+            "close": round(_safe_num(closes[i - 1]), 12),
+            "volume": round(_safe_num(volumes[i - 1]), 12),
         }
         zone_midpoint = (zone_top + zone_bottom) / 2.0
         zone_width_abs = max(0.0, zone_top - zone_bottom)
@@ -952,7 +968,7 @@ def generate_zone_signals(
             {
                 "event_id": event_id,
                 "idx": i,
-                "time": df.loc[i, "timestamp"].isoformat(),
+                "time": timestamps[i].isoformat(),
                 "type": direction,
                 "symbol": symbol.upper(),
                 "entry": cur_c,
@@ -1006,8 +1022,8 @@ def generate_zone_signals(
                     "zone_touch": True,
                     "midpoint_touch": True,
                     "volume_ratio": round(vol_ratio, 3) if vol_ratio is not None else None,
-                    "candle_body_atr": round(_safe_num(df.loc[i, "body_atr"]), 3),
-                    "range_atr": round(_safe_num(df.loc[i, "range_atr"]), 3),
+                    "candle_body_atr": round(_safe_num(body_atr_values[i]), 3),
+                    "range_atr": round(_safe_num(range_atr_values[i]), 3),
                     "bullish_candle": cur_c >= cur_o,
                     "bearish_candle": cur_c <= cur_o,
                 },
