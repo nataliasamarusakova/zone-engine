@@ -22,7 +22,9 @@ data/retention_archive/<UTC_RUN>/snapshots_before/<file>.before.jsonl.gz
 
 When the command is run without `--archive-dir`, the implementation defaults to the external sibling directory `../zone-engine-data-archive`, keeping large recovery snapshots outside the repository working tree.
 
-The manifest records the original SHA-256, byte count, and row count. Therefore the exact pre-migration file can be restored even if a later analyst needs the full historical chain.
+In GitHub Actions, `data/retention_archive/` is ignored by Git and is uploaded as a cumulative `zone-engine-retention-archive` artifact after the size guard. The next run looks back through successful `event-engine.yml` runs and restores the most recent available archive before the engine can compact more data. The artifact is configured for 90-day retention; because each uploaded archive contains previous generations too, successful workflow cycles refresh the cumulative copy. If no prior artifact is available, the workflow warns explicitly. This mechanism must still be verified on the first real Actions run after deployment; local tests cannot prove GitHub's artifact round trip.
+
+The manifest records the original SHA-256, byte count, and row count. Therefore the exact pre-migration file can be restored while its archive remains available.
 
 Pruned rows are also written to a smaller `*.pruned.jsonl.gz` delta archive for convenience.
 
@@ -151,9 +153,9 @@ The engine uses a **split runtime-data policy**. Persistent engine/reconciliatio
 - `data/retention_archive/`;
 - Python caches, locks and temporary files via the repository-wide ignore rules.
 
-The persistent `data/` state remains subject to the 90 MB pre-commit guard. Retention creates byte-faithful external snapshots under `data/retention_archive/` before compaction, and that archive is deliberately **not committed**.
+The persistent `data/` state remains subject to the 90 MB pre-commit guard. Retention creates byte-faithful snapshots and pruned deltas under `data/retention_archive/` before compaction, and that archive is deliberately **not committed**; the workflow carries it between clean runners with the cumulative Actions artifact described in section 1.
 
-This policy is required for the GitHub Actions workflow: every run starts from a fresh runner, so persistent state must survive through the repository between runs. A clean source release still contains no runtime `data/`; the directory is created on the first run.
+This policy is required for the GitHub Actions workflow: every run starts from a fresh runner, so persistent engine state survives through Git while full historical retention archives survive through the cumulative artifact. A clean source release still contains no runtime `data/`; the directory is created on the first run.
 
 Verify the policy before pushing:
 

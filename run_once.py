@@ -785,6 +785,33 @@ def _save_zone_visit_state(state: dict[str, Any]) -> None:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
+def _clear_stale_pending_zone_visit(zone_state: dict[str, Any], signal: dict[str, Any]) -> bool:
+    """Release only the zone visit that owns a stale 5m event rejected pre-order."""
+    symbol = str(signal.get("symbol", "")).upper()
+    event_id = str(signal.get("event_id", ""))
+    if not symbol or not event_id:
+        return False
+    symbols = zone_state.get("symbols") if isinstance(zone_state, dict) else None
+    symbol_state = symbols.get(symbol) if isinstance(symbols, dict) else None
+    zones = symbol_state.get("zones") if isinstance(symbol_state, dict) else None
+    if not isinstance(zones, dict):
+        return False
+    for visit in zones.values():
+        if not isinstance(visit, dict):
+            continue
+        pending = visit.get("pending_signal")
+        if not isinstance(pending, dict) or str(pending.get("event_id", "")) != event_id:
+            continue
+        visit.update({
+            "state": "ARMED",
+            "pending_signal": None,
+            "trigger_event_id": None,
+            "lock_reason": "stale_5m_trigger_rejected_before_order",
+        })
+        return True
+    return False
+
+
 def _make_5m_event_id(symbol: str, direction: str, trigger_ts_ms: int, zone: dict[str, Any]) -> str:
     zone_id = str(zone.get("zone_id", "")).strip()
     if zone_id:
@@ -2600,6 +2627,22 @@ def _elapsed_minutes(start_ts: Any, end_ts: Any) -> float | None:
     return sec / 60.0 if sec is not None else None
 
 
+def _five_m_trigger_age_minutes(signal: dict[str, Any], now_ts: Any = None) -> tuple[float | None, str | None]:
+    """Return age using the same trigger timestamp semantics as execution gates."""
+    if str(signal.get("trigger_timeframe", "1h")).lower() != "5m":
+        return None, None
+    try:
+        trigger_ts = _coerce_utc_timestamp(signal.get("trigger_bar_time") or signal.get("time"))
+        if trigger_ts is None:
+            return None, "invalid_5m_trigger_time"
+        now = _coerce_utc_timestamp(now_ts) if now_ts is not None else pd.Timestamp.now(tz="UTC")
+        if now is None:
+            return None, "invalid_execution_clock"
+        return max(0.0, (now - trigger_ts).total_seconds() / 60.0), None
+    except Exception:
+        return None, "invalid_5m_trigger_time"
+
+
 def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     symbol = str(signal["symbol"])
     direction = str(signal["type"]).upper()
@@ -2824,6 +2867,29 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
             "position": None,
         }
 
+    # The signal may have aged while preflight, quote validation and context
+    # collection were running. Recheck the 5m timestamp before announcing order
+    # submission; the same guard runs a second time immediately before MARKET POST.
+    trigger_age_min, trigger_age_error = _five_m_trigger_age_minutes(signal)
+    if trigger_age_error or (trigger_age_min is not None and trigger_age_min > MAX_5M_TRIGGER_AGE_MINUTES):
+        reject_reason = trigger_age_error or "5m_trigger_too_old"
+        details = {
+            "status": "skipped_stale_signal",
+            "reason": reject_reason,
+            "trigger_age_minutes": trigger_age_min,
+            "max_trigger_age_minutes": MAX_5M_TRIGGER_AGE_MINUTES,
+            "trigger_bar_time": signal.get("trigger_bar_time") or signal.get("time"),
+            "order_submitted": False,
+        }
+        _append_execution_ledger(event_id, signal.get("attempt_id"), "EXECUTION_REJECTED_TRIGGER_AGE", details)
+        log.warning("[EXEC_REJECT_5M_AGE_PRE_POST] %s %s | reason=%s age_min=%s allowed=%.2f", symbol, direction, reject_reason, f"{trigger_age_min:.3f}" if trigger_age_min is not None else "unknown", MAX_5M_TRIGGER_AGE_MINUTES)
+        return {
+            "status": "skipped_stale_signal", "error": reject_reason,
+            "stale_trigger_reason": reject_reason, "stale_trigger_age_minutes": trigger_age_min,
+            "symbol": symbol, "direction": direction, "order_submitted": False,
+        }
+    signal["execution_age_minutes_at_order_ready"] = trigger_age_min
+
     setup = _build_setup(signal)
     # ``order_submit_ts`` is reserved for an actual MARKET POST. Do not populate
     # it with the function-call start time because rejected/stale attempts did not
@@ -2851,7 +2917,43 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         quote_unknown_age_policy=execution_quote.get("quote_unknown_age_policy"),
         execution_reference_quality=execution_quote.get("execution_reference_quality"),
     )
-    order = open_market(symbol, direction, entry_price, event_id, execution_quote=execution_quote, attempt_id=signal.get("attempt_id"))
+    # Final freshness check: no network call, sleep or other work may occur
+    # between this check and open_market's MARKET POST. If the order-aged signal
+    # crossed its configured boundary during local telemetry writes, reject it.
+    trigger_age_min, trigger_age_error = _five_m_trigger_age_minutes(signal)
+    if trigger_age_error or (trigger_age_min is not None and trigger_age_min > MAX_5M_TRIGGER_AGE_MINUTES):
+        reject_reason = trigger_age_error or "5m_trigger_too_old"
+        details = {
+            "status": "skipped_stale_signal", "reason": reject_reason,
+            "trigger_age_minutes": trigger_age_min,
+            "max_trigger_age_minutes": MAX_5M_TRIGGER_AGE_MINUTES,
+            "trigger_bar_time": signal.get("trigger_bar_time") or signal.get("time"),
+            "order_submitted": False,
+        }
+        telemetry.record_order_event(
+            event_id=event_id, attempt_id=signal.get("attempt_id"), order_id=None,
+            symbol=symbol, direction=direction, leg="ENTRY", status="REJECTED",
+            order_type="MARKET", reduce_only=False, error=reject_reason,
+        )
+        _append_execution_ledger(event_id, signal.get("attempt_id"), "ORDER_NOT_SUBMITTED_TRIGGER_STALE", details)
+        log.warning("[EXEC_REJECT_5M_AGE_FINAL] %s %s | reason=%s age_min=%s allowed=%.2f", symbol, direction, reject_reason, f"{trigger_age_min:.3f}" if trigger_age_min is not None else "unknown", MAX_5M_TRIGGER_AGE_MINUTES)
+        return {
+            "status": "skipped_stale_signal", "error": reject_reason,
+            "stale_trigger_reason": reject_reason, "stale_trigger_age_minutes": trigger_age_min,
+            "symbol": symbol, "direction": direction, "order_submitted": False,
+        }
+    signal["execution_age_minutes_at_order_submit"] = trigger_age_min
+    trigger_bar_time_ms = None
+    if str(signal.get("trigger_timeframe", "1h")).lower() == "5m":
+        trigger_ts = _coerce_utc_timestamp(signal.get("trigger_bar_time") or signal.get("time"))
+        trigger_bar_time_ms = int(trigger_ts.timestamp() * 1000) if trigger_ts is not None else None
+    order = open_market(
+        symbol, direction, entry_price, event_id,
+        execution_quote=execution_quote,
+        attempt_id=signal.get("attempt_id"),
+        trigger_bar_time_ms=trigger_bar_time_ms,
+        max_trigger_age_minutes=MAX_5M_TRIGGER_AGE_MINUTES if str(signal.get("trigger_timeframe", "1h")).lower() == "5m" else None,
+    )
     order_status = str(order.get("status", "")).lower() if isinstance(order, dict) else ""
     response = order.get("response") if isinstance(order, dict) and isinstance(order.get("response"), dict) else {}
     telemetry.record_order_event(
@@ -2877,6 +2979,30 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
             signal["order_submit_ts"] = pd.to_datetime(int(exact_order_submit_ms), unit="ms", utc=True).isoformat()
     except (TypeError, ValueError, OverflowError):
         log.warning("[EXEC_LEDGER] invalid order_submit_at_ms for %s: %r", event_id, exact_order_submit_ms)
+    if order.get("status") == "skipped_stale_signal" and isinstance(order, dict):
+        order_error = str(order.get("error") or "")
+        if "5m_trigger_too_old_at_post" in order_error or "invalid_5m_trigger_time_at_post" in order_error:
+            stale_reason = "invalid_5m_trigger_time" if "invalid_5m_trigger_time_at_post" in order_error else "5m_trigger_too_old"
+            stale_age = order.get("trigger_age_minutes")
+            details = {
+                "status": "skipped_stale_signal",
+                "reason": stale_reason,
+                "trigger_age_minutes": stale_age,
+                "max_trigger_age_minutes": order.get("max_trigger_age_minutes", MAX_5M_TRIGGER_AGE_MINUTES),
+                "trigger_bar_time": signal.get("trigger_bar_time") or signal.get("time"),
+                "order_submitted": False,
+                "rejected_inside_market_submitter": True,
+            }
+            _append_execution_ledger(event_id, signal.get("attempt_id"), "ORDER_NOT_SUBMITTED_TRIGGER_STALE", details)
+            return {
+                "status": "skipped_stale_signal",
+                "error": order_error,
+                "stale_trigger_reason": stale_reason,
+                "stale_trigger_age_minutes": stale_age,
+                "order_submitted": False,
+                "order": order,
+            }
+
     if order.get("status") == "skipped_min_qty":
         _append_execution_ledger(event_id, signal.get("attempt_id"), "ORDER_REJECTED", {"status": order.get("status"), "error": order.get("error")})
         telemetry.record_exchange_error(
@@ -4177,11 +4303,17 @@ def main() -> None:
             except Exception:
                 log.warning("[EXEC_REJECT_TRIGGER_TIME] %s %s | invalid 5m trigger time=%s", _display_symbol(signal.get("symbol")), signal.get("type"), signal.get("trigger_bar_time"))
                 _exec_gate("invalid_5m_trigger_time", signal)
+                if _clear_stale_pending_zone_visit(zone_visit_state, signal):
+                    _save_zone_visit_state(zone_visit_state)
                 continue
             signal["execution_age_minutes"] = age_min
             if age_min > MAX_5M_TRIGGER_AGE_MINUTES:
                 log.info("[EXEC_REJECT_5M_AGE] %s %s | age_min=%.2f allowed=%.2f", _display_symbol(signal["symbol"]), signal["type"], age_min, MAX_5M_TRIGGER_AGE_MINUTES)
                 _exec_gate("5m_trigger_too_old", signal)
+                # A trigger that expired after scanning must not leave its zone
+                # locked with an un-retryable pending_signal.
+                if _clear_stale_pending_zone_visit(zone_visit_state, signal):
+                    _save_zone_visit_state(zone_visit_state)
                 continue
         else:
             latest_closed_idx = latest_index_by_symbol.get(symbol_key)
@@ -4349,6 +4481,9 @@ def main() -> None:
         execution["execution_wall_clock_seconds"] = max(0.0, (execution_finish_ts - execution_call_start_ts).total_seconds())
         execution["trigger_to_execution_finish_minutes"] = _elapsed_minutes(signal.get("trigger_bar_time") or signal.get("time"), execution_finish_ts.isoformat())
         execution_status = str(execution.get("status", ""))
+        if execution.get("stale_trigger_reason") in {"5m_trigger_too_old", "invalid_5m_trigger_time"}:
+            if _clear_stale_pending_zone_visit(zone_visit_state, signal):
+                _save_zone_visit_state(zone_visit_state)
         _append_execution_ledger(event_id, attempt_id, "EXECUTION_RESULT", {
             "status": execution_status,
             "error": execution.get("error"),

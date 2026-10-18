@@ -3944,9 +3944,10 @@ def test_data_retention_preserves_production_state_and_prunes_only_research_hist
     assert json.loads((data_dir / "zone_visit_state.json").read_text()) == zone_state
     assert json.loads((data_dir / "research_bar_cursors.json").read_text()) == cursors
     assert json.loads((data_dir / "research_outcome_state.json").read_text()) == outcome_state
-    assert (tmp_path / "archive" / "20260923T130000Z" / "market_bars_5m.jsonl.pruned.jsonl.gz").exists()
-    assert (tmp_path / "archive" / "20260923T130000Z" / "zone_observations.jsonl.pruned.jsonl.gz").exists()
-    assert not (tmp_path / "archive" / "20260923T130000Z" / "market_bars_1h.jsonl.pruned.jsonl.gz").exists()
+    archive_root = next((tmp_path / "archive").iterdir())
+    assert list(archive_root.rglob("market_bars_5m.jsonl.pruned.jsonl.gz"))
+    assert list(archive_root.rglob("zone_observations.jsonl.pruned.jsonl.gz"))
+    assert not list(archive_root.rglob("market_bars_1h.jsonl.pruned.jsonl.gz"))
 
 
 def test_data_retention_refuses_stale_market_bar_history(tmp_path, monkeypatch):

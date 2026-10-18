@@ -36,6 +36,11 @@ def test_workflow_runs_size_guard_before_commit():
     assert "git status --ignored --porcelain -- data" in text
     assert 'EXECUTION_REQUIRE_EXCHANGE_TIMESTAMP: "true"' in text
     assert 'EXECUTION_UNKNOWN_QUOTE_AGE_POLICY: "block"' in text
+    assert "Restore cumulative retention archive from previous successful runs" in text
+    assert "Upload cumulative retention archive for next clean runner" in text
+    assert 'gh run list --repo "$GITHUB_REPOSITORY" --workflow event-engine.yml --status success' in text
+    assert 'gh run download "$run_id" --name zone-engine-retention-archive' in text
+    assert "retention-days: 90" in text
 
 
 def test_size_guard_constants_have_headroom():
