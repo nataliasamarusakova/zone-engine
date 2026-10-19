@@ -394,7 +394,57 @@ def _size_guard_plan(path: Path, *, now: datetime, pending_ids: set[str], pendin
             cutoff = now - timedelta(hours=h)
             return ts >= cutoff
 
-        return [(f"keep_newer_than_{h}h_archiving_older_bars", lambda row, h=h: keep_5m(row, h)) for h in hours]
+        policies: list[tuple[str, Callable[[dict[str, Any]], bool]]] = [
+            (f"keep_newer_than_{h}h_archiving_older_bars", lambda row, h=h: keep_5m(row, h))
+            for h in hours
+        ]
+
+        # Last-resort, lossless fallback for runtime journals whose timestamps
+        # cannot be parsed or whose recent/future-dated rows alone exceed the
+        # GitHub size guard. Earlier passes preserve unknown timestamps on
+        # purpose; if that conservative policy cannot get below the limit, keep
+        # the newest parseable rows from the most recent hour up to a bounded
+        # byte budget and archive every other row. `_compact_jsonl` writes the
+        # removed rows to immutable gzip deltas, and workflow commit is still
+        # blocked until that cumulative archive is uploaded and verified.
+        #
+        # Use signatures as a multiset rather than a set so identical duplicate
+        # rows are counted correctly. The selected rows are sorted by timestamp
+        # only for budget selection; working-file order remains unchanged.
+        fallback_budget_bytes = max(1, min(
+            GITHUB_SIZE_TARGET_BYTES - 1,
+            int(GITHUB_SIZE_TARGET_BYTES * 0.90),
+        ))
+        fallback_candidates: list[tuple[datetime, int, int, str]] = []
+        for line_no, row in _iter_jsonl(path):
+            ts = _parse_ts(row.get("timestamp"))
+            if ts is None or ts < now - timedelta(hours=1) or ts > now + timedelta(minutes=5):
+                continue
+            encoded = (json.dumps(row, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n").encode("utf-8")
+            signature = hashlib.sha256(encoded).hexdigest()
+            fallback_candidates.append((ts, line_no, len(encoded), signature))
+        fallback_candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        selected_signatures: Counter[str] = Counter()
+        selected_bytes = 0
+        for _ts, _line_no, row_bytes, signature in fallback_candidates:
+            if selected_bytes + row_bytes > fallback_budget_bytes:
+                continue
+            selected_signatures[signature] += 1
+            selected_bytes += row_bytes
+
+        fallback_seen: Counter[str] = Counter()
+
+        def keep_recent_5m_within_budget(row: dict[str, Any]) -> bool:
+            encoded = (json.dumps(row, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n").encode("utf-8")
+            signature = hashlib.sha256(encoded).hexdigest()
+            fallback_seen[signature] += 1
+            return fallback_seen[signature] <= selected_signatures.get(signature, 0)
+
+        policies.append((
+            "keep_newest_valid_5m_rows_within_size_budget_archiving_unknown_or_excess_rows",
+            keep_recent_5m_within_budget,
+        ))
+        return policies
     if name == "market_bars_1h.jsonl":
         hours = [168, 72, 48, 24, 12]
         return [
@@ -526,9 +576,15 @@ def _apply_size_guard_to_file(path: Path, *, now: datetime, archive_root: Path, 
                     break
 
     if current["bytes"] >= GITHUB_SIZE_GUARD_BYTES:
+        attempted = ", ".join(
+            f"{item.get('policy', 'unknown')}={item.get('bytes_after', '?')}B"
+            for item in applied
+        ) or "no compaction policy applied"
         raise RuntimeError(
-            f"size guard could not reduce {rel} below {GITHUB_SIZE_GUARD_BYTES} bytes; "
-            "refusing to risk audit-critical deletion. No commit should be created."
+            f"size guard could not reduce {rel} below {GITHUB_SIZE_GUARD_BYTES} bytes "
+            f"(remaining={current['bytes']} bytes; target={GITHUB_SIZE_TARGET_BYTES}; "
+            f"policies=[{attempted}]); refusing to risk unarchived data loss. "
+            "No commit should be created."
         )
     return {
         "path": str(rel),
