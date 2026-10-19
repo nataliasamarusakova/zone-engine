@@ -348,6 +348,79 @@ def test_forward_outcome_marks_incomplete_5m_path_as_censored():
     assert out["forward_path_complete_24h"] is False
 
 
+def test_forward_outcome_does_not_mark_empty_24h_window_complete_when_later_bars_exist():
+    import research_forward
+
+    obs_ts = pd.Timestamp("2026-01-01T00:00:00Z")
+    later_times = pd.date_range("2026-01-02T01:00:00Z", periods=2, freq="5min")
+    bars = pd.DataFrame({
+        "timestamp": later_times,
+        "close_time": later_times + pd.Timedelta(minutes=5),
+        "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0,
+    })
+    observation = {
+        "observation_id": "O_EMPTY_24H", "event_id": "E_EMPTY_24H",
+        "symbol": "TEST-USDT", "direction": "LONG", "event_type": "SIGNAL_CREATED",
+        "observation_ts": obs_ts.isoformat(), "reference_price": 100.0,
+    }
+
+    outcome = research_forward.calculate_forward_outcome(observation, bars)
+    assert outcome is not None
+    assert outcome["forward_return_1440m_pct"] is None
+    assert outcome["forward_gap_count_24h"] > 0
+    assert outcome["forward_path_complete_24h"] is False
+    assert research_forward._calculate_forward_outcome_indexed(
+        observation, research_forward._BarIndex(bars), require_complete_24h=True,
+    ) is None
+
+
+def test_batch_forward_maturity_gate_skips_counterfactual_only_for_incomplete_paths(monkeypatch):
+    import research_forward
+
+    calls = []
+    monkeypatch.setattr(
+        research_forward.shadow,
+        "calculate_counterfactual_outcomes",
+        lambda observation, bars, **kwargs: calls.append(observation["observation_id"]) or {"status": "ok"},
+    )
+    observation = {
+        "observation_id": "O_MATURITY", "symbol": "TEST-USDT", "direction": "LONG",
+        "event_type": "SIGNAL_CREATED", "observation_ts": "2026-01-01T00:00:00Z",
+        "reference_price": 100.0,
+    }
+    short_times = pd.date_range("2026-01-01T00:05:00Z", periods=3, freq="5min")
+    short_bars = pd.DataFrame({
+        "timestamp": short_times, "close_time": short_times + pd.Timedelta(minutes=5),
+        "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0,
+    })
+    index = research_forward._BarIndex(short_bars)
+
+    # The public function keeps returning its partial/censored research result.
+    partial = research_forward._calculate_forward_outcome_indexed(observation, index)
+    assert partial is not None
+    assert partial["forward_path_complete_24h"] is False
+    assert calls == ["O_MATURITY"]
+
+    # The production batch caller discards this row as pending, so it skips the
+    # expensive counterfactual calculation without changing persisted outcomes.
+    assert research_forward._calculate_forward_outcome_indexed(
+        observation, index, require_complete_24h=True,
+    ) is None
+    assert calls == ["O_MATURITY"]
+
+    full_times = pd.date_range("2026-01-01T00:05:00Z", periods=289, freq="5min")
+    full_bars = pd.DataFrame({
+        "timestamp": full_times, "close_time": full_times + pd.Timedelta(minutes=5),
+        "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0,
+    })
+    full_index = research_forward._BarIndex(full_bars)
+    ordinary = research_forward._calculate_forward_outcome_indexed(observation, full_index)
+    strict = research_forward._calculate_forward_outcome_indexed(
+        observation, full_index, require_complete_24h=True,
+    )
+    assert ordinary == strict
+
+
 def test_touch_event_structural_distance_is_converted_to_R(monkeypatch):
     zone = {"zone_id": "ZID_STRUCT", "top": 105.0, "btm": 95.0, "poi": 100.0, "origin_ts_ms": 1767225600000}
     event = {
