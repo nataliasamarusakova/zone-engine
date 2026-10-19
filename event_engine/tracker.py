@@ -53,6 +53,56 @@ TRADES_PATH = DATA / "trades.jsonl"
 ACTIONS_PATH = DATA / "actions.jsonl"
 DEFAULT_PLANNED_WEIGHTED_RR = 0.45
 
+
+def _timed_tracker_call(
+    timings: dict[str, dict[str, float]],
+    name: str,
+    function,
+    *args,
+    **kwargs,
+):
+    """Measure one tracker operation without changing its return/error behavior."""
+    started = time.perf_counter()
+    try:
+        return function(*args, **kwargs)
+    finally:
+        elapsed = max(0.0, time.perf_counter() - started)
+        bucket = timings.setdefault(name, {"calls": 0.0, "seconds": 0.0, "max_seconds": 0.0})
+        bucket["calls"] += 1
+        bucket["seconds"] += elapsed
+        bucket["max_seconds"] = max(bucket["max_seconds"], elapsed)
+
+
+def _log_tracker_timings(timings: dict[str, dict[str, float]], total_seconds: float, active_trades: int) -> None:
+    """Emit one compact diagnostic line; these measurements never gate trading."""
+    pieces = [
+        f"total_s={max(0.0, total_seconds):.3f}",
+        f"active_trades={max(0, int(active_trades))}",
+    ]
+    for name in (
+        "kline_1m",
+        "tp_order_evidence",
+        "tp_position_recheck",
+        "final_position_recheck",
+        "be_retry",
+        "be_after_tp1",
+        "exit_sl_order",
+        "historical_exit_lookup",
+        "close_fill_accounting",
+        "exit_order_evidence",
+        "active_state_save",
+    ):
+        item = timings.get(name)
+        if not item:
+            continue
+        pieces.extend((
+            f"{name}_calls={int(item['calls'])}",
+            f"{name}_s={item['seconds']:.3f}",
+            f"{name}_max_s={item['max_seconds']:.3f}",
+        ))
+    log.info("[TRACKER_PERF_DETAIL] %s", " ".join(pieces))
+
+
 _ACTIVE_TRADES_THREAD_LOCK = threading.RLock()
 
 
@@ -2523,6 +2573,8 @@ def _reconciliation_status(local_qty: float, exchange_qty: float, base_status: s
 
 
 def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None:
+    tracker_perf_started = time.perf_counter()
+    tracker_timings: dict[str, dict[str, float]] = {}
     # Reconciliation is a live-state operation. Once the engine has reached this
     # stage, missing state must fail closed rather than be interpreted as an empty
     # portfolio. Fresh-start bootstrap happens only in the top-level run preflight.
@@ -2618,7 +2670,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
 
             cur_price = entry_price
             try:
-                k1m = fetch_klines(symbol, "1m", limit=60)
+                k1m = _timed_tracker_call(tracker_timings, "kline_1m", fetch_klines, symbol, "1m", limit=60)
                 if k1m:
                     cur_price = _safe_float(k1m[-1].get("close"), entry_price)
                     _update_mfe_mae(trade, k1m)
@@ -2640,7 +2692,11 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                 old_sl = trade.get("sl_order", {}) if isinstance(trade.get("sl_order"), dict) else {}
                 old_sl_id = old_sl.get("order_id")
                 old_sl_price = _safe_float(old_sl.get("stop_price"), 0.0) or None
-                retry = _move_sl_to_break_even(symbol, direction, entry_price, rem_qty, old_sl_id, str(event_id).replace("EVT_", ""), old_sl_price=old_sl_price)
+                retry = _timed_tracker_call(
+                    tracker_timings, "be_retry", _move_sl_to_break_even,
+                    symbol, direction, entry_price, rem_qty, old_sl_id,
+                    str(event_id).replace("EVT_", ""), old_sl_price=old_sl_price,
+                )
                 if retry.get("status") == "created":
                     trade["sl_order"] = retry
                     trade["be_activated"] = True
@@ -2659,7 +2715,10 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                     continue
 
                 try:
-                    order_info = _get_order_execution_evidence(symbol, str(order_id), entry_ts=entry_ts)
+                    order_info = _timed_tracker_call(
+                        tracker_timings, "tp_order_evidence", _get_order_execution_evidence,
+                        symbol, str(order_id), entry_ts=entry_ts,
+                    )
                 except Exception as exc:
                     telemetry.record_exchange_error(
                         event_id=event_id,
@@ -2727,7 +2786,9 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                 # Do not subtract the TP delta from it again: the exchange position may already
                 # reflect the fill. Reconcile the live quantity after observing the TP execution.
                 try:
-                    tp_pos = get_position_directional(symbol, direction)
+                    tp_pos = _timed_tracker_call(
+                        tracker_timings, "tp_position_recheck", get_position_directional, symbol, direction,
+                    )
                 except Exception as tp_pos_exc:
                     tp_pos = {"status": "error", "error": str(tp_pos_exc)}
                     telemetry.record_exchange_error(
@@ -2847,7 +2908,8 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                         old_sl = trade.get("sl_order", {}) if isinstance(trade.get("sl_order"), dict) else {}
                         old_sl_id = old_sl.get("order_id")
                         old_sl_price = _safe_float(old_sl.get("stop_price"), 0.0) or None
-                        new_sl = _move_sl_to_break_even(
+                        new_sl = _timed_tracker_call(
+                            tracker_timings, "be_after_tp1", _move_sl_to_break_even,
                             symbol=symbol,
                             direction=direction,
                             entry_price=entry_price,
@@ -2945,7 +3007,9 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
             # the final exchange lookup says the position has disappeared. It is
             # required to reconstruct the PnL of the residual close.
             residual_qty_before_position_disappeared = max(0.0, rem_qty)
-            final_pos = get_position_directional(symbol, direction)
+            final_pos = _timed_tracker_call(
+                tracker_timings, "final_position_recheck", get_position_directional, symbol, direction,
+            )
             final_pos_status = str(final_pos.get("status", "")).lower()
             if final_pos_status == "found":
                 rem_qty = abs(_safe_float(final_pos.get("positionAmt")))
@@ -3016,7 +3080,9 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
             sl_order = trade.get("sl_order", {}) if isinstance(trade.get("sl_order"), dict) else {}
             sl_order_id = sl_order.get("order_id")
 
-            sl_exit_price, _ = _get_exit_from_sl(symbol, sl_order_id)
+            sl_exit_price, _ = _timed_tracker_call(
+                tracker_timings, "exit_sl_order", _get_exit_from_sl, symbol, sl_order_id,
+            )
             historical_source = None
             historical_order = None
             if sl_exit_price is not None:
@@ -3025,7 +3091,8 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
             elif closed_by_tp:
                 exit_reason = "TAKE_PROFIT_FULL"
             elif position_gone:
-                hist_px, hist_reason, hist_source, historical_order = _reconcile_historical_exit_order(
+                hist_px, hist_reason, hist_source, historical_order = _timed_tracker_call(
+                    tracker_timings, "historical_exit_lookup", _reconcile_historical_exit_order,
                     symbol, direction, entry_ts, residual_qty_before_position_disappeared, trade.get("tp_orders", []), sl_order,
                     trade=trade,
                 )
@@ -3148,7 +3215,9 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
 
             # Reconcile actual exchange fills once more at close time.  This is
             # diagnostic/accounting I/O only; it does not affect live entry logic.
-            fill_accounting = _collect_trade_fill_accounting(trade, now_ms)
+            fill_accounting = _timed_tracker_call(
+                tracker_timings, "close_fill_accounting", _collect_trade_fill_accounting, trade, now_ms,
+            )
             trade["fill_accounting"] = fill_accounting
             close_execution_evidence = _close_execution_evidence(trade, fill_accounting)
             trade["close_execution_evidence"] = close_execution_evidence
@@ -3233,7 +3302,10 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
             # For BE/SL exits, retain exchange-confirmed trigger/fill telemetry
             # so the next audit can measure actual stop degradation rather than
             # infer it from PnL.
-            exit_order_info = _get_filled_order(symbol, sl_order_id) if sl_order_id else None
+            exit_order_info = (
+                _timed_tracker_call(tracker_timings, "exit_order_evidence", _get_filled_order, symbol, sl_order_id)
+                if sl_order_id else None
+            )
             if exit_order_info:
                 actual_exit_fill = _safe_float(exit_order_info.get("avg_price"), 0.0)
                 trigger_px = _safe_float(
@@ -3545,4 +3617,13 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
             log.exception("[TRACKER] Fatal trade error for event %s: %s", event_id, exc)
             updated_trades[event_id] = trade
 
-    _save_active_trades_after_reconciliation(original_trades, updated_trades)
+    try:
+        _timed_tracker_call(
+            tracker_timings, "active_state_save", _save_active_trades_after_reconciliation,
+            original_trades, updated_trades,
+        )
+    finally:
+        _log_tracker_timings(
+            tracker_timings, time.perf_counter() - tracker_perf_started,
+            sum(1 for trade in trades.values() if isinstance(trade, dict) and not trade.get("closed", False)),
+        )
