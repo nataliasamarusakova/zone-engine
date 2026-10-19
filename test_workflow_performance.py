@@ -63,3 +63,38 @@ def test_deferred_research_bar_prefetch_preserves_symbol_mapping(monkeypatch):
     assert id(payloads[3]) not in prefetch
     assert len(calls) == 2
     assert {call[0] for call in calls} == {"binance", "bingx"}
+
+
+def test_deferred_research_prefetch_uses_bounded_four_worker_pool(monkeypatch):
+    import threading
+    import time
+    import run_once
+
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    def fake_fetch(symbol, interval, *, limit, retryable):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            time.sleep(0.05)
+            return [{"symbol": symbol, "timestamp": 1}]
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(run_once, "fetch_binance_klines", fake_fetch)
+    payloads = [
+        {"symbol": f"S{i}-USDT", "provider": "binance", "persist_bars_for_forward": True, "bars_5m": []}
+        for i in range(8)
+    ]
+    result = run_once._prefetch_missing_research_5m_bars(
+        payloads, {}, limit=24, max_workers=8,
+    )
+
+    assert len(result) == len(payloads)
+    assert max_active == 4
+    assert max_active <= 4

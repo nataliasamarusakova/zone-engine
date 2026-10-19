@@ -2,7 +2,7 @@
 
 ## 0. Pre-commit 90 MB size guard
 
-Every GitHub Actions cycle runs the size guard **before `git add`/commit**. If any managed audit journal reaches 90,000,000 bytes, the guard snapshots the exact original bytes into `data/retention_archive/<UTC_RUN>/...`, then progressively archives older safe-to-prune rows until the working file is below 90 MB, targeting 80 MB. Pending observations, active trades, and trade/decision-linked records are protected.
+Every GitHub Actions cycle runs the size guard **before `git add`/commit**. If any managed audit journal reaches 90,000,000 bytes, the guard snapshots the exact original bytes into `data/retention_archive/<UTC_RUN>/...`, then progressively archives rows until the working file is below 90 MB, targeting 80 MB. Active trade/execution state and trade/decision-linked audit records remain protected. For 5m market bars, if ordinary age-based passes cannot reach the target (for example, because timestamps are unparseable or too many recent rows remain), a final byte-budget policy keeps only the newest valid recent bars that fit the budget and archives the rest. This is lossless archival, not deletion: `research_forward.py` reads the immutable `*.pruned*.jsonl.gz` deltas on subsequent runs. The archive must be durably uploaded and verified before a compacted journal can be committed.
 
 The workflow then stages `data/` and runs `python -m event_engine.data_retention --check-staged`. If **any staged file under `data/` is still >=90,000,000 bytes, the commit step is skipped and the workflow fails**. This prevents GitHub's 100 MB hard limit from being hit. GitHub enforces the 100 MB single-object limit in regular Git repositories. citeturn899502search1turn899502search5
 
@@ -54,7 +54,7 @@ These are the operational anchors needed to reconstruct the production lifecycle
 
 ### Market bars
 
-- `market_bars_5m.jsonl`: keep 36h, plus older per-symbol history required by unprocessed research observations.
+- `market_bars_5m.jsonl`: normally keep the recent 36h working window; the size guard may escalate to 24h, 12h, 6h, 3h, and 1h, then use a byte-budgeted recent subset if needed. Removed rows stay in immutable archive deltas and remain available to `research_forward.py`; pending-observation state itself is never rewritten.
 - `market_bars_1h.jsonl`: keep 168h.
 
 ### Zone observations
@@ -148,27 +148,22 @@ This does not delete the older records: they remain in the timestamped external 
 
 ## 7. Git policy for runtime data
 
-The engine uses a **split runtime-data policy**. Persistent engine/reconciliation state is intentionally tracked by Git so consecutive GitHub Actions VST cycles can restore state from the previous run. The unbounded or purely ephemeral artifacts stay ignored:
+Large, mutable runtime state is persisted in the self-verifying **`zone-engine-runtime-state` GitHub Actions artifact**, not by creating a new Git snapshot commit every five minutes. The artifact includes active-trade/execution state, research cursors and outcomes, the working JSONL journals, and the immutable research-history seed. Its manifest contains a SHA-256 and byte size for every bundled file. The workflow verifies the complete inventory before restoring it and refuses to run the engine if the newest state artifact is unavailable or invalid after migration.
 
-- `data/scan_history.jsonl` and its rotated variants;
-- `data/zone_engine_diagnostic.log`;
-- `data/retention_archive/`;
-- Python caches, locks and temporary files via the repository-wide ignore rules.
+The first run after deploying this workflow may still perform the existing slow checkout, because the current `main` tree still contains the legacy data blobs. That run uses the complete tracked state, performs the normal quality and retention gates, uploads and verifies the runtime-state artifact, and only then removes the legacy data files from the Git index. Subsequent checkouts no longer need to download those large blobs. The workflow retains only the two newest runtime-state artifacts after a successful upload.
 
-The persistent `data/` state remains subject to the 90 MB pre-commit guard. Retention creates byte-faithful snapshots and pruned deltas under `data/retention_archive/` before compaction, and that archive is deliberately **not committed**; the workflow carries it between clean runners with the cumulative Actions artifact described in section 1.
+`data/retention_archive/` remains managed by its separate cumulative retention-artifact chain. It is intentionally excluded from the runtime-state artifact and must still be restored, verified, and uploaded before compacted journals are considered safe. Ephemeral scan history, diagnostic logs, Python caches, locks, and temporary files are not included in the runtime-state artifact.
 
-This policy is required for the GitHub Actions workflow: every run starts from a fresh runner, so persistent engine state survives through Git while full historical retention archives survive through the cumulative artifact. A clean source release still contains no runtime `data/`; the directory is created on the first run.
+After migration, `git ls-files data/` should be empty for runtime journals, and `git ls-files bootstrap/research_history_seed/` should also be empty. Do not manually stage runtime `data/` or the research-history seed; the workflow owns their artifact lifecycle. If the runtime-state artifact API/download or checksum validation fails, the workflow stops before trading rather than starting with empty or stale state.
 
-Verify the policy before pushing:
+Useful checks:
 
 ```bash
 git status --short
-git diff --cached --name-only
 git ls-files data/
-git check-ignore -v data/scan_history.jsonl data/zone_engine_diagnostic.log data/retention_archive/example.gz
+git ls-files bootstrap/research_history_seed/
+git check-ignore -v data/active_trades.json data/market_bars_5m.jsonl bootstrap/research_history_seed/2026-10-16/manifest.json
 ```
-
-`git ls-files data/` should list persistent state files after a runtime cycle, while the explicitly ignored artifacts above should never be staged.
 
 ### Rebuild the unpushed local history safely
 
@@ -194,24 +189,13 @@ This does **not** delete or reset live `data/`; `--soft` only rewrites the local
 
 If `git ls-files data/` still shows real JSONL/JSON files, stop and do not push.
 
-## 7. Rejected commit handling
+## 8. Rejected legacy commit handling
 
-The rejected push happened on local commit `627ebe9`.
+For older local histories that already contain oversized runtime-data blobs, a later cleanup commit does not shrink those earlier Git objects. The workflow migration only removes the data blobs from the current `main` tree after the current runtime state has been successfully uploaded and verified as an artifact; it does not erase the historical record or the authoritative state.
 
-If the oversized data blobs were introduced by that unpushed commit and were not present in `HEAD^`, **amend the existing commit rather than creating another commit on top**:
+Do not use `git reset --hard`, and do not manually delete active trades, research cursors, research outcome state, trades, or execution journals to solve the Git size problem. If the artifact migration has not completed, retain the legacy working data and let the workflow perform the migration only after the state artifact is durable.
 
-```bash
-git ls-tree -l HEAD^ -- data/market_bars_5m.jsonl data/zone_observations.jsonl
-
-git commit --amend --no-edit
-git push origin main
-```
-
-Do not use `git reset --hard`.
-
-Do not delete `active_trades.json`, research cursors, research outcome state, trades, or execution journals as a way to solve the Git size problem.
-
-## 8. Production logging fix included in this release
+## 9. Production logging fix included in this release
 
 `TRACKER_TRADE_CLOSED` had a placeholder/argument mismatch that produced `TypeError: must be real number, not str` during otherwise successful trade-close logging. The format string now has the correct number and ordering of placeholders. This affects logging only; it does not change trade state or execution logic.
 

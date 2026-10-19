@@ -1,19 +1,21 @@
 from pathlib import Path
 
 
-def test_persistent_runtime_data_is_git_trackable_and_ephemeral_data_is_ignored():
+def test_persistent_runtime_data_is_artifact_backed_and_ephemeral_data_is_ignored():
     lines = {line.strip() for line in Path(".gitignore").read_text(encoding="utf-8").splitlines()}
-    assert "data/" not in lines
+    assert "data/*" in lines
+    assert "bootstrap/research_history_seed/" in lines
     assert "data/scan_history.jsonl" in lines
     assert "data/scan_history.jsonl.*" in lines
     assert "data/zone_engine_diagnostic.log" in lines
     assert "data/retention_archive/" in lines
 
 
-def test_runbook_requires_history_rebuild_for_large_unpushed_blobs():
+def test_runbook_documents_artifact_backed_runtime_state_migration():
     text = Path("DATA_RETENTION_RUNBOOK.md").read_text(encoding="utf-8")
-    assert "git reset --soft origin/main" in text
-    assert "git branch backup-before-data-git-cleanup" in text
+    assert "zone-engine-runtime-state" in text
+    assert "only then removes the legacy data files from the Git index" in text
+    assert "refuses to run the engine if the newest state artifact is unavailable or invalid" in text
 
 
 def test_pytest_has_global_repository_data_isolation():
@@ -24,16 +26,17 @@ def test_pytest_has_global_repository_data_isolation():
     assert 'COUNTERFACTUAL_EXPERIMENTS_PATH' in text
 
 
-def test_workflow_runs_size_guard_before_commit():
+def test_workflow_runs_size_guard_before_runtime_state_artifact_upload():
     text = Path(".github/workflows/event-engine.yml").read_text(encoding="utf-8")
     assert "Pre-commit data size guard" in text
     assert "--size-guard" in text
-    assert "--check-staged" in text
+    assert "runtime-state-manifest.json" in Path("event_engine/runtime_state_bundle.py").read_text(encoding="utf-8")
     assert 'DATA_RETENTION_SIZE_GUARD_BYTES: "90000000"' in text
     assert 'DATA_RETENTION_SIZE_TARGET_BYTES: "80000000"' in text
     assert "Verify tests did not mutate runtime data" in text
-    assert "git diff --quiet -- data" in text
-    assert "git status --ignored --porcelain -- data" in text
+    assert "runtime_state_bundle.py verify-unchanged" in text
+    assert "Upload durable runtime-state artifact" in text
+    assert text.index("Pre-commit data size guard") < text.index("Upload durable runtime-state artifact")
     assert 'EXECUTION_REQUIRE_EXCHANGE_TIMESTAMP: "true"' in text
     assert 'EXECUTION_UNKNOWN_QUOTE_AGE_POLICY: "block"' in text
     assert "Restore cumulative retention archive from previous successful runs" in text
@@ -50,9 +53,10 @@ def test_size_guard_constants_have_headroom():
     assert data_retention.GITHUB_SIZE_TARGET_BYTES < data_retention.GITHUB_SIZE_GUARD_BYTES < data_retention.GITHUB_MAX_FILE_BYTES
 
 
-def test_git_policy_persists_engine_state_but_excludes_unbounded_runtime_artifacts():
+def test_git_policy_externalizes_engine_state_but_keeps_retention_archive_separate():
     lines = {line.strip() for line in Path(".gitignore").read_text(encoding="utf-8").splitlines()}
-    assert "data/" not in lines
+    assert "data/*" in lines
+    assert "bootstrap/research_history_seed/" in lines
     assert "data/retention_archive/" in lines
 
 
@@ -260,60 +264,105 @@ def test_size_guard_archives_old_bars_instead_of_blocking_on_pending_observation
     assert "OBS_OLD" in json.loads((data_dir / "research_outcome_state.json").read_text(encoding="utf-8"))["pending_observations_v1"]
 
 
-def test_clean_checkout_can_persist_and_restore_runtime_state(tmp_path):
-    """Prove the exact lifecycle used by GitHub Actions between two clean runs."""
-    import subprocess
+def test_size_guard_has_lossless_backstop_for_unparseable_or_excess_recent_5m_rows(monkeypatch, tmp_path):
+    """Oversized bars are bounded even if conservative timestamp policies cannot prune them."""
+    import gzip
+    import json
+    from datetime import timedelta
+    from event_engine import data_retention
 
-    remote = tmp_path / "remote.git"
-    work1 = tmp_path / "work1"
-    work2 = tmp_path / "work2"
-    source = Path.cwd()
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    now = data_retention.datetime(2026, 10, 19, 12, 0, tzinfo=data_retention.timezone.utc)
+    path = data_dir / "market_bars_5m.jsonl"
+    rows = []
+    # These rows deliberately have timestamps the normal age policies cannot parse.
+    for index in range(80):
+        rows.append({
+            "record_type": "MARKET_BAR", "symbol": f"BAD{index % 8}-USDT", "provider": "binance",
+            "timestamp": "not-a-timestamp", "bar_id": f"BAD-{index:03d}",
+            "payload": "u" * 1_400,
+        })
+    # Valid recent rows alone are also large enough to require the adaptive fallback.
+    for index in range(50):
+        ts = now - timedelta(minutes=index * 1.2)
+        rows.append({
+            "record_type": "MARKET_BAR", "symbol": f"GOOD{index % 10}-USDT", "provider": "binance",
+            "timestamp": ts.isoformat(), "bar_id": f"GOOD-{index:03d}",
+            "payload": "v" * 1_400,
+        })
+    path.write_text("".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows), encoding="utf-8")
 
-    subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+    monkeypatch.setattr(data_retention, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(data_retention, "GITHUB_SIZE_GUARD_BYTES", 80_000)
+    monkeypatch.setattr(data_retention, "GITHUB_SIZE_TARGET_BYTES", 50_000)
 
-    # Use a disposable repo directory with only the source policy files required
-    # for this integration check; do not mutate the real project repository.
-    subprocess.run(["git", "clone", "-q", str(remote), str(work1)], check=True)
-    (work1 / ".gitignore").write_text((source / ".gitignore").read_text(encoding="utf-8"), encoding="utf-8")
-    (work1 / ".github").mkdir(parents=True, exist_ok=True)
-    (work1 / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
-    (work1 / ".github" / "workflows" / "event-engine.yml").write_text(
-        (source / ".github" / "workflows" / "event-engine.yml").read_text(encoding="utf-8"), encoding="utf-8"
+    result = data_retention._apply_size_guard_to_file(
+        path, now=now, archive_root=data_dir / "retention_archive", pending_ids=set(),
+        pending_bar_cutoffs={}, protected_observation_ids=set(), protected_refs=set(),
     )
-    subprocess.run(["git", "config", "user.name", "test"], cwd=work1, check=True)
-    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=work1, check=True)
-    subprocess.run(["git", "add", ".gitignore", ".github/workflows/event-engine.yml"], cwd=work1, check=True)
-    subprocess.run(["git", "commit", "-qm", "seed"], cwd=work1, check=True)
-    subprocess.run(["git", "push", "-q", "origin", "HEAD:main"], cwd=work1, check=True)
-    subprocess.run(["git", "--git-dir", str(remote), "symbolic-ref", "HEAD", "refs/heads/main"], check=True)
 
-    # Run #1 creates the persistent state plus ephemeral artifacts.
-    data = work1 / "data"
-    data.mkdir()
-    (data / "active_trades.json").write_text('{"version": 1, "events": {"E1": {"symbol": "TEST-USDT"}}}\n', encoding="utf-8")
-    (data / "research_outcome_state.json").write_text('{"version": 2, "processed_observation_ids": ["OBS1"]}\n', encoding="utf-8")
+    assert result["triggered"] is True
+    assert result["bytes_after"] < data_retention.GITHUB_SIZE_GUARD_BYTES
+    assert result["bytes_after"] <= data_retention.GITHUB_SIZE_TARGET_BYTES
+    assert result["policies"][-1]["policy"] == "keep_newest_valid_5m_rows_within_size_budget_archiving_unknown_or_excess_rows"
+
+    kept_ids = {
+        json.loads(line)["bar_id"]
+        for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
+    }
+    archived_ids = set()
+    for delta in (data_dir / "retention_archive").rglob("market_bars_5m.jsonl.pruned*.jsonl.gz"):
+        with gzip.open(delta, "rt", encoding="utf-8") as fh:
+            archived_ids.update(json.loads(line)["bar_id"] for line in fh if line.strip())
+    original_ids = {row["bar_id"] for row in rows}
+    assert kept_ids.isdisjoint(archived_ids)
+    assert kept_ids | archived_ids == original_ids
+
+def test_clean_checkout_can_restore_runtime_state_from_verified_bundle(tmp_path):
+    """A clean checkout restores the same persistent state from its artifact bundle."""
+    import json
+
+    from event_engine.runtime_state_bundle import create_bundle, restore_bundle, REQUIRED_FILES
+
+    root = tmp_path / "source"
+    data = root / "data"
+    seed = root / "bootstrap" / "research_history_seed"
+    for relative in REQUIRED_FILES:
+        path = data / relative.removeprefix("data/") if relative.startswith("data/") else root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"path": relative}) + "\n", encoding="utf-8")
+    (data / "active_trades.json").write_text(
+        '{"version": 1, "events": {"E1": {"symbol": "TEST-USDT"}}}\n', encoding="utf-8"
+    )
+    (data / "research_outcome_state.json").write_text(
+        '{"version": 2, "processed_observation_ids": ["OBS1"]}\n', encoding="utf-8"
+    )
     (data / "trades.jsonl").write_text('{"record_type":"TRADE_OPEN","event_id":"E1"}\n', encoding="utf-8")
     (data / "scan_history.jsonl").write_text('{"ephemeral":true}\n', encoding="utf-8")
     (data / "zone_engine_diagnostic.log").write_text("diagnostic\n", encoding="utf-8")
     (data / "retention_archive").mkdir()
-    (data / "retention_archive" / "snapshot.jsonl.gz").write_bytes(b"archive")
+    (data / "retention_archive" / "snapshot.jsonl.gz").write_bytes(b"separately managed")
+    for rel in REQUIRED_FILES:
+        if rel.endswith(".gz"):
+            path = root / rel
+            path.write_bytes(b"compressed historical seed placeholder")
 
-    subprocess.run(["git", "add", "data/"], cwd=work1, check=True)
-    staged = subprocess.check_output(["git", "diff", "--cached", "--name-only"], cwd=work1, text=True).splitlines()
-    assert "data/active_trades.json" in staged
-    assert "data/research_outcome_state.json" in staged
-    assert "data/trades.jsonl" in staged
-    assert "data/scan_history.jsonl" not in staged
-    assert "data/zone_engine_diagnostic.log" not in staged
-    assert not any(path.startswith("data/retention_archive/") for path in staged)
-    subprocess.run(["git", "commit", "-qm", "persist state"], cwd=work1, check=True)
-    subprocess.run(["git", "push", "-q", "origin", "HEAD:main"], cwd=work1, check=True)
+    bundle = tmp_path / "runtime-state-bundle"
+    create_bundle(data_dir=data, seed_dir=seed, output_dir=bundle)
 
-    # Run #2 starts from a fresh checkout and must recover persistent state.
-    subprocess.run(["git", "clone", "-q", str(remote), str(work2)], check=True)
-    assert (work2 / "data" / "active_trades.json").exists()
-    assert (work2 / "data" / "research_outcome_state.json").exists()
-    assert (work2 / "data" / "trades.jsonl").exists()
-    assert not (work2 / "data" / "scan_history.jsonl").exists()
-    assert not (work2 / "data" / "zone_engine_diagnostic.log").exists()
-    assert not (work2 / "data" / "retention_archive").exists()
+    clean = tmp_path / "clean-checkout"
+    clean_data = clean / "data"
+    clean_seed = clean / "bootstrap" / "research_history_seed"
+    clean_data.mkdir(parents=True)
+    (clean_data / "stale-state.json").write_text("stale\n", encoding="utf-8")
+    restore_bundle(bundle_dir=bundle, data_dir=clean_data, seed_dir=clean_seed)
+
+    assert json.loads((clean_data / "active_trades.json").read_text(encoding="utf-8"))["events"]["E1"]["symbol"] == "TEST-USDT"
+    assert json.loads((clean_data / "research_outcome_state.json").read_text(encoding="utf-8"))["processed_observation_ids"] == ["OBS1"]
+    assert (clean_data / "trades.jsonl").exists()
+    assert not (clean_data / "scan_history.jsonl").exists()
+    assert not (clean_data / "zone_engine_diagnostic.log").exists()
+    assert not (clean_data / "retention_archive").exists()
+    assert not (clean_data / "stale-state.json").exists()
+    assert (clean_seed / "2026-10-16" / "manifest.json").exists()

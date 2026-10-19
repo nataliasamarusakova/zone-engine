@@ -3636,9 +3636,9 @@ def _prefetch_missing_research_5m_bars(
 ) -> dict[int, list[dict]]:
     """Fetch missing forward bars concurrently, preserving serial persistence.
 
-    The default concurrency is intentionally low to avoid bursting public market
-    data APIs. Returned results are keyed by object identity so two symbols with
-    similar payloads can never share the wrong bars.
+    Read-only market-data requests use a small bounded pool. The results are keyed
+    by object identity so two symbols with similar payloads can never share the
+    wrong bars. Persistence and per-symbol application remain serial below.
     """
     pending = [
         payload for payload in payload_batch
@@ -3646,7 +3646,7 @@ def _prefetch_missing_research_5m_bars(
     ]
     if not pending:
         return {}
-    workers = max(1, min(2, int(max_workers), len(pending)))
+    workers = max(1, min(4, int(max_workers), len(pending)))
     results: dict[int, list[dict]] = {}
     if workers == 1:
         for payload in pending:
@@ -4829,9 +4829,9 @@ def main() -> None:
             batch_bars5m = 0
             pending_limit = max(12, int(os.environ.get("RESEARCH_PENDING_5M_FETCH_LIMIT", "24")))
             try:
-                prefetch_workers = int(os.environ.get("RESEARCH_DEFERRED_BAR_FETCH_WORKERS", "2"))
+                prefetch_workers = int(os.environ.get("RESEARCH_DEFERRED_BAR_FETCH_WORKERS", "4"))
             except (TypeError, ValueError):
-                prefetch_workers = 2
+                prefetch_workers = 4
             prefetched_bars = _prefetch_missing_research_5m_bars(
                 payload_batch, analysis_meta, limit=pending_limit, max_workers=prefetch_workers,
             )

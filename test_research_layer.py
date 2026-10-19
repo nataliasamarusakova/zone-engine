@@ -315,6 +315,10 @@ def test_persist_market_bars_normalizes_epoch_ms_5m(tmp_path: Path, monkeypatch)
 
 def test_forward_loader_separates_multiple_providers(tmp_path: Path, monkeypatch):
     import research_forward
+    # This focused unit test must not ingest the immutable production recovery
+    # seed bundled under the repository root; that seed has hundreds of
+    # thousands of bars and would turn this tiny fixture into an integration test.
+    monkeypatch.setattr(research_forward, "PROJECT_ROOT", tmp_path / "empty_repo")
     monkeypatch.setattr(research_forward.research, "MARKET_BARS_5M_PATH", tmp_path / "market_bars_5m.jsonl")
     ts0 = pd.Timestamp("2026-01-01T00:00:00Z")
     rows = []

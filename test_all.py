@@ -3007,15 +3007,22 @@ def test_emergency_close_cleanup_happens_before_market_close(monkeypatch):
     assert calls[0][0] == "close"
 
 
-def test_workflow_stages_all_data_but_excludes_scan_history():
+def test_workflow_persists_runtime_state_in_verified_artifact_not_git_snapshots():
     from pathlib import Path
-    text = Path(".github/workflows/event-engine.yml").read_text(encoding="utf-8")
-    assert "git add data/" in text
-    assert "git reset -- data/scan_history.jsonl" in text
-    assert "schedule:" not in text
-    assert 'cron: "*/5 * * * *"' not in text
-    assert "repository_dispatch:" in text
-    assert "run_event_engine" in text
+    workflow = Path(".github/workflows/event-engine.yml").read_text(encoding="utf-8")
+    gitignore = Path(".gitignore").read_text(encoding="utf-8")
+    assert "name: Upload durable runtime-state artifact" in workflow
+    assert "zone-engine-runtime-state" in workflow
+    assert "python3 event_engine/runtime_state_bundle.py restore" in workflow
+    assert "python event_engine/runtime_state_bundle.py create" in workflow
+    assert "git rm --cached -r -f --ignore-unmatch data/ bootstrap/research_history_seed/" in workflow
+    assert "data/*" in gitignore
+    assert "bootstrap/research_history_seed/" in gitignore
+    assert "git add data/" not in workflow
+    assert "schedule:" not in workflow
+    assert 'cron: "*/5 * * * *"' not in workflow
+    assert "repository_dispatch:" in workflow
+    assert "run_event_engine" in workflow
 
 
 def test_execution_ledger_is_append_only_and_carries_attempt_lineage(tmp_path, monkeypatch):

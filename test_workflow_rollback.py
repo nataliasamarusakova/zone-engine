@@ -7,7 +7,8 @@ def test_workflow_restores_snapshots_on_retention_archive_upload_failure():
     assert "--restore-pre-compaction-snapshots" in workflow
     assert "steps.upload_retention_archive.outcome != 'success'" in workflow
     assert 'steps.restore_pre_compaction_snapshots.outputs.restored_any' in workflow
-    assert "--check-staged --limit-bytes 100000000" in workflow
+    assert "Upload durable runtime-state artifact" in workflow
+    assert "Retain only the two newest runtime-state artifacts" in workflow
 
 
 def test_staged_guard_exposes_configurable_hard_limit():
@@ -39,7 +40,7 @@ def test_commit_gate_blocks_compaction_when_archive_is_empty_and_rollback_was_sk
     gate = next(step for step in steps if step.get("id") == "retention_archive_commit_gate")
     script = gate["run"]
     substitutions = {
-        "${{ steps.tests.outcome }}": "success",
+        "${{ steps.quality_gate.outcome }}": "success",
         "${{ steps.verify_tests_data.outcome }}": "success",
         "${{ steps.restore_pre_compaction_snapshots.outcome }}": "skipped",
         "${{ steps.restore_pre_compaction_snapshots.outputs.restored_any }}": "",
@@ -81,7 +82,7 @@ def test_commit_gate_allows_empty_archive_when_size_guard_did_not_compact(tmp_pa
     gate = next(step for step in steps if step.get("id") == "retention_archive_commit_gate")
     script = gate["run"]
     substitutions = {
-        "${{ steps.tests.outcome }}": "success",
+        "${{ steps.quality_gate.outcome }}": "success",
         "${{ steps.verify_tests_data.outcome }}": "success",
         "${{ steps.restore_pre_compaction_snapshots.outcome }}": "skipped",
         "${{ steps.restore_pre_compaction_snapshots.outputs.restored_any }}": "",
@@ -121,18 +122,31 @@ def test_workflow_does_not_write_research_or_commit_state_after_test_failure(tmp
     by_id = {step.get("id"): step for step in steps if step.get("id")}
 
     assert by_id["tests"]["name"] == "Run tests"
-    assert "steps.tests.outcome == 'success'" in by_id["restore_research_history_seed"]["if"]
+    assert "steps.quality_gate.outcome == 'success'" in by_id["restore_research_history_seed"]["if"]
     assert "steps.verify_tests_data.outcome == 'success'" in by_id["restore_research_history_seed"]["if"]
     seed_warning = next(step for step in steps if step.get("name") == "Report research seed restore status")
-    assert "steps.tests.outcome == 'success'" in seed_warning["if"]
+    assert "steps.quality_gate.outcome == 'success'" in seed_warning["if"]
     assert "steps.restore_research_history_seed.outcome == 'failure'" in seed_warning["if"]
-    assert "steps.tests.outcome == 'success'" in by_id["research_outcomes"]["if"]
-    assert '${{ steps.tests.outcome }}' in by_id["retention_archive_commit_gate"]["run"]
-    commit_step = next(step for step in steps if step.get("name") == "Commit state")
-    assert "steps.tests.outcome == 'success'" in commit_step["if"]
+    assert "steps.quality_gate.outcome == 'success'" in by_id["research_outcomes"]["if"]
+    assert '${{ steps.quality_gate.outcome }}' in by_id["retention_archive_commit_gate"]["run"]
+    assert by_id["test_policy"]["id"] == "test_policy"
+    assert "data/source_test_fingerprint.json" in by_id["test_policy"]["run"]
+    assert "required=true" in by_id["test_policy"]["run"]
+    assert by_id["source_fingerprint"]["id"] == "source_fingerprint"
+    assert 'subprocess.check_output(["git", "ls-files", "-z"])' in by_id["source_fingerprint"]["run"]
+    # requirements.txt allows compatible version ranges; test cache identity must
+    # change if Python or any installed dependency changes, not only source files.
+    assert '"-m", "pip", "freeze"' in by_id["source_fingerprint"]["run"]
+    assert "PYTHON_VERSION" in by_id["source_fingerprint"]["run"]
+    assert "steps.record_source_fingerprint.outcome" not in by_id["retention_archive_commit_gate"]["run"]
+    assert "steps.tests.outcome == 'success'" in by_id["record_source_fingerprint"]["if"]
+    persist_step = next(step for step in steps if step.get("id") == "externalize_runtime_state")
+    assert "steps.quality_gate.outcome == 'success'" in persist_step["if"]
+    assert "steps.verify_runtime_state_artifact.outcome == 'success'" in persist_step["if"]
+    assert "git rm --cached -r -f --ignore-unmatch data/ bootstrap/research_history_seed/" in persist_step["run"]
 
     script = by_id["retention_archive_commit_gate"]["run"]
-    script = script.replace("${{ steps.tests.outcome }}", "failure")
+    script = script.replace("${{ steps.quality_gate.outcome }}", "failure")
     script = script.replace("${{ steps.verify_tests_data.outcome }}", "success")
     result = subprocess.run(
         ["bash", "-euo", "pipefail", "-c", script],
@@ -142,7 +156,7 @@ def test_workflow_does_not_write_research_or_commit_state_after_test_failure(tmp
         check=False,
     )
     assert result.returncode != 0
-    assert "Tests did not pass (outcome=failure); refusing to commit persistent state." in result.stdout + result.stderr
+    assert "Quality gate did not pass (outcome=failure); refusing to commit persistent state." in result.stdout + result.stderr
 
 
 def test_workflow_blocks_state_commit_when_runtime_data_isolation_check_is_skipped(tmp_path):
@@ -155,7 +169,7 @@ def test_workflow_blocks_state_commit_when_runtime_data_isolation_check_is_skipp
     steps = workflow["jobs"]["run"]["steps"]
     gate = next(step for step in steps if step.get("id") == "retention_archive_commit_gate")
     script = gate["run"]
-    script = script.replace("${{ steps.tests.outcome }}", "success")
+    script = script.replace("${{ steps.quality_gate.outcome }}", "success")
     script = script.replace("${{ steps.verify_tests_data.outcome }}", "skipped")
     result = subprocess.run(
         ["bash", "-euo", "pipefail", "-c", script],
@@ -166,3 +180,41 @@ def test_workflow_blocks_state_commit_when_runtime_data_isolation_check_is_skipp
     )
     assert result.returncode != 0
     assert "Runtime-data isolation verification did not pass (outcome=skipped); refusing to commit persistent state." in result.stdout + result.stderr
+
+
+def test_full_test_suite_is_skipped_only_when_source_fingerprint_matches(tmp_path):
+    import json
+    import os
+    import subprocess
+    import yaml
+
+    workflow_path = Path(__file__).parent / ".github" / "workflows" / "event-engine.yml"
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    steps = workflow["jobs"]["run"]["steps"]
+    policy = next(step for step in steps if step.get("id") == "test_policy")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    marker = data_dir / "source_test_fingerprint.json"
+    output = tmp_path / "github_output.txt"
+
+    def run_policy(fingerprint: str) -> tuple[str, subprocess.CompletedProcess[str]]:
+        output.write_text("", encoding="utf-8")
+        result = subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", policy["run"]],
+            cwd=tmp_path, text=True, capture_output=True, check=False,
+            env={**os.environ, "CURRENT_SOURCE_FINGERPRINT": fingerprint, "GITHUB_OUTPUT": str(output)},
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        return output.read_text(encoding="utf-8"), result
+
+    marker.write_text(json.dumps({"schema_version": 1, "sha256": "same"}), encoding="utf-8")
+    out, result = run_policy("same")
+    assert "run_tests=false" in out
+    assert "skipping redundant tests" in result.stdout
+
+    out, _ = run_policy("changed")
+    assert "run_tests=true" in out
+
+    marker.write_text("{}", encoding="utf-8")
+    out, _ = run_policy("same")
+    assert "run_tests=true" in out
