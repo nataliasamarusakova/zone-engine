@@ -201,6 +201,65 @@ def test_size_guard_continues_safe_policies_below_guard_until_target(monkeypatch
     assert list((data_dir / "retention_archive").rglob("*.pruned.jsonl.gz"))
 
 
+def test_size_guard_archives_old_bars_instead_of_blocking_on_pending_observation(monkeypatch, tmp_path):
+    """Pending outcomes must remain replayable from archive deltas without pinning every live 5m bar."""
+    import gzip
+    import json
+    from datetime import timedelta
+    from event_engine import data_retention
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    now = data_retention.datetime(2026, 10, 19, 12, 0, tzinfo=data_retention.timezone.utc)
+    path = data_dir / "market_bars_5m.jsonl"
+    rows = []
+    for index in range(72):
+        ts = now - timedelta(minutes=5 * index)
+        rows.append({
+            "record_type": "MARKET_BAR", "symbol": "TEST-USDT", "provider": "binance",
+            "timestamp": ts.isoformat(), "close_time": (ts + timedelta(minutes=5)).isoformat(),
+            "open": 100, "high": 101, "low": 99, "close": 100, "volume": 1,
+            "retention_test_id": f"BAR-{index:03d}", "payload": "x" * 2_000,
+        })
+    path.write_text("".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows), encoding="utf-8")
+    (data_dir / "research_outcome_state.json").write_text(json.dumps({
+        "version": 2,
+        "pending_observations_v1": {
+            "OBS_OLD": {
+                "observation_id": "OBS_OLD", "symbol": "TEST-USDT", "direction": "LONG",
+                "observation_ts": (now - timedelta(days=3)).isoformat(), "reference_price": 100,
+                "event_type": "SIGNAL_CREATED",
+            }
+        },
+    }), encoding="utf-8")
+
+    monkeypatch.setattr(data_retention, "DATA_DIR", data_dir)
+    monkeypatch.setattr(data_retention, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(data_retention, "REPO_RETENTION_ARCHIVE_ROOT", data_dir / "retention_archive")
+    monkeypatch.setattr(data_retention, "GITHUB_SIZE_GUARD_BYTES", 50_000)
+    monkeypatch.setattr(data_retention, "GITHUB_SIZE_TARGET_BYTES", 30_000)
+
+    result = data_retention.apply_size_guard(now=now, archive_root=data_dir / "retention_archive")
+    file_result = result["files"]["market_bars_5m.jsonl"]
+    assert file_result["triggered"] is True
+    assert file_result["bytes_after"] <= data_retention.GITHUB_SIZE_TARGET_BYTES
+
+    # Every original bar remains available either in the live file or a pruned
+    # delta. The archive path is what makes pruning safe for pending research.
+    retained_ids = {
+        json.loads(line)["retention_test_id"]
+        for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
+    }
+    archived_ids = set()
+    for delta in (data_dir / "retention_archive").rglob("market_bars_5m.jsonl.pruned*.jsonl.gz"):
+        with gzip.open(delta, "rt", encoding="utf-8") as fh:
+            archived_ids.update(json.loads(line)["retention_test_id"] for line in fh if line.strip())
+    original_ids = {row["retention_test_id"] for row in rows}
+    assert retained_ids.isdisjoint(archived_ids)
+    assert retained_ids | archived_ids == original_ids
+    assert "OBS_OLD" in json.loads((data_dir / "research_outcome_state.json").read_text(encoding="utf-8"))["pending_observations_v1"]
+
+
 def test_clean_checkout_can_persist_and_restore_runtime_state(tmp_path):
     """Prove the exact lifecycle used by GitHub Actions between two clean runs."""
     import subprocess
