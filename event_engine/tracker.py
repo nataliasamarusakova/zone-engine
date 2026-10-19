@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 import logging
 import math
@@ -36,9 +37,10 @@ from event_engine.bingx import (
     POSITION_PATH,
     position_side_param,
     _validate_sl_order_for_position,
+    thread_local_retry_session,
 )
 from event_engine.telegram import send as send_tg
-from event_engine import telemetry
+from event_engine import request_metrics, telemetry
 
 log = logging.getLogger("event_engine.tracker")
 _TRACKER_TRADE_CLOSED_LOG_FORMAT = (
@@ -53,6 +55,33 @@ TRADES_PATH = DATA / "trades.jsonl"
 ACTIONS_PATH = DATA / "actions.jsonl"
 DEFAULT_PLANNED_WEIGHTED_RR = 0.45
 
+# The executor is scoped to one update_active_trades call so it is always shut
+# down cleanly and never leaves a worker alive after the engine run completes.
+
+def _tracker_parallel_first_tp_read_enabled() -> bool:
+    return os.environ.get("TRACKER_PARALLEL_FIRST_TP_READ", "true").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _record_tracker_elapsed(timings: dict[str, dict[str, float]], name: str, elapsed: float) -> None:
+    elapsed = max(0.0, float(elapsed))
+    bucket = timings.setdefault(name, {"calls": 0.0, "seconds": 0.0, "max_seconds": 0.0})
+    bucket["calls"] += 1
+    bucket["seconds"] += elapsed
+    bucket["max_seconds"] = max(bucket["max_seconds"], elapsed)
+
+
+def _fetch_tp_evidence_timed(
+    symbol: str, order_id: str, entry_ts: int, phase_name: str,
+) -> tuple[dict | None, float, Exception | None]:
+    """Fetch one read-only TP status in a worker with isolated retry/session context."""
+    started = time.perf_counter()
+    try:
+        with request_metrics.phase(phase_name), request_metrics.symbol_context(symbol), thread_local_retry_session():
+            value = _get_order_execution_evidence(symbol, order_id, entry_ts=entry_ts)
+        return value, max(0.0, time.perf_counter() - started), None
+    except Exception as exc:
+        return None, max(0.0, time.perf_counter() - started), exc
+
 
 def _timed_tracker_call(
     timings: dict[str, dict[str, float]],
@@ -66,11 +95,7 @@ def _timed_tracker_call(
     try:
         return function(*args, **kwargs)
     finally:
-        elapsed = max(0.0, time.perf_counter() - started)
-        bucket = timings.setdefault(name, {"calls": 0.0, "seconds": 0.0, "max_seconds": 0.0})
-        bucket["calls"] += 1
-        bucket["seconds"] += elapsed
-        bucket["max_seconds"] = max(bucket["max_seconds"], elapsed)
+        _record_tracker_elapsed(timings, name, time.perf_counter() - started)
 
 
 def _log_tracker_timings(timings: dict[str, dict[str, float]], total_seconds: float, active_trades: int) -> None:
@@ -2582,6 +2607,10 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
     if not trades:
         return
 
+    # One bounded worker overlaps a read-only TP status lookup with the existing
+    # 1m kline request. The worker is shut down before this function returns.
+    tp_read_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tracker-tp-read")
+
     original_trades = copy.deepcopy(trades)
     now_ms = int(time.time() * 1000)
     updated_trades: dict[str, dict] = {}
@@ -2668,6 +2697,26 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                 # zero after reconciliation.
                 rem_qty = max(0.0, rem_qty)
 
+            # Start only the first known TP status read alongside the existing
+            # 1m kline read. The result is still consumed at its original position
+            # in the TP loop, before any later TP leg is queried/processed.
+            tp_orders_for_evidence = trade.get("tp_orders", [])
+            first_tp_evidence_index = next((
+                idx for idx, candidate in enumerate(tp_orders_for_evidence)
+                if isinstance(candidate, dict) and candidate.get("leg") and candidate.get("order_id")
+            ), None)
+            first_tp_evidence_future: Future | None = None
+            first_tp_evidence_result: tuple[dict | None, float, Exception | None] | None = None
+            if _tracker_parallel_first_tp_read_enabled() and first_tp_evidence_index is not None:
+                first_tp = tp_orders_for_evidence[first_tp_evidence_index]
+                first_tp_evidence_future = tp_read_executor.submit(
+                    _fetch_tp_evidence_timed,
+                    symbol,
+                    str(first_tp.get("order_id")),
+                    entry_ts,
+                    request_metrics.current_phase(),
+                )
+
             cur_price = entry_price
             try:
                 k1m = _timed_tracker_call(tracker_timings, "kline_1m", fetch_klines, symbol, "1m", limit=60)
@@ -2681,6 +2730,11 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
             trade["current_pnl_pct"] = current_pnl
             trade["current_position_qty"] = pos_amt
             trade["last_observation_ts"] = now_ms
+
+            # Join the read-only worker before any possible protection mutation below.
+            # Its result is consumed in the original TP-loop position after the BE retry.
+            if first_tp_evidence_future is not None:
+                first_tp_evidence_result = first_tp_evidence_future.result()
 
             # Break-even is intentionally activated ONLY after TP1 is fully filled.
             # There is no earlier +0.50R price-triggered BE in this strategy.
@@ -2708,17 +2762,23 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                     trade["be_last_error"] = retry.get("error")
 
             # Проверка исполнения Тейк-Профитов
-            for tp in trade.get("tp_orders", []):
+            for tp_index, tp in enumerate(tp_orders_for_evidence):
                 leg = str(tp.get("leg", ""))
                 order_id = tp.get("order_id")
                 if not leg or not order_id:
                     continue
 
                 try:
-                    order_info = _timed_tracker_call(
-                        tracker_timings, "tp_order_evidence", _get_order_execution_evidence,
-                        symbol, str(order_id), entry_ts=entry_ts,
-                    )
+                    if tp_index == first_tp_evidence_index and first_tp_evidence_result is not None:
+                        order_info, elapsed, query_error = first_tp_evidence_result
+                        _record_tracker_elapsed(tracker_timings, "tp_order_evidence", elapsed)
+                        if query_error is not None:
+                            raise query_error
+                    else:
+                        order_info = _timed_tracker_call(
+                            tracker_timings, "tp_order_evidence", _get_order_execution_evidence,
+                            symbol, str(order_id), entry_ts=entry_ts,
+                        )
                 except Exception as exc:
                     telemetry.record_exchange_error(
                         event_id=event_id,
@@ -3623,6 +3683,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
             original_trades, updated_trades,
         )
     finally:
+        tp_read_executor.shutdown(wait=True)
         _log_tracker_timings(
             tracker_timings, time.perf_counter() - tracker_perf_started,
             sum(1 for trade in trades.values() if isinstance(trade, dict) and not trade.get("closed", False)),

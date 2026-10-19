@@ -12,6 +12,7 @@ import re
 import time
 import threading
 import uuid
+from contextlib import contextmanager
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
 from decimal import (
@@ -115,6 +116,49 @@ def _get_fast_session() -> requests.Session:
     return session
 
 
+def _get_retry_session() -> requests.Session:
+    """Return a thread-local session with the same GET retry policy as SESSION."""
+    session = getattr(_FAST_LOCAL, "retry_session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = HTTPAdapter(
+            pool_connections=8,
+            pool_maxsize=8,
+            max_retries=Retry(
+                total=3,
+                connect=3,
+                read=3,
+                status=3,
+                backoff_factor=0.5,
+                status_forcelist=(429, 500, 502, 503, 504),
+                allowed_methods=frozenset({"GET"}),
+                respect_retry_after_header=True,
+                raise_on_status=False,
+            ),
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        _FAST_LOCAL.retry_session = session
+    return session
+
+
+@contextmanager
+def thread_local_retry_session():
+    """Use an isolated retry-enabled HTTP session for read-only worker calls."""
+    previous = getattr(_FAST_LOCAL, "use_retry_session", False)
+    _FAST_LOCAL.use_retry_session = True
+    try:
+        yield
+    finally:
+        if previous:
+            _FAST_LOCAL.use_retry_session = previous
+        else:
+            try:
+                delattr(_FAST_LOCAL, "use_retry_session")
+            except AttributeError:
+                pass
+
+
 def get_credentials() -> tuple[str, str]:
     """Read private BingX credentials at call time, not only at module import."""
     return os.environ.get("BINGX_API_KEY", "").strip(), os.environ.get("BINGX_SECRET_KEY", "").strip()
@@ -215,7 +259,14 @@ def _request(
     except (TypeError, ValueError):
         request_timeout = 10.0
     request_timeout = max(1.0, min(request_timeout, 60.0))
-    session = SESSION if retryable else _get_fast_session()
+    if not retryable:
+        session = _get_fast_session()
+    elif getattr(_FAST_LOCAL, "use_retry_session", False):
+        # Concurrent tracker reads must not share requests.Session with the main
+        # orchestration thread. Preserve the normal retry and fallback behavior.
+        session = _get_retry_session()
+    else:
+        session = SESSION
 
     try:
         source_key_required = True
