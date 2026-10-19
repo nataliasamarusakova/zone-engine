@@ -510,7 +510,12 @@ def _path_gap_count_indexed(index: _BarIndex, observation_ts_ns: int, target_ts_
     start = index.start_at_timestamp(observation_ts_ns)
     end = index.end_at_close(target_ts_ns)
     if end <= start:
-        return 0
+        interval_ns = 5 * 60 * 1_000_000_000
+        first_expected_ns = ((observation_ts_ns // interval_ns) + 1) * interval_ns
+        last_expected_ns = target_ts_ns - interval_ns
+        if last_expected_ns < first_expected_ns:
+            return 0
+        return int((last_expected_ns - first_expected_ns) // interval_ns) + 1
     ts = index.ts_ns[start:end]
     if ts.size == 0:
         return 0
@@ -562,6 +567,7 @@ def _calculate_forward_outcome_indexed(
     index: _BarIndex,
     *,
     counterfactual_bars: pd.DataFrame | None = None,
+    require_complete_24h: bool = False,
 ) -> dict[str, Any] | None:
     direction = str(observation.get("direction", "")).upper()
     symbol = str(observation.get("symbol", "")).upper()
@@ -607,6 +613,14 @@ def _calculate_forward_outcome_indexed(
     future_end = index.n
     last_close_ns = int(index.close_ts_ns[future_end - 1])
     last_close_ts = pd.Timestamp(last_close_ns, tz="UTC")
+    horizon_24_ns = obs_ns + int(24 * 60 * 60 * 1_000_000_000)
+    gap_count_24h = None
+    if require_complete_24h:
+        if last_close_ns < horizon_24_ns:
+            return None
+        gap_count_24h = _path_gap_count_indexed(index, obs_ns, horizon_24_ns)
+        if gap_count_24h:
+            return None
     result: dict[str, Any] = {
         "outcome_id": research.stable_id("forward-v1", observation.get("observation_id"), last_close_ts.isoformat(), prefix="OUT_"),
         "schema_version": research.RESEARCH_SCHEMA_VERSION, "record_type": "FORWARD_OUTCOME",
@@ -655,8 +669,9 @@ def _calculate_forward_outcome_indexed(
         result[f"forward_gap_count_{minutes}m"] = gap_count
         result[f"censored_path_{minutes}m"] = not path_complete
 
-    horizon_24_ns = obs_ns + int(24 * 60 * 60 * 1_000_000_000)
-    result["forward_gap_count_24h"] = _path_gap_count_indexed(index, obs_ns, horizon_24_ns)
+    result["forward_gap_count_24h"] = (
+        gap_count_24h if gap_count_24h is not None else _path_gap_count_indexed(index, obs_ns, horizon_24_ns)
+    )
     result["forward_path_complete_24h"] = result["forward_gap_count_24h"] == 0 and last_close_ns >= horizon_24_ns
     # Counterfactual experiments use only the persisted pre-entry snapshot plus
     # future market bars. They never modify production trade outcomes.
@@ -1038,6 +1053,7 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
             continue
         outcome = _calculate_forward_outcome_indexed(
             obs, index, counterfactual_bars=counterfactual_bars_by_index_id.get(id(index)),
+            require_complete_24h=True,
         )
         oid = str(obs.get("observation_id", ""))
         invalid_observation = isinstance(outcome, dict) and outcome.get("outcome_class") == "INVALID_RESEARCH_OBSERVATION"
