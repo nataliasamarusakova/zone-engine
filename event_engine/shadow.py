@@ -6,6 +6,7 @@ from datetime import timezone
 from typing import Any
 
 import pandas as pd
+import numpy as np
 
 
 SHADOW_SCHEMA_VERSION = 1
@@ -509,14 +510,17 @@ def _simulate_single_exit(
     }
     if future.empty:
         return result
-    for idx, row in future.reset_index(drop=True).iterrows():
-        event, ambiguous = _stop_or_target_hit(direction, float(row["high"]), float(row["low"]), stop, target)
+    for idx, (high_value, low_value, close_time) in enumerate(
+        future.reset_index(drop=True)[["high", "low", "close_time"]].itertuples(index=False, name=None)
+    ):
+        event, ambiguous = _stop_or_target_hit(direction, float(high_value), float(low_value), stop, target)
         if event is None:
             continue
         result["exit"] = event
         result["ambiguous"] = ambiguous
         result["exit_price"] = target if event == "TARGET" else stop if event == "STOP" else None
-        result["exit_ts"] = _parse_ts(row["close_time"]).isoformat() if _parse_ts(row["close_time"]) is not None else None
+        parsed_close_time = _parse_ts(close_time)
+        result["exit_ts"] = parsed_close_time.isoformat() if parsed_close_time is not None else None
         result["bars_to_exit"] = idx + 1
         if result["exit_price"] is not None:
             result["pnl_pct"] = _pct_return(direction, entry, float(result["exit_price"]))
@@ -534,6 +538,55 @@ def _weighted_partial_exit_pnl(
     tp1_pnl = _pct_return(direction, entry, tp1_price)
     residual_pnl = _pct_return(direction, entry, residual_price)
     return float(tp1_pnl * tp1_fraction + residual_pnl * (1.0 - tp1_fraction))
+
+
+_SHADOW_ATR_BEFORE_CLOSE = "_shadow_atr_before_close"
+
+
+def _precompute_atr_before_close(bars: pd.DataFrame) -> np.ndarray | None:
+    """Precompute the exact trailing ATR used by counterfactual simulations.
+
+    For each current candle, the old implementation selected all rows with
+    ``close_time < current.close_time`` and averaged the last 14 true-range
+    values, but only when at least 15 historical rows existed. This vectorized
+    version preserves that strict prior-close boundary and warm-up rule.
+
+    Return ``None`` for non-monotonic close times; the caller then uses the
+    conservative legacy calculation for those unusual inputs.
+    """
+    if bars.empty or "close_time" not in bars.columns:
+        return None
+    close_time = bars["close_time"]
+    if not close_time.is_monotonic_increasing:
+        return None
+
+    high = pd.to_numeric(bars["high"], errors="coerce").to_numpy(dtype=float)
+    low = pd.to_numeric(bars["low"], errors="coerce").to_numpy(dtype=float)
+    close = pd.to_numeric(bars["close"], errors="coerce").to_numpy(dtype=float)
+    if not (np.isfinite(high).all() and np.isfinite(low).all() and np.isfinite(close).all()):
+        return None
+
+    previous_close = np.empty_like(close)
+    previous_close[0:1] = np.nan
+    if close.size > 1:
+        previous_close[1:] = close[:-1]
+    # pandas DataFrame.max(axis=1) skips NaN, so the first TR equals high-low.
+    true_range = np.fmax.reduce((high - low, np.abs(high - previous_close), np.abs(low - previous_close)))
+    atr14 = pd.Series(true_range).rolling(window=14, min_periods=14).mean().to_numpy(dtype=float)
+
+    close_ns = close_time.astype("int64").to_numpy()
+    # Strictly exclude the current candle: the historical implementation used
+    # close_time < current_close_time, not <=. searchsorted-left also handles
+    # duplicate close times without allowing same-close candles into history.
+    history_ends = np.searchsorted(close_ns, close_ns, side="left")
+    result = np.full(len(bars), np.nan, dtype=float)
+    valid = history_ends >= 15
+    atr_indices = history_ends[valid] - 1
+    valid_positions = np.flatnonzero(valid)
+    values = atr14[atr_indices]
+    finite = np.isfinite(values)
+    result[valid_positions[finite]] = values[finite]
+    return result
 
 
 def _simulate_management_only(
@@ -562,15 +615,23 @@ def _simulate_management_only(
     tp1_pnl_pct = _pct_return(direction, entry, production_tp1)
 
     future = future.reset_index(drop=True)
-    all_bars = all_bars.copy().reset_index(drop=True)
-    all_bars["timestamp"] = _timestamp_series_to_utc(all_bars["timestamp"])
-    all_bars["close_time"] = _timestamp_series_to_utc(all_bars["close_time"])
-    for col in ("open", "high", "low", "close"):
-        all_bars[col] = pd.to_numeric(all_bars[col], errors="coerce")
+    # calculate_counterfactual_outcomes normalizes/sorts the full bar frame once
+    # and adds a strictly prior-close ATR series when the close times are ordered.
+    # Re-copying/re-normalizing all bars for each of five management variants was
+    # redundant. Keep the original fallback for direct/legacy inputs without it.
+    has_precomputed_atr = _SHADOW_ATR_BEFORE_CLOSE in future.columns
+    if not has_precomputed_atr:
+        all_bars = all_bars.copy().reset_index(drop=True)
+        all_bars["timestamp"] = _timestamp_series_to_utc(all_bars["timestamp"])
+        all_bars["close_time"] = _timestamp_series_to_utc(all_bars["close_time"])
+        for col in ("open", "high", "low", "close"):
+            all_bars[col] = pd.to_numeric(all_bars[col], errors="coerce")
 
-    for idx, row in future.iterrows():
-        high = float(row["high"])
-        low = float(row["low"])
+    for idx, (high_value, low_value, close_time) in enumerate(
+        future[["high", "low", "close_time"]].itertuples(index=False, name=None)
+    ):
+        high = float(high_value)
+        low = float(low_value)
         stop_hit = _directional_hit(direction, high, low, float(production_stop), False)
         tp1_hit = _directional_hit(direction, high, low, float(production_tp1), True)
         tp2_hit = _directional_hit(direction, high, low, float(production_tp2), True)
@@ -579,7 +640,7 @@ def _simulate_management_only(
                 "status": "AMBIGUOUS_PRE_TP1_BAR",
                 "exit": "AMBIGUOUS",
                 "exit_price": None,
-                "exit_ts": _parse_ts(row["close_time"]).isoformat() if _parse_ts(row["close_time"]) is not None else None,
+                "exit_ts": _parse_ts(close_time).isoformat() if _parse_ts(close_time) is not None else None,
                 "pnl_pct": None,
                 "standalone_management_only": True,
             }
@@ -609,7 +670,7 @@ def _simulate_management_only(
             }
         if tp1_hit:
             tp1_hit_idx = int(idx)
-            tp1_fill_ts = _parse_ts(row["close_time"]).isoformat() if _parse_ts(row["close_time"]) is not None else None
+            tp1_fill_ts = _parse_ts(close_time).isoformat() if _parse_ts(close_time) is not None else None
             break
 
     if tp1_hit_idx is None:
@@ -626,34 +687,44 @@ def _simulate_management_only(
     highest = None
     lowest = None
 
+    future_high = future["high"].to_numpy(dtype=float, copy=False)
+    future_low = future["low"].to_numpy(dtype=float, copy=False)
+    future_close = future["close"].to_numpy(dtype=float, copy=False)
+    future_close_times = future["close_time"].tolist()
+    future_atr = (
+        future[_SHADOW_ATR_BEFORE_CLOSE].to_numpy(dtype=float, copy=False)
+        if has_precomputed_atr else None
+    )
     for idx in range(tp1_hit_idx + 1, len(future)):
-        row = future.iloc[idx]
-        high = float(row["high"])
-        low = float(row["low"])
-        close = float(row["close"])
+        high = float(future_high[idx])
+        low = float(future_low[idx])
+        close = float(future_close[idx])
 
         if mode == "DELAYED_BE" and idx >= activation_idx:
             current_stop = float(entry)
         elif mode == "DELAYED_BE":
             current_stop = float(production_stop)
 
-        current_close_ts = _parse_ts(row["close_time"])
+        current_close_ts = _parse_ts(future_close_times[idx])
         if mode == "TRAIL_ATR":
-            # No intrabar look-ahead: build the trail only from bars that closed
-            # before the current bar. The current bar can trigger the already-set stop,
-            # but cannot retroactively move that stop using its own high/low.
-            hist = all_bars.loc[all_bars["close_time"] < current_close_ts]
-            if len(hist) >= 15:
-                prev = hist["close"].shift(1)
-                tr = pd.concat([
-                    hist["high"] - hist["low"],
-                    (hist["high"] - prev).abs(),
-                    (hist["low"] - prev).abs(),
-                ], axis=1).max(axis=1)
-                atr_vals = tr.dropna().tail(14)
-                atr = _finite(atr_vals.mean()) if len(atr_vals) == 14 else None
+            # No intrabar look-ahead: use ATR computed only from candles whose
+            # close_time is strictly before this candle. The precomputed series
+            # follows the same boundary and 15-row warm-up as the legacy path.
+            if has_precomputed_atr:
+                atr = _finite(future_atr[idx])
             else:
-                atr = None
+                hist = all_bars.loc[all_bars["close_time"] < current_close_ts]
+                if len(hist) >= 15:
+                    prev = hist["close"].shift(1)
+                    tr = pd.concat([
+                        hist["high"] - hist["low"],
+                        (hist["high"] - prev).abs(),
+                        (hist["low"] - prev).abs(),
+                    ], axis=1).max(axis=1)
+                    atr_vals = tr.dropna().tail(14)
+                    atr = _finite(atr_vals.mean()) if len(atr_vals) == 14 else None
+                else:
+                    atr = None
             if atr is not None:
                 if direction == "LONG":
                     highest = max(float(highest), float(production_tp1)) if highest is not None else float(production_tp1)
@@ -722,7 +793,44 @@ def _simulate_management_only(
         "standalone_management_only": True,
     }
 
-def calculate_counterfactual_outcomes(observation: dict[str, Any], bars: pd.DataFrame) -> dict[str, Any]:
+def prepare_counterfactual_bars(bars: pd.DataFrame) -> pd.DataFrame:
+    """Normalize one symbol's bars once for repeated counterfactual calculations.
+
+    The returned frame is detached from caller-owned data and can safely be
+    reused for multiple observations on the same symbol/provider. ATR is based
+    only on candles closed strictly before each candidate candle.
+    """
+    if bars is None or bars.empty:
+        return pd.DataFrame(columns=["timestamp", "close_time", "open", "high", "low", "close"])
+    x = bars.copy()
+    x["timestamp"] = _timestamp_series_to_utc(x["timestamp"])
+    if "close_time" not in x.columns:
+        x["close_time"] = x["timestamp"] + pd.Timedelta(minutes=5)
+    else:
+        x["close_time"] = _timestamp_series_to_utc(x["close_time"])
+    for col in ("open", "high", "low", "close"):
+        x[col] = pd.to_numeric(x[col], errors="coerce")
+    x = x.dropna(subset=["timestamp", "close_time", "open", "high", "low", "close"]).sort_values("timestamp").reset_index(drop=True)
+    # Never trust a caller-supplied value for this internal acceleration field.
+    x = x.drop(columns=[_SHADOW_ATR_BEFORE_CLOSE], errors="ignore")
+    atr_before_close = _precompute_atr_before_close(x)
+    if atr_before_close is not None:
+        x[_SHADOW_ATR_BEFORE_CLOSE] = atr_before_close
+    return x
+
+
+def calculate_counterfactual_outcomes(
+    observation: dict[str, Any],
+    bars: pd.DataFrame,
+    *,
+    bars_prepared: bool = False,
+) -> dict[str, Any]:
+    """Calculate counterfactual paths; prepared frames may be reused by symbol.
+
+    ``bars_prepared`` is an internal fast path for frames returned by
+    :func:`prepare_counterfactual_bars`. It avoids re-copying, re-normalizing,
+    and re-sorting the same market history for each observation.
+    """
     shadow = ((observation.get("features") or {}).get("shadow_experiments") or {})
     direction = str(observation.get("direction", "")).upper()
     entry = _finite(observation.get("reference_price"))
@@ -733,15 +841,7 @@ def calculate_counterfactual_outcomes(observation: dict[str, Any], bars: pd.Data
     )
     if direction not in {"LONG", "SHORT"} or entry is None or entry <= 0 or source_ts is None or bars is None or bars.empty:
         return {"schema_version": SHADOW_SCHEMA_VERSION, "status": "INSUFFICIENT_INPUT"}
-    x = bars.copy()
-    x["timestamp"] = _timestamp_series_to_utc(x["timestamp"])
-    if "close_time" not in x.columns:
-        x["close_time"] = x["timestamp"] + pd.Timedelta(minutes=5)
-    else:
-        x["close_time"] = _timestamp_series_to_utc(x["close_time"])
-    for col in ("open", "high", "low", "close"):
-        x[col] = pd.to_numeric(x[col], errors="coerce")
-    x = x.dropna(subset=["timestamp", "close_time", "open", "high", "low", "close"]).sort_values("timestamp")
+    x = bars if bars_prepared else prepare_counterfactual_bars(bars)
     future = x.loc[(x["timestamp"] >= source_ts) & (x["close_time"] > source_ts)].copy().reset_index(drop=True)
     if future.empty:
         return {"schema_version": SHADOW_SCHEMA_VERSION, "status": "NO_FUTURE_PATH"}
