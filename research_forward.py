@@ -83,6 +83,25 @@ class _BarIndex:
         return slice(start, self.end_at_close(target_ns))
 
 
+def _build_bar_indexes(bars_by_key: dict[str, pd.DataFrame]) -> dict[str, _BarIndex]:
+    """Build one numpy index per underlying frame, reusing symbol aliases.
+
+    ``_load_bars`` maps a single-provider frame under both ``SYMBOL|PROVIDER``
+    and ``SYMBOL``. The frames are the same object; indexing both copies the full
+    DataFrame and its numpy arrays needlessly. Reuse by object identity without
+    merging genuinely distinct provider histories.
+    """
+    indexed: dict[str, _BarIndex] = {}
+    by_frame_id: dict[int, _BarIndex] = {}
+    for key, frame in bars_by_key.items():
+        frame_id = id(frame)
+        index = by_frame_id.get(frame_id)
+        if index is None:
+            index = _BarIndex(frame)
+            by_frame_id[frame_id] = index
+        indexed[key] = index
+    return indexed
+
 
 from event_engine import research, shadow
 
@@ -538,7 +557,12 @@ def _time_to_threshold(direction: str, reference: float, bars: pd.DataFrame, thr
     return None
 
 
-def _calculate_forward_outcome_indexed(observation: dict[str, Any], index: _BarIndex) -> dict[str, Any] | None:
+def _calculate_forward_outcome_indexed(
+    observation: dict[str, Any],
+    index: _BarIndex,
+    *,
+    counterfactual_bars: pd.DataFrame | None = None,
+) -> dict[str, Any] | None:
     direction = str(observation.get("direction", "")).upper()
     symbol = str(observation.get("symbol", "")).upper()
     if direction not in {"LONG", "SHORT"} or index.n == 0:
@@ -637,7 +661,12 @@ def _calculate_forward_outcome_indexed(observation: dict[str, Any], index: _BarI
     # Counterfactual experiments use only the persisted pre-entry snapshot plus
     # future market bars. They never modify production trade outcomes.
     try:
-        result["counterfactual_experiments"] = shadow.calculate_counterfactual_outcomes(observation, index.df)
+        if counterfactual_bars is None:
+            result["counterfactual_experiments"] = shadow.calculate_counterfactual_outcomes(observation, index.df)
+        else:
+            result["counterfactual_experiments"] = shadow.calculate_counterfactual_outcomes(
+                observation, counterfactual_bars, bars_prepared=True,
+            )
     except Exception as exc:
         result["counterfactual_experiments"] = {"schema_version": shadow.SHADOW_SCHEMA_VERSION, "status": "ERROR", "error": f"{type(exc).__name__}: {exc}"}
 
@@ -961,7 +990,27 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
             research._atomic_json_locked(research.RESEARCH_OUTCOME_STATE_PATH, state_payload)
         return 0, total_observations
 
-    indexed: dict[str, _BarIndex] = {key: _BarIndex(df) for key, df in bars_by_symbol.items()}
+    index_started = time.perf_counter()
+    indexed = _build_bar_indexes(bars_by_symbol)
+    index_seconds = time.perf_counter() - index_started
+
+    # Counterfactual simulations need the same sorted OHLC path for every
+    # observation. Prepare it once per unique symbol/provider index, not once per
+    # observation; formulas and strict close-time boundaries remain unchanged.
+    prepare_started = time.perf_counter()
+    counterfactual_bars_by_index_id: dict[int, pd.DataFrame] = {}
+    for index in indexed.values():
+        index_id = id(index)
+        if index_id not in counterfactual_bars_by_index_id:
+            counterfactual_bars_by_index_id[index_id] = shadow.prepare_counterfactual_bars(index.df)
+    prepare_seconds = time.perf_counter() - prepare_started
+    unique_indexes = {id(index): index for index in indexed.values()}
+    indexed_rows = sum(index.n for index in unique_indexes.values())
+    log.info(
+        "[RESEARCH_FORWARD_INDEX] frame_keys=%d unique_frames=%d bar_rows=%d index_seconds=%.3f prepare_seconds=%.3f total_seconds=%.3f",
+        len(indexed), len(unique_indexes), indexed_rows, index_seconds, prepare_seconds,
+        index_seconds + prepare_seconds,
+    )
 
     existing_outcome_ids: set[str] = set()
     if not bootstrap_complete and research.RESEARCH_OUTCOMES_PATH.exists():
@@ -987,7 +1036,9 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
             if oid := str(obs.get("observation_id", "")):
                 pending_now[oid] = dict(candidate_meta.get(oid) or {"offset": 0, "observation_ts": str(obs.get("observation_ts", ""))})
             continue
-        outcome = _calculate_forward_outcome_indexed(obs, index)
+        outcome = _calculate_forward_outcome_indexed(
+            obs, index, counterfactual_bars=counterfactual_bars_by_index_id.get(id(index)),
+        )
         oid = str(obs.get("observation_id", ""))
         invalid_observation = isinstance(outcome, dict) and outcome.get("outcome_class") == "INVALID_RESEARCH_OBSERVATION"
         if outcome is None or (not invalid_observation and not bool(outcome.get("forward_path_complete_24h"))):
@@ -1022,9 +1073,14 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
             unique_ready.append(row)
         if unique_ready:
             research._append_jsonl_locked(research.RESEARCH_OUTCOMES_PATH, unique_ready)
+            observations_by_id: dict[str, dict[str, Any]] = {}
+            for observation_row in observations:
+                observation_id = str(observation_row.get("observation_id", ""))
+                if observation_id and observation_id not in observations_by_id:
+                    observations_by_id[observation_id] = observation_row
             for outcome_row in unique_ready:
                 try:
-                    obs = next((o for o in observations if str(o.get("observation_id", "")) == str(outcome_row.get("observation_id", ""))), None)
+                    obs = observations_by_id.get(str(outcome_row.get("observation_id", "")))
                     if obs is not None and outcome_row.get("outcome_class") != "INVALID_RESEARCH_OBSERVATION":
                         research.record_counterfactual_outcome(observation=obs, outcomes=outcome_row.get("counterfactual_experiments") or {}, outcome_id=str(outcome_row.get("outcome_id") or ""))
                 except Exception as cf_exc:

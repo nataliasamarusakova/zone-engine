@@ -8,7 +8,7 @@ import pytest
 import pandas as pd
 
 from event_engine import research
-from research_forward import calculate_forward_outcome
+from research_forward import calculate_forward_outcome, _build_bar_indexes
 
 
 def _df_1h() -> pd.DataFrame:
@@ -1538,3 +1538,26 @@ def test_forward_invalid_timestamp_is_terminal_not_pending(tmp_path, monkeypatch
     assert "OBS_BAD_TEMPORAL" in set(state.get("processed_observation_ids", [])) or "OBS_BAD_TEMPORAL" not in state.get("pending_observations_v1", {})
     rows = [json.loads(x) for x in outcomes_path.read_text(encoding="utf-8").splitlines() if x.strip()]
     assert rows and rows[-1]["outcome_class"] == "INVALID_RESEARCH_OBSERVATION"
+
+
+def test_bar_index_aliases_reuse_same_frame_but_keep_provider_histories_separate():
+    ts = pd.date_range("2026-01-01", periods=20, freq="5min", tz="UTC")
+    close = [100.0 + i for i in range(len(ts))]
+    frame = pd.DataFrame({
+        "timestamp": ts,
+        "close_time": ts + pd.Timedelta(minutes=5),
+        "open": close,
+        "high": [x + 1 for x in close],
+        "low": [x - 1 for x in close],
+        "close": close,
+        "volume": [1000.0] * len(ts),
+    })
+    other_provider = frame.copy()
+    indexed = _build_bar_indexes({
+        "TEST-USDT|binance": frame,
+        "TEST-USDT": frame,
+        "TEST-USDT|bingx": other_provider,
+    })
+    assert indexed["TEST-USDT|binance"] is indexed["TEST-USDT"]
+    assert indexed["TEST-USDT|bingx"] is not indexed["TEST-USDT|binance"]
+    assert indexed["TEST-USDT|binance"].n == indexed["TEST-USDT|bingx"].n == 20

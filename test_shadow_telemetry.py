@@ -307,3 +307,66 @@ def test_shadow_1h_history_uses_decision_boundary_not_trigger_open():
     exp = snap["experiments"]["CF_VOLUME_1H"]
     assert exp["current_closed_1h_volume"] == 1000.0
     assert snap["decision_anchor"]["decision_ts"] == "2026-10-06T17:00:00+00:00"
+
+
+def test_precomputed_counterfactual_atr_matches_legacy_strict_prior_close_formula():
+    bars = shadow.prepare_counterfactual_bars(_bars_5m([10] * 40))
+    atr_column = shadow._SHADOW_ATR_BEFORE_CLOSE
+    assert atr_column in bars.columns
+
+    for idx, row in bars.iterrows():
+        hist = bars.loc[bars["close_time"] < row["close_time"]]
+        expected = None
+        if len(hist) >= 15:
+            prev = hist["close"].shift(1)
+            tr = pd.concat([
+                hist["high"] - hist["low"],
+                (hist["high"] - prev).abs(),
+                (hist["low"] - prev).abs(),
+            ], axis=1).max(axis=1)
+            values = tr.dropna().tail(14)
+            if len(values) == 14:
+                expected = float(values.mean())
+        actual = float(bars.iloc[idx][atr_column])
+        if expected is None:
+            assert pd.isna(actual)
+        else:
+            assert actual == expected
+
+
+def test_prepared_counterfactual_frame_matches_unprepared_output_exactly():
+    bars = _bars_5m([10] * 55)
+    signal = _signal("LONG")
+    snap = shadow.build_entry_snapshot(signal, df_5m=bars, df_1h=_bars_1h())
+    obs = {
+        "event_id": "EVT_PREPARED_EQUIVALENCE",
+        "symbol": "TEST-USDT",
+        "direction": "LONG",
+        "reference_price": 100.0,
+        "source_event_ts": "2026-09-28T10:00:00Z",
+        "counterfactual_path_start_ts": "2026-09-28T10:00:00Z",
+        "features": {"shadow_experiments": snap["experiments"]},
+    }
+    direct = shadow.calculate_counterfactual_outcomes(obs, bars)
+    prepared_bars = shadow.prepare_counterfactual_bars(bars)
+    prepared = shadow.calculate_counterfactual_outcomes(obs, prepared_bars, bars_prepared=True)
+    assert prepared == direct
+
+
+def test_prepared_counterfactual_falls_back_for_non_monotonic_close_times():
+    bars = _bars_5m([10] * 40)
+    bars.loc[20, "close_time"] = bars.loc[18, "close_time"]
+    prepared_bars = shadow.prepare_counterfactual_bars(bars)
+    assert shadow._SHADOW_ATR_BEFORE_CLOSE not in prepared_bars.columns
+    signal = _signal("LONG")
+    snap = shadow.build_entry_snapshot(signal, df_5m=_bars_5m([10] * 40), df_1h=_bars_1h())
+    obs = {
+        "event_id": "EVT_PREPARED_FALLBACK",
+        "symbol": "TEST-USDT",
+        "direction": "LONG",
+        "reference_price": 100.0,
+        "source_event_ts": "2026-09-28T10:00:00Z",
+        "counterfactual_path_start_ts": "2026-09-28T10:00:00Z",
+        "features": {"shadow_experiments": snap["experiments"]},
+    }
+    assert shadow.calculate_counterfactual_outcomes(obs, prepared_bars, bars_prepared=True) == shadow.calculate_counterfactual_outcomes(obs, bars)
