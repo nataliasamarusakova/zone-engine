@@ -2481,6 +2481,60 @@ def test_execution_outcome_categories_separate_technical_failures():
     assert run_once._execution_outcome_category("opened_then_emergency_closed") == "EMERGENCY_EXIT"
     assert run_once._execution_outcome_category("entry_state_unverified") == "EXECUTION_UNVERIFIED"
     assert run_once._execution_outcome_category("blocked_protection_preflight") == "PROTECTION_FAILURE"
+    assert run_once._trade_event_record_type("opened_protected") == "TRADE_OPEN"
+    assert run_once._trade_event_record_type("opened_then_emergency_closed") == "TRADE_OPEN"
+    assert run_once._trade_event_record_type("skipped_stale_signal") == "ENTRY_ATTEMPT"
+    assert run_once._trade_event_record_type("entry_state_unverified") == "ENTRY_ATTEMPT"
+
+
+def test_emergency_close_record_requires_matching_confirmed_rollback_fill():
+    import run_once
+
+    signal = {"event_id": "EVT_EMERGENCY", "attempt_id": "ATTEMPT-1", "symbol": "TEST-USDT", "type": "LONG"}
+    execution = {
+        "status": "opened_then_emergency_closed",
+        "position": {"avgPrice": 100.0, "positionAmt": 2.0},
+        "close": {
+            "status": "closed_verified",
+            "verification": {"status": "not_found"},
+            "attempts": [{"response": {"code": 0, "data": {"order": {
+                "status": "FILLED", "avgPrice": "98", "executedQty": "2",
+                "orderId": "ROLLBACK-1", "workingType": "MARK_PRICE",
+            }}}}],
+        },
+    }
+
+    close = run_once._emergency_trade_close_record(signal, execution, observed_closed_ts_ms=123)
+    assert close["record_type"] == "TRADE_CLOSE"
+    assert close["exit_reason"] == "EMERGENCY_CLOSE"
+    assert close["realized_pnl_pct"] == -2.0
+    assert close["gross_realized_pnl_abs"] == -4.0
+    assert close["net_realized_pnl_abs"] is None
+    assert close["observed_closed_ts"] == 123
+
+    execution["close"]["attempts"][0]["response"]["data"]["order"]["executedQty"] = "1"
+    assert run_once._emergency_trade_close_record(signal, execution) is None
+
+    execution["close"]["attempts"][0]["response"]["data"]["order"]["executedQty"] = "2"
+    execution["close"]["verification"]["status"] = "error"
+    assert run_once._emergency_trade_close_record(signal, execution) is None
+
+
+def test_entry_attempt_does_not_count_as_successful_trade_or_hide_terminal_rollback(tmp_path, monkeypatch):
+    import run_once
+
+    journal = tmp_path / "trades.jsonl"
+    rows = [
+        {"record_type": "ENTRY_ATTEMPT", "event_id": "BLOCKED", "result": {"status": "skipped_stale_signal"}},
+        {"record_type": "TRADE_OPEN", "event_id": "OPEN", "result": {"status": "opened_protected"}},
+        {"record_type": "TRADE_OPEN", "event_id": "ROLLBACK", "result": {"status": "opened_then_emergency_closed"}},
+        {"record_type": "TRADE_CLOSE", "event_id": "ROLLBACK", "exit_reason": "EMERGENCY_CLOSE"},
+    ]
+    journal.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    monkeypatch.setattr(run_once, "TRADES_PATH", journal)
+
+    assert run_once._load_successful_trade_ids() == {"OPEN"}
+    assert run_once._load_terminal_event_ids() == {"BLOCKED", "ROLLBACK"}
 
 
 def test_exit_outcome_categories_separate_strategy_and_unverified_closes():
