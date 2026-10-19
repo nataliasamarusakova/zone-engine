@@ -681,6 +681,112 @@ def _execution_outcome_category(status: str) -> str:
     return "EXECUTION_OTHER"
 
 
+def _trade_event_record_type(status: str) -> str:
+    """Use TRADE_OPEN only when exchange execution confirms a position lifecycle."""
+    return "TRADE_OPEN" if str(status or "").lower() in {
+        "opened_protected",
+        "opened_then_emergency_closed",
+    } else "ENTRY_ATTEMPT"
+
+
+def _emergency_trade_close_record(
+    signal: dict[str, Any], execution: dict[str, Any], *, observed_closed_ts_ms: int | None = None
+) -> dict[str, Any] | None:
+    """Build a gross-only close row when rollback fills and flat position are confirmed."""
+    if str(execution.get("status", "")).lower() != "opened_then_emergency_closed":
+        return None
+    close = execution.get("close") if isinstance(execution.get("close"), dict) else {}
+    verification = close.get("verification") if isinstance(close.get("verification"), dict) else {}
+    if str(close.get("status", "")).lower() != "closed_verified" or str(verification.get("status", "")).lower() != "not_found":
+        return None
+    position = execution.get("position") if isinstance(execution.get("position"), dict) else {}
+    try:
+        entry_price = float(position.get("avgPrice") or position.get("entryPrice"))
+        entry_qty = abs(float(position.get("positionAmt") or position.get("availableAmt")))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(entry_price) or entry_price <= 0 or not math.isfinite(entry_qty) or entry_qty <= 0:
+        return None
+
+    confirmed_orders = []
+    for attempt in close.get("attempts", []):
+        if not isinstance(attempt, dict):
+            continue
+        response = attempt.get("response") if isinstance(attempt.get("response"), dict) else {}
+        if response.get("code") not in (0, "0"):
+            continue
+        data = response.get("data") if isinstance(response.get("data"), dict) else {}
+        order = data.get("order") if isinstance(data.get("order"), dict) else {}
+        if str(order.get("status", "")).upper() != "FILLED":
+            continue
+        try:
+            qty = abs(float(order.get("executedQty")))
+            price = float(order.get("avgPrice"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(qty) or qty <= 0 or not math.isfinite(price) or price <= 0:
+            continue
+        confirmed_orders.append({
+            "order_id": str(order.get("orderId") or order.get("orderID") or "") or None,
+            "status": "FILLED", "qty": qty, "avg_price": price,
+            "working_type": order.get("workingType"),
+            "execution_ts_ms": next((int(order[key]) for key in ("updateTime", "time", "transactTime")
+                                      if str(order.get(key, "")).isdigit() and int(order[key]) > 0), None),
+        })
+    exit_qty = sum(row["qty"] for row in confirmed_orders)
+    tolerance = max(1e-10, entry_qty * 1e-6)
+    if not confirmed_orders or abs(exit_qty - entry_qty) > tolerance:
+        return None
+
+    exit_vwap = sum(row["qty"] * row["avg_price"] for row in confirmed_orders) / exit_qty
+    direction = str(signal.get("type") or "").upper()
+    if direction not in {"LONG", "SHORT"}:
+        return None
+    signed_move = exit_vwap - entry_price if direction == "LONG" else entry_price - exit_vwap
+    gross_pnl_abs = signed_move * entry_qty
+    gross_pnl_pct = signed_move / entry_price * 100.0
+    execution_times = [row["execution_ts_ms"] for row in confirmed_orders if row["execution_ts_ms"] is not None]
+    observed_ts = observed_closed_ts_ms if observed_closed_ts_ms is not None else int(time.time() * 1000)
+    order_ids = [row["order_id"] for row in confirmed_orders if row["order_id"]]
+    evidence = {
+        "status": "CONFIRMED", "authority": "EMERGENCY_ORDER_EXECUTION_RESPONSE",
+        "confirmed_exit_qty": exit_qty, "exit_vwap_confirmed": exit_vwap,
+        "exit_vwap_source": "FILLED_EMERGENCY_ORDER_AVG_PRICE",
+        "position_verification": "not_found", "orders": confirmed_orders,
+        "execution_timestamp_source": "EXCHANGE_ORDER_TIME" if execution_times else "UNAVAILABLE",
+    }
+    return {
+        "record_type": "TRADE_CLOSE", "event_id": signal.get("event_id"),
+        "attempt_id": signal.get("attempt_id") or execution.get("attempt_id"),
+        "symbol": signal.get("symbol"), "direction": direction,
+        "closed_ts": max(execution_times) if execution_times else None,
+        "execution_close_ts": max(execution_times) if execution_times else None,
+        "observed_closed_ts": observed_ts,
+        "close_timestamp_source": "EXCHANGE_ORDER_TIME" if execution_times else "UNAVAILABLE",
+        "exit_reason": "EMERGENCY_CLOSE", "outcome_category": "EMERGENCY_EXIT",
+        "strategy_version": signal.get("strategy_version", _effective_strategy_version()),
+        "code_commit_sha": CODE_COMMIT_SHA,
+        "entry_bar": signal.get("entry_bar", {}),
+        "previous_bar": signal.get("previous_bar", {}),
+        "signal_snapshot": dict(signal),
+        "entry_order": execution.get("order", {}) if isinstance(execution.get("order"), dict) else {},
+        "fill_position": dict(position),
+        "entry_price": entry_price, "exit_price": exit_vwap,
+        "exit_price_semantics": "CONFIRMED_EMERGENCY_ORDER_AVG_PRICE",
+        "exit_vwap_confirmed": exit_vwap, "exit_vwap_source": "FILLED_EMERGENCY_ORDER_AVG_PRICE",
+        "realized_pnl_pct": gross_pnl_pct,
+        "realized_pnl_source": "CONFIRMED_EMERGENCY_POSITION_AND_ORDER_FILL_GROSS",
+        "realized_pnl_abs": None, "realized_pnl_abs_source": "UNAVAILABLE_NET_FEES_FUNDING",
+        "realized_pnl_abs_status": "UNAVAILABLE", "gross_realized_pnl_abs": gross_pnl_abs,
+        "gross_realized_pnl_source": "CONFIRMED_EMERGENCY_POSITION_AND_ORDER_FILL",
+        "net_realized_pnl_abs": None, "net_realized_pnl_source": "UNAVAILABLE",
+        "entry_qty": entry_qty, "exit_qty": exit_qty, "exit_order_ids": order_ids,
+        "fees_paid_abs": None, "fee_raw_total": None, "fees_source": "UNAVAILABLE",
+        "funding_paid_abs": None, "funding_source": "UNAVAILABLE",
+        "close_execution_evidence": evidence,
+    }
+
+
 def _load_successful_trade_ids() -> set[str]:
     if not TRADES_PATH.exists():
         return set()
@@ -4595,7 +4701,7 @@ def main() -> None:
         else:
             _finalize_event_claim(event_id, attempt_id, terminal=False, status=execution_status)
         _append_jsonl(TRADES_PATH, {
-            "record_type": "TRADE_OPEN",
+            "record_type": _trade_event_record_type(execution_status),
             "event_id": signal["event_id"],
             "attempt_id": execution.get("attempt_id"),
             "symbol": signal["symbol"],
@@ -4618,6 +4724,15 @@ def main() -> None:
             "outcome_category": _execution_outcome_category(execution_status),
             "result": execution,
         })
+        if execution_status == "opened_then_emergency_closed":
+            emergency_close = _emergency_trade_close_record(signal, execution)
+            if emergency_close is not None:
+                _append_jsonl(TRADES_PATH, emergency_close)
+            else:
+                log.error(
+                    "[EMERGENCY_CLOSE_LEDGER_PENDING] event_id=%s: rollback is not sufficiently evidenced for a canonical close record",
+                    event_id,
+                )
         _send_signal(signal, execution)
         if str(execution.get("status")) == "opened_protected":
             executed += 1
