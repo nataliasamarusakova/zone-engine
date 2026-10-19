@@ -375,17 +375,26 @@ def _size_guard_plan(path: Path, *, now: datetime, pending_ids: set[str], pendin
     name = path.name
     if name == "market_bars_5m.jsonl":
         hours = [36, 24, 12, 6, 3, 1]
+
         def keep_5m(row: dict[str, Any], h: int) -> bool:
             ts = _parse_ts(row.get("timestamp"))
             if ts is None:
+                # Unknown timestamps are preserved in the working file; the size
+                # guard must not guess that an unparseable bar is safe to drop.
                 return True
-            symbol = str(row.get("symbol", "")).upper()
+            # Do not extend the live JSONL window to the oldest pending outcome.
+            # Every row removed by this size-guard pass is written losslessly to
+            # an immutable *.pruned*.gz delta, which research_forward._load_bars()
+            # reads on subsequent runs. The workflow verifies and uploads that
+            # cumulative archive before allowing the compacted journals to commit;
+            # if upload/verification fails, its rollback restores the pre-compaction
+            # snapshot. Keeping all pending history in this working file caused
+            # the guard to make no progress when pending observations were older
+            # than the available candle window.
             cutoff = now - timedelta(hours=h)
-            pending_cutoff = pending_bar_cutoffs.get(symbol)
-            if pending_cutoff is not None and pending_cutoff < cutoff:
-                cutoff = pending_cutoff
             return ts >= cutoff
-        return [(f"keep_newer_than_{h}h_with_pending_protection", lambda row, h=h: keep_5m(row, h)) for h in hours]
+
+        return [(f"keep_newer_than_{h}h_archiving_older_bars", lambda row, h=h: keep_5m(row, h)) for h in hours]
     if name == "market_bars_1h.jsonl":
         hours = [168, 72, 48, 24, 12]
         return [
