@@ -449,7 +449,7 @@ def _compact_reconciliation_size_guard(path: Path, *, now: datetime, run_root: P
     # Work from a conservative set of closed-position rows only. The standard
     # reconciliation rule keeps anomalies/terminal rows and last healthy FOUND.
     for cutoff_hours in (336, 168, 72, 24):
-        if _file_meta(path)["bytes"] < GITHUB_SIZE_GUARD_BYTES:
+        if _file_meta(path)["bytes"] <= GITHUB_SIZE_TARGET_BYTES:
             break
         cutoff = now - timedelta(hours=cutoff_hours)
         last_healthy = _reconciliation_last_healthy_lines(
@@ -491,7 +491,7 @@ def _apply_size_guard_to_file(path: Path, *, now: datetime, archive_root: Path, 
         applied: list[dict[str, Any]] = []
         current = before
         for name, policy in _size_guard_plan(path, now=now, pending_ids=pending_ids, pending_bar_cutoffs=pending_bar_cutoffs, protected_observation_ids=protected_observation_ids, protected_refs=protected_refs):
-            if current["bytes"] < GITHUB_SIZE_GUARD_BYTES:
+            if current["bytes"] <= GITHUB_SIZE_TARGET_BYTES:
                 break
             # Each escalation pass must have its own immutable delta directory.
             # Otherwise a later pass writes the same ``*.pruned.jsonl.gz`` name
