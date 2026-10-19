@@ -167,6 +167,40 @@ def test_size_guard_zone_observations_can_archive_old_non_nearest_rows_without_t
     assert "OBS_OLD_0" in restored_ids
 
 
+def test_size_guard_continues_safe_policies_below_guard_until_target(monkeypatch, tmp_path):
+    import json
+    from event_engine import data_retention
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    path = data_dir / "market_bars_5m.jsonl"
+    rows = [
+        {"id": "discard-first", "payload": "a" * 5_000},
+        {"id": "keep-first-pass", "payload": "b" * 5_000},
+        {"id": "discard-second", "payload": "c" * 5_000},
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    monkeypatch.setattr(data_retention, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(data_retention, "GITHUB_SIZE_GUARD_BYTES", 10_000)
+    monkeypatch.setattr(data_retention, "GITHUB_SIZE_TARGET_BYTES", 1_000)
+    monkeypatch.setattr(data_retention, "_size_guard_plan", lambda *args, **kwargs: [
+        ("first-policy", lambda row: row.get("id") == "keep-first-pass"),
+        ("second-policy", lambda row: False),
+    ])
+
+    result = data_retention._apply_size_guard_to_file(
+        path, now=data_retention.datetime.now(data_retention.timezone.utc),
+        archive_root=data_dir / "retention_archive", pending_ids=set(),
+        pending_bar_cutoffs={}, protected_observation_ids=set(), protected_refs=set(),
+    )
+
+    assert result["bytes_after"] <= data_retention.GITHUB_SIZE_TARGET_BYTES
+    assert [row["policy"] for row in result["policies"]] == ["first-policy", "second-policy"]
+    assert list(path.read_text(encoding="utf-8").splitlines()) == []
+    assert list((data_dir / "retention_archive").rglob("*.before.part-*.jsonl.gz"))
+    assert list((data_dir / "retention_archive").rglob("*.pruned.jsonl.gz"))
+
+
 def test_clean_checkout_can_persist_and_restore_runtime_state(tmp_path):
     """Prove the exact lifecycle used by GitHub Actions between two clean runs."""
     import subprocess
