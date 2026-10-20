@@ -270,7 +270,7 @@ def restore_bundle(*, bundle_dir: Path, data_dir: Path) -> None:
         raise RuntimeError("Bundle path must not overlap restore target")
 
     data_dir.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="zone-runtime-restore-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="zone-runtime-restore-", dir=data_dir.parent) as temporary:
         tmp = Path(temporary)
         staged_data = tmp / "staged-data"
         shutil.copytree(bundle_dir / "data", staged_data)

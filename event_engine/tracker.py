@@ -48,6 +48,46 @@ _TRACKER_TRADE_CLOSED_LOG_FORMAT = (
     "[TRACKER_TRADE_CLOSED] %s %s (%s) | PnL: %+.2f%% | "
     "Realized R:R: %s | Planned R:R: %.2f | Exit: %.8g (%s) | Duration: %.1f min"
 )
+_TRACKER_TRADE_CLOSED_UNCONFIRMED_LOG_FORMAT = (
+    "[TRACKER_TRADE_CLOSED] %s %s (%s) | PnL: %s | "
+    "Realized R:R: %s | Planned R:R: %.2f | Exit: %.8g (%s) | Duration: %.1f min"
+)
+
+
+def _pnl_log_value(value: float | None) -> str:
+    """Render unknown/unconfirmed PnL without passing None to numeric logging formats."""
+    return f"{value:+.2f}%" if value is not None else "unconfirmed"
+
+
+_POSITION_ABSENCE_UNVERIFIED_KEYS = (
+    "position_absence_unverified",
+    "position_absence_unverified_ts",
+    "position_absence_unverified_last_seen_ts",
+    "position_absence_unverified_qty",
+    "position_absence_unverified_reason",
+    "position_absence_unverified_alerted",
+    "position_absence_unverified_alert_ts",
+)
+
+
+def _clear_position_absence_unverified_if_position_found(
+    trade: dict[str, Any], *, exchange_qty: float, now_ms: int, qty_tolerance: float,
+) -> bool:
+    """Clear a stale absence marker only after an authoritative positive position read.
+
+    This deliberately does not close a trade or unblock reconciliation when the exchange
+    still reports no position; that case needs confirmed exit evidence or operator review.
+    """
+    if exchange_qty <= max(0.0, qty_tolerance) or not trade.get("position_absence_unverified"):
+        return False
+    first_seen = trade.get("position_absence_unverified_ts")
+    if first_seen is not None:
+        trade["position_absence_unverified_first_seen_ts"] = first_seen
+    trade["position_absence_unverified_resolved_ts"] = int(now_ms)
+    trade["position_absence_unverified_resolution_reason"] = "exchange_position_reappeared"
+    for key in _POSITION_ABSENCE_UNVERIFIED_KEYS:
+        trade.pop(key, None)
+    return True
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA = PROJECT_ROOT / "data"
@@ -3322,6 +3362,12 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                 rem_qty = abs(_safe_float(final_pos.get("positionAmt")))
                 trade["current_position_qty"] = rem_qty
                 trade["remaining_qty"] = rem_qty
+                _clear_position_absence_unverified_if_position_found(
+                    trade,
+                    exchange_qty=rem_qty,
+                    now_ms=now_ms,
+                    qty_tolerance=max(1e-12, init_qty * 1e-8),
+                )
                 final_avg = _safe_float(final_pos.get("avgPrice"))
                 if final_avg > 0:
                     trade["last_exchange_avg_price"] = final_avg
@@ -3454,7 +3500,8 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                 trade["remaining_qty"] = residual_qty_to_preserve
                 trade["current_position_qty"] = residual_qty_to_preserve
                 trade["position_absence_unverified"] = True
-                trade["position_absence_unverified_ts"] = now_ms
+                trade.setdefault("position_absence_unverified_ts", now_ms)
+                trade["position_absence_unverified_last_seen_ts"] = now_ms
                 trade["position_absence_unverified_qty"] = residual_qty_to_preserve
                 trade["position_absence_unverified_reason"] = "no_confirmed_residual_exit_order"
                 if first_pending_observation:
@@ -3962,7 +4009,19 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
             trade["closed"] = True
 
             duration_min = trade["duration_min"] if trade["duration_min"] is not None else trade["observed_duration_min"]
-            log.info(_TRACKER_TRADE_CLOSED_LOG_FORMAT, emoji, trade.get("name", symbol), symbol, final_pnl, (f"{realized_rr:.3f}" if realized_rr is not None else "—"), planned_rr, exit_price, exit_reason, duration_min)
+            realized_rr_log = f"{realized_rr:.3f}" if realized_rr is not None else "—"
+            if final_pnl is None:
+                log.info(
+                    _TRACKER_TRADE_CLOSED_UNCONFIRMED_LOG_FORMAT,
+                    emoji, trade.get("name", symbol), symbol, _pnl_log_value(final_pnl),
+                    realized_rr_log, planned_rr, exit_price, exit_reason, duration_min,
+                )
+            else:
+                log.info(
+                    _TRACKER_TRADE_CLOSED_LOG_FORMAT,
+                    emoji, trade.get("name", symbol), symbol, final_pnl,
+                    realized_rr_log, planned_rr, exit_price, exit_reason, duration_min,
+                )
 
             _send_tracker_notification(
                 "TRADE_CLOSE",

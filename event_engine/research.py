@@ -1902,6 +1902,18 @@ def record_scan_symbol(
     # Production signals receive the richest record, including target/score/visit data.
     for signal in signals:
         signal_boundary_ts = signal.get("decision_boundary_ts") or decision_ts
+        # In deferred mode the first pass had no account snapshot, so its immutable-looking
+        # shadow dict can contain CF_CORRELATION=CONTEXT_UNAVAILABLE. If a persisted
+        # decision-time account snapshot is available now, rebuild the snapshot before both
+        # the observation and counterfactual journal consume it.
+        if account_context is not None:
+            try:
+                signal["shadow_experiments"] = shadow.build_entry_snapshot(
+                    signal, df_5m=closed_5m_df, df_1h=df_1h,
+                    account_context=account_context, decision_ts=signal_boundary_ts,
+                )
+            except Exception as exc:
+                _record_error("counterfactual_snapshot_refresh", COUNTERFACTUAL_EXPERIMENTS_PATH, exc, symbol=symbol)
         signal_context = signal.get("pre_execution_market_context") if isinstance(signal.get("pre_execution_market_context"), dict) else market_context
         observations.append(_observation_from_signal(
             signal, scan_id=scan_id, strategy_version=strategy_version,
