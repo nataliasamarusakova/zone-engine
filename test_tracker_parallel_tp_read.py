@@ -3,6 +3,27 @@ from __future__ import annotations
 import pytest
 
 
+def test_shared_telemetry_reconciliation_journal_is_isolated_from_repo_data():
+    from event_engine import telemetry
+
+    production_path = telemetry.PROJECT_ROOT / "data" / "position_reconciliation.jsonl"
+    isolated_path = telemetry.POSITION_RECONCILIATION_PATH
+    assert isolated_path.resolve() != production_path.resolve()
+
+    telemetry.record_position_reconciliation(
+        event_id="EVT_TEST_ISOLATED_TELEMETRY",
+        attempt_id="ATT_TEST_ISOLATED_TELEMETRY",
+        position_id="POS_TEST_ISOLATED_TELEMETRY",
+        symbol="AAA-USDT",
+        direction="LONG",
+        status="FOUND",
+        internal_remaining_qty=1.0,
+        exchange_position_qty=1.0,
+    )
+    assert isolated_path.exists()
+    assert not isolated_path.resolve().is_relative_to(production_path.parent.resolve())
+
+
 def test_thread_local_retry_session_uses_isolated_session_and_keeps_default(monkeypatch):
     from event_engine import bingx
 

@@ -6,7 +6,7 @@ import pytest
 @pytest.fixture(autouse=True)
 def isolate_repository_research_data(monkeypatch, tmp_path):
     """Never allow pytest research tests to mutate the repository's production data/."""
-    from event_engine import research, bingx
+    from event_engine import research, bingx, telemetry
     # Default deterministic unit-test account mode is one-way; tests that exercise
     # hedge mode explicitly override the cache or mock position_side_param.
     bingx._POSITION_MODE_CACHE.update({"ts": 9999999999, "dual": False})
@@ -15,6 +15,21 @@ def isolate_repository_research_data(monkeypatch, tmp_path):
     runtime_data.mkdir(parents=True, exist_ok=True)
     (runtime_data / "active_trades.json").write_text("{}", encoding="utf-8")
     (runtime_data / "event_execution_claims.json").write_text("{}", encoding="utf-8")
+
+    # Telemetry is imported by run_once, tracker, and several test modules. Isolate
+    # its shared module-level paths globally, not only in test_all.py, so any test
+    # that exercises reconciliation cannot append to the restored production journal.
+    telemetry_paths = {
+        "DATA": runtime_data,
+        "QUOTE_SNAPSHOTS_PATH": runtime_data / "quote_snapshots.jsonl",
+        "ORDER_LIFECYCLE_PATH": runtime_data / "order_lifecycle.jsonl",
+        "PROTECTION_LIFECYCLE_PATH": runtime_data / "protection_lifecycle.jsonl",
+        "POSITION_RECONCILIATION_PATH": runtime_data / "position_reconciliation.jsonl",
+        "EXCHANGE_ERRORS_PATH": runtime_data / "exchange_errors.jsonl",
+    }
+    for name, value in telemetry_paths.items():
+        monkeypatch.setattr(telemetry, name, value)
+
     # Do not create any other runtime data up-front: individual tests may intentionally
     # construct their own tmp/data directory for retention-policy assertions.
     research_paths = {

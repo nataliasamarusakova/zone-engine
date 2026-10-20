@@ -1896,12 +1896,14 @@ def test_tracker_close_once_is_idempotent(tmp_path, monkeypatch):
 
 def test_open_market_blocks_two_tp_min_quantity_before_order(monkeypatch):
     from event_engine import bingx
-    # Keep this sizing test deterministic when CI supplies a conservative
-    # runtime leverage (e.g. 3x). The test specifically exercises qty == one
-    # exchange minimum, which is insufficient to split into two TP legs.
-    monkeypatch.setattr(bingx, "LEVERAGE", 10)
-    monkeypatch.setattr(bingx, "MAX_LEVERAGE", 10)
-    monkeypatch.setenv("BINGX_MARGIN_USDT", "1")
+    # Set the sizing inputs explicitly. CI's workflow now runs at 3x, so relying
+    # on import-time environment constants made this test accidentally size zero.
+    monkeypatch.setenv("BINGX_MARGIN_USDT", "3.34")
+    monkeypatch.setattr(bingx, "MARGIN_USDT", 3.34)
+    monkeypatch.setattr(bingx, "LEVERAGE", 3)
+    monkeypatch.setattr(bingx, "MAX_LEVERAGE", 3)
+    monkeypatch.setattr(bingx, "get_order", lambda *args, **kwargs: {"status": "not_found"})
+    monkeypatch.setattr(bingx, "_set_leverage", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("leverage must not be changed for a skipped entry")))
     monkeypatch.setattr(bingx, "get_contract", lambda symbol: {
         "symbol": "BNB-USDT", "quantityPrecision": 2, "tradeMinQuantity": 0.01,
         "multiplier": 1, "maxLeverage": 10,
@@ -1916,6 +1918,35 @@ def test_open_market_blocks_two_tp_min_quantity_before_order(monkeypatch):
     monkeypatch.setattr(bingx, "position_side_param", lambda *args, **kwargs: "LONG")
     out = bingx.open_market("BNB-USDT", "LONG", 1000.0, "EVT_TEST")
     assert out["status"] == "skipped_tp_min_qty"
+
+
+
+def test_open_market_zero_rounded_quantity_is_skipped_min_qty(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setenv("BINGX_MARGIN_USDT", "1")
+    monkeypatch.setattr(bingx, "MARGIN_USDT", 1.0)
+    monkeypatch.setattr(bingx, "LEVERAGE", 3)
+    monkeypatch.setattr(bingx, "MAX_LEVERAGE", 3)
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)
+    monkeypatch.setattr(bingx, "get_contract", lambda symbol: {
+        "symbol": symbol, "quantityPrecision": 2, "tradeMinQuantity": 0.01,
+        "multiplier": 1, "maxLeverage": 10,
+    })
+    monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
+    monkeypatch.setattr(bingx, "has_open_position", lambda *args, **kwargs: False)
+    monkeypatch.setattr(bingx, "position_side_param", lambda direction: "BOTH")
+    monkeypatch.setattr(bingx, "get_order", lambda *args, **kwargs: {"status": "not_found"})
+    monkeypatch.setattr(bingx, "get_execution_quote", lambda symbol, **kwargs: {
+        "status": "ok", "symbol": symbol, "bid": 1000.0, "ask": 1000.0,
+        "spread_pct": 0.0, "quote_observed_at_ms": int(time.time() * 1000),
+        "quote_exchange_time_ms": int(time.time() * 1000),
+    })
+    monkeypatch.setattr(bingx, "_set_leverage", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not set leverage")))
+    out = bingx.open_market("BNB-USDT", "LONG", 1000.0, "EVT_ZERO_QTY")
+    assert out["status"] == "skipped_min_qty"
+    assert out["qty"] == 0.0
+    assert out["raw_qty"] == 0.003
+    assert out["required_margin_usdt"] > out["configured_margin_usdt"]
 
 
 def test_sl_order_validation_is_one_sided_and_be_allows_entry(monkeypatch):
