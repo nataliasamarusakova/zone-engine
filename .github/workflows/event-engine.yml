@@ -170,28 +170,27 @@ jobs:
                 and .head_branch == "main"
                 and .event == "repository_dispatch"
                 and .status == "completed"
-                and .conclusion == "success"
               ' >/dev/null <<< "$run_json"; then
                 artifact_id="$candidate_artifact_id"
                 run_id="$candidate_run_id"
                 selected_created_at="$candidate_created_at"
                 break
               fi
-              echo "Ignoring runtime-state artifact id=$candidate_artifact_id from a non-successful workflow run."
+              echo "Ignoring runtime-state artifact id=$candidate_artifact_id because it is not from a completed event-engine run on main."
             done <<< "$artifact_candidates"
           fi
 
           if [ -z "$artifact_id" ]; then
-            named_count="$(jq '[.[].artifacts[] | select(.name == "zone-engine-runtime-state") | select(.expired == false)] | length' <<< "$api_json")"
+            named_count="$(jq '[.[].artifacts[] | select(.name == "zone-engine-runtime-state")] | length' <<< "$api_json")"
             if [ "$named_count" -gt 0 ]; then
-              echo "::error::Runtime-state artifacts exist, but none is from a successful completed event-engine run on main; refusing to initialize an empty state over prior state."
+              echo "::error::Runtime-state artifacts exist (including possibly expired/ineligible artifacts), but none is usable; refusing to initialize an empty state over prior state."
               exit 1
             fi
             echo "No prior runtime-state artifact exists. Requesting guarded clean-start bootstrap; trading remains disabled for this run."
             echo "mode=bootstrap" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "Selected verified-state candidate from successful run $run_id created at $selected_created_at."
+          echo "Selected self-verifying runtime-state candidate from completed run $run_id created at $selected_created_at."
 
           tmp_dir="$(mktemp -d)"
           trap 'rm -rf "$tmp_dir"' EXIT
@@ -205,7 +204,7 @@ jobs:
             sleep "$download_attempt"
           done
           if [ "$downloaded" != "true" ]; then
-            echo "::error::Could not download the selected successful runtime-state artifact (id=$artifact_id, run=$run_id); refusing to fall back to stale or empty state."
+            echo "::error::Could not download the selected runtime-state artifact (id=$artifact_id, run=$run_id); refusing to fall back to stale or empty state."
             exit 1
           fi
 
@@ -665,7 +664,7 @@ jobs:
 
       - name: Restore pre-compaction journals if retention archive upload failed
         id: restore_pre_compaction_snapshots
-        if: ${{ always() && steps.size_guard.outcome == 'success' && (steps.retention_archive_upload_decision.outcome != 'success' || (steps.retention_archive_upload_decision.outputs.archive_upload_required == 'true' && steps.upload_retention_archive.outcome != 'success')) }}
+        if: ${{ always() && (steps.size_guard.outcome == 'success' || steps.size_guard.outcome == 'failure') && (steps.size_guard.outcome == 'failure' || steps.retention_archive_upload_decision.outcome != 'success' || (steps.retention_archive_upload_decision.outputs.archive_upload_required == 'true' && steps.upload_retention_archive.outcome != 'success')) }}
         shell: bash
         run: |
           set -euo pipefail
@@ -699,9 +698,9 @@ jobs:
           # The size-guard manifest is rewritten each time that step succeeds.
           # If it is absent or malformed, we cannot prove whether compaction
           # occurred, so fail closed rather than commit unverifiable state.
-          if [ "$size_guard_outcome" = "success" ]; then
+          if [ "$size_guard_outcome" = "success" ] || [ "$size_guard_outcome" = "failure" ]; then
             if [ ! -f data/data_retention_manifest.json ]; then
-              echo "::error::Size guard succeeded without a retention manifest; refusing to commit unverifiable state."
+              echo "::error::Size guard ran without a retention manifest; refusing to commit unverifiable state."
               exit 1
             fi
             if ! jq -e '.mode == "size_guard" and (.files | type == "object") and (.files | length > 0)' data/data_retention_manifest.json >/dev/null; then
@@ -780,7 +779,7 @@ jobs:
 
       - name: Prepare self-verifying runtime-state bundle
         id: prepare_runtime_state_bundle
-        if: ${{ !cancelled() && steps.quality_gate.outcome == 'success' && steps.verify_tests_data.outcome == 'success' && (steps.restore_runtime_state.outputs.mode != 'bootstrap' || steps.run_engine.outcome == 'success') && (steps.size_guard.outcome == 'success' || steps.restore_retention_archive.outputs.recovery_safe != 'true' || steps.retention_archive_restore_verification.outcome != 'success') && steps.retention_archive_commit_gate.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.quality_gate.outcome == 'success' && steps.verify_tests_data.outcome == 'success' && (steps.restore_runtime_state.outputs.mode != 'bootstrap' || steps.run_engine.outcome == 'success') && (steps.size_guard.outcome == 'success' || steps.restore_pre_compaction_snapshots.outcome == 'success' || (steps.size_guard.outcome == 'skipped' && (steps.restore_retention_archive.outputs.recovery_safe != 'true' || steps.retention_archive_restore_verification.outcome != 'success'))) && (steps.retention_archive_commit_gate.outcome == 'success' || steps.restore_pre_compaction_snapshots.outcome == 'success' || (steps.size_guard.outcome == 'skipped' && (steps.restore_retention_archive.outputs.recovery_safe != 'true' || steps.retention_archive_restore_verification.outcome != 'success'))) }}
         run: >-
           python event_engine/runtime_state_bundle.py create
           --data-dir data
