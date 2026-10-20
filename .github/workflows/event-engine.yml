@@ -102,6 +102,20 @@ jobs:
           ref: main
           persist-credentials: true
 
+      - name: Detect legacy Git-backed runtime state
+        id: legacy_runtime_state
+        shell: bash
+        run: |
+          set -euo pipefail
+          tracked_paths="$(git ls-files -- data/)"
+          if [ -n "$tracked_paths" ]; then
+            echo "tracked=true" >> "$GITHUB_OUTPUT"
+            echo "Legacy runtime state is still tracked in Git; migration must verify its replacement artifact before untracking it."
+          else
+            echo "tracked=false" >> "$GITHUB_OUTPUT"
+            echo "Runtime state is already externalized; no one-time Git migration is required."
+          fi
+
       - name: Restore latest durable runtime-state artifact
         id: restore_runtime_state
         env:
@@ -109,11 +123,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p data
           api_json=""
           for api_attempt in 1 2 3; do
-            if api_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=zone-engine-runtime-state&per_page=10" 2>/dev/null)" \
-              && jq -e '.artifacts | type == "array"' >/dev/null <<< "$api_json"; then
+            if api_json="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=zone-engine-runtime-state&per_page=100" 2>/dev/null)" \
+              && jq -e 'type == "array" and all(.[]; .artifacts | type == "array")' >/dev/null <<< "$api_json"; then
               break
             fi
             api_json=""
@@ -125,40 +138,60 @@ jobs:
           fi
 
           current_run="$GITHUB_RUN_ID"
-          candidate="$(jq -c --arg current_run "$current_run" '
-            [.artifacts[]
+          workflow_id="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/event-engine.yml" --jq '.id')"
+          artifact_candidates="$(jq -r --arg current_run "$current_run" '
+            [ .[].artifacts[]
               | select(.name == "zone-engine-runtime-state")
               | select(.expired == false)
               | select(.workflow_run.head_branch == "main")
-              | select((.workflow_run.id | tostring) != $current_run)]
+              | select((.workflow_run.id | tostring) != $current_run)
+              | {created_at: .created_at, artifact_id: .id, run_id: .workflow_run.id}
+            ]
             | sort_by(.created_at)
-            | last // empty
+            | reverse
+            | .[]
+            | [.artifact_id, (.run_id | tostring), .created_at]
+            | @tsv
           ' <<< "$api_json")"
 
-          if [ -z "$candidate" ] || [ "$candidate" = "null" ]; then
-            if ! python3 event_engine/runtime_state_bundle.py check-legacy \
-              --data-dir data \
-              --seed-dir bootstrap/research_history_seed; then
-              echo "::error::No valid runtime-state artifact and no complete legacy Git snapshot. Refusing to run the engine with incomplete persistent state."
-              exit 1
-            fi
-            echo "::warning::No runtime-state artifact exists yet; using the complete tracked snapshot for one-time migration."
-            echo "mode=legacy" >> "$GITHUB_OUTPUT"
-            exit 0
+          artifact_id=""
+          run_id=""
+          selected_created_at=""
+          if [ -n "$artifact_candidates" ]; then
+            while IFS=$'\t' read -r candidate_artifact_id candidate_run_id candidate_created_at; do
+              [ -n "$candidate_run_id" ] || continue
+              run_json=""
+              if ! run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${candidate_run_id}" 2>/dev/null)"; then
+                echo "::error::Could not verify the workflow result for runtime-state artifact id=$candidate_artifact_id; refusing to guess or initialize empty state."
+                exit 1
+              fi
+              if jq -e --argjson expected_workflow_id "$workflow_id" '
+                .workflow_id == $expected_workflow_id
+                and .head_branch == "main"
+                and .event == "repository_dispatch"
+                and .status == "completed"
+                and .conclusion == "success"
+              ' >/dev/null <<< "$run_json"; then
+                artifact_id="$candidate_artifact_id"
+                run_id="$candidate_run_id"
+                selected_created_at="$candidate_created_at"
+                break
+              fi
+              echo "Ignoring runtime-state artifact id=$candidate_artifact_id from a non-successful workflow run."
+            done <<< "$artifact_candidates"
           fi
 
-          artifact_id="$(jq -r '.id' <<< "$candidate")"
-          run_id="$(jq -r '.workflow_run.id' <<< "$candidate")"
-          workflow_id="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/event-engine.yml" --jq '.id')"
-          run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}")"
-          if ! jq -e --argjson expected_workflow_id "$workflow_id" '
-            .workflow_id == $expected_workflow_id
-            and .head_branch == "main"
-            and .event == "repository_dispatch"
-          ' >/dev/null <<< "$run_json"; then
-            echo "::error::Latest runtime-state artifact does not belong to the expected main-branch event-engine run; refusing to use it."
-            exit 1
+          if [ -z "$artifact_id" ]; then
+            named_count="$(jq '[.[].artifacts[] | select(.name == "zone-engine-runtime-state") | select(.expired == false)] | length' <<< "$api_json")"
+            if [ "$named_count" -gt 0 ]; then
+              echo "::error::Runtime-state artifacts exist, but none is from a successful completed event-engine run on main; refusing to initialize an empty state over prior state."
+              exit 1
+            fi
+            echo "No prior runtime-state artifact exists. Requesting guarded clean-start bootstrap; trading remains disabled for this run."
+            echo "mode=bootstrap" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          echo "Selected verified-state candidate from successful run $run_id created at $selected_created_at."
 
           tmp_dir="$(mktemp -d)"
           trap 'rm -rf "$tmp_dir"' EXIT
@@ -172,16 +205,30 @@ jobs:
             sleep "$download_attempt"
           done
           if [ "$downloaded" != "true" ]; then
-            echo "::error::Could not download the newest runtime-state artifact (id=$artifact_id, run=$run_id); refusing to fall back to a stale Git snapshot."
+            echo "::error::Could not download the selected successful runtime-state artifact (id=$artifact_id, run=$run_id); refusing to fall back to stale or empty state."
             exit 1
           fi
 
-          # Verifies every bundled file's SHA-256 and required state files before
-          # atomically replacing the checked-out legacy data and research seed.
+          manifest_path="$tmp_dir/runtime-state-manifest.json"
+          if [ ! -f "$manifest_path" ] || ! jq -e '.format == "zone-engine-runtime-state" and (.schema_version | type == "number")' "$manifest_path" >/dev/null; then
+            echo "::error::Runtime-state artifact manifest is missing or malformed; refusing to bootstrap over potentially important state."
+            exit 1
+          fi
+          bundle_schema="$(jq -r '.schema_version' "$manifest_path")"
+          if [ "$bundle_schema" -lt 2 ]; then
+            echo "::warning::Found an older runtime-state schema ($bundle_schema). It will not be restored as current state; requesting guarded clean-start bootstrap."
+            echo "mode=bootstrap" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$bundle_schema" -ne 2 ]; then
+            echo "::error::Runtime-state schema $bundle_schema is newer than this engine supports; refusing to restore it."
+            exit 1
+          fi
+
+          # Verifies every bundled file's SHA-256 before atomically replacing data.
           python3 event_engine/runtime_state_bundle.py restore \
             --bundle-dir "$tmp_dir" \
-            --data-dir data \
-            --seed-dir bootstrap/research_history_seed
+            --data-dir data
           echo "mode=artifact" >> "$GITHUB_OUTPUT"
           echo "restored_run_id=$run_id" >> "$GITHUB_OUTPUT"
           echo "Restored verified runtime state from artifact id=$artifact_id, run=$run_id."
@@ -204,8 +251,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Initialize guarded clean runtime on empty BingX VST
+        id: clean_start_bootstrap
+        if: ${{ steps.restore_runtime_state.outputs.mode == 'bootstrap' }}
+        env:
+          BINGX_ENV: vst
+          BINGX_BASE_URL: https://open-api-vst.bingx.com
+          BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
+          BINGX_SECRET_KEY: ${{ secrets.BINGX_SECRET_KEY }}
+          ZONE_TRIGGER_MODE: zone
+        run: python -m event_engine.clean_start --data-dir data
+
       - name: Syntax check
-        run: python -m compileall -q event_engine run_once.py research_forward.py restore_research_history_seed.py pine_r541_sr.py pine_sr_diagnostic.py test_all.py test_pine_sr_diagnostic.py test_research_layer.py test_restore_research_history_seed.py test_research_cursor_portability.py test_workflow_rollback.py
+        run: python -m compileall -q event_engine run_once.py research_forward.py pine_r541_sr.py pine_sr_diagnostic.py test_all.py test_pine_sr_diagnostic.py test_research_layer.py test_research_cursor_portability.py test_workflow_rollback.py
 
       - name: Fingerprint source, tests, dependencies and workflow files
         id: source_fingerprint
@@ -223,7 +281,6 @@ jobs:
           files = sorted(
               item.decode("utf-8") for item in paths if item
               and not item.decode("utf-8").startswith("data/")
-              and not item.decode("utf-8").startswith("bootstrap/research_history_seed/")
               and (root / item.decode("utf-8")).is_file()
           )
           digest = hashlib.sha256()
@@ -535,20 +592,10 @@ jobs:
           --state-file data/retention_archive_state.json
           --github-output "$GITHUB_OUTPUT"
 
-      - name: Restore immutable research outcome seed
-        id: restore_research_history_seed
-        # Only attempt recovery after the test suite and its data-isolation guard
-        # succeeded. A skipped step must not be reported as a failed restoration.
-        if: ${{ success() && steps.quality_gate.outcome == 'success' && steps.verify_tests_data.outcome == 'success' }}
-        continue-on-error: true
-        run: python restore_research_history_seed.py
-
-      - name: Report research seed restore status
-        if: ${{ always() && steps.quality_gate.outcome == 'success' && steps.verify_tests_data.outcome == 'success' && steps.restore_research_history_seed.outcome == 'failure' }}
-        run: echo "::warning::Research outcome seed restoration actually failed. Existing trading-state management continues, but historical research data may remain incomplete."
-
       - name: Run engine
+        id: run_engine
         env:
+          EXECUTION_ENABLED: ${{ steps.restore_runtime_state.outputs.mode == 'artifact' && 'true' || 'false' }}
           FUNDAMENTAL_WHITELIST_ENABLED: "false"
           # Keep the explicitly tested production entry semantics: a 5m touch
           # creates the signal and the trigger-bar close is the market-entry
@@ -733,11 +780,10 @@ jobs:
 
       - name: Prepare self-verifying runtime-state bundle
         id: prepare_runtime_state_bundle
-        if: ${{ !cancelled() && steps.quality_gate.outcome == 'success' && steps.verify_tests_data.outcome == 'success' && (steps.size_guard.outcome == 'success' || steps.restore_retention_archive.outputs.recovery_safe != 'true' || steps.retention_archive_restore_verification.outcome != 'success') && steps.retention_archive_commit_gate.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.quality_gate.outcome == 'success' && steps.verify_tests_data.outcome == 'success' && (steps.restore_runtime_state.outputs.mode != 'bootstrap' || steps.run_engine.outcome == 'success') && (steps.size_guard.outcome == 'success' || steps.restore_retention_archive.outputs.recovery_safe != 'true' || steps.retention_archive_restore_verification.outcome != 'success') && steps.retention_archive_commit_gate.outcome == 'success' }}
         run: >-
           python event_engine/runtime_state_bundle.py create
           --data-dir data
-          --seed-dir bootstrap/research_history_seed
           --output-dir runtime-state-bundle
           --source-commit "$GITHUB_SHA"
           --run-id "$GITHUB_RUN_ID"
@@ -786,6 +832,29 @@ jobs:
           echo "::error::Runtime-state upload step succeeded but the artifact is not visible through the API; refusing to untrack Git state."
           exit 1
 
+      - name: Download and verify uploaded runtime-state bundle
+        id: verify_uploaded_runtime_state_bundle
+        if: ${{ steps.verify_runtime_state_artifact.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "$tmp_dir"' EXIT
+          for attempt in 1 2 3; do
+            if gh run download "$GITHUB_RUN_ID" --name zone-engine-runtime-state --repo "$GITHUB_REPOSITORY" --dir "$tmp_dir"; then
+              if python3 event_engine/runtime_state_bundle.py verify --bundle-dir "$tmp_dir"; then
+                echo "The uploaded runtime-state artifact was downloaded and every file checksum was verified."
+                exit 0
+              fi
+            fi
+            rm -rf "$tmp_dir"/* "$tmp_dir"/.[!.]* "$tmp_dir"/..?* 2>/dev/null || true
+            sleep "$attempt"
+          done
+          echo "::error::The runtime-state artifact is listed by GitHub but could not be downloaded and checksum-verified; refusing to externalize tracked state."
+          exit 1
+
       - name: Retain only the two newest runtime-state artifacts
         id: prune_runtime_state_artifacts
         if: ${{ steps.verify_runtime_state_artifact.outcome == 'success' }}
@@ -818,10 +887,10 @@ jobs:
 
       - name: Remove legacy runtime data from Git history tip
         id: externalize_runtime_state
-        # State may leave Git only after the new artifact is uploaded, visible and
-        # retained. This stages a one-time deletion of large data blobs; later runs
-        # persist state solely through the verified artifact and create no data commits.
-        if: ${{ !cancelled() && steps.quality_gate.outcome == 'success' && steps.verify_tests_data.outcome == 'success' && steps.verify_runtime_state_artifact.outcome == 'success' && steps.prune_runtime_state_artifacts.outcome == 'success' && (steps.size_guard.outcome == 'success' || steps.restore_retention_archive.outputs.recovery_safe != 'true' || steps.retention_archive_restore_verification.outcome != 'success') && steps.retention_archive_commit_gate.outcome == 'success' }}
+        # Tracked runtime state may leave Git only after its replacement artifact has
+        # been downloaded and checksum-verified, and retention recovery is confirmed safe.
+        # This is a one-time deletion; later runs persist state through runtime artifacts.
+        if: ${{ !cancelled() && steps.legacy_runtime_state.outputs.tracked == 'true' && steps.quality_gate.outcome == 'success' && steps.verify_tests_data.outcome == 'success' && steps.verify_runtime_state_artifact.outcome == 'success' && steps.verify_uploaded_runtime_state_bundle.outcome == 'success' && steps.prune_runtime_state_artifacts.outcome == 'success' && steps.restore_retention_archive.outputs.recovery_safe == 'true' && steps.retention_archive_restore_verification.outcome == 'success' && steps.retention_archive_commit_gate.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -830,7 +899,7 @@ jobs:
           git status --short
           # --cached keeps the just-uploaded, verified working state on disk. The
           # next clean runner restores it from the artifact before any trading step.
-          git rm --cached -r -f --ignore-unmatch data/ bootstrap/research_history_seed/
+          git rm --cached -r -f --ignore-unmatch data/
           if git diff --cached --quiet; then
             echo "Runtime state is already externalized; no Git data snapshot is needed."
             exit 0
