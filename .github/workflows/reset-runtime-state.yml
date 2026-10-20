@@ -1,0 +1,129 @@
+name: Reset Zone Engine Runtime State
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "This permanently deletes saved runtime state and research-retention archives. The next engine run starts from empty state."
+        type: choice
+        required: true
+        default: CANCEL
+        options:
+          - CANCEL
+          - DELETE_PERSISTED_RUNTIME_STATE
+
+permissions:
+  contents: read
+  actions: write
+
+# Serialize with normal engine runs so an active run cannot recreate the old
+# state artifacts while this reset is deleting them.
+concurrency:
+  group: zone-engine
+  cancel-in-progress: false
+
+jobs:
+  reset:
+    if: ${{ inputs.confirmation == 'DELETE_PERSISTED_RUNTIME_STATE' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
+      BINGX_SECRET_KEY: ${{ secrets.BINGX_SECRET_KEY }}
+      BINGX_ENV: vst
+      BINGX_BASE_URL: https://open-api-vst.bingx.com
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Require default branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Runtime reset may only run from refs/heads/main."
+            exit 1
+          fi
+          echo "Confirmed manual runtime reset on main. Source code, repository secrets and diagnostic artifacts will be preserved."
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      # This fails closed unless the API credentials are explicitly for BingX
+      # VST and the exchange confirms zero positions, open orders and TWAP orders.
+      # It also replaces only the ephemeral runner checkout's local data/ folder.
+      - name: Verify VST account is flat and initialize empty local state
+        run: python -m event_engine.clean_start --data-dir data
+
+      - name: Delete all persisted runtime-state and retention-archive artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifacts_json=""
+          for attempt in 1 2 3; do
+            if artifacts_json="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" 2>/dev/null)" \
+              && jq -e 'type == "array" and all(.[]; .artifacts | type == "array")' >/dev/null <<< "$artifacts_json"; then
+              break
+            fi
+            artifacts_json=""
+            sleep "$attempt"
+          done
+          if [ -z "$artifacts_json" ]; then
+            echo "::error::Could not reliably enumerate repository artifacts; nothing was intentionally deleted by this step."
+            exit 1
+          fi
+
+          artifact_rows="$(jq -r '
+            [ .[].artifacts[]?
+              | select(.name == "zone-engine-runtime-state" or .name == "zone-engine-retention-archive")
+              | [.id, .name] | @tsv
+            ] | .[]?
+          ' <<< "$artifacts_json")"
+
+          deleted=0
+          if [ -n "$artifact_rows" ]; then
+            while IFS=$'\t' read -r artifact_id artifact_name; do
+              [ -n "$artifact_id" ] || continue
+              echo "Deleting persisted state artifact: name=$artifact_name id=$artifact_id"
+              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}" >/dev/null
+              deleted=$((deleted + 1))
+            done <<< "$artifact_rows"
+          fi
+
+          # Verify both artifact chains are completely gone, including expired or
+          # otherwise ineligible entries that could make event-engine refuse a
+          # bootstrap or restore a prior retention history.
+          verify_json="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100")"
+          remaining="$(jq '[ .[].artifacts[]?
+            | select(.name == "zone-engine-runtime-state" or .name == "zone-engine-retention-archive")
+          ] | length' <<< "$verify_json")"
+          if [ "$remaining" -ne 0 ]; then
+            echo "::error::Reset incomplete: $remaining runtime-state/retention artifact(s) remain. Do not start the engine until this is resolved."
+            exit 1
+          fi
+          echo "Runtime reset verified: deleted=$deleted persisted runtime-state and retention artifacts remain=0."
+
+      - name: Summary
+        if: success()
+        shell: bash
+        run: |
+          {
+            echo "## Runtime state reset complete"
+            echo
+            echo "- BingX VST was verified to have no open positions, regular orders or TWAP orders."
+            echo "- Persisted `zone-engine-runtime-state` artifacts were deleted."
+            echo "- Persisted `zone-engine-retention-archive` artifacts were deleted."
+            echo "- Source code, GitHub secrets and diagnostic artifacts were preserved."
+            echo "- The next normal engine run will use the guarded clean-start bootstrap; trading stays disabled for that bootstrap run."
+          } >> "$GITHUB_STEP_SUMMARY"
