@@ -463,8 +463,15 @@ def test_zone_forensics_and_be_retry_keep_the_state_they_report():
 
     run_source = Path(inspect.getsourcefile(run_once)).read_text(encoding="utf-8")
     tracker_source = inspect.getsource(tracker.update_active_trades)
-    assert "private_layer_available = private_ready" in run_source
-    assert "if private_layer_available:" in run_source
+    assert "private_checkpoint_state_trusted = False" in run_source
+    assert "if private_checkpoint_state_trusted:" in run_source
+    assert "private_layer_available = private_ready" not in run_source
+    preflight_start = run_source.index("private_preflight_started = time.perf_counter()")
+    strict_load = run_source.index("_load_active_trades_file(fresh_runtime_start=fresh_runtime_start)", preflight_start)
+    position_mode_check = run_source.index("mode = get_position_mode(", strict_load)
+    reconciliation_call = run_source.index("reconciliation_ok = reconcile_all_open_positions()", position_mode_check)
+    trust_mark = run_source.index("private_checkpoint_state_trusted = True", reconciliation_call)
+    assert strict_load < position_mode_check < reconciliation_call < trust_mark
     assert "BLOCKED_PRIVATE_PREFLIGHT" in run_source
     assert "_build_5m_zone_signal(symbol, direction, zone, bar, prev, df_1h, demand, supply, state, df_5m=x)" in run_source
     retry_branch = tracker_source.split('if retry_status in {"created", "created_cleanup_pending"}:', 1)[1].split("elif retry_status", 1)[0]
@@ -498,3 +505,104 @@ def test_cancel_ack_is_not_called_verified_while_order_remains_open(monkeypatch,
     assert cancelled is False
     assert "remains visible" in reason
     assert len(deleted) == 1
+
+
+def test_semantically_untrusted_duplicate_owner_state_cannot_enable_final_tracker(monkeypatch, tmp_path):
+    """Credential availability must not bypass strict ownership validation at final checkpoint."""
+    import inspect
+    from event_engine import tracker
+    import run_once
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    active_path = data_dir / "active_trades.json"
+    duplicated = {
+        event_id: {
+            "event_id": event_id,
+            "symbol": "AAA-USDT",
+            "direction": "LONG",
+            "closed": False,
+            "initial_qty": 1.0,
+            "remaining_qty": 1.0,
+            "entry_price": 100.0,
+            "entry_ts": 1,
+            "entry_order": {},
+            "sl_order": {},
+            "tp_orders": [],
+        }
+        for event_id in ("EVT_A", "EVT_B")
+    }
+    active_path.write_text(json.dumps(duplicated), encoding="utf-8")
+    monkeypatch.setattr(run_once, "DATA", data_dir)
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", active_path)
+
+    # Strict run preflight rejects two local owners of one exchange position.
+    with pytest.raises(RuntimeError, match="cross-event position ownership collision"):
+        run_once._load_active_trades_file()
+    # The tracker-level JSON loader alone is more permissive, so it must never be
+    # run after strict preflight rejects the state.
+    assert len(tracker._load_active_trades_required()) == 2
+
+    source = Path(inspect.getsourcefile(run_once)).read_text(encoding="utf-8")
+    assert "private_checkpoint_state_trusted = False" in source
+    assert "private_checkpoint_state_trusted = True" in source
+    assert "if private_checkpoint_state_trusted:" in source
+    assert "private_layer_available = private_ready" not in source
+
+
+def test_complete_emergency_exit_fills_upgrade_residual_pnl_from_unverified_to_confirmed(tmp_path, monkeypatch):
+    import json
+    from event_engine import tracker
+
+    active_path = tmp_path / "active_trades.json"
+    trades_path = tmp_path / "trades.jsonl"
+    actions_path = tmp_path / "actions.jsonl"
+    trade = {
+        "event_id":"EVT_PARTIAL_CONFIRMED", "symbol":"AAA-USDT", "direction":"LONG", "name":"AAA",
+        "entry_price":100.0, "initial_qty":1.0, "remaining_qty":0.5, "entry_ts":1, "closed":False,
+        "entry_order":{"order_id":"ENTRY1"}, "tp_orders":[], "sl_order":{},
+        "hit_legs":["tp1"], "tp_filled_qty":{"tp1":0.5}, "realized_pnl_qty":0.5,
+        "realized_pnl_weighted_sum":1.5, "tp_fill_events":[{
+            "order_id":"TP1", "leg":"TP1", "delta_qty":0.5, "executed_qty_total":0.5,
+            "avg_price":103.0, "pnl_pct":3.0, "ts":200, "fill_time_ms":200,
+        }],
+        "be_failure_rollback":{"status":"closed_verified", "attempts":[
+            {"response":{"code":0, "data":{"order":{"orderId":"EMERGENCY1"}}}}
+        ]},
+        "peak_pnl_pct":3.0, "mae_pct":-1.0, "max_drawdown_pct":-1.0,
+        "planned_risk_pct":10.0, "planned_weighted_rr":0.45, "effective_weighted_rr":0.45,
+        "setup":{}, "tp_levels":[], "effective_tp_levels":[],
+    }
+    active_path.write_text(json.dumps({trade["event_id"]:trade}), encoding="utf-8")
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", active_path)
+    monkeypatch.setattr(tracker, "TRADES_PATH", trades_path)
+    monkeypatch.setattr(tracker, "ACTIONS_PATH", actions_path)
+    monkeypatch.setattr(tracker, "credentials_available", lambda: True)
+    monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: {"status":"not_found"})
+    monkeypatch.setattr(tracker, "fetch_klines", lambda *a, **k: [])
+    fills = [
+        {"order_id":"ENTRY1", "qty":1.0, "price":100.0, "fee":-0.1, "realized_pnl":0.0, "time_ms":100},
+        {"order_id":"TP1", "qty":0.5, "price":103.0, "fee":-0.1, "realized_pnl":1.5, "time_ms":200},
+        {"order_id":"EMERGENCY1", "qty":0.5, "price":99.0, "fee":-0.1, "realized_pnl":-0.5, "time_ms":300},
+    ]
+    monkeypatch.setattr(tracker, "get_fill_orders", lambda symbol, start, end, *, order_id=None, limit=1000: [x for x in fills if order_id is None or x["order_id"] == order_id])
+    executions = {
+        "ENTRY1": (1.0, 100.0), "TP1": (0.5, 103.0), "EMERGENCY1": (0.5, 99.0),
+    }
+    def execution_evidence(symbol, order_id, **kwargs):
+        if order_id not in executions:
+            return {"status":"error", "error":"no order id", "order_id":order_id}
+        return {
+            "status":"ok", "order_id":order_id, "order_status":"FILLED", "executed_qty":executions[order_id][0],
+            "avg_price":executions[order_id][1], "time_ms":100, "update_time_ms":300,
+        }
+    monkeypatch.setattr(tracker, "_get_order_execution_evidence", execution_evidence)
+    monkeypatch.setattr(tracker, "get_all_orders", lambda *a, **k: [])
+    monkeypatch.setattr(tracker, "send_tg", lambda text: True)
+
+    tracker.update_active_trades(position_snapshot=[])
+    close = next(json.loads(line) for line in trades_path.read_text(encoding="utf-8").splitlines() if json.loads(line).get("record_type") == "TRADE_CLOSE")
+    assert close["realized_pnl_reconciliation"]["status"] == "VERIFIED"
+    assert close["realized_pnl_pct"] == pytest.approx(1.0)
+    assert close["realized_pnl_pct_confirmed_partial"] is None
+    assert close["realized_pnl_source"] == "confirmed_fill_accounting"

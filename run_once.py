@@ -4224,7 +4224,11 @@ def main() -> None:
     #    prevent public market analysis from running.
     private_preflight_started = time.perf_counter()
     private_ready = _private_layer_ready()
-    private_layer_available = private_ready
+    # Final tracking is allowed after an ambiguous execution only when the local
+    # state AND mandatory private preflight passed. Credentials/state-file validity
+    # alone are insufficient: position-mode, provenance, tracker, and reconciliation
+    # must get through their guarded preflight calls before the final checkpoint runs.
+    private_checkpoint_state_trusted = False
     if private_ready:
         try:
             _load_active_trades_file(fresh_runtime_start=fresh_runtime_start)
@@ -4262,9 +4266,11 @@ def main() -> None:
                     log.info("[TRACKER_PROVENANCE] backfilled code_commit_sha for %d active trade(s)", backfilled)
             except ActiveTradeStateCorrupt as exc:
                 private_ready = False
+                private_checkpoint_state_trusted = False
                 log.critical("[LIVE_BLOCKED_STATE] tracker provenance found untrusted active state: %s", exc)
             except Exception as exc:
                 private_ready = False
+                private_checkpoint_state_trusted = False
                 log.critical("[LIVE_BLOCKED_STATE] tracker provenance/backfill failed; execution disabled for this run: %s", exc)
             if private_ready:
                 tracker_started = time.perf_counter()
@@ -4273,9 +4279,11 @@ def main() -> None:
                         _update_active_trades_with_snapshot()
                 except ActiveTradeStateCorrupt as exc:
                     private_ready = False
+                    private_checkpoint_state_trusted = False
                     log.critical("[LIVE_BLOCKED_STATE] tracker update found untrusted active state: %s", exc)
                 except Exception as exc:
                     private_ready = False
+                    private_checkpoint_state_trusted = False
                     log.exception("[LIVE_BLOCKED_STATE] active trade update failed; execution disabled for this run: %s", exc)
                 finally:
                     log.info("[PERF_STAGE] stage=pre_scan_update_active_trades seconds=%.3f", time.perf_counter() - tracker_started)
@@ -4284,11 +4292,18 @@ def main() -> None:
                 try:
                     with request_metrics.phase("pre_scan_reconcile"):
                         reconciliation_ok = reconcile_all_open_positions()
+                    # A completed reconciliation call may report unresolved exchange
+                    # state (private_ready becomes false) but is still safe to retry at
+                    # the final checkpoint. Exceptions and earlier preflight failures
+                    # leave this false, preventing permissive tracker loads on corrupt
+                    # or account-mode-unverified local state.
+                    private_checkpoint_state_trusted = True
                     if reconciliation_ok is False:
                         private_ready = False
                         log.critical("[LIVE_BLOCKED_RECON] unresolved exchange/local position state; new entries disabled for this run")
                 except Exception as exc:
                     private_ready = False
+                    private_checkpoint_state_trusted = False
                     log.exception("[LIVE_BLOCKED_RECON] reconciliation failed; execution disabled for this run: %s", exc)
                 finally:
                     log.info("[PERF_STAGE] stage=pre_scan_reconcile seconds=%.3f", time.perf_counter() - reconcile_started)
@@ -5243,7 +5258,7 @@ def main() -> None:
     log.info("[PERF_STAGE] stage=save_scan seconds=%.3f", time.perf_counter() - scan_saved_started)
     # Final tracking checkpoint: orders/positions can change during scan/execution.
     # This remains a full pass with existing error handling and protection checks.
-    if private_layer_available:
+    if private_checkpoint_state_trusted:
         tracker_started = time.perf_counter()
         try:
             with request_metrics.phase("final_tracker"):

@@ -20,7 +20,8 @@ def test_runbook_documents_artifact_backed_runtime_state_migration():
     assert "guarded clean-start" in text
     assert "trading remains disabled" in text
     assert "self-verifying runtime-state artifact" in text
-    assert "failed workflow run is not automatically rejected" in text
+    assert "completed, successful event-engine run" in text
+    assert "Artifacts from failed runs are not selected" in text
 
 
 def test_pytest_has_global_repository_data_isolation():
