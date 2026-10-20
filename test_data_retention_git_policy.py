@@ -5,6 +5,8 @@ from pathlib import Path
 def test_persistent_runtime_data_is_artifact_backed_and_ephemeral_data_is_ignored():
     lines = {line.strip() for line in Path(".gitignore").read_text(encoding="utf-8").splitlines()}
     assert "data/*" in lines
+    assert "!data/.gitkeep" in lines
+    assert (Path("data") / ".gitkeep").is_file()
     assert "bootstrap/research_history_seed/" not in lines
     assert "data/scan_history.jsonl" in lines
     assert "data/scan_history.jsonl.*" in lines
@@ -416,3 +418,14 @@ def test_chunked_snapshot_can_restore_file_after_mid_policy_failure(tmp_path):
     path.write_bytes(b'{"partial":"compaction"}\n')
     retention._restore_chunked_snapshot(path, snapshot, archive_root)
     assert path.read_bytes() == original
+
+
+def test_data_placeholder_is_visible_but_never_migrated_as_runtime_state():
+    workflow = Path(".github/workflows/event-engine.yml").read_text(encoding="utf-8")
+    detect = workflow.split("- name: Detect legacy Git-backed runtime state", 1)[1].split(
+        "- name: Restore latest durable runtime-state artifact", 1
+    )[0]
+    externalize = workflow.split("- name: Remove legacy runtime data from Git history tip", 1)[1]
+    assert "grep -vx 'data/.gitkeep'" in detect
+    assert "touch data/.gitkeep" in externalize
+    assert "git add -f data/.gitkeep" in externalize

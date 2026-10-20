@@ -30,6 +30,7 @@ def _make_complete_state(root: Path) -> Path:
             path.write_text(json.dumps({"path": rel, "version": 1}) + "\n", encoding="utf-8")
     (data / "retention_archive").mkdir(parents=True, exist_ok=True)
     (data / "retention_archive" / "large-history-delta.jsonl.gz").write_bytes(b"separately-managed-archive")
+    (data / ".gitkeep").write_text("", encoding="utf-8")
     (data / "scan_history.jsonl").write_text("ephemeral\n", encoding="utf-8")
     (data / "zone_engine_diagnostic.log").write_text("ephemeral log\n", encoding="utf-8")
     return data
@@ -47,6 +48,7 @@ def test_runtime_state_bundle_roundtrip_is_verified_and_excludes_ephemeral_files
     assert not any("retention_archive/" in path for path in paths)
     assert "data/scan_history.jsonl" not in paths
     assert "data/zone_engine_diagnostic.log" not in paths
+    assert "data/.gitkeep" not in paths
 
     fresh_data = tmp_path / "fresh" / "data"
     fresh_data.mkdir(parents=True)

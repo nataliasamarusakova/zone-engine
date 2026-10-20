@@ -2279,6 +2279,37 @@ def test_reconcile_persists_tp_recovery_gate_across_cycles(monkeypatch):
     assert protection_calls == [{"qty": 449.0, "levels": []}]
 
 
+def test_reconcile_sl_only_persists_valid_stop_and_blocks_new_entries(monkeypatch):
+    import run_once
+
+    trade = {
+        "event_id": "ZONE_PARTIAL_PROTECTION", "symbol": "AAA-USDT", "direction": "LONG",
+        "closed": False, "remaining_qty": 1.0, "planned_risk_pct": 10.0,
+        "setup": {"tp_levels": [
+            {"leg": "tp1", "pnl_pct": 3.0, "close_fraction": 0.5},
+            {"leg": "tp2", "pnl_pct": 6.0, "close_fraction": 0.5},
+        ]},
+    }
+    conflicts = []
+    ledger = []
+    monkeypatch.setattr(run_once, "_load_active_trades_file", lambda: {"ZONE_PARTIAL_PROTECTION": trade})
+    monkeypatch.setattr(run_once, "get_positions", lambda **kwargs: [
+        {"symbol": "AAA-USDT", "positionSide": "LONG", "positionAmt": "1", "avgPrice": "100"},
+    ])
+    monkeypatch.setattr(run_once, "ensure_directional_protection", lambda *a, **k: {
+        "status": "SL_ONLY", "sl_result": {"status": "verified", "order_id": "SL-VERIFIED"},
+        "tp_orders": [], "effective_tp_levels": [], "tp_mode": "REPAIR_PENDING",
+        "effective_weighted_rr": None, "error": "TP2 not verified",
+    })
+    monkeypatch.setattr(run_once, "update_active_trade_protection", lambda *a, **k: True)
+    monkeypatch.setattr(run_once.telemetry, "record_position_reconciliation", lambda **kwargs: None)
+    monkeypatch.setattr(run_once.telemetry, "record_state_conflict", lambda **kwargs: conflicts.append(kwargs))
+    monkeypatch.setattr(run_once, "_append_execution_ledger", lambda *a, **k: ledger.append((a, k)))
+    assert run_once.reconcile_all_open_positions() is False
+    assert any(row.get("conflict_type") == "PROTECTION_TP_INCOMPLETE" for row in conflicts)
+    assert any(args[2] == "RECON_PROTECTION_PARTIAL" for args, kwargs in ledger)
+
+
 def test_reconcile_classifies_side_mismatch_and_orphan_local(monkeypatch):
     import run_once
     statuses = []
@@ -2890,6 +2921,7 @@ def test_emergency_be_rollback_verifies_order_before_final_unverified(monkeypatc
 def test_be_rollback_reports_already_closed_when_position_is_absent(monkeypatch):
     from event_engine import tracker
     monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: {"status": "not_found"})
+    monkeypatch.setattr(tracker, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
     monkeypatch.setattr(tracker, "close_position_market", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not send close when already absent")))
     out = tracker._emergency_close_after_be_failure("AAA-USDT", "LONG", 1.0, "T")
     assert out["status"] == "already_closed"
@@ -2906,6 +2938,24 @@ def test_be_rollback_uses_full_position_fallback_when_directional_read_errors(mo
     assert out["status"] == "already_closed"
     assert out["remaining_qty"] == 0.0
 
+
+
+def test_be_rollback_position_fallback_normalizes_compact_exchange_symbol(monkeypatch):
+    from event_engine import tracker
+
+    open_rows = [{"symbol": "AAAUSDT", "positionSide": "LONG", "positionAmt": "0.5", "avgPrice": "100"}]
+    close_calls = []
+    monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: {"status": "error", "error": "temporary directional read failure"})
+    monkeypatch.setattr(tracker, "get_positions", lambda *a, **k: open_rows)
+    monkeypatch.setattr(tracker, "close_position_market", lambda *a, **k: close_calls.append(a) or {"status": "error", "error": "exchange reject"})
+    monkeypatch.setattr(tracker, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
+    monkeypatch.setenv("BE_FAILURE_CLOSE_POLLS", "4")
+    monkeypatch.setenv("BE_FAILURE_CLOSE_POLL_SEC", "0.15")
+    monkeypatch.setattr(tracker.time, "sleep", lambda *a, **k: None)
+    out = tracker._emergency_close_after_be_failure("AAA-USDT", "LONG", 0.5, "T")
+    assert out["status"] == "close_unverified"
+    assert close_calls and close_calls[0][2] == pytest.approx(0.5)
+    assert out["remaining_qty"] == pytest.approx(0.5)
 
 def test_be_rollback_does_not_call_stale_qty_current_after_close_verification_error(monkeypatch):
     from event_engine import tracker
@@ -2991,7 +3041,7 @@ def test_be_failure_accepts_full_size_old_sl_for_residual_position(monkeypatch):
     assert out["old_sl_restored"] is True
 
 
-def test_emergency_close_cleanup_happens_before_market_close(monkeypatch):
+def test_emergency_close_does_not_cancel_protection_before_verification(monkeypatch):
     import run_once
     calls = []
     monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {
@@ -3001,20 +3051,17 @@ def test_emergency_close_cleanup_happens_before_market_close(monkeypatch):
     })
     monkeypatch.setattr(run_once, "cancel_order", lambda symbol, oid: calls.append(("cancel", oid)) or {"code": 0})
     monkeypatch.setattr(run_once, "get_position_directional", lambda *a, **k: {"status": "found", "positionAmt": 1.0})
-    monkeypatch.setattr(run_once, "close_position_market", lambda *a, **k: calls.append(("close",)) or {"status": "closed", "response": {"data": {"order": {"orderId": "C1"}}}})
+    monkeypatch.setattr(run_once, "close_position_market", lambda *a, **k: calls.append(("close",)) or {"status": "closed", "response": {"code": 0, "data": {"order": {"orderId": "C1"}}}})
+    monkeypatch.setattr(run_once, "get_order", lambda *a, **k: {"status": "ok", "order_status": "NEW", "order_id": "C1"})
     monkeypatch.setattr(run_once, "time", type("T", (), {"sleep": staticmethod(lambda *a, **k: None)})())
     # Force one bounded attempt to avoid a long mock loop.
     monkeypatch.setenv("EMERGENCY_CLOSE_ATTEMPTS", "2")
     monkeypatch.setenv("EMERGENCY_CLOSE_VERIFY_POLLS", "2")
-    result = run_once.execute_new_position
-    # Inspect helper directly: cleanup must precede any caller that invokes the close.
-    cleanup = run_once._cancel_engine_protection_before_emergency_close("AAA-USDT", "LONG")
-    assert cleanup["status"] == "ok"
-    calls.clear()
-    run_once._emergency_close_and_verify("AAA-USDT", "LONG", 1.0, "EVT1")
-    # The close helper itself has no cleanup side effect; the production call sites
-    # are responsible for invoking cleanup first. Verify that helper separately is callable.
-    assert calls[0][0] == "close"
+    result = run_once._emergency_close_and_verify("AAA-USDT", "LONG", 1.0, "EVT1")
+    # The helper retains protection on an ambiguous close and does not post another
+    # MARKET order while the first close remains NEW/unresolved.
+    assert result["status"] == "close_unverified"
+    assert calls == [("close",)]
 
 
 def test_workflow_persists_runtime_state_in_verified_artifact_not_git_snapshots():
@@ -3052,7 +3099,7 @@ def test_execution_ledger_is_append_only_and_carries_attempt_lineage(tmp_path, m
     assert row["code_commit_sha"] == run_once.CODE_COMMIT_SHA
 
 
-def test_emergency_be_rollback_cleans_engine_orders_before_close(monkeypatch):
+def test_emergency_be_rollback_keeps_protection_until_close_is_verified(monkeypatch):
     from event_engine import tracker
     calls = []
     monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: {"status": "found", "positionAmt": 1.0, "avgPrice": 100.0})
@@ -3070,7 +3117,27 @@ def test_emergency_be_rollback_cleans_engine_orders_before_close(monkeypatch):
     monkeypatch.setenv("BE_FAILURE_CLOSE_POLLS", "2")
     out = tracker._emergency_close_after_be_failure("AAA-USDT", "LONG", 1.0, "T")
     assert out["status"] == "closed_verified"
-    assert calls[:3] == [("cancel", "SL1"), ("cancel", "TP1"), ("close",)]
+    assert calls[:3] == [("close",), ("cancel", "SL1"), ("cancel", "TP1")]
+    assert out["cleanup_after_flat_verified"]["status"] == "ok"
+
+
+def test_emergency_be_rollback_preserves_protection_when_close_is_unverified(monkeypatch):
+    from event_engine import tracker
+    calls = []
+    states = iter([{"status": "found", "positionAmt": 1.0, "avgPrice": 100.0}] * 8)
+    monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: next(states, {"status": "found", "positionAmt": 1.0, "avgPrice": 100.0}))
+    monkeypatch.setattr(tracker, "get_open_protection_directional", lambda *a, **k: {
+        "status": "ok", "sl_orders": [{"orderId": "SL1", "clientOrderId": "EVT_SL"}],
+        "tp_orders": [{"orderId": "TP1", "clientOrderId": "EVT_TP"}],
+    })
+    monkeypatch.setattr(tracker, "cancel_order", lambda symbol, oid: calls.append(("cancel", oid)) or {"code": 0})
+    monkeypatch.setattr(tracker, "close_position_market", lambda *a, **k: calls.append(("close",)) or {"status": "error", "error": "timeout after submit"})
+    monkeypatch.setattr(tracker, "get_order", lambda *a, **k: {"status": "error", "error": "not verifiable"})
+    monkeypatch.setattr(tracker.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setenv("BE_FAILURE_CLOSE_POLLS", "2")
+    out = tracker._emergency_close_after_be_failure("AAA-USDT", "LONG", 1.0, "T")
+    assert out["status"] == "close_unverified"
+    assert calls == [("close",)]
 
 
 def test_emergency_close_only_cancels_engine_owned_protection(monkeypatch):
@@ -3094,6 +3161,9 @@ def test_emergency_be_rollback_fallback_does_not_refresh_contracts(monkeypatch):
     from event_engine import tracker
     monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: {"status": "error", "error": "temporary"})
     monkeypatch.setattr(tracker, "get_positions", lambda *a, **k: [])
+    # Flatness verification now also cleans up engine-owned stale orders; keep
+    # that separate REST path mocked so this test only verifies the local fallback.
+    monkeypatch.setattr(tracker, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
     monkeypatch.setattr(tracker, "to_bx_symbol", lambda *a, **k: (_ for _ in ()).throw(AssertionError("fallback must not refresh contracts")))
     out = tracker._emergency_close_after_be_failure("AAA-USDT", "LONG", 1.0, "T")
     assert out["status"] == "already_closed"
@@ -3483,17 +3553,23 @@ def test_5m_rearm_bar_that_also_crosses_midpoint_does_not_create_same_bar_reentr
     monkeypatch.setattr(run_once, "INITIAL_5M_TRIGGER_LOOKBACK_MINUTES", 60.0)
     monkeypatch.setattr(run_once, "MAX_5M_TRIGGER_AGE_MINUTES", 60.0)
     now = pd.Timestamp.now(tz="UTC").floor("5min")
-    t0 = now - pd.Timedelta(minutes=15)
+    t0 = now - pd.Timedelta(minutes=20)
     zone = {"start": 0, "top": 110.0, "btm": 100.0, "poi": 105.0}
     bars = [
         {"timestamp": int(t0.timestamp()*1000), "open": 107, "high": 108, "low": 104, "close": 106, "volume": 10},
         {"timestamp": int((t0+pd.Timedelta(minutes=5)).timestamp()*1000), "open": 106, "high": 112, "low": 104, "close": 111, "volume": 10},
         {"timestamp": int((t0+pd.Timedelta(minutes=10)).timestamp()*1000), "open": 112, "high": 113, "low": 104, "close": 105, "volume": 10},
+        {"timestamp": int((t0+pd.Timedelta(minutes=15)).timestamp()*1000), "open": 112, "high": 114, "low": 111, "close": 112, "volume": 10},
     ]
     df1h = pd.DataFrame([{"timestamp": now-pd.Timedelta(hours=12-i), "open":100, "high":111, "low":99, "close":105, "volume":100, "atr50":2.0} for i in range(12)])
     sigs, state, _ = _process_5m_zone_visits("TEST-USDT", bars, [zone], [], df1h, None, set(), set())
     assert len(sigs) == 1
     assert sigs[0]["trigger_bar_time"] == pd.Timestamp(bars[0]["timestamp"], unit="ms", tz="UTC").isoformat()
+    zone_state = state["zones"]["DEMAND:0:110.000000000000:100.000000000000"]
+    # The same-visit block after a re-arm must always restore visit metadata;
+    # the later confirmed excursion outside the zone can therefore re-arm it.
+    assert zone_state["state"] == "ARMED"
+    assert zone_state["first_touch_ts"] is None
 
 
 def test_5m_stale_touch_does_not_lock_zone(monkeypatch):
@@ -5386,7 +5462,6 @@ def test_execution_ledger_recovers_orphan_when_trade_row_was_never_written(tmp_p
 
     trades = tmp_path / "trades.jsonl"
     ledger = tmp_path / "execution_ledger.jsonl"
-    trades.write_text("", encoding="utf-8")
     now_ms = int(time.time() * 1000)
     rows = [
         {"event_id": "EVT_CRASH_AFTER_ACK", "stage": "EXECUTION_START", "symbol": "AAA-USDT", "direction": "LONG", "ts_ms": now_ms, "ledger_ts": pd.Timestamp.now(tz="UTC").isoformat()},
@@ -5394,6 +5469,7 @@ def test_execution_ledger_recovers_orphan_when_trade_row_was_never_written(tmp_p
     ]
     ledger.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
     monkeypatch.setattr(run_once, "TRADES_PATH", trades)
+    assert not trades.exists()  # simulate a first-ever run crashing before journal creation
     monkeypatch.setattr(run_once, "EXECUTION_LEDGER_PATH", ledger)
     found = run_once._find_recent_unresolved_engine_entry("AAA-USDT", "LONG")
     assert found and found["event_id"] == "EVT_CRASH_AFTER_ACK"
@@ -5537,3 +5613,265 @@ def test_market_ack_with_flat_position_and_ambiguous_order_state_is_not_retryabl
     out = run_once.execute_new_position(signal)
     assert out["status"] == "entry_state_unverified"
     assert run_once._is_terminal_execution_failure(out) is True
+
+
+def test_find_recent_unresolved_engine_entry_recovers_pre_post_identity_without_order_ack(tmp_path, monkeypatch):
+    import json
+    import pandas as pd
+    import run_once
+
+    now_ms = int(pd.Timestamp.now(tz="UTC").timestamp() * 1000)
+    trades = tmp_path / "trades.jsonl"
+    ledger = tmp_path / "execution_ledger.jsonl"
+    records = [
+        {"event_id": "ZONE_CRASH_WINDOW", "stage": "EXECUTION_START", "symbol": "AAA-USDT", "direction": "LONG", "ts_ms": now_ms, "ledger_ts": pd.Timestamp(now_ms, unit="ms", tz="UTC").isoformat()},
+        {"event_id": "ZONE_CRASH_WINDOW", "stage": "ENTRY_ORDER_IDENTITY", "symbol": "AAA-USDT", "direction": "LONG", "client_order_id": "CID_OPEN_X", "ts_ms": now_ms, "ledger_ts": pd.Timestamp(now_ms, unit="ms", tz="UTC").isoformat()},
+    ]
+    ledger.write_text("\n".join(json.dumps(row) for row in records) + "\n", encoding="utf-8")
+    monkeypatch.setattr(run_once, "TRADES_PATH", trades)
+    assert not trades.exists()  # crash before the first TRADE_OPEN journal row
+    monkeypatch.setattr(run_once, "EXECUTION_LEDGER_PATH", ledger)
+    monkeypatch.setattr(run_once, "get_order", lambda symbol, order_id=None, client_order_id=None: {
+        "status": "ok", "order_status": "FILLED", "side": "BUY", "symbol": "AAAUSDT",
+        "order_type": "MARKET", "client_order_id": client_order_id, "order_id": "OID-1",
+    })
+    found = run_once._find_recent_unresolved_engine_entry("AAA-USDT", "LONG", max_age_seconds=7200)
+    assert found is not None
+    assert found["event_id"] == "ZONE_CRASH_WINDOW"
+    assert found["source"] == "execution_ledger_client_id_reconciliation"
+    assert found["result"]["order"]["order_id"] == "OID-1"
+
+
+
+def test_find_recent_unresolved_engine_entry_does_not_claim_position_for_new_unfilled_order(tmp_path, monkeypatch):
+    import json
+    import pandas as pd
+    import run_once
+
+    now_ms = int(pd.Timestamp.now(tz="UTC").timestamp() * 1000)
+    ledger = tmp_path / "execution_ledger.jsonl"
+    records = [
+        {"event_id": "ZONE_UNFILLED_ORDER", "stage": "EXECUTION_START", "symbol": "AAA-USDT", "direction": "LONG", "ts_ms": now_ms, "ledger_ts": pd.Timestamp(now_ms, unit="ms", tz="UTC").isoformat()},
+        {"event_id": "ZONE_UNFILLED_ORDER", "stage": "ENTRY_ORDER_IDENTITY", "symbol": "AAA-USDT", "direction": "LONG", "client_order_id": "CID_NEW_X", "ts_ms": now_ms, "ledger_ts": pd.Timestamp(now_ms, unit="ms", tz="UTC").isoformat()},
+    ]
+    ledger.write_text("\n".join(json.dumps(row) for row in records) + "\n", encoding="utf-8")
+    monkeypatch.setattr(run_once, "TRADES_PATH", tmp_path / "trades.jsonl")
+    monkeypatch.setattr(run_once, "EXECUTION_LEDGER_PATH", ledger)
+    monkeypatch.setattr(run_once, "get_order", lambda *a, **k: {
+        "status": "ok", "order_status": "NEW", "side": "BUY", "symbol": "AAAUSDT",
+        "order_type": "MARKET", "client_order_id": "CID_NEW_X", "order_id": "OID-NEW",
+    })
+    found = run_once._find_recent_unresolved_engine_entry("AAA-USDT", "LONG", max_age_seconds=7200)
+    assert found is None
+
+def test_open_market_blocks_market_post_if_order_identity_cannot_be_persisted(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "TESTUSDT")
+    monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
+    monkeypatch.setattr(bingx, "get_contract", lambda symbol: {"quantityPrecision": 2, "tradeMinQuantity": 0.01, "multiplier": 1, "maxLeverage": 20})
+    monkeypatch.setattr(bingx, "has_open_position", lambda *a, **k: False)
+    monkeypatch.setattr(bingx, "_set_leverage", lambda *a, **k: True)
+    monkeypatch.setattr(bingx, "position_side_param", lambda *a, **k: "LONG")
+    monkeypatch.setattr(bingx, "get_order", lambda *a, **k: {"status": "error", "error": "not found"})
+    monkeypatch.setattr(bingx, "_request", lambda *a, **k: pytest.fail("MARKET POST must be blocked before any order request"))
+    out = bingx.open_market(
+        "TEST-USDT", "LONG", 100.0, "EVENT_LEDGER_FAIL",
+        order_identity_callback=lambda cid: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    assert out["status"] == "error"
+    assert out["order_submitted"] is False
+    assert "identity_persistence_failed" in out["error"]
+
+
+def test_emergency_close_does_not_resubmit_while_previous_order_is_ambiguous(monkeypatch):
+    import run_once
+    close_calls = []
+    position_reads = [{"status": "found", "positionAmt": 1.0}, {"status": "found", "positionAmt": 1.0}]
+    monkeypatch.setattr(run_once, "get_position_directional", lambda *a, **k: position_reads.pop(0) if position_reads else {"status": "found", "positionAmt": 1.0})
+    monkeypatch.setattr(run_once, "close_position_market", lambda *a, **k: close_calls.append(1) or {"status": "closed", "response": {"code": 0, "data": {"order": {"orderId": "CLOSE-1"}}}})
+    monkeypatch.setattr(run_once, "get_order", lambda *a, **k: {"status": "ok", "order_status": "NEW", "order_id": "CLOSE-1"})
+    monkeypatch.setattr(run_once.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setenv("EMERGENCY_CLOSE_ATTEMPTS", "4")
+    monkeypatch.setenv("EMERGENCY_CLOSE_VERIFY_POLLS", "2")
+    out = run_once._emergency_close_and_verify("AAA-USDT", "LONG", 1.0, "EVT_CLOSE_AMBIG")
+    assert out["status"] == "close_unverified"
+    assert len(close_calls) == 1
+
+
+
+def test_emergency_close_retries_only_after_definite_exchange_rejection(monkeypatch):
+    import run_once
+
+    close_calls = []
+    position_reads = iter([
+        {"status": "found", "positionAmt": 1.0},
+        {"status": "found", "positionAmt": 1.0},
+        {"status": "not_found"},
+    ])
+    responses = iter([
+        {"status": "error", "error": "order rejected", "response": {"code": 109400, "msg": "rejected"}},
+        {"status": "closed", "response": {"code": 0, "data": {"order": {"orderId": "CLOSE-2"}}}},
+    ])
+    monkeypatch.setattr(run_once, "get_position_directional", lambda *a, **k: next(position_reads, {"status": "not_found"}))
+    monkeypatch.setattr(run_once, "close_position_market", lambda *a, **k: close_calls.append(a[2]) or next(responses))
+    monkeypatch.setattr(run_once.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setenv("EMERGENCY_CLOSE_ATTEMPTS", "2")
+    monkeypatch.setenv("EMERGENCY_CLOSE_VERIFY_POLLS", "2")
+    out = run_once._emergency_close_and_verify("AAA-USDT", "LONG", 1.0, "EVT_CLOSE_RETRY")
+    assert out["status"] == "closed_verified"
+    assert close_calls == [1.0, 1.0]
+
+
+def test_emergency_close_respects_confirmed_zero_position_quantity(monkeypatch):
+    import run_once
+    monkeypatch.setattr(run_once, "get_position_directional", lambda *a, **k: {"status": "found", "positionAmt": 0.0})
+    monkeypatch.setattr(run_once, "close_position_market", lambda *a, **k: pytest.fail("must not submit MARKET close for confirmed zero quantity"))
+    result = run_once._emergency_close_and_verify("AAA-USDT", "LONG", 1.0, "EVT_ZERO_CLOSE")
+    assert result["status"] == "closed_verified"
+
+
+def test_emergency_close_does_not_retry_terminal_order_with_partial_fill(monkeypatch):
+    import run_once
+
+    close_calls = []
+    position_reads = iter([
+        {"status": "found", "positionAmt": 1.0},
+        {"status": "found", "positionAmt": 0.4},
+    ])
+    monkeypatch.setattr(run_once, "get_position_directional", lambda *a, **k: next(position_reads, {"status": "found", "positionAmt": 0.4}))
+    monkeypatch.setattr(run_once, "close_position_market", lambda *a, **k: close_calls.append(a[2]) or {
+        "status": "closed", "response": {"code": 0, "data": {"order": {"orderId": "CLOSE-PARTIAL"}}},
+    })
+    monkeypatch.setattr(run_once, "get_order", lambda *a, **k: {
+        "status": "ok", "order_status": "CANCELED", "order_id": "CLOSE-PARTIAL", "executed_qty": 0.6,
+    })
+    monkeypatch.setattr(run_once.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setenv("EMERGENCY_CLOSE_ATTEMPTS", "3")
+    monkeypatch.setenv("EMERGENCY_CLOSE_VERIFY_POLLS", "2")
+    out = run_once._emergency_close_and_verify("AAA-USDT", "LONG", 1.0, "EVT_CLOSE_PARTIAL")
+    assert out["status"] == "close_unverified"
+    assert close_calls == [1.0]
+    assert out["remaining_qty"] == pytest.approx(0.4)
+
+def test_fetch_research_account_snapshot_unknown_fill_shape_uses_income_fallback(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "get_credentials", lambda: ("TEST_PUBLIC_KEY", "TEST_SECRET"))
+
+    def fake_request(method, path, params=None, signed=True, **kwargs):
+        if path == bingx.BALANCE_PATH:
+            return {"code": 0, "data": [{"asset": "USDT", "balance": "100", "equity": "100", "availableMargin": "90", "usedMargin": "10", "freezedMargin": "0"}]}
+        if path == bingx.ALL_FILL_ORDERS_PATH:
+            return {"code": 0, "data": {"unexpected_wrapper": [{"orderId": "O1"}]}}
+        if path == bingx.INCOME_PATH:
+            return {"code": 0, "data": [{"incomeType": "REALIZED_PNL", "income": "7.25", "asset": "USDT", "time": 1767225500000}]}
+        if path in {bingx.FORCE_ORDERS_PATH, bingx.POSITION_PATH}:
+            return {"code": 0, "data": []}
+        if path == bingx.COMMISSION_RATE_PATH:
+            return {"code": 0, "data": {"commission": {"takerCommissionRate": "0.0005", "makerCommissionRate": "0.0002"}}}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(bingx, "_request", fake_request)
+    snap = bingx.fetch_research_account_snapshot()
+    assert snap["recent_fill_status"] == "UNRECOGNIZED_RESPONSE_SHAPE"
+    assert snap["recent_fill_count"] is None
+    assert snap["recent_fill_realized_pnl_total"] is None
+    assert snap["recent_realized_pnl_total"] == pytest.approx(7.25)
+    assert snap["recent_realized_pnl_source"] == "INCOME_REALIZED_PNL_FALLBACK"
+
+
+def test_tracker_be_retry_persists_cleanup_pending_state(tmp_path, monkeypatch):
+    import json
+    from event_engine import tracker, telemetry
+
+    active = tmp_path / "active_trades.json"
+    trades_path = tmp_path / "trades.jsonl"
+    event_id = "ZONE_BE_RETRY_PENDING"
+    trade = {
+        "event_id": event_id, "symbol": "AAA-USDT", "direction": "LONG", "name": "AAA",
+        "entry_price": 100.0, "initial_qty": 1.0, "remaining_qty": 0.5, "entry_ts": 1,
+        "closed": False, "tp_orders": [], "sl_order": {"order_id": "OLD_SL", "stop_price": 90.0},
+        "hit_legs": ["tp1"], "tp_filled_qty": {"tp1": 0.5},
+        "realized_pnl_qty": 0.5, "realized_pnl_weighted_sum": 1.5,
+        "peak_pnl_pct": 3.0, "mae_pct": 0.0, "max_drawdown_pct": 0.0,
+    }
+    active.write_text(json.dumps({event_id: trade}), encoding="utf-8")
+    monkeypatch.setattr(tracker, "DATA", tmp_path)
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", active)
+    monkeypatch.setattr(tracker, "TRADES_PATH", trades_path)
+    monkeypatch.setattr(tracker, "ACTIONS_PATH", tmp_path / "actions.jsonl")
+    monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: {"status": "found", "positionAmt": 0.5, "avgPrice": 100.0})
+    monkeypatch.setattr(tracker, "fetch_klines", lambda *a, **k: [])
+    monkeypatch.setattr(tracker, "_move_sl_to_break_even", lambda *a, **k: {
+        "status": "created_cleanup_pending", "order_id": "BE_SL", "stop_price": 100.0,
+        "old_sl_cleanup_pending": True, "old_sl_cleanup_pending_order_id": "OLD_SL",
+        "error": "old SL cancellation not verified",
+    })
+    monkeypatch.setattr(tracker, "_cancel_old_sl_verified", lambda *a, **k: (False, "still open"))
+    monkeypatch.setattr(tracker, "_send_tracker_notification", lambda *a, **k: True)
+    for name in ("record_position_reconciliation", "record_protection_event", "record_exchange_error", "record_state_conflict", "record_performance_metric"):
+        if hasattr(telemetry, name):
+            monkeypatch.setattr(telemetry, name, lambda *a, **k: None)
+    tracker.update_active_trades()
+    saved = json.loads(active.read_text(encoding="utf-8"))[event_id]
+    assert saved["be_activated"] is True
+    assert saved["be_required"] is False
+    assert saved["be_order_id"] == "BE_SL"
+    assert saved["sl_cleanup_pending"]["old_order_id"] == "OLD_SL"
+    assert "old SL cancellation not verified" in saved["sl_cleanup_pending"]["last_error"]
+
+
+def test_tracker_be_retry_persists_verified_rollback_and_classifies_exit(tmp_path, monkeypatch):
+    import json
+    from event_engine import tracker, telemetry
+
+    active = tmp_path / "active_trades.json"
+    trades_path = tmp_path / "trades.jsonl"
+    event_id = "ZONE_BE_RETRY_ROLLBACK"
+    trade = {
+        "event_id": event_id, "symbol": "AAA-USDT", "direction": "LONG", "name": "AAA",
+        "entry_price": 100.0, "initial_qty": 1.0, "remaining_qty": 0.5, "entry_ts": 1,
+        "closed": False, "tp_orders": [], "sl_order": {"order_id": "OLD_SL", "stop_price": 90.0},
+        "hit_legs": ["tp1"], "tp_filled_qty": {"tp1": 0.5},
+        "realized_pnl_qty": 0.5, "realized_pnl_weighted_sum": 1.5,
+        "peak_pnl_pct": 3.0, "mae_pct": 0.0, "max_drawdown_pct": 0.0,
+    }
+    active.write_text(json.dumps({event_id: trade}), encoding="utf-8")
+    monkeypatch.setattr(tracker, "DATA", tmp_path)
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", active)
+    monkeypatch.setattr(tracker, "TRADES_PATH", trades_path)
+    monkeypatch.setattr(tracker, "ACTIONS_PATH", tmp_path / "actions.jsonl")
+    positions = iter([
+        {"status": "found", "positionAmt": 0.5, "avgPrice": 100.0},
+        {"status": "found", "positionAmt": 0.5, "avgPrice": 100.0},
+        {"status": "not_found"},
+        {"status": "not_found"},
+    ])
+    monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: next(positions, {"status": "not_found"}))
+    monkeypatch.setattr(tracker, "fetch_klines", lambda *a, **k: [])
+    be_calls = []
+    monkeypatch.setattr(tracker, "_move_sl_to_break_even", lambda *a, **k: be_calls.append(1) or {
+        "status": "error", "error": "old SL restore failed",
+        "rollback": {"status": "closed_verified", "remaining_qty": 0.0, "last_known_qty": 0.0},
+    })
+    monkeypatch.setattr(tracker, "_get_exit_from_sl", lambda *a, **k: (None, None))
+    monkeypatch.setattr(tracker, "_get_filled_order", lambda *a, **k: None)
+    monkeypatch.setattr(tracker, "cancel_order", lambda *a, **k: {"code": 0})
+    monkeypatch.setattr(tracker, "_collect_trade_fill_accounting", lambda *a, **k: {
+        "entry_fee_raw": None, "exit_fee_raw": None, "fee_raw_total": None, "fees_paid_abs": None,
+        "exchange_realized_pnl_abs": None, "exit_vwap_confirmed": None, "exit_vwap_source": None,
+        "exit_leg_vwap_confirmed": None, "exit_leg_vwap_source": None, "fee_source": "UNAVAILABLE",
+        "confirmed_exit_qty": None, "last_exit_fill_ts_ms": None,
+    })
+    monkeypatch.setattr(tracker, "_send_tracker_notification", lambda *a, **k: True)
+    for name in ("record_position_reconciliation", "record_protection_event", "record_exchange_error", "record_state_conflict", "record_performance_metric"):
+        if hasattr(telemetry, name):
+            monkeypatch.setattr(telemetry, name, lambda *a, **k: None)
+    tracker.update_active_trades()
+    saved_first = json.loads(active.read_text(encoding="utf-8"))[event_id]
+    assert saved_first["be_failure_rollback"]["status"] == "closed_verified"
+    assert saved_first["be_failure_rollback_verified_ts"]
+    tracker.update_active_trades()
+    assert be_calls == [1], "a verified BE-failure rollback must not be retried as a live BE transition"
+    close_rows = [json.loads(line) for line in trades_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert close_rows[-1]["record_type"] == "TRADE_CLOSE"
+    assert close_rows[-1]["exit_reason"] == "EMERGENCY_CLOSE_AFTER_BE_FAILURE"

@@ -280,12 +280,20 @@ def _append_jsonl(path: Path, obj: dict[str, Any]) -> None:
 
 
 
-def _append_execution_ledger(event_id: str, attempt_id: str | None, stage: str, payload: dict[str, Any] | None = None) -> None:
+def _append_execution_ledger(
+    event_id: str,
+    attempt_id: str | None,
+    stage: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    raise_on_error: bool = False,
+) -> None:
     """Append one immutable execution-lifecycle event.
 
-    This journal is observability-only: a ledger write failure must never alter
-    a trading decision. The record is intentionally append-only and carries the
-    strategy/commit lineage needed to reconstruct one attempt end-to-end.
+    Ledger writes are normally observability-only. A narrow set of transitions
+    (notably the pre-POST MARKET identity breadcrumb) can request fail-closed
+    behavior because proceeding without that durable identity would make a
+    later exchange order impossible to reconcile reliably after a process crash.
     """
     record = {
         "record_type": "EXECUTION_LEDGER",
@@ -304,6 +312,8 @@ def _append_execution_ledger(event_id: str, attempt_id: str | None, stage: str, 
         _append_jsonl(EXECUTION_LEDGER_PATH, record)
     except Exception as exc:
         log.error("[EXECUTION_LEDGER_WRITE_FAILED] event_id=%s attempt_id=%s stage=%s error=%s", event_id, attempt_id, stage, exc)
+        if raise_on_error:
+            raise RuntimeError(f"execution ledger write failed for stage={stage}: {exc}") from exc
 
 
 
@@ -1511,7 +1521,14 @@ def _process_5m_zone_visits(
             )
             previous_touch = state["previous_midpoint_touch"] if ZONE_TRIGGER_MODE == "midpoint" else state["previous_zone_touch"]
             if previous_touch:
-                # This is still the same continuous visit, not a new touch event.
+                # This is still a continuous touch, not a new signal. However, a
+                # preceding breakout/re-arm may already have cleared first_touch_ts.
+                # Re-locking without restoring visit metadata makes the zone
+                # permanently LOCKED because the re-arm gate requires first_touch_ts.
+                if not zs.get("first_touch_ts"):
+                    zs["first_touch_ts"] = bar_ts.isoformat()
+                    zs["visit_id"] = f"{symbol}:{zone_key}:{int(bar_ts.timestamp()*1000)}"
+                    zs["lock_reason"] = "continuous_touch_after_rearm"
                 zs.update({"state": "LOCKED", "last_touch_ts": bar_ts.isoformat(), "touch_count": int(zs.get("touch_count", 0)) + 1})
                 if diagnostics is not None:
                     diagnostics["zones"][zone_key]["same_visit_blocks"] += 1
@@ -1913,32 +1930,37 @@ def _position_keys(positions: list[dict]) -> set[tuple[str, str]]:
 
 def _find_recent_unresolved_engine_entry(symbol: str, direction: str, *, max_age_seconds: float = 7200.0) -> dict[str, Any] | None:
     """Find a recent engine entry explicitly recorded as unresolved, never a manual position."""
-    if not TRADES_PATH.exists():
-        return None
-    wanted_symbol = str(symbol).upper().replace("-USDT", "").replace("-", "")
+    # The trade journal may not exist if the process dies on the very first
+    # entry before TRADE_OPEN is written. Still inspect the execution ledger;
+    # otherwise that exact crash window would bypass the identity recovery below.
+    # Normalize to the exchange's compact contract symbol (AAA-USDT -> AAAUSDT).
+    # Do not strip the quote asset here: BingX order lookups return the compact
+    # symbol without a hyphen, so stripping USDT on one side breaks reconciliation.
+    wanted_symbol = _display_symbol(symbol)
     wanted_direction = str(direction).upper()
     now = pd.Timestamp.now(tz="UTC")
     eligible = {"opened_emergency_close_unverified", "opened_registration_failed_close_unverified", "entry_state_unverified"}
     rows: list[dict[str, Any]] = []
-    try:
-        with TRADES_PATH.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                if not line.strip():
-                    continue
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    log.error("[RECON_ORPHAN_LOOKUP] skipping malformed trade journal line")
-                    continue
-                if isinstance(row, dict):
-                    rows.append(row)
-    except OSError as exc:
-        log.error("[RECON_ORPHAN_LOOKUP] cannot inspect trade journal: %s", exc)
-        return None
+    if TRADES_PATH.exists():
+        try:
+            with TRADES_PATH.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        log.error("[RECON_ORPHAN_LOOKUP] skipping malformed trade journal line")
+                        continue
+                    if isinstance(row, dict):
+                        rows.append(row)
+        except OSError as exc:
+            log.error("[RECON_ORPHAN_LOOKUP] cannot inspect trade journal: %s", exc)
+            return None
     for row in reversed(rows):
         if not isinstance(row, dict):
             continue
-        if str(row.get("symbol", "")).upper().replace("-USDT", "").replace("-", "") != wanted_symbol:
+        if _display_symbol(row.get("symbol", "")) != wanted_symbol:
             continue
         if str(row.get("direction", "")).upper() != wanted_direction:
             continue
@@ -1988,9 +2010,10 @@ def _find_recent_unresolved_engine_entry(symbol: str, direction: str, *, max_age
             continue
         start = next((r for r in records if r.get("stage") == "EXECUTION_START"), None)
         ack = next((r for r in reversed(records) if r.get("stage") == "ORDER_ACK"), None)
-        if not start or not ack:
+        identity = next((r for r in reversed(records) if r.get("stage") == "ENTRY_ORDER_IDENTITY"), None)
+        if not start:
             continue
-        if str(start.get("symbol", "")).upper().replace("-USDT", "").replace("-", "") != wanted_symbol:
+        if _display_symbol(start.get("symbol", "")) != wanted_symbol:
             continue
         if str(start.get("direction", "")).upper() != wanted_direction:
             continue
@@ -1999,8 +2022,46 @@ def _find_recent_unresolved_engine_entry(symbol: str, direction: str, *, max_age
         recovery = next((r for r in reversed(records) if r.get("stage") == "ORPHAN_ENGINE_POSITION_RECOVERY"), None)
         if recovery and str(recovery.get("status", "")).lower() == "closed_verified":
             continue
+
+        # A crash can occur after the exchange accepted MARKET but before the
+        # ORDER_ACK ledger row was appended. Recover only if the pre-POST identity
+        # breadcrumb exists and the exchange confirms that exact MARKET order.
+        if ack is None:
+            client_order_id = str((identity or {}).get("client_order_id") or "")
+            if not client_order_id:
+                continue
+            try:
+                observed_order = get_order(symbol, client_order_id=client_order_id)
+            except Exception as exc:
+                log.warning("[RECON_ORPHAN_LOOKUP] entry clientOrderId query failed for %s: %s", client_order_id, exc)
+                continue
+            observed_status = str(observed_order.get("order_status", "")).upper() if isinstance(observed_order, dict) else ""
+            observed_side = str(observed_order.get("side", "")).upper() if isinstance(observed_order, dict) else ""
+            expected_side = "BUY" if wanted_direction == "LONG" else "SELL"
+            observed_symbol = _display_symbol(observed_order.get("symbol", "")) if isinstance(observed_order, dict) else ""
+            if not (
+                isinstance(observed_order, dict)
+                and observed_order.get("status") == "ok"
+                and observed_status in {"PARTIALLY_FILLED", "FILLED"}
+                and observed_symbol == wanted_symbol
+                and observed_side == expected_side
+                and str(observed_order.get("order_type", "")).upper() == "MARKET"
+                and str(observed_order.get("client_order_id", client_order_id)) == client_order_id
+            ):
+                continue
+            ack = {
+                "stage": "ORDER_ACK_RECONCILED_BY_CLIENT_ID",
+                "order_id": observed_order.get("order_id"),
+                "client_order_id": client_order_id,
+                "ts_ms": (identity or {}).get("ts_ms"),
+                "order_status": observed_status,
+            }
+
         try:
-            stamp_ms = int(start.get("ts_ms") or ack.get("ts_ms") or 0)
+            if ack.get("stage") == "ORDER_ACK_RECONCILED_BY_CLIENT_ID" and identity:
+                stamp_ms = int(identity.get("ts_ms") or identity.get("order_submit_at_ms") or start.get("ts_ms") or 0)
+            else:
+                stamp_ms = int(start.get("ts_ms") or ack.get("ts_ms") or 0)
         except (TypeError, ValueError):
             stamp_ms = 0
         age_sec = (int(now.timestamp() * 1000) - stamp_ms) / 1000.0 if stamp_ms > 0 else float("inf")
@@ -2009,8 +2070,8 @@ def _find_recent_unresolved_engine_entry(symbol: str, direction: str, *, max_age
         return {
             "event_id": event_id,
             "row": start,
-            "result": {"status": "entry_state_unverified", "execution_call_start_ts": start.get("ledger_ts"), "order": {"order_id": ack.get("order_id")}},
-            "source": "execution_ledger",
+            "result": {"status": "entry_state_unverified", "execution_call_start_ts": (identity or {}).get("ledger_ts") if ack.get("stage") == "ORDER_ACK_RECONCILED_BY_CLIENT_ID" else start.get("ledger_ts"), "order": {"order_id": ack.get("order_id"), "client_order_id": ack.get("client_order_id")}},
+            "source": "execution_ledger_client_id_reconciliation" if ack.get("stage") == "ORDER_ACK_RECONCILED_BY_CLIENT_ID" else "execution_ledger",
         }
     return None
 
@@ -2041,7 +2102,7 @@ def reconcile_all_open_positions() -> bool:
         candidates = [
             (event_id, trade) for event_id, trade in active.items()
             if isinstance(trade, dict) and not trade.get("closed")
-            and str(trade.get("symbol", "")).upper().replace("-USDT", "").replace("-", "") == symbol.replace("-USDT", "").replace("-", "")
+            and _display_symbol(trade.get("symbol", "")) == _display_symbol(symbol)
             and str(trade.get("direction", "")).upper() == side
         ]
         if len(candidates) != 1:
@@ -2050,7 +2111,7 @@ def reconcile_all_open_positions() -> bool:
                 (str(event_id), str(trade.get("direction", "")).upper())
                 for event_id, trade in active.items()
                 if isinstance(trade, dict) and not trade.get("closed")
-                and str(trade.get("symbol", "")).upper().replace("-USDT", "").replace("-", "") == symbol.replace("-USDT", "").replace("-", "")
+                and _display_symbol(trade.get("symbol", "")) == _display_symbol(symbol)
                 and str(trade.get("direction", "")).upper() != side
             ]
             if not candidates and same_symbol_other_side:
@@ -2217,6 +2278,25 @@ def reconcile_all_open_positions() -> bool:
                         message="unique owner disappeared or no longer matched before protection state update",
                         owner_event_ids=[str(event_id)],
                     )
+                if result.get("status") == "SL_ONLY":
+                    # A verified SL is valuable protection and must not be removed
+                    # by an unnecessary emergency close, but missing TP protection
+                    # means the trade is not fully reconciled. Keep SL, persist any
+                    # TP repairs made, and block new entries until a later cycle
+                    # proves the complete protection set.
+                    unresolved = True
+                    telemetry.record_state_conflict(
+                        event_id=str(event_id), attempt_id=trade.get("attempt_id"),
+                        position_id=trade.get("position_id") or str(event_id), order_id=None,
+                        symbol=symbol, direction=side, conflict_type="PROTECTION_TP_INCOMPLETE",
+                        message="SL is verified but one or more expected TP legs are not fully verified; keeping the SL and retrying reconciliation",
+                        owner_event_ids=[str(event_id)],
+                    )
+                    _append_execution_ledger(str(event_id), None, "RECON_PROTECTION_PARTIAL", {
+                        "status": "SL_ONLY", "symbol": symbol, "direction": side,
+                        "error": result.get("error"), "action": "keep_verified_sl_retry_missing_tp_and_block_new_entries",
+                    })
+                    log.error("[RECON_PROTECTION_PARTIAL] %s %s event=%s: verified SL retained; TP protection incomplete, blocking new entries until repaired", symbol, side, event_id)
             else:
                 unresolved = True
                 log.critical("[RECON_PROTECTION_UNVERIFIED] %s %s event=%s status=%s error=%s; attempting verified emergency close", symbol, side, event_id, result.get("status"), result.get("error"))
@@ -2639,11 +2719,75 @@ def _cancel_engine_protection_before_emergency_close(
 
 
 def _emergency_close_and_verify(symbol: str, direction: str, qty: float, trade_id: str) -> dict[str, Any]:
-    """Close a safety-rollback position and verify that it is actually gone."""
-    attempts = []
-    configured_attempts = max(2, int(os.environ.get("EMERGENCY_CLOSE_ATTEMPTS", "4")))
+    """Close a safety-rollback position without overlapping ambiguous MARKET closes.
+
+    A second close POST is allowed only when the preceding request is proven to
+    have been rejected (non-zero exchange response) or its order is verified in
+    a terminal non-fill state. A transport error, missing order ID, accepted
+    order still pending, or failed order lookup is ambiguous and must never
+    trigger a blind second MARKET close.
+    """
+    attempts: list[dict[str, Any]] = []
+    configured_attempts = max(1, int(os.environ.get("EMERGENCY_CLOSE_ATTEMPTS", "4")))
     verify_polls = max(2, int(os.environ.get("EMERGENCY_CLOSE_VERIFY_POLLS", "6")))
     last_qty = max(0.0, float(qty or 0.0))
+    previous_close: dict[str, Any] | None = None
+
+    def _order_id_from_close(close_result: dict[str, Any] | None) -> str | None:
+        if not isinstance(close_result, dict):
+            return None
+        response = close_result.get("response")
+        if isinstance(response, dict):
+            data = response.get("data")
+            if isinstance(data, dict):
+                order = data.get("order") if isinstance(data.get("order"), dict) else data
+                if isinstance(order, dict) and order.get("orderId") not in (None, ""):
+                    return str(order.get("orderId"))
+        if close_result.get("order_id") not in (None, ""):
+            return str(close_result.get("order_id"))
+        return None
+
+    def _previous_close_definitively_rejected(close_result: dict[str, Any] | None) -> bool:
+        if not isinstance(close_result, dict):
+            return False
+        # close_position_market returns a response only when the exchange sent a
+        # definite non-zero error code. Exceptions/timeouts carry no response and
+        # remain ambiguous: the order may have reached the exchange.
+        response = close_result.get("response")
+        if close_result.get("status") == "error" and isinstance(response, dict):
+            code = response.get("code")
+            return code not in (None, 0, "0")
+        order_id = _order_id_from_close(close_result)
+        if not order_id:
+            return False
+        try:
+            order_info = get_order(symbol, order_id)
+        except Exception as exc:
+            attempts.append({"verification": "prior_close_order", "order_id": order_id, "status": "query_error", "error": str(exc)})
+            return False
+        attempts.append({"verification": "prior_close_order", "order_id": order_id, "order": order_info})
+        if not isinstance(order_info, dict) or order_info.get("status") != "ok":
+            return False
+        order_status = str(order_info.get("order_status", "")).upper()
+        if order_status not in {"REJECTED", "CANCELED", "CANCELLED", "EXPIRED"}:
+            return False
+        # A canceled/expired order may have partially filled. Do not submit the
+        # previous full quantity again unless the exchange confirms zero executed
+        # quantity; otherwise a stale position snapshot could cause an oversized
+        # second close. The next retry re-reads the current directional quantity.
+        executed_qty_known = order_info.get("executed_qty_known")
+        if executed_qty_known is False:
+            return False
+        # Test doubles and older connector wrappers may not expose the explicit
+        # known flag; require the field to be present in that case. The live
+        # BingX get_order wrapper sets executed_qty_known based on raw evidence.
+        if executed_qty_known is None and "executed_qty" not in order_info:
+            return False
+        try:
+            executed_qty = abs(float(order_info.get("executed_qty", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            return False
+        return executed_qty <= 1e-12
 
     for attempt in range(configured_attempts):
         try:
@@ -2652,25 +2796,35 @@ def _emergency_close_and_verify(symbol: str, direction: str, qty: float, trade_i
             current = {"status": "error", "error": str(exc)}
         if current.get("status") == "not_found":
             return {"status": "closed_verified", "attempts": attempts, "verification": current}
-        if current.get("status") == "error":
-            attempts.append({"status": "position_check_error", "error": current.get("error")})
-            time.sleep(0.4 * (attempt + 1))
-            continue
-        if current.get("status") == "found":
+        if current.get("status") != "found":
+            attempts.append({"status": "position_check_error", "error": current.get("error", "position not authoritatively found")})
+            # Never submit based on an unknown position state.
+            break
+        raw_current_qty = current.get("positionAmt")
+        if raw_current_qty is not None:
             try:
-                last_qty = abs(float(current.get("positionAmt", last_qty) or last_qty))
+                last_qty = abs(float(raw_current_qty))
             except (TypeError, ValueError):
                 pass
         if last_qty <= 0:
             return {"status": "closed_verified", "attempts": attempts, "verification": current}
+
+        if previous_close is not None and not _previous_close_definitively_rejected(previous_close):
+            # Previous POST may still be accepted/in-flight or may have succeeded
+            # while the position endpoint is lagging. Switch to verification-only.
+            break
+
         try:
             close_result = close_position_market(symbol, direction, last_qty, trade_id=trade_id)
         except Exception as exc:
-            close_result = {"status": "error", "error": str(exc)}
+            close_result = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
         attempts.append(close_result)
+        previous_close = close_result
+        # Avoid tight resubmission; on next iteration we re-read position and
+        # require explicit rejection evidence before issuing another MARKET POST.
         time.sleep(0.35 * (attempt + 1))
 
-    verification = {"status": "verification_error", "error": "no verification attempted"}
+    verification: dict[str, Any] = {"status": "verification_error", "error": "no verification attempted"}
     for poll in range(verify_polls):
         try:
             verification = get_position_directional(symbol, direction)
@@ -2679,13 +2833,20 @@ def _emergency_close_and_verify(symbol: str, direction: str, qty: float, trade_i
         if verification.get("status") == "not_found":
             return {"status": "closed_verified", "attempts": attempts, "verification": verification, "verify_poll": poll + 1}
         if verification.get("status") == "found":
-            try:
-                last_qty = abs(float(verification.get("positionAmt", last_qty) or last_qty))
-            except (TypeError, ValueError):
-                pass
+            raw_verified_qty = verification.get("positionAmt")
+            if raw_verified_qty is not None:
+                try:
+                    last_qty = abs(float(raw_verified_qty))
+                except (TypeError, ValueError):
+                    pass
         time.sleep(0.35)
 
-    return {"status": "close_unverified", "attempts": attempts, "verification": verification, "remaining_qty": last_qty}
+    return {
+        "status": "close_unverified",
+        "attempts": attempts,
+        "verification": verification,
+        "remaining_qty": last_qty if verification.get("status") == "found" else None,
+    }
 
 
 def _emergency_close_preserving_protection(
@@ -3283,6 +3444,11 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         attempt_id=signal.get("attempt_id"),
         trigger_bar_time_ms=trigger_bar_time_ms,
         max_trigger_age_minutes=MAX_5M_TRIGGER_AGE_MINUTES if str(signal.get("trigger_timeframe", "1h")).lower() == "5m" else None,
+        order_identity_callback=lambda client_order_id: _append_execution_ledger(
+            event_id, signal.get("attempt_id"), "ENTRY_ORDER_IDENTITY",
+            {"symbol": symbol, "direction": direction, "client_order_id": client_order_id},
+            raise_on_error=True,
+        ),
     )
     order_status = str(order.get("status", "")).lower() if isinstance(order, dict) else ""
     response = order.get("response") if isinstance(order, dict) and isinstance(order.get("response"), dict) else {}
