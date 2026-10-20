@@ -59,9 +59,9 @@ def test_deferred_research_bar_prefetch_preserves_symbol_mapping(monkeypatch):
 
     assert prefetch[id(payloads[0])] == [{"symbol": "AAAUSDT", "timestamp": 1}]
     assert prefetch[id(payloads[1])] == [{"symbol": "BBB-USDT", "timestamp": 2}]
-    assert id(payloads[2]) not in prefetch
-    assert id(payloads[3]) not in prefetch
-    assert len(calls) == 2
+    assert prefetch[id(payloads[2])] == [{"symbol": "CCCUSDT", "timestamp": 1}]
+    assert prefetch[id(payloads[3])] == [{"symbol": "DDDUSDT", "timestamp": 1}]
+    assert len(calls) == 4
     assert {call[0] for call in calls} == {"binance", "bingx"}
 
 

@@ -24,6 +24,8 @@ def _make_complete_state(root: Path) -> Path:
             path.write_text("", encoding="utf-8")
         elif path.name.endswith(".txt"):
             path.write_text("empty scan\n", encoding="utf-8")
+        elif path.name in {"active_trades.json", "event_execution_claims.json"}:
+            path.write_text("{}\n", encoding="utf-8")
         else:
             path.write_text(json.dumps({"path": rel, "version": 1}) + "\n", encoding="utf-8")
     (data / "retention_archive").mkdir(parents=True, exist_ok=True)
@@ -125,3 +127,22 @@ def test_runtime_state_bundle_rejects_symlinked_roots(tmp_path):
         restore_bundle(bundle_dir=bundle, data_dir=data_link)
     with pytest.raises(RuntimeError, match="must not be symlinks"):
         create_bundle(data_dir=data_link, output_dir=tmp_path / "other-bundle")
+
+
+def test_runtime_state_bundle_rejects_checksumming_corrupt_active_trade_json(tmp_path):
+    import hashlib
+
+    data = _make_complete_state(tmp_path / "source")
+    bundle = tmp_path / "bundle"
+    create_bundle(data_dir=data, output_dir=bundle)
+    active_path = bundle / "data" / "active_trades.json"
+    active_path.write_text("[]", encoding="utf-8")
+    manifest_path = bundle / "runtime-state-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for record in manifest["files"]:
+        if record["path"] == "data/active_trades.json":
+            record["sha256"] = hashlib.sha256(active_path.read_bytes()).hexdigest()
+            record["size_bytes"] = active_path.stat().st_size
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="active_trades.json must have root type dict"):
+        verify_bundle(bundle)

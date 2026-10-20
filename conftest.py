@@ -11,6 +11,7 @@ def isolate_repository_research_data(monkeypatch, tmp_path):
     runtime_data = tmp_path / "research-data"
     runtime_data.mkdir(parents=True, exist_ok=True)
     (runtime_data / "active_trades.json").write_text("{}", encoding="utf-8")
+    (runtime_data / "event_execution_claims.json").write_text("{}", encoding="utf-8")
     # Do not create any other runtime data up-front: individual tests may intentionally
     # construct their own tmp/data directory for retention-policy assertions.
     research_paths = {

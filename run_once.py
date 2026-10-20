@@ -48,7 +48,7 @@ from event_engine.signals import STRATEGY_VERSION, SWING_LEN, TP1_PCT, TP2_PCT, 
 from event_engine.version import ENGINE_VERSION
 from event_engine.fundamental_assets import FUNDAMENTAL_ASSET_SYMBOLS
 from event_engine.telegram import format_signal, send as send_tg
-from event_engine.tracker import ActiveTradeStateCorrupt, register_active_trade, update_active_trades, update_active_trade_protection, merge_reconciled_tp_orders, has_active_trade_conflict, backfill_active_trade_provenance
+from event_engine.tracker import ActiveTradeStateCorrupt, register_active_trade, update_active_trades, update_active_trade_protection, merge_reconciled_tp_orders, has_active_trade_conflict, backfill_active_trade_provenance, record_verified_emergency_close
 from event_engine import research, telemetry, shadow, request_metrics
 from event_engine.trend_filter import evaluate_trend_filter
 
@@ -511,13 +511,13 @@ def _load_failed_signal_ids() -> dict[str, dict[str, Any]]:
 
 def _load_event_claims_unlocked() -> dict[str, dict[str, Any]]:
     if not EVENT_CLAIMS_PATH.exists():
-        return {}
+        raise RuntimeError("execution claims file is missing; refusing duplicate-prone reset")
     try:
         raw = json.loads(EVENT_CLAIMS_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    except Exception as exc:
+        raise RuntimeError(f"execution claims file is unreadable; refusing duplicate-prone reset: {exc}") from exc
     if not isinstance(raw, dict):
-        return {}
+        raise RuntimeError("execution claims file is not a JSON object; refusing duplicate-prone reset")
     return {str(k): v for k, v in raw.items() if isinstance(v, dict)}
 
 
@@ -610,6 +610,9 @@ def _load_terminal_event_ids() -> set[str]:
         "skipped_min_qty",
         "skipped_invalid_setup",
         "opened_then_emergency_closed",
+        "opened_emergency_close_unverified",
+        "opened_registration_failed_close_unverified",
+        "entry_state_unverified",
     }
     for line in TRADES_PATH.read_text(encoding="utf-8").splitlines():
         try:
@@ -912,6 +915,10 @@ def _clear_stale_pending_zone_visit(zone_state: dict[str, Any], signal: dict[str
             "state": "ARMED",
             "pending_signal": None,
             "trigger_event_id": None,
+            "first_touch_ts": None,
+            "last_touch_ts": None,
+            "touch_count": 0,
+            "visit_id": None,
             "lock_reason": "stale_5m_trigger_rejected_before_order",
         })
         return True
@@ -1568,17 +1575,21 @@ def _process_5m_zone_visits(
                 # A stale touch is useful audit data but must not consume the zone visit.
                 # Otherwise a delayed provider/API response could lock a zone until a
                 # future full exit/re-entry, silently suppressing the next valid setup.
+                stale_visit_id = zs.get("visit_id")
+                stale_touch_count = int(zs.get("touch_count", 0))
                 zs.update({
                     "state": "ARMED",
-                    "last_touch_ts": bar_ts.isoformat(),
-                    "touch_count": int(zs.get("touch_count", 0)) + 1,
+                    "first_touch_ts": None,
+                    "last_touch_ts": None,
+                    "touch_count": 0,
+                    "visit_id": None,
                     "lock_reason": ("stale_midpoint_touch_ignored" if ZONE_TRIGGER_MODE == "midpoint" else "stale_zone_touch_ignored"),
                     "trigger_event_id": None,
                     "pending_signal": None,
                 })
                 if diagnostics is not None:
                     diagnostics["zones"][zone_key]["stale_touches"] += 1
-                    diagnostics["touch_events"].append({"timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction, "midpoint": midpoint, "state_before": "ARMED", "reason": ("stale_midpoint_touch_ignored" if ZONE_TRIGGER_MODE == "midpoint" else "stale_zone_touch_ignored"), "touch_mode": ZONE_TRIGGER_MODE, "age_min": age_min, "visit_id": zs.get("visit_id"), "touch_count_before_trigger": int(zs.get("touch_count", 0)), "bar": {"timestamp": bar_ts.isoformat(), "open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"]), "volume": float(bar["volume"])}})
+                    diagnostics["touch_events"].append({"timestamp": bar_ts.isoformat(), "zone_key": zone_key, "direction": direction, "midpoint": midpoint, "state_before": "ARMED", "reason": ("stale_midpoint_touch_ignored" if ZONE_TRIGGER_MODE == "midpoint" else "stale_zone_touch_ignored"), "touch_mode": ZONE_TRIGGER_MODE, "age_min": age_min, "visit_id": stale_visit_id, "touch_count_before_trigger": stale_touch_count, "bar": {"timestamp": bar_ts.isoformat(), "open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"]), "close": float(bar["close"]), "volume": float(bar["volume"])}})
                 _set_decision("BLOCKED_STALE_TOUCH", zone_key=zone_key, direction=direction, reason=("stale_midpoint_touch_ignored" if ZONE_TRIGGER_MODE == "midpoint" else "stale_zone_touch_ignored"), timestamp=bar_ts.isoformat())
                 continue
             zs["trigger_event_id"] = event_id
@@ -1627,7 +1638,7 @@ def _process_5m_zone_visits(
 
     # Retry an already-created event only while it remains fresh. This keeps
     # transient exchange failures attached to the same visit/event id.
-    for zs in symbol_state["zones"].values():
+    for zone_key, zs in symbol_state["zones"].items():
         pending = zs.get("pending_signal")
         if not isinstance(pending, dict):
             continue
@@ -1639,11 +1650,22 @@ def _process_5m_zone_visits(
             age_min = max(0.0, (now - _pending_ts).total_seconds() / 60.0) if _pending_ts is not None else float("inf")
         except Exception:
             age_min = float("inf")
-        if age_min <= MAX_5M_TRIGGER_AGE_MINUTES and not any(str(s.get("event_id")) == eid for s in signals):
-            signals.append(pending)
+        if age_min <= MAX_5M_TRIGGER_AGE_MINUTES:
+            if not any(str(s.get("event_id")) == eid for s in signals):
+                signals.append(pending)
+                if diagnostics is not None:
+                    diagnostics["pending_retries"] += 1
+                trigger_text = trigger_text or f"{pending.get('type')} @ {pending.get('entry')} 5m_{ZONE_TRIGGER_MODE}_touch_retry"
+        else:
+            # Only retire retryable events here. Successful/terminal events above
+            # remain LOCKED until a real price re-arm, preventing duplicate entries.
+            zs.update({
+                "state": "ARMED", "pending_signal": None, "trigger_event_id": None,
+                "first_touch_ts": None, "last_touch_ts": None, "touch_count": 0,
+                "visit_id": None, "lock_reason": "stale_pending_5m_trigger_retired",
+            })
             if diagnostics is not None:
-                diagnostics["pending_retries"] += 1
-            trigger_text = trigger_text or f"{pending.get('type')} @ {pending.get('entry')} 5m_{ZONE_TRIGGER_MODE}_touch_retry"
+                diagnostics.setdefault("stale_pending_retired", []).append({"zone_key": zone_key, "event_id": eid, "age_min": age_min})
     return signals, symbol_state, trigger_text
 
 def _signal_count_from_diag(diagnostics: dict[str, Any]) -> int:
@@ -1889,13 +1911,119 @@ def _position_keys(positions: list[dict]) -> set[tuple[str, str]]:
     return out
 
 
-def reconcile_all_open_positions() -> None:
+def _find_recent_unresolved_engine_entry(symbol: str, direction: str, *, max_age_seconds: float = 7200.0) -> dict[str, Any] | None:
+    """Find a recent engine entry explicitly recorded as unresolved, never a manual position."""
+    if not TRADES_PATH.exists():
+        return None
+    wanted_symbol = str(symbol).upper().replace("-USDT", "").replace("-", "")
+    wanted_direction = str(direction).upper()
+    now = pd.Timestamp.now(tz="UTC")
+    eligible = {"opened_emergency_close_unverified", "opened_registration_failed_close_unverified", "entry_state_unverified"}
+    rows: list[dict[str, Any]] = []
+    try:
+        with TRADES_PATH.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    log.error("[RECON_ORPHAN_LOOKUP] skipping malformed trade journal line")
+                    continue
+                if isinstance(row, dict):
+                    rows.append(row)
+    except OSError as exc:
+        log.error("[RECON_ORPHAN_LOOKUP] cannot inspect trade journal: %s", exc)
+        return None
+    for row in reversed(rows):
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("symbol", "")).upper().replace("-USDT", "").replace("-", "") != wanted_symbol:
+            continue
+        if str(row.get("direction", "")).upper() != wanted_direction:
+            continue
+        result = row.get("result") if isinstance(row.get("result"), dict) else {}
+        if str(result.get("status", "")).lower() not in eligible:
+            continue
+        stamp = _coerce_utc_timestamp(result.get("execution_call_start_ts") or result.get("order_submit_ts"))
+        if stamp is None or (now - stamp).total_seconds() < 0 or (now - stamp).total_seconds() > max_age_seconds:
+            continue
+        return {"event_id": str(row.get("event_id") or ""), "row": row, "result": result, "source": "trades_journal"}
+
+    # The process can die after ORDER_ACK/POSITION_FILL but before writing the
+    # result row in trades.jsonl. The append-only execution ledger is the second
+    # recovery source for a recent entry with no local owner.
+    ledger_path = EXECUTION_LEDGER_PATH
+    if not ledger_path.exists():
+        return None
+    try:
+        ledger_rows = []
+        with ledger_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    ledger_rows.append(record)
+    except OSError as exc:
+        log.error("[RECON_ORPHAN_LOOKUP] cannot inspect execution ledger: %s", exc)
+        return None
+    closed_event_ids = {
+        str(row.get("event_id")) for row in rows
+        if row.get("event_id") and (
+            row.get("record_type") == "TRADE_CLOSE"
+            or (row.get("record_type") == "TRADE_ROLLBACK" and str(row.get("status", "")).lower() == "opened_then_emergency_closed")
+        )
+    }
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for record in ledger_rows:
+        event_id = str(record.get("event_id") or "")
+        if event_id:
+            grouped.setdefault(event_id, []).append(record)
+    for event_id, records in reversed(list(grouped.items())):
+        if event_id in closed_event_ids:
+            continue
+        start = next((r for r in records if r.get("stage") == "EXECUTION_START"), None)
+        ack = next((r for r in reversed(records) if r.get("stage") == "ORDER_ACK"), None)
+        if not start or not ack:
+            continue
+        if str(start.get("symbol", "")).upper().replace("-USDT", "").replace("-", "") != wanted_symbol:
+            continue
+        if str(start.get("direction", "")).upper() != wanted_direction:
+            continue
+        if any(r.get("stage") == "TRADE_CLOSE" for r in records):
+            continue
+        recovery = next((r for r in reversed(records) if r.get("stage") == "ORPHAN_ENGINE_POSITION_RECOVERY"), None)
+        if recovery and str(recovery.get("status", "")).lower() == "closed_verified":
+            continue
+        try:
+            stamp_ms = int(start.get("ts_ms") or ack.get("ts_ms") or 0)
+        except (TypeError, ValueError):
+            stamp_ms = 0
+        age_sec = (int(now.timestamp() * 1000) - stamp_ms) / 1000.0 if stamp_ms > 0 else float("inf")
+        if age_sec < 0 or age_sec > min(max_age_seconds, 1800.0):
+            continue
+        return {
+            "event_id": event_id,
+            "row": start,
+            "result": {"status": "entry_state_unverified", "execution_call_start_ts": start.get("ledger_ts"), "order": {"order_id": ack.get("order_id")}},
+            "source": "execution_ledger",
+        }
+    return None
+
+
+def reconcile_all_open_positions() -> bool:
+    """Reconcile positions; False means ownership/protection is not trustworthy."""
     started = time.time()
+    unresolved = False
     try:
         positions = get_positions(timeout_sec=float(os.environ.get("RECONCILIATION_HTTP_TIMEOUT_SEC", "5")), retryable=False)
     except Exception as exc:
         log.error("[RECON] positions fetch failed: %s", exc)
-        return
+        return False
 
     active = _load_active_trades_file()
     for p in positions:
@@ -1942,6 +2070,44 @@ def reconcile_all_open_positions() -> None:
                 status=status, internal_remaining_qty=None, exchange_position_qty=qty,
                 exchange_avg_price=avg, local_owner_event_ids=owner_ids,
             )
+            if not candidates and not same_symbol_other_side:
+                unresolved_entry = _find_recent_unresolved_engine_entry(symbol, side)
+                if unresolved_entry and unresolved_entry.get("event_id"):
+                    event_id = str(unresolved_entry["event_id"])
+                    log.critical("[RECON_ORPHAN_ENGINE_RECOVERY] attempting emergency close for known unresolved engine entry event=%s symbol=%s side=%s qty=%s", event_id, symbol, side, qty)
+                    try:
+                        close_result = _emergency_close_and_verify(symbol, side, qty, event_id)
+                    except Exception as close_exc:
+                        close_result = {"status": "close_unverified", "error": str(close_exc)}
+                    if str(close_result.get("status", "")).lower() == "closed_verified":
+                        try:
+                            cleanup_result = _cancel_engine_protection_before_emergency_close(symbol, side)
+                        except Exception as cleanup_exc:
+                            cleanup_result = {"status": "error", "error": str(cleanup_exc)}
+                        _append_execution_ledger(event_id, None, "ORPHAN_ENGINE_POSITION_RECOVERY", {
+                            "status": "closed_verified", "symbol": symbol, "direction": side,
+                            "previous_exchange_qty": qty, "previous_exchange_avg_price": avg,
+                            "close": close_result, "protection_cleanup": cleanup_result,
+                        })
+                        telemetry.record_position_reconciliation(
+                            event_id=event_id, attempt_id=None, position_id=event_id,
+                            symbol=symbol, direction=side, status="ORPHAN_ENGINE_POSITION_CLOSED_VERIFIED",
+                            internal_remaining_qty=qty, exchange_position_qty=0.0,
+                            exchange_avg_price=avg, position_gone=True,
+                        )
+                        log.critical("[RECON_ORPHAN_ENGINE_RECOVERY] close verified event=%s symbol=%s side=%s", event_id, symbol, side)
+                        continue
+                    unresolved = True
+                    _append_execution_ledger(event_id, None, "ORPHAN_ENGINE_POSITION_RECOVERY", {
+                        "status": "close_unverified", "symbol": symbol, "direction": side,
+                        "exchange_qty": qty, "exchange_avg_price": avg, "close": close_result,
+                        "action": "left_existing_exchange_protection_untouched",
+                    })
+                    log.critical("[RECON_ORPHAN_ENGINE_RECOVERY_FAILED] event=%s symbol=%s side=%s qty=%s; preserving exchange protection and blocking new entries", event_id, symbol, side, qty)
+                else:
+                    unresolved = True
+            if candidates or same_symbol_other_side:
+                unresolved = True
             if candidates:
                 telemetry.record_state_conflict(
                     event_id=None, attempt_id=None, position_id=None, order_id=None,
@@ -2026,9 +2192,16 @@ def reconcile_all_open_positions() -> None:
             ]
 
         try:
-            result = ensure_directional_protection(
-                symbol, side, avg, qty, stop_loss_pct, tp_levels, trade_id=str(event_id)
-            )
+            try:
+                result = ensure_directional_protection(
+                    symbol, side, avg, qty, stop_loss_pct, tp_levels, trade_id=str(event_id)
+                )
+            except Exception as protection_exc:
+                result = {
+                    "status": "PROTECTION_FAILED",
+                    "error": f"ensure_directional_protection raised: {type(protection_exc).__name__}: {protection_exc}",
+                }
+                log.exception("[RECON_PROTECTION_EXCEPTION] %s %s event=%s; escalating to emergency close", symbol, side, event_id)
             if result.get("status") in {"PROTECTED", "SL_ONLY"}:
                 updated = update_active_trade_protection(
                     symbol, side, result.get("tp_orders", []), result.get("sl_result", {}),
@@ -2036,6 +2209,7 @@ def reconcile_all_open_positions() -> None:
                     result.get("effective_weighted_rr"), event_id=str(event_id),
                 )
                 if not updated:
+                    unresolved = True
                     telemetry.record_state_conflict(
                         event_id=str(event_id), attempt_id=trade.get("attempt_id"),
                         position_id=trade.get("position_id") or str(event_id), order_id=None,
@@ -2043,7 +2217,28 @@ def reconcile_all_open_positions() -> None:
                         message="unique owner disappeared or no longer matched before protection state update",
                         owner_event_ids=[str(event_id)],
                     )
+            else:
+                unresolved = True
+                log.critical("[RECON_PROTECTION_UNVERIFIED] %s %s event=%s status=%s error=%s; attempting verified emergency close", symbol, side, event_id, result.get("status"), result.get("error"))
+                try:
+                    close_result = _emergency_close_and_verify(symbol, side, qty, str(event_id))
+                except Exception as close_exc:
+                    close_result = {"status": "close_unverified", "error": str(close_exc)}
+                if str(close_result.get("status", "")).lower() == "closed_verified":
+                    try:
+                        record_verified_emergency_close(str(event_id), close_result, reason="EMERGENCY_CLOSE_AFTER_PROTECTION_FAILURE")
+                    except Exception as state_exc:
+                        log.critical("[RECON_EMERGENCY_CLOSE_STATE] event=%s verified flat but could not persist evidence: %s", event_id, state_exc)
+                    try:
+                        cleanup_result = _cancel_engine_protection_before_emergency_close(symbol, side)
+                    except Exception as cleanup_exc:
+                        cleanup_result = {"status": "error", "error": str(cleanup_exc)}
+                    _append_execution_ledger(str(event_id), None, "RECON_PROTECTION_FAILURE_EMERGENCY_CLOSE", {"status": "closed_verified", "symbol": symbol, "direction": side, "close": close_result, "protection_cleanup": cleanup_result})
+                else:
+                    _append_execution_ledger(str(event_id), None, "RECON_PROTECTION_FAILURE_EMERGENCY_CLOSE", {"status": "close_unverified", "symbol": symbol, "direction": side, "close": close_result, "action": "existing_exchange_protection_left_untouched"})
+                    log.critical("[RECON_PROTECTION_CLOSE_UNVERIFIED] event=%s symbol=%s side=%s; preserving any exchange orders and blocking entries", event_id, symbol, side)
         except Exception as exc:
+            unresolved = True
             log.exception("[RECON] protection repair failed for %s %s event=%s: %s", symbol, side, event_id, exc)
 
     # Second pass: local active trades missing from the exchange position snapshot.
@@ -2071,6 +2266,9 @@ def reconcile_all_open_positions() -> None:
                 local_sl_order_id=(trade.get("sl_order") or {}).get("order_id") if isinstance(trade.get("sl_order"), dict) else None,
                 exchange_error=None, position_gone=True,
             )
+            unresolved = True
+
+    return not unresolved
 
 
 def _load_active_trades_file(*, fresh_runtime_start: bool = False) -> dict[str, dict]:
@@ -2253,8 +2451,10 @@ def _build_setup(signal: dict[str, Any]) -> dict[str, Any]:
 
 
 
-def _validate_trade_geometry(signal: dict[str, Any]) -> tuple[bool, str]:
-    """Reject mathematically invalid setups before any MARKET order is sent."""
+def _validate_trade_geometry(
+    signal: dict[str, Any], *, require_structure_room: bool = True,
+) -> tuple[bool, str]:
+    """Validate protection geometry; optionally enforce the pre-entry structural-room filter."""
     try:
         direction = str(signal["type"]).upper()
         entry = float(signal["entry"])
@@ -2282,9 +2482,9 @@ def _validate_trade_geometry(signal: dict[str, Any]) -> tuple[bool, str]:
         obstacle_price = None
     min_room_r = MIN_STRUCTURE_ROOM_R
     risk_abs = abs(entry - sl)
-    if obstacle_price is None and REQUIRE_STRUCTURE_OBSTACLE:
+    if require_structure_room and obstacle_price is None and REQUIRE_STRUCTURE_OBSTACLE:
         return False, "missing_structural_obstacle"
-    if obstacle_price is not None and risk_abs > 0:
+    if require_structure_room and obstacle_price is not None and risk_abs > 0:
         room = (obstacle_price - entry) if direction == "LONG" else (entry - obstacle_price)
         if room <= 0 or (room / risk_abs) < min_room_r:
             return False, f"insufficient_structure_room={room / risk_abs:.3f}R < {min_room_r:.3f}R"
@@ -2488,6 +2688,33 @@ def _emergency_close_and_verify(symbol: str, direction: str, qty: float, trade_i
     return {"status": "close_unverified", "attempts": attempts, "verification": verification, "remaining_qty": last_qty}
 
 
+def _emergency_close_preserving_protection(
+    symbol: str,
+    direction: str,
+    qty: float,
+    trade_id: str,
+    *,
+    known_order_ids: set[str] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Attempt a verified close while retaining existing SL/TP until flatness is proven."""
+    try:
+        close_result = _emergency_close_and_verify(symbol, direction, qty, trade_id)
+    except Exception as exc:
+        close_result = {"status": "close_unverified", "attempts": [], "error": f"{type(exc).__name__}: {exc}"}
+    if str(close_result.get("status", "")).lower() == "closed_verified":
+        try:
+            cleanup = _cancel_engine_protection_before_emergency_close(
+                symbol, direction, known_order_ids=known_order_ids,
+            )
+        except Exception as exc:
+            cleanup = {"status": "error", "cancelled": [], "errors": [str(exc)]}
+    else:
+        # Cancelling the last known SL/TP before an unverified close can leave a
+        # still-open position naked. Preserve exchange protection and retry close.
+        cleanup = {"status": "deferred_until_flat_verified", "cancelled": [], "errors": []}
+    return close_result, cleanup
+
+
 def _rollback_after_registration_failure(
     *,
     event_id: str,
@@ -2549,19 +2776,9 @@ def _rollback_after_registration_failure(
                 if tp.get(key):
                     known_ids.add(str(tp[key]))
 
-    try:
-        cleanup = _cancel_engine_protection_before_emergency_close(
-            symbol,
-            direction,
-            known_order_ids=known_ids or None,
-        )
-    except Exception as exc:
-        cleanup = {"status": "error", "cancelled": [], "errors": [str(exc)]}
-
-    try:
-        close_result = _emergency_close_and_verify(symbol, direction, qty, event_id)
-    except Exception as exc:
-        close_result = {"status": "close_unverified", "attempts": [], "error": str(exc)}
+    close_result, cleanup = _emergency_close_preserving_protection(
+        symbol, direction, qty, event_id, known_order_ids=known_ids or None,
+    )
 
     rollback_verified = str(close_result.get("status")) == "closed_verified"
     final_status = "opened_then_emergency_closed" if rollback_verified else "opened_registration_failed_close_unverified"
@@ -2690,10 +2907,17 @@ def _validate_exchange_price_distinctness(signal: dict[str, Any]) -> tuple[bool,
     return True, "ok"
 
 
+def _emergency_execution_status(close_result: dict[str, Any] | None) -> str:
+    """Return a closed status only when the exchange position is verified flat."""
+    if isinstance(close_result, dict) and str(close_result.get("status", "")).lower() == "closed_verified":
+        return "opened_then_emergency_closed"
+    return "opened_emergency_close_unverified"
+
+
 def _is_terminal_execution_failure(execution: dict[str, Any]) -> bool:
     status = str(execution.get("status", "")).lower()
     error = str(execution.get("error", "")).lower()
-    if status in {"skipped_stale_signal", "skipped_tp_min_qty", "skipped_min_qty", "skipped_invalid_setup", "opened_then_emergency_closed"}:
+    if status in {"skipped_stale_signal", "skipped_tp_min_qty", "skipped_min_qty", "skipped_invalid_setup", "opened_then_emergency_closed", "opened_emergency_close_unverified", "opened_registration_failed_close_unverified", "entry_state_unverified"}:
         return True
     terminal_fragments = (
         "risk_pct_above_limit",
@@ -3177,16 +3401,51 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
             )
             position = reconciled_position
         elif reconciled_position.get("status") == "not_found":
-            log.warning(
-                "[EXEC_ENTRY_NOT_FILLED] %s %s | market order acknowledged but no position exists after authoritative reconciliation.",
-                symbol, direction,
+            # A flat position snapshot does not prove the acknowledged MARKET
+            # order never filled. Inspect the order itself before allowing retry.
+            order_state = None
+            try:
+                order_id = (order or {}).get("order_id") if isinstance(order, dict) else None
+                if order_id:
+                    order_state = get_order(symbol, str(order_id))
+            except Exception as exc:
+                order_state = {"status": "error", "error": str(exc)}
+            order_status = str((order_state or {}).get("order_status", "")).upper()
+            try:
+                executed_qty = abs(float((order_state or {}).get("executed_qty") or 0.0))
+            except (TypeError, ValueError):
+                executed_qty = 0.0
+            if (order_state or {}).get("status") == "ok" and order_id and order_status in {"NEW", "PENDING", "PARTIALLY_FILLED"}:
+                # Prevent an acknowledged but not-yet-terminal order from filling
+                # after the position snapshot was observed flat.
+                try:
+                    cancel_result = cancel_order(symbol, str(order_id))
+                    if isinstance(cancel_result, dict) and cancel_result.get("code") in (0, "0"):
+                        order_state_after_cancel = get_order(symbol, str(order_id))
+                        if isinstance(order_state_after_cancel, dict):
+                            order_state = order_state_after_cancel
+                            order_status = str(order_state.get("order_status", "")).upper()
+                            try:
+                                executed_qty = abs(float(order_state.get("executed_qty") or 0.0))
+                            except (TypeError, ValueError):
+                                executed_qty = 0.0
+                except Exception as cancel_exc:
+                    log.critical("[EXEC_ENTRY_ORDER_CANCEL_UNVERIFIED] %s order=%s error=%s", symbol, order_id, cancel_exc)
+            if (order_state or {}).get("status") == "ok" and order_status in {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED"} and executed_qty <= 0:
+                log.warning("[EXEC_ENTRY_NOT_FILLED] %s %s | order=%s terminal_status=%s executed_qty=0", symbol, direction, (order or {}).get("order_id"), order_status)
+                return {
+                    "status": "entry_not_filled", "order": order, "order_state": order_state,
+                    "position": reconciled_position, "fill_poll": position,
+                    "error": f"market entry order terminal without fills: {order_status}",
+                }
+            log.critical(
+                "[EXEC_ENTRY_STATE_UNVERIFIED] %s %s | position is currently flat but order fill state is not proven absent; blocking retries. order_state=%s",
+                symbol, direction, order_state,
             )
             return {
-                "status": "entry_not_filled",
-                "order": order,
-                "position": reconciled_position,
-                "fill_poll": position,
-                "error": "market order acknowledged but authoritative position reconciliation found no open position",
+                "status": "entry_state_unverified", "order": order, "order_state": order_state,
+                "position": reconciled_position, "fill_poll": position,
+                "error": "market order acknowledged; position is flat now but no authoritative no-fill order status was confirmed",
             }
         else:
             error_detail = reconciled_position.get("error") or position.get("error") or position.get("last_poll_error")
@@ -3252,10 +3511,9 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     if execution_slippage_pct > MAX_ENTRY_SLIPPAGE_PCT:
         reason = f"execution_slippage_pct={execution_slippage_pct:.4f}% > {MAX_ENTRY_SLIPPAGE_PCT:.4f}%"
         log.critical("[SAFETY_CLOSE] %s %s | %s", symbol, direction, reason)
-        cleanup = _cancel_engine_protection_before_emergency_close(symbol, direction)
-        close_result = _emergency_close_and_verify(symbol, direction, qty, event_id)
+        close_result, cleanup = _emergency_close_preserving_protection(symbol, direction, qty, event_id)
         return {
-            "status": "opened_then_emergency_closed",
+            "status": _emergency_execution_status(close_result),
             "error": reason,
             "order": order,
             "position": position,
@@ -3278,9 +3536,8 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         reason = f"post-fill protection rebase failed: {exc}"
         log.critical("[SAFETY_CLOSE] %s %s | %s", symbol, direction, reason)
-        cleanup = _cancel_engine_protection_before_emergency_close(symbol, direction)
-        close_result = _emergency_close_and_verify(symbol, direction, qty, event_id)
-        return {"status": "opened_then_emergency_closed", "error": reason, "order": order, "position": position, "close": close_result, "protection_cleanup": cleanup, "executed_signal": dict(signal)}
+        close_result, cleanup = _emergency_close_preserving_protection(symbol, direction, qty, event_id)
+        return {"status": _emergency_execution_status(close_result), "error": reason, "order": order, "position": position, "close": close_result, "protection_cleanup": cleanup, "executed_signal": dict(signal)}
 
     sl_price = float(rebased["sl"])
     tp1_price = float(rebased["tp1"])
@@ -3293,15 +3550,13 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     distinct, precision_reason = _validate_exchange_price_distinctness(actual_signal)
     if not distinct:
         log.critical("[SAFETY_CLOSE] %s %s | invalid exchange-rounded protection geometry | %s", symbol, direction, precision_reason)
-        cleanup = _cancel_engine_protection_before_emergency_close(symbol, direction)
-        close_result = _emergency_close_and_verify(symbol, direction, qty, event_id)
-        return {"status": "opened_then_emergency_closed", "error": precision_reason, "order": order, "position": position, "close": close_result, "protection_cleanup": cleanup, "executed_signal": actual_signal}
-    valid, reason = _validate_trade_geometry(actual_signal)
+        close_result, cleanup = _emergency_close_preserving_protection(symbol, direction, qty, event_id)
+        return {"status": _emergency_execution_status(close_result), "error": precision_reason, "order": order, "position": position, "close": close_result, "protection_cleanup": cleanup, "executed_signal": actual_signal}
+    valid, reason = _validate_trade_geometry(actual_signal, require_structure_room=False)
     if not valid:
         log.critical("[SAFETY_CLOSE] %s %s | invalid post-fill protection geometry | %s", symbol, direction, reason)
-        cleanup = _cancel_engine_protection_before_emergency_close(symbol, direction)
-        close_result = _emergency_close_and_verify(symbol, direction, qty, event_id)
-        return {"status": "opened_then_emergency_closed", "error": reason, "order": order, "position": position, "close": close_result, "protection_cleanup": cleanup, "executed_signal": actual_signal}
+        close_result, cleanup = _emergency_close_preserving_protection(symbol, direction, qty, event_id)
+        return {"status": _emergency_execution_status(close_result), "error": reason, "order": order, "position": position, "close": close_result, "protection_cleanup": cleanup, "executed_signal": actual_signal}
 
     setup["entry_reference"] = avg_price
     setup["signal_price"] = entry_price
@@ -3374,10 +3629,21 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
 
     protection_started_ts = pd.Timestamp.now(tz="UTC")
     signal["protection_started_ts"] = protection_started_ts.isoformat()
-    protection = ensure_directional_protection(
-        symbol, direction, avg_price, qty,
-        actual_risk_pct, setup["tp_levels"], trade_id=event_id,
-    )
+    try:
+        protection = ensure_directional_protection(
+            symbol, direction, avg_price, qty,
+            actual_risk_pct, setup["tp_levels"], trade_id=event_id,
+        )
+    except Exception as exc:
+        # A protection helper exception after a fill is a protection failure, not
+        # a reason to abandon the position without rollback/reconciliation.
+        protection = {
+            "status": "PROTECTION_FAILED",
+            "error": f"ensure_directional_protection raised: {type(exc).__name__}: {exc}",
+            "sl_result": {"status": "error", "error": str(exc)},
+            "tp_orders": [],
+        }
+        log.exception("[PROTECTION_EXCEPTION] %s %s after fill; routing to emergency close", symbol, direction)
     protection_finished_ts = pd.Timestamp.now(tz="UTC")
     signal["protection_finished_ts"] = protection_finished_ts.isoformat()
     # The snapshot is persisted with the active trade after protection is complete.
@@ -3467,15 +3733,14 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         log.critical("[SAFETY_CLOSE] %s %s | mandatory protection incomplete | %s", symbol, direction, protection)
         # Mandatory rule: never leave a newly-opened position live without BOTH
         # a verified SL and both TP legs. Attempt an immediate market rollback.
-        cleanup = _cancel_engine_protection_before_emergency_close(symbol, direction)
-        close_result = _emergency_close_and_verify(symbol, direction, qty, event_id)
+        close_result, cleanup = _emergency_close_preserving_protection(symbol, direction, qty, event_id)
         try:
             time.sleep(0.25)
             verify_closed = get_position_directional(symbol, direction)
         except Exception as exc:
             verify_closed = {"status": "verification_error", "error": str(exc)}
         return {
-            "status": "opened_then_emergency_closed",
+            "status": _emergency_execution_status(close_result),
             "error": protection.get("error") or protection.get("status"),
             "order": order,
             "position": position,
@@ -3642,7 +3907,7 @@ def _prefetch_missing_research_5m_bars(
     """
     pending = [
         payload for payload in payload_batch
-        if payload.get("persist_bars_for_forward") and not payload.get("bars_5m")
+        if len(payload.get("bars_5m") or []) < max(1, int(limit))
     ]
     if not pending:
         return {}
@@ -3670,6 +3935,43 @@ def _prefetch_missing_research_5m_bars(
                 log.warning("[RESEARCH_PENDING_BARS_POST] %s | unavailable: %s", payload.get("symbol"), exc)
                 results[id(payload)] = []
     return results
+
+
+def _account_context_asof(decision_ts: Any) -> dict[str, Any] | None:
+    """Return the latest persisted account snapshot no later than a decision boundary."""
+    target = research._parse_timestamp(decision_ts)
+    path = research.ACCOUNT_CONTEXT_PATH
+    if target is None or not path.exists():
+        return None
+    best_row = None
+    best_ts = None
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                text = line.strip()
+                if not text:
+                    continue
+                try:
+                    row = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                stamp = research._parse_timestamp(row.get("captured_at_ms") or row.get("captured_at") or row.get("recorded_at"))
+                if stamp is None or stamp > target:
+                    continue
+                if best_ts is None or stamp > best_ts:
+                    best_row, best_ts = row, stamp
+    except OSError as exc:
+        log.warning("[RESEARCH_ACCOUNT_ASOF] could not read prior account snapshots: %s", exc)
+        return None
+    if best_row is None:
+        return None
+    result = dict(best_row)
+    result["persisted"] = True
+    result["account_context_asof"] = True
+    result["account_context_age_ms_at_decision"] = max(0.0, (target - best_ts).total_seconds() * 1000.0)
+    return result
 
 
 def _research_persistence_batch_size(raw_value: str | None = None) -> int:
@@ -3796,7 +4098,10 @@ def main() -> None:
                 reconcile_started = time.perf_counter()
                 try:
                     with request_metrics.phase("pre_scan_reconcile"):
-                        reconcile_all_open_positions()
+                        reconciliation_ok = reconcile_all_open_positions()
+                    if reconciliation_ok is False:
+                        private_ready = False
+                        log.critical("[LIVE_BLOCKED_RECON] unresolved exchange/local position state; new entries disabled for this run")
                 except Exception as exc:
                     private_ready = False
                     log.exception("[LIVE_BLOCKED_RECON] reconciliation failed; execution disabled for this run: %s", exc)
@@ -4650,6 +4955,9 @@ def main() -> None:
         execution["execution_wall_clock_seconds"] = max(0.0, (execution_finish_ts - execution_call_start_ts).total_seconds())
         execution["trigger_to_execution_finish_minutes"] = _elapsed_minutes(signal.get("trigger_bar_time") or signal.get("time"), execution_finish_ts.isoformat())
         execution_status = str(execution.get("status", ""))
+        if execution_status in {"opened_emergency_close_unverified", "opened_registration_failed_close_unverified", "entry_state_unverified"}:
+            private_ready = False
+            log.critical("[LIVE_BLOCKED_EXECUTION_STATE] status=%s symbol=%s direction=%s; no further entries this cycle", execution_status, signal.get("symbol"), signal.get("type"))
         if execution.get("stale_trigger_reason") in {"5m_trigger_too_old", "invalid_5m_trigger_time"}:
             if _clear_stale_pending_zone_visit(zone_visit_state, signal):
                 _save_zone_visit_state(zone_visit_state)
@@ -4791,6 +5099,8 @@ def main() -> None:
             log.warning("[RESEARCH_ACCOUNT_POST] account context unavailable: %s", exc)
         finally:
             log.info("[PERF_STAGE] stage=research_post_account seconds=%.3f", time.perf_counter() - account_started)
+        btc_raw_5m: list[dict[str, Any]] = []
+        btc_raw_1h: list[dict[str, Any]] = []
         btc5_started = time.perf_counter()
         try:
             with request_metrics.phase("research_post_btc_5m"):
@@ -4812,6 +5122,8 @@ def main() -> None:
         finally:
             log.info("[PERF_STAGE] stage=research_post_btc_1h seconds=%.3f", time.perf_counter() - btc1h_started)
 
+        btc_df_5m = pd.DataFrame(btc_raw_5m) if btc_raw_5m else None
+        btc_df_1h = pd.DataFrame(btc_raw_1h) if btc_raw_1h else None
         deferred_rows = list(deferred_research_rows)
         research_batch_size = _research_persistence_batch_size()
         queued_observation_count = 0
@@ -4827,7 +5139,11 @@ def main() -> None:
             batch_observations = 0
             batch_bars1h = 0
             batch_bars5m = 0
-            pending_limit = max(12, int(os.environ.get("RESEARCH_PENDING_5M_FETCH_LIMIT", "24")))
+            pending_limit = max(
+                12,
+                int(os.environ.get("RESEARCH_PENDING_5M_FETCH_LIMIT", "24")),
+                max(300, int(os.environ.get("RESEARCH_5M_HISTORY_LIMIT", "288"))),
+            )
             try:
                 prefetch_workers = int(os.environ.get("RESEARCH_DEFERRED_BAR_FETCH_WORKERS", "4"))
             except (TypeError, ValueError):
@@ -4845,7 +5161,9 @@ def main() -> None:
                             bars_1h=payload["bars_1h"], bars_5m=bars_5m, df_1h=payload["df_1h"],
                             demand=payload["demand"], supply=payload["supply"], diagnostics=payload["diagnostics"],
                             symbol_state=payload["symbol_state"], signals=payload["signals"], decision_ts=payload["decision_ts"],
-                            market_context=None, account_context=None, btc_df_5m=None, btc_df_1h=None,
+                            market_context=None,
+                            account_context=_account_context_asof(payload.get("decision_ts")),
+                            btc_df_5m=btc_df_5m, btc_df_1h=btc_df_1h,
                             persist_bars_for_forward=bool(payload.get("persist_bars_for_forward")),
                         )
                         batch_observations += int(counts.get("observations", 0))

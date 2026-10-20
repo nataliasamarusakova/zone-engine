@@ -369,6 +369,14 @@ def _load_bars(*, symbols: set[str] | None = None) -> dict[str, pd.DataFrame]:
         )
         df = df.drop(columns=["_archive_source_priority"], errors="ignore").reset_index(drop=True)
         out[f"{symbol}|{provider}"] = df
+    # Preserve the documented SYMBOL alias only when provider selection is unambiguous.
+    providers_by_symbol: dict[str, list[str]] = defaultdict(list)
+    for key in out:
+        symbol, _, provider = key.partition("|")
+        providers_by_symbol[symbol].append(provider)
+    for symbol, providers in providers_by_symbol.items():
+        if len(providers) == 1:
+            out[symbol] = out[f"{symbol}|{providers[0]}"]
     return out
 
 
@@ -871,6 +879,13 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
     bars_by_symbol = _load_bars(symbols=candidate_symbols)
     log.info("[RESEARCH_FORWARD_BARS] symbols=%d groups=%d seconds=%.3f", len(candidate_symbols), len(bars_by_symbol), time.perf_counter() - bars_started)
     if not bars_by_symbol and not terminal_invalid:
+        # No bars means no outcome can be calculated yet. Keep every candidate replayable
+        # before advancing the journal cursor, otherwise these observations are lost.
+        for obs in observations:
+            oid = str(obs.get("observation_id", ""))
+            if oid:
+                meta = candidate_meta.get(oid) or {}
+                pending_now[oid] = _pending_meta_from_observation(obs, offset=int(meta.get("offset", 0)))
         if write:
             state_payload = dict(state)
             state_payload.update({
@@ -929,7 +944,7 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
         index = indexed.get(key) or indexed.get(symbol)
         if index is None:
             if oid := str(obs.get("observation_id", "")):
-                pending_now[oid] = dict(candidate_meta.get(oid) or {"offset": 0, "observation_ts": str(obs.get("observation_ts", ""))})
+                pending_now[oid] = _pending_meta_from_observation(obs, offset=int((candidate_meta.get(oid) or {}).get("offset", 0)))
             continue
         outcome = _calculate_forward_outcome_indexed(
             obs, index, counterfactual_bars=counterfactual_bars_by_index_id.get(id(index)),

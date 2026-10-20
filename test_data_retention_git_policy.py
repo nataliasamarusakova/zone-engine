@@ -1,3 +1,4 @@
+import pytest
 from pathlib import Path
 
 
@@ -16,7 +17,8 @@ def test_runbook_documents_artifact_backed_runtime_state_migration():
     assert "zone-engine-runtime-state" in text
     assert "guarded clean-start" in text
     assert "trading remains disabled" in text
-    assert "successful completed event-engine run" in text
+    assert "self-verifying runtime-state artifact" in text
+    assert "failed workflow run is not automatically rejected" in text
 
 
 def test_pytest_has_global_repository_data_isolation():
@@ -333,6 +335,8 @@ def test_clean_checkout_can_restore_runtime_state_from_verified_bundle(tmp_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         if relative.endswith(".jsonl"):
             path.write_text("", encoding="utf-8")
+        elif relative in {"data/active_trades.json", "data/event_execution_claims.json"}:
+            path.write_text("{}\n", encoding="utf-8")
         else:
             path.write_text(json.dumps({"path": relative}) + "\n", encoding="utf-8")
     (data / "active_trades.json").write_text(
@@ -364,3 +368,51 @@ def test_clean_checkout_can_restore_runtime_state_from_verified_bundle(tmp_path)
     assert not (clean_data / "retention_archive").exists()
     assert not (clean_data / "stale-state.json").exists()
     assert not (clean / "bootstrap").exists()
+
+
+def test_size_guard_persists_failure_manifest_before_raising(tmp_path, monkeypatch):
+    import json
+    from datetime import datetime, timezone
+
+    from event_engine import data_retention as retention
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    target = data_dir / "market_bars_5m.jsonl"
+    target.write_text("original\n", encoding="utf-8")
+    monkeypatch.setattr(retention, "DATA_DIR", data_dir)
+    monkeypatch.setattr(retention, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(retention, "REPO_RETENTION_ARCHIVE_ROOT", tmp_path / "retention_archive")
+    monkeypatch.setattr(retention, "_validate_state_before", lambda: {})
+    monkeypatch.setattr(retention, "_validate_state_unchanged", lambda before: None)
+    monkeypatch.setattr(retention, "_pending_observations", lambda: [])
+    monkeypatch.setattr(retention, "_pending_bar_cutoffs", lambda **kwargs: {})
+    monkeypatch.setattr(retention, "_protected_audit_refs", lambda: (set(), set()))
+
+    def fake_apply(path, **kwargs):
+        path.write_text("compacted-but-unarchived\n", encoding="utf-8")
+        return {
+            "path": f"data/{path.name}", "triggered": True, "failed": True,
+            "error": "cannot reduce below test guard", "snapshot": {"source_sha256": "before"},
+        }
+
+    monkeypatch.setattr(retention, "_apply_size_guard_to_file", fake_apply)
+    with pytest.raises(RuntimeError, match="cannot reduce below test guard"):
+        retention.apply_size_guard(now=datetime.now(timezone.utc), archive_root=tmp_path / "archive")
+    manifest = json.loads((data_dir / "data_retention_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "failed"
+    assert manifest["files"]["market_bars_5m.jsonl"]["triggered"] is True
+    assert manifest["files"]["market_bars_5m.jsonl"]["snapshot"]["source_sha256"] == "before"
+
+
+def test_chunked_snapshot_can_restore_file_after_mid_policy_failure(tmp_path):
+    from event_engine import data_retention as retention
+
+    archive_root = tmp_path / "archive"
+    path = tmp_path / "journal.jsonl"
+    original = b'{"id":1}\n{"id":2}\n'
+    path.write_bytes(original)
+    snapshot = retention._snapshot_jsonl_chunked_locked(path, archive_root / "snapshots")
+    path.write_bytes(b'{"partial":"compaction"}\n')
+    retention._restore_chunked_snapshot(path, snapshot, archive_root)
+    assert path.read_bytes() == original
