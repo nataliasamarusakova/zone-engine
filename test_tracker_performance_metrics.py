@@ -7,7 +7,8 @@ import pytest
 from event_engine import tracker
 
 
-def test_timed_tracker_call_preserves_return_value_and_aggregates_time() -> None:
+def test_timed_tracker_call_preserves_return_value_and_aggregates_time(monkeypatch) -> None:
+    monkeypatch.setattr(tracker.request_metrics, "_ENABLED", True)
     timings: dict[str, dict[str, float]] = {}
 
     result = tracker._timed_tracker_call(timings, "sample", lambda value: value * 2, 21)
@@ -18,7 +19,8 @@ def test_timed_tracker_call_preserves_return_value_and_aggregates_time() -> None
     assert timings["sample"]["max_seconds"] == timings["sample"]["seconds"]
 
 
-def test_timed_tracker_call_records_and_reraises_original_exception() -> None:
+def test_timed_tracker_call_records_and_reraises_original_exception(monkeypatch) -> None:
+    monkeypatch.setattr(tracker.request_metrics, "_ENABLED", True)
     timings: dict[str, dict[str, float]] = {}
 
     def fail() -> None:
@@ -31,7 +33,8 @@ def test_timed_tracker_call_records_and_reraises_original_exception() -> None:
     assert timings["sample_failure"]["seconds"] >= 0.0
 
 
-def test_tracker_timing_log_is_compact_and_diagnostic_only(caplog: pytest.LogCaptureFixture) -> None:
+def test_tracker_timing_log_is_compact_and_diagnostic_only(caplog: pytest.LogCaptureFixture, monkeypatch) -> None:
+    monkeypatch.setattr(tracker.request_metrics, "_ENABLED", True)
     timings = {
         "kline_1m": {"calls": 2.0, "seconds": 1.25, "max_seconds": 0.90},
         "active_state_save": {"calls": 1.0, "seconds": 0.03, "max_seconds": 0.03},

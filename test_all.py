@@ -3652,6 +3652,35 @@ def test_5m_rearm_bar_that_also_crosses_midpoint_does_not_create_same_bar_reentr
     assert zone_state["first_touch_ts"] is None
 
 
+def test_5m_touch_freshness_uses_trigger_close_not_open(monkeypatch):
+    import pandas as pd
+    import run_once
+    from run_once import _process_5m_zone_visits
+
+    wall_now = pd.Timestamp.now(tz="UTC")
+    floored_now = wall_now.floor("5min")
+    t0 = floored_now - pd.Timedelta(minutes=10)
+    close_age_min = (wall_now - (t0 + pd.Timedelta(minutes=5))).total_seconds() / 60.0
+    # The close is within the permitted window, while the candle open is at
+    # least five minutes older than the limit. This exposes an open-vs-close bug.
+    monkeypatch.setattr(run_once, "INITIAL_5M_TRIGGER_LOOKBACK_MINUTES", 60.0)
+    monkeypatch.setattr(run_once, "MAX_5M_TRIGGER_AGE_MINUTES", close_age_min + 1.0)
+
+    zone = {"start": 0, "top": 110.0, "btm": 100.0, "poi": 105.0}
+    bars = [{"timestamp": int(t0.timestamp() * 1000), "open": 108, "high": 109, "low": 104, "close": 106, "volume": 10}]
+    df1h = pd.DataFrame([{
+        "timestamp": floored_now - pd.Timedelta(hours=12-i),
+        "open": 100, "high": 111, "low": 99, "close": 105, "volume": 100, "atr50": 2.0,
+    } for i in range(12)])
+    zone_key = "DEMAND:0:110.000000000000:100.000000000000"
+    prior_state = {"zones": {zone_key: {"state": "ARMED", "visit_id": None, "touch_count": 0}}}
+
+    signals, state, _ = _process_5m_zone_visits("TEST-USDT", bars, [zone], [], df1h, prior_state, set(), set())
+    assert len(signals) == 1
+    assert signals[0]["trigger_bar_close_time"] == (t0 + pd.Timedelta(minutes=5)).isoformat()
+    assert state["zones"][zone_key]["state"] == "LOCKED"
+
+
 def test_5m_stale_touch_does_not_lock_zone(monkeypatch):
     import pandas as pd
     import run_once
@@ -6016,3 +6045,62 @@ def test_idempotent_existing_entry_does_not_trigger_fresh_quote_slippage_close(m
     result = run_once.execute_new_position(signal)
     assert result["status"] == "opened_protected"
     assert result["execution_snapshot"]["execution_slippage_pct"] is None
+
+
+def test_be_ownership_conflict_cleans_only_our_new_order_when_old_sl_is_verified(monkeypatch, tmp_path):
+    import json
+    from event_engine import tracker, bingx
+
+    state_path = tmp_path / "active_trades.json"
+    state_path.write_text(json.dumps({
+        "EVT_OTHER": {
+            "event_id": "EVT_OTHER", "symbol": "AAA-USDT", "direction": "LONG",
+            "initial_qty": 1.0, "remaining_qty": 1.0, "entry_price": 100.0,
+            "closed": False, "sl_order": {"order_id": "BE1"}, "tp_orders": [],
+        }
+    }), encoding="utf-8")
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", state_path)
+    monkeypatch.setattr(tracker, "to_bx_symbol", lambda symbol: symbol)
+    monkeypatch.setattr(tracker, "get_contract", lambda symbol: {"quantityPrecision": 3, "pricePrecision": 2})
+    monkeypatch.setattr(tracker, "position_side_param", lambda direction: "LONG")
+    monkeypatch.setattr(bingx, "position_side_param", lambda direction, **kwargs: "LONG")
+
+    old_sl = {
+        "orderId": "OLD1", "clientOrderId": "EVT_OLD_SL", "type": "STOP_MARKET",
+        "stopPrice": "99.00", "origQty": "1.000", "positionSide": "LONG", "side": "SELL",
+    }
+    exchange_orders = [dict(old_sl)]
+    calls = []
+
+    def open_orders(*args, **kwargs):
+        return {"status": "ok", "sl_orders": [dict(o) for o in exchange_orders], "tp_orders": []}
+
+    def create_order(method, path, params):
+        assert method == "POST"
+        new_order = {
+            "orderId": "BE1", "clientOrderId": params["clientOrderId"], "type": "STOP_MARKET",
+            "stopPrice": params["stopPrice"], "origQty": params["quantity"],
+            "positionSide": params["positionSide"], "side": params["side"],
+        }
+        exchange_orders.append(new_order)
+        return {"code": 0, "data": {"order": dict(new_order)}}
+
+    def cancel(symbol, order_id):
+        calls.append((symbol, str(order_id)))
+        exchange_orders[:] = [o for o in exchange_orders if str(o["orderId"]) != str(order_id)]
+        return {"code": 0}
+
+    monkeypatch.setattr(tracker, "get_open_protection_directional", open_orders)
+    monkeypatch.setattr(tracker, "_request", create_order)
+    monkeypatch.setattr(tracker, "cancel_order", cancel)
+
+    result = tracker._move_sl_to_break_even(
+        "AAA-USDT", "LONG", 100.0, 1.0, "OLD1", "T", old_sl_price=99.0, owner_event_id="EVT_CURRENT",
+    )
+
+    assert result["status"] == "error"  # ownership conflict still blocks BE activation
+    assert result["safety_action"] == "old_sl_kept"
+    assert result["orphaned_order_cleanup_status"] == "cancelled_verified"
+    assert result["orphaned_order_cleanup_pending"] is False
+    assert calls == [("AAA-USDT", "BE1")]
+    assert [o["orderId"] for o in exchange_orders] == ["OLD1"]

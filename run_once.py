@@ -142,7 +142,7 @@ TREND_FILTER_PERSISTENCE_LOOKBACK_4H = max(1, int(os.environ.get("TREND_FILTER_P
 TREND_FILTER_SLOPE_LOOKBACK_4H = max(1, int(os.environ.get("TREND_FILTER_SLOPE_LOOKBACK_4H", "6")))
 TREND_FILTER_HISTORY_BUFFER_BARS = max(4, int(os.environ.get("TREND_FILTER_HISTORY_BUFFER_BARS", "12")))
 TREND_FILTER_REQUIRE_PERSISTENCE = os.environ.get("TREND_FILTER_REQUIRE_PERSISTENCE", "false").lower() == "true"
-ENTRY_CONTEXT_TELEMETRY_ENABLED = os.environ.get("ENTRY_CONTEXT_TELEMETRY_ENABLED", "true").lower() == "true"
+ENTRY_CONTEXT_TELEMETRY_ENABLED = os.environ.get("ENTRY_CONTEXT_TELEMETRY_ENABLED", "false").strip().lower() == "true"
 ENTRY_CONTEXT_DEPTH_LEVELS = max(5, int(os.environ.get("ENTRY_CONTEXT_DEPTH_LEVELS", "20")))
 ENTRY_CONTEXT_TRADES_LIMIT = max(10, int(os.environ.get("ENTRY_CONTEXT_TRADES_LIMIT", "100")))
 ENTRY_CONTEXT_HTTP_TIMEOUT_SEC = max(0.5, float(os.environ.get("ENTRY_CONTEXT_HTTP_TIMEOUT_SEC", "2.0")))
@@ -456,7 +456,7 @@ def _record_entry_decision(
         "execution_gate_ts": signal.get("execution_gate_ts"),
         "execution_age_minutes": signal.get("execution_age_minutes"),
         "execution_age_semantics": "trigger_to_execution_gate_when_available",
-        "trigger_to_decision_minutes": _elapsed_minutes(signal.get("trigger_bar_time") or signal.get("time"), decision_ts),
+        "trigger_to_decision_minutes": _elapsed_minutes(signal.get("trigger_bar_close_time") or signal.get("decision_boundary_ts") or signal.get("trigger_bar_time") or signal.get("time"), decision_ts),
         "shadow_short_filter_experiment": research.SHADOW_SHORT_FILTER_EXPERIMENT,
         "shadow_short_geometry_available": shadow_geometry_available,
         "shadow_short_geometry_bad": shadow_geometry_bad,
@@ -1587,7 +1587,13 @@ def _process_5m_zone_visits(
                     _set_decision(decision, zone_key=zone_key, direction=direction, reason=reason, timestamp=bar_ts.isoformat())
                 continue
             event_id = str(signal["event_id"])
-            age_min = max(0.0, (now - bar_ts).total_seconds() / 60.0)
+            # The 5m trigger becomes actionable when the candle closes. Measuring
+            # from its open incorrectly removes five minutes from the configured
+            # freshness window and rejects otherwise-current signals.
+            bar_close_ts = _coerce_utc_timestamp(signal.get("trigger_bar_close_time") or signal.get("decision_boundary_ts"))
+            if bar_close_ts is None:
+                bar_close_ts = bar_ts + pd.Timedelta(minutes=5)
+            age_min = max(0.0, (now - bar_close_ts).total_seconds() / 60.0)
             if age_min > MAX_5M_TRIGGER_AGE_MINUTES:
                 # A stale touch is useful audit data but must not consume the zone visit.
                 # Otherwise a delayed provider/API response could lock a zone until a
@@ -1663,7 +1669,7 @@ def _process_5m_zone_visits(
         if not eid or eid in successful_ids or eid in terminal_event_ids:
             continue
         try:
-            _pending_ts = _coerce_utc_timestamp(pending["trigger_bar_time"])
+            _pending_ts = _coerce_utc_timestamp(pending.get("trigger_bar_close_time") or pending.get("decision_boundary_ts") or pending["trigger_bar_time"])
             age_min = max(0.0, (now - _pending_ts).total_seconds() / 60.0) if _pending_ts is not None else float("inf")
         except Exception:
             age_min = float("inf")
@@ -1812,7 +1818,6 @@ def _update_active_trades_with_snapshot() -> None:
     targeted exchange queries inside the tracker. If bulk retrieval fails, keep
     the original per-symbol behavior.
     """
-    snapshot_started = time.perf_counter()
     try:
         snapshot = get_positions(
             timeout_sec=float(os.environ.get("TRACKER_POSITION_SNAPSHOT_TIMEOUT_SEC", "5")),
@@ -1820,15 +1825,7 @@ def _update_active_trades_with_snapshot() -> None:
         )
         if not isinstance(snapshot, list) or any(not isinstance(row, dict) for row in snapshot):
             raise RuntimeError("bulk positions response has an invalid shape")
-        log.info(
-            "[PERF_STAGE] stage=tracker_positions_snapshot seconds=%.3f positions=%d outcome=bulk",
-            time.perf_counter() - snapshot_started, len(snapshot),
-        )
     except Exception as exc:
-        log.warning(
-            "[PERF_STAGE] stage=tracker_positions_snapshot seconds=%.3f outcome=fallback error=%s",
-            time.perf_counter() - snapshot_started, exc,
-        )
         log.warning("[TRACKER_POSITION_SNAPSHOT] bulk fetch failed; using per-symbol queries: %s", exc)
         update_active_trades()
         return
@@ -3140,11 +3137,14 @@ def _elapsed_minutes(start_ts: Any, end_ts: Any) -> float | None:
 
 
 def _five_m_trigger_age_minutes(signal: dict[str, Any], now_ts: Any = None) -> tuple[float | None, str | None]:
-    """Return age using the same trigger timestamp semantics as execution gates."""
+    """Return age from the closed 5m trigger boundary, with legacy fallback."""
     if str(signal.get("trigger_timeframe", "1h")).lower() != "5m":
         return None, None
     try:
-        trigger_ts = _coerce_utc_timestamp(signal.get("trigger_bar_time") or signal.get("time"))
+        trigger_ts = _coerce_utc_timestamp(
+            signal.get("trigger_bar_close_time") or signal.get("decision_boundary_ts")
+            or signal.get("trigger_bar_time") or signal.get("time")
+        )
         if trigger_ts is None:
             return None, "invalid_5m_trigger_time"
         now = _coerce_utc_timestamp(now_ts) if now_ts is not None else pd.Timestamp.now(tz="UTC")
@@ -3457,7 +3457,8 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     signal["execution_age_minutes_at_order_submit"] = trigger_age_min
     trigger_bar_time_ms = None
     if str(signal.get("trigger_timeframe", "1h")).lower() == "5m":
-        trigger_ts = _coerce_utc_timestamp(signal.get("trigger_bar_time") or signal.get("time"))
+        trigger_ts = _coerce_utc_timestamp(signal.get("trigger_bar_close_time") or signal.get("decision_boundary_ts") or signal.get("trigger_bar_time") or signal.get("time"))
+        # The downstream parameter name is historical; pass the close boundary, not candle open.
         trigger_bar_time_ms = int(trigger_ts.timestamp() * 1000) if trigger_ts is not None else None
     order = open_market(
         symbol, direction, entry_price, event_id,
@@ -3808,7 +3809,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         "fill_observed_ts": signal.get("fill_observed_ts"),
         "protection_started_ts": signal.get("protection_started_ts"),
         "protection_finished_ts": signal.get("protection_finished_ts"),
-        "trigger_to_order_minutes": _elapsed_minutes(signal.get("trigger_bar_time") or signal.get("time"), signal.get("order_submit_ts")),
+        "trigger_to_order_minutes": _elapsed_minutes(signal.get("trigger_bar_close_time") or signal.get("decision_boundary_ts") or signal.get("trigger_bar_time") or signal.get("time"), signal.get("order_submit_ts")),
         "order_to_fill_seconds": _elapsed_seconds(signal.get("order_submit_ts"), signal.get("fill_observed_ts")),
         "fill_to_protection_seconds": _elapsed_seconds(signal.get("fill_observed_ts"), signal.get("protection_started_ts")),
         "protection_seconds": _elapsed_seconds(signal.get("protection_started_ts"), signal.get("protection_finished_ts")),
@@ -4024,7 +4025,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
             "fill_observed_ts": signal.get("fill_observed_ts"),
             "protection_started_ts": signal.get("protection_started_ts"),
             "protection_finished_ts": signal.get("protection_finished_ts"),
-            "trigger_to_order_minutes": _elapsed_minutes(signal.get("trigger_bar_time") or signal.get("time"), signal.get("order_submit_ts")),
+            "trigger_to_order_minutes": _elapsed_minutes(signal.get("trigger_bar_close_time") or signal.get("decision_boundary_ts") or signal.get("trigger_bar_time") or signal.get("time"), signal.get("order_submit_ts")),
             "order_to_fill_seconds": _elapsed_seconds(signal.get("order_submit_ts"), signal.get("fill_observed_ts")),
             "fill_to_protection_seconds": _elapsed_seconds(signal.get("fill_observed_ts"), signal.get("protection_started_ts")),
             "protection_seconds": _elapsed_seconds(signal.get("protection_started_ts"), signal.get("protection_finished_ts")),
@@ -4096,6 +4097,33 @@ def _prefer_longer_research_5m_history(
     return prefetched if len(prefetched) > len(existing) else existing
 
 
+def _research_payload_needs_5m_history(payload: dict[str, Any]) -> bool:
+    """Only fetch extended 5m bars when this payload can persist research rows."""
+    if bool(payload.get("persist_bars_for_forward")):
+        return True
+    if payload.get("signals"):
+        return True
+    diagnostics = payload.get("diagnostics")
+    if not isinstance(diagnostics, dict):
+        return False
+    if diagnostics.get("touch_events") or diagnostics.get("rearm_events"):
+        return True
+    try:
+        near_limit = max(0.0, float(os.environ.get("RESEARCH_NEAREST_APPROACH_MAX_PCT", "1.0")))
+    except (TypeError, ValueError):
+        near_limit = 1.0
+    for zone_diag in (diagnostics.get("zones") or {}).values():
+        if not isinstance(zone_diag, dict) or not isinstance(zone_diag.get("closest_midpoint_bar"), dict):
+            continue
+        try:
+            distance = float(zone_diag.get("closest_midpoint_distance_pct"))
+        except (TypeError, ValueError):
+            continue
+        if 0.0 < distance <= near_limit:
+            return True
+    return False
+
+
 def _prefetch_missing_research_5m_bars(
     payload_batch: list[dict[str, Any]],
     analysis_meta: dict[str, dict],
@@ -4111,7 +4139,8 @@ def _prefetch_missing_research_5m_bars(
     """
     pending = [
         payload for payload in payload_batch
-        if len(payload.get("bars_5m") or []) < max(1, int(limit))
+        if _research_payload_needs_5m_history(payload)
+        and len(payload.get("bars_5m") or []) < max(1, int(limit))
     ]
     if not pending:
         return {}
@@ -4242,7 +4271,6 @@ def main() -> None:
 
     # 1) Private account layer is optional for a scan. Never let missing credentials
     #    prevent public market analysis from running.
-    private_preflight_started = time.perf_counter()
     private_ready = _private_layer_ready()
     # Final tracking is allowed after an ambiguous execution only when the local
     # state AND mandatory private preflight passed. Credentials/state-file validity
@@ -4293,7 +4321,6 @@ def main() -> None:
                 private_checkpoint_state_trusted = False
                 log.critical("[LIVE_BLOCKED_STATE] tracker provenance/backfill failed; execution disabled for this run: %s", exc)
             if private_ready:
-                tracker_started = time.perf_counter()
                 try:
                     with request_metrics.phase("pre_scan_tracker"):
                         _update_active_trades_with_snapshot()
@@ -4305,10 +4332,7 @@ def main() -> None:
                     private_ready = False
                     private_checkpoint_state_trusted = False
                     log.exception("[LIVE_BLOCKED_STATE] active trade update failed; execution disabled for this run: %s", exc)
-                finally:
-                    log.info("[PERF_STAGE] stage=pre_scan_update_active_trades seconds=%.3f", time.perf_counter() - tracker_started)
             if private_ready:
-                reconcile_started = time.perf_counter()
                 try:
                     with request_metrics.phase("pre_scan_reconcile"):
                         reconciliation_ok = reconcile_all_open_positions()
@@ -4325,16 +4349,12 @@ def main() -> None:
                     private_ready = False
                     private_checkpoint_state_trusted = False
                     log.exception("[LIVE_BLOCKED_RECON] reconciliation failed; execution disabled for this run: %s", exc)
-                finally:
-                    log.info("[PERF_STAGE] stage=pre_scan_reconcile seconds=%.3f", time.perf_counter() - reconcile_started)
     else:
         log.info("[PRIVATE] BingX private layer unavailable | reconciliation/execution disabled")
-    log.info("[PERF_STAGE] stage=private_preflight_total seconds=%.3f", time.perf_counter() - private_preflight_started)
 
     # 2) Dynamic universe. Crypto uses Binance public Spot/Vision candles.
     # TradFi/equity contracts are analyzed from BingX candles because Binance
     # public Spot market data does not expose the corresponding stock universe.
-    universe_setup_started = time.perf_counter()
     with request_metrics.phase("universe_setup"):
         bingx_symbols = get_scan_symbols()
         bingx_contract_map = contracts()
@@ -4367,8 +4387,6 @@ def main() -> None:
         elif asset_class == "EQUITY":
             item["market_provider"] = "bingx"
         analysis_universe.append(item)
-
-    log.info("[PERF_STAGE] stage=universe_setup seconds=%.3f bingx_symbols=%d eligible_symbols=%d", time.perf_counter() - universe_setup_started, len(bingx_symbols), len(analysis_universe))
 
     # Research-only account context is fetched once per scan and reused by all observations.
     research_account_context = None
@@ -4418,13 +4436,11 @@ def main() -> None:
             log.warning("[TREND_BTC] 1h context unavailable: %s", exc)
 
     research_pending_forward_symbols: set[str] = set()
-    pending_symbols_started = time.perf_counter()
     if research.RESEARCH_ENABLED:
         try:
             research_pending_forward_symbols = research.pending_forward_symbols(horizon_hours=24.0)
         except Exception as exc:
             log.warning("[RESEARCH_PENDING_SYMBOLS] unable to load pending symbols: %s", exc)
-    log.info("[PERF_STAGE] stage=research_pending_forward_symbols seconds=%.3f count=%d", time.perf_counter() - pending_symbols_started, len(research_pending_forward_symbols))
 
     symbols = [str(item["bingx_symbol"]) for item in analysis_universe]
     analysis_meta = {str(item["bingx_symbol"]): item for item in analysis_universe}
@@ -4434,7 +4450,6 @@ def main() -> None:
     if not symbols:
         log.error("[SCAN] No eligible symbols for signal scan")
 
-    execution_state_load_started = time.perf_counter()
     successful_ids = _load_successful_trade_ids()
     terminal_event_ids = _load_terminal_event_ids()
     failed_ids = _load_failed_signal_ids()
@@ -4451,7 +4466,6 @@ def main() -> None:
     if open_keys:
         log.info("[POSITIONS] open=%s", json.dumps([f"{_display_symbol(sym)}:{direction}" for sym, direction in sorted(open_keys)], ensure_ascii=False))
     zone_visit_state = _load_zone_visit_state()
-    log.info("[PERF_STAGE] stage=execution_state_load seconds=%.3f successful_ids=%d terminal_ids=%d failed_ids=%d open_positions=%d", time.perf_counter() - execution_state_load_started, len(successful_ids), len(terminal_event_ids), len(failed_ids), len(open_keys))
     if RESET_ZONE_VISIT_STATE_ON_START:
         log.warning("[ZONE_STATE] RESET_ZONE_VISIT_STATE_ON_START=true | starting the 5m visit state empty for this test run")
         zone_visit_state = {"version": ZONE_VISIT_STATE_VERSION, "trigger_mode": ZONE_TRIGGER_MODE, "symbols": {}}
@@ -4672,7 +4686,7 @@ def main() -> None:
                 except Exception as shadow_exc:
                     log.warning("[SHADOW_TELEMETRY] %s | snapshot build failed: %s", _display_symbol(symbol), shadow_exc)
                 market_snapshot = sig.setdefault("market_snapshot", {})
-                trigger_ts = _coerce_utc_timestamp(sig.get("trigger_bar_time")) or pd.Timestamp.now(tz="UTC")
+                trigger_ts = _coerce_utc_timestamp(sig.get("trigger_bar_close_time") or sig.get("decision_boundary_ts") or sig.get("trigger_bar_time") or sig.get("time")) or pd.Timestamp.now(tz="UTC")
                 market_snapshot.update({
                     "bingx_live_price": bingx_price,
                     "binance_live_price": binance_live_price,
@@ -5000,7 +5014,7 @@ def main() -> None:
         trigger_tf = str(signal.get("trigger_timeframe", "1h")).lower()
         if trigger_tf == "5m":
             try:
-                trigger_ts = _coerce_utc_timestamp(signal.get("trigger_bar_time") or signal.get("time"))
+                trigger_ts = _coerce_utc_timestamp(signal.get("trigger_bar_close_time") or signal.get("decision_boundary_ts") or signal.get("trigger_bar_time") or signal.get("time"))
                 if trigger_ts is None:
                     raise ValueError("invalid_5m_trigger_timestamp")
                 age_min = max(0.0, (now_exec - trigger_ts).total_seconds() / 60.0)
@@ -5058,7 +5072,7 @@ def main() -> None:
     for rank, signal in enumerate(selected_signals, start=1):
         execution_gate_ts = pd.Timestamp.now(tz="UTC")
         signal["execution_gate_ts"] = execution_gate_ts.isoformat()
-        trigger_raw = signal.get("trigger_bar_time") or signal.get("time")
+        trigger_raw = signal.get("trigger_bar_close_time") or signal.get("decision_boundary_ts") or signal.get("trigger_bar_time") or signal.get("time")
         try:
             trigger_ts = _coerce_utc_timestamp(trigger_raw)
             if trigger_ts is None:
@@ -5092,15 +5106,18 @@ def main() -> None:
         if not private_ready:
             blocked = _blocked_private_execution_result()
             log.error("[EXEC_BLOCKED] %s %s: %s", signal["symbol"], signal["type"], blocked["error"])
-            _append_jsonl(TRADES_PATH, {
-                "record_type": "TRADE_BLOCKED",
-                "event_id": signal["event_id"],
-                "symbol": signal["symbol"],
-                "direction": signal["type"],
-                "score": signal["score"],
-                "signal": signal,
-                "result": blocked,
-            })
+            try:
+                _append_jsonl(TRADES_PATH, {
+                    "record_type": "TRADE_BLOCKED",
+                    "event_id": signal["event_id"],
+                    "symbol": signal["symbol"],
+                    "direction": signal["type"],
+                    "score": signal["score"],
+                    "signal": signal,
+                    "result": blocked,
+                })
+            except Exception as blocked_log_exc:
+                log.error("[TRADE_BLOCKED_JOURNAL_FAILED] event_id=%s error=%s", signal.get("event_id"), blocked_log_exc)
             _record_entry_decision(scan_id, signal, "EXECUTION_RESULT", "missing_private_credentials", selection_rank=rank, execution_status=blocked.get("status"), terminal=True)
             _send_signal(signal, blocked)
             continue
@@ -5183,12 +5200,17 @@ def main() -> None:
         execution["execution_call_start_ts"] = execution_call_start_ts.isoformat()
         execution["execution_finish_ts"] = execution_finish_ts.isoformat()
         execution["execution_wall_clock_seconds"] = max(0.0, (execution_finish_ts - execution_call_start_ts).total_seconds())
-        execution["trigger_to_execution_finish_minutes"] = _elapsed_minutes(signal.get("trigger_bar_time") or signal.get("time"), execution_finish_ts.isoformat())
+        execution["trigger_to_execution_finish_minutes"] = _elapsed_minutes(signal.get("trigger_bar_close_time") or signal.get("decision_boundary_ts") or signal.get("trigger_bar_time") or signal.get("time"), execution_finish_ts.isoformat())
         execution_status = str(execution.get("status", ""))
         if execution_status in {"opened_emergency_close_unverified", "opened_registration_failed_close_unverified", "entry_state_unverified"}:
             private_ready = False
             log.critical("[LIVE_BLOCKED_EXECUTION_STATE] status=%s symbol=%s direction=%s; no further entries this cycle", execution_status, signal.get("symbol"), signal.get("type"))
-        if execution.get("stale_trigger_reason") in {"5m_trigger_too_old", "invalid_5m_trigger_time"}:
+        execution_error_text = str(execution.get("error", ""))
+        rejected_stale_entry = (
+            execution.get("stale_trigger_reason") in {"5m_trigger_too_old", "invalid_5m_trigger_time"}
+            or (execution_status == "skipped_stale_signal" and "signal_price_displacement_pct" in execution_error_text)
+        )
+        if rejected_stale_entry:
             if _clear_stale_pending_zone_visit(zone_visit_state, signal):
                 _save_zone_visit_state(zone_visit_state)
         _append_execution_ledger(event_id, attempt_id, "EXECUTION_RESULT", {
@@ -5238,34 +5260,51 @@ def main() -> None:
             _finalize_event_claim(event_id, attempt_id, terminal=True, status=execution_status)
         else:
             _finalize_event_claim(event_id, attempt_id, terminal=False, status=execution_status)
-        _append_jsonl(TRADES_PATH, {
-            "record_type": _trade_event_record_type(execution_status),
-            "event_id": signal["event_id"],
-            "attempt_id": execution.get("attempt_id"),
-            "symbol": signal["symbol"],
-            "direction": signal["type"],
-            "score": signal["score"],
-            "strategy_version": signal.get("strategy_version", _effective_strategy_version()),
-            "code_commit_sha": CODE_COMMIT_SHA,
-            "entry_rule": (signal.get("trigger") or {}).get("zone_entry_rule"),
-            "zone_midpoint": signal.get("zone_midpoint") or (signal.get("trigger") or {}).get("zone_midpoint"),
-            "stop_pct": (signal.get("risk_model") or {}).get("fixed_stop_pct"),
-            "tp1_pct": (signal.get("target") or {}).get("tp1_pct"),
-            "tp2_pct": (signal.get("target") or {}).get("tp2_pct"),
-            "execution_age_minutes": signal.get("execution_age_minutes"),
-            "trigger_to_execution_gate_minutes": signal.get("trigger_to_execution_gate_minutes"),
-            "trigger_to_execution_finish_minutes": execution.get("trigger_to_execution_finish_minutes"),
-            "be_rule": (signal.get("target") or {}).get("be_rule", "after_tp1_filled"),
-            "entry_bar": signal.get("entry_bar", {}),
-            "previous_bar": signal.get("previous_bar", {}),
-            "signal": signal,
-            "outcome_category": _execution_outcome_category(execution_status),
-            "result": execution,
-        })
+        try:
+            _append_jsonl(TRADES_PATH, {
+                "record_type": _trade_event_record_type(execution_status),
+                "event_id": signal["event_id"],
+                "attempt_id": execution.get("attempt_id"),
+                "symbol": signal["symbol"],
+                "direction": signal["type"],
+                "score": signal["score"],
+                "strategy_version": signal.get("strategy_version", _effective_strategy_version()),
+                "code_commit_sha": CODE_COMMIT_SHA,
+                "entry_rule": (signal.get("trigger") or {}).get("zone_entry_rule"),
+                "zone_midpoint": signal.get("zone_midpoint") or (signal.get("trigger") or {}).get("zone_midpoint"),
+                "stop_pct": (signal.get("risk_model") or {}).get("fixed_stop_pct"),
+                "tp1_pct": (signal.get("target") or {}).get("tp1_pct"),
+                "tp2_pct": (signal.get("target") or {}).get("tp2_pct"),
+                "execution_age_minutes": signal.get("execution_age_minutes"),
+                "trigger_to_execution_gate_minutes": signal.get("trigger_to_execution_gate_minutes"),
+                "trigger_to_execution_finish_minutes": execution.get("trigger_to_execution_finish_minutes"),
+                "be_rule": (signal.get("target") or {}).get("be_rule", "after_tp1_filled"),
+                "entry_bar": signal.get("entry_bar", {}),
+                "previous_bar": signal.get("previous_bar", {}),
+                "signal": signal,
+                "outcome_category": _execution_outcome_category(execution_status),
+                "result": execution,
+            })
+        except Exception as trade_log_exc:
+            # Exchange execution / active-trade registration has already happened.
+            # A secondary journal failure must not skip the final tracker checkpoint
+            # or runtime-state artifact; fail closed for additional entries this run.
+            private_ready = False
+            log.critical(
+                "[TRADE_EVENT_JOURNAL_FAILED] event_id=%s status=%s error=%s; further entries blocked, final reconciliation retained",
+                event_id, execution_status, trade_log_exc, exc_info=True,
+            )
         if execution_status == "opened_then_emergency_closed":
             emergency_close = _emergency_trade_close_record(signal, execution)
             if emergency_close is not None:
-                _append_jsonl(TRADES_PATH, emergency_close)
+                try:
+                    _append_jsonl(TRADES_PATH, emergency_close)
+                except Exception as close_log_exc:
+                    private_ready = False
+                    log.critical(
+                        "[EMERGENCY_CLOSE_JOURNAL_FAILED] event_id=%s error=%s; final reconciliation retained",
+                        event_id, close_log_exc, exc_info=True,
+                    )
             else:
                 log.error(
                     "[EMERGENCY_CLOSE_LEDGER_PENDING] event_id=%s: rollback is not sufficiently evidenced for a canonical close record",
@@ -5278,28 +5317,23 @@ def main() -> None:
     # Persist the scan summary and run the final position/protection checkpoint
     # before slow deferred research I/O. This does not skip tracker/reconciliation;
     # it prevents research writes from delaying TP1->BE and close-state observation.
-    scan_saved_started = time.perf_counter()
-    save_scan(scan_rows, fresh_signals, duration_sec=scan_duration_sec, scan_id=scan_id)
-    log.info("[PERF_STAGE] stage=save_scan seconds=%.3f", time.perf_counter() - scan_saved_started)
+    try:
+        save_scan(scan_rows, fresh_signals, duration_sec=scan_duration_sec, scan_id=scan_id)
+    except Exception as scan_save_exc:
+        log.exception("[SCAN_SAVE_FAILED] scan summary could not be persisted; continuing final tracker/reconciliation: %s", scan_save_exc)
     # Final tracking checkpoint: orders/positions can change during scan/execution.
     # This remains a full pass with existing error handling and protection checks.
     if private_checkpoint_state_trusted:
-        tracker_started = time.perf_counter()
         try:
             with request_metrics.phase("final_tracker"):
                 _update_active_trades_with_snapshot()
         except Exception as exc:
             log.exception("[TRACKER_FINAL] active trade update failed: %s", exc)
-        finally:
-            log.info("[PERF_STAGE] stage=final_update_active_trades seconds=%.3f", time.perf_counter() - tracker_started)
-        reconcile_started = time.perf_counter()
         try:
             with request_metrics.phase("final_reconcile"):
                 reconcile_all_open_positions()
         except Exception as exc:
             log.exception("[RECON_FINAL] reconciliation failed: %s", exc)
-        finally:
-            log.info("[PERF_STAGE] stage=final_reconcile seconds=%.3f", time.perf_counter() - reconcile_started)
 
     # Deferred research persistence is deliberately last: decision-boundary
     # observations remain pre-entry data, while the live tracker/protection
@@ -5307,9 +5341,7 @@ def main() -> None:
     if research.RESEARCH_ENABLED and RESEARCH_DEFER_UNTIL_AFTER_EXECUTION and deferred_research_rows:
         # Post-execution research phase: never attach post-trade context to earlier
         # decision-time observations, because that would create a lookahead artifact.
-        research_flush_started = time.perf_counter()
         log.info("[RESEARCH_DEFERRED_FLUSH] rows=%d | live execution path complete", len(deferred_research_rows))
-        account_started = time.perf_counter()
         try:
             with request_metrics.phase("research_post_account"):
                 post_account = fetch_research_account_snapshot()
@@ -5327,11 +5359,8 @@ def main() -> None:
                 research.record_account_context(post_account)
         except Exception as exc:
             log.warning("[RESEARCH_ACCOUNT_POST] account context unavailable: %s", exc)
-        finally:
-            log.info("[PERF_STAGE] stage=research_post_account seconds=%.3f", time.perf_counter() - account_started)
         btc_raw_5m: list[dict[str, Any]] = []
         btc_raw_1h: list[dict[str, Any]] = []
-        btc5_started = time.perf_counter()
         try:
             with request_metrics.phase("research_post_btc_5m"):
                 btc_raw_5m = fetch_binance_klines("BTCUSDT", interval="5m", limit=288, retryable=False)
@@ -5339,9 +5368,6 @@ def main() -> None:
                 research.persist_market_bars("BTC-USDT", "5m", btc_raw_5m, provider="binance", source="binance_spot_btc_context_post_execution", scan_id=scan_id, code_commit_sha=CODE_COMMIT_SHA)
         except Exception as exc:
             log.warning("[RESEARCH_BTC_POST] 5m context unavailable: %s", exc)
-        finally:
-            log.info("[PERF_STAGE] stage=research_post_btc_5m seconds=%.3f", time.perf_counter() - btc5_started)
-        btc1h_started = time.perf_counter()
         try:
             with request_metrics.phase("research_post_btc_1h"):
                 btc_raw_1h = fetch_binance_klines("BTCUSDT", interval="1h", limit=300, retryable=False)
@@ -5349,8 +5375,6 @@ def main() -> None:
                 research.persist_market_bars("BTC-USDT", "1h", btc_raw_1h, provider="binance", source="binance_spot_btc_context_post_execution", scan_id=scan_id, code_commit_sha=CODE_COMMIT_SHA)
         except Exception as exc:
             log.warning("[RESEARCH_BTC_POST] 1h context unavailable: %s", exc)
-        finally:
-            log.info("[PERF_STAGE] stage=research_post_btc_1h seconds=%.3f", time.perf_counter() - btc1h_started)
 
         btc_df_5m = pd.DataFrame(btc_raw_5m) if btc_raw_5m else None
         btc_df_1h = pd.DataFrame(btc_raw_1h) if btc_raw_1h else None
@@ -5410,7 +5434,6 @@ def main() -> None:
             persisted_bar5m_count += int(actual.get("bars_5m_written", 0))
             persistence_error_count += int(actual.get("persistence_errors", 0))
             log.info("[RESEARCH_BATCH_DONE] batch=%d rows=%d/%d queued_observations=%d queued_bars1h=%d queued_bars5m=%d seconds=%.3f", batch_offset // research_batch_size + 1, min(batch_offset + len(payload_batch), len(deferred_rows)), len(deferred_rows), batch_observations, batch_bars1h, batch_bars5m, time.perf_counter() - research_batch_started)
-        log.info("[PERF_STAGE] stage=research_deferred_total seconds=%.3f rows=%d queued_observations=%d queued_bars1h=%d queued_bars5m=%d persisted_observations=%d persisted_bars1h=%d persisted_bars5m=%d persistence_errors=%d batch_size=%d", time.perf_counter() - research_flush_started, len(deferred_rows), queued_observation_count, queued_bar1h_count, queued_bar5m_count, persisted_observation_count, persisted_bar1h_count, persisted_bar5m_count, persistence_error_count, research_batch_size)
 
     total_duration_sec = time.perf_counter() - run_started_perf
     request_metrics.log_summary(log)

@@ -949,16 +949,17 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
 
     existing_outcome_ids: set[str] = set()
     if not bootstrap_complete and research.RESEARCH_OUTCOMES_PATH.exists():
-        for line in research.RESEARCH_OUTCOMES_PATH.open("r", encoding="utf-8"):
-            text = line.strip()
-            if not text:
-                continue
-            try:
-                row = json.loads(text)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(row, dict) and row.get("outcome_id"):
-                existing_outcome_ids.add(str(row["outcome_id"]))
+        with research.RESEARCH_OUTCOMES_PATH.open("r", encoding="utf-8") as outcome_handle:
+            for line in outcome_handle:
+                text = line.strip()
+                if not text:
+                    continue
+                try:
+                    row = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict) and row.get("outcome_id"):
+                    existing_outcome_ids.add(str(row["outcome_id"]))
 
     calc_started = time.perf_counter()
     ready: list[dict[str, Any]] = list(terminal_invalid)
@@ -979,12 +980,11 @@ def update_outcomes(*, write: bool = False) -> tuple[int, int]:
         invalid_observation = isinstance(outcome, dict) and outcome.get("outcome_class") == "INVALID_RESEARCH_OBSERVATION"
         if outcome is None or (not invalid_observation and not bool(outcome.get("forward_path_complete_24h"))):
             if oid:
-                # Incomplete but otherwise valid observations stay pending; explicit
-                # temporal-integrity failures are terminal research records instead.
-                meta = pending_now.get(oid) or candidate_meta.get(oid)
-                if meta is None:
-                    meta = {"offset": 0, "observation_ts": str(obs.get("observation_ts", "")), "source_event_ts": obs.get("source_event_ts")}
-                pending_now[oid] = dict(meta)
+                # Incomplete but otherwise valid observations stay replayable across
+                # incremental runs and retention compaction. Candidate metadata for a
+                # newly matured row contains only an offset, so upgrade it here.
+                meta = pending_now.get(oid) or candidate_meta.get(oid) or {}
+                pending_now[oid] = _pending_meta_from_observation(obs, offset=int(meta.get("offset", 0)))
             continue
         if invalid_observation:
             ready.append(outcome)

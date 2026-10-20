@@ -466,7 +466,7 @@ def test_zone_forensics_and_be_retry_keep_the_state_they_report():
     assert "private_checkpoint_state_trusted = False" in run_source
     assert "if private_checkpoint_state_trusted:" in run_source
     assert "private_layer_available = private_ready" not in run_source
-    preflight_start = run_source.index("private_preflight_started = time.perf_counter()")
+    preflight_start = run_source.index("private_ready = _private_layer_ready()")
     strict_load = run_source.index("_load_active_trades_file(fresh_runtime_start=fresh_runtime_start)", preflight_start)
     position_mode_check = run_source.index("mode = get_position_mode(", strict_load)
     reconciliation_call = run_source.index("reconciliation_ok = reconcile_all_open_positions()", position_mode_check)

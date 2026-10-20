@@ -97,13 +97,15 @@ def test_counterfactual_path_detects_target():
         "direction": "LONG",
         "reference_price": 100.0,
         "source_event_ts": "2026-09-28T10:00:00Z",
-        "features": {"shadow_experiments": snap["experiments"]},
+        # Real research observations persist the entire envelope, not only experiments.
+        "features": {"shadow_experiments": snap},
     }
     future = pd.DataFrame([
         {"timestamp": "2026-09-28T10:05:00Z", "close_time": "2026-09-28T10:10:00Z", "open": 100, "high": 102.5, "low": 99.5, "close": 102},
     ])
     out = shadow.calculate_counterfactual_outcomes(obs, future)
     assert out["experiments"]["CF_STRUCTURAL_SL"]["exit"] in {"TARGET", "AMBIGUOUS_SAME_BAR"}
+    assert any(key.startswith("CF_DELAYED_BE_CURRENT_") for key in out["experiments"])
 
 
 def test_no_open_peers_has_explicit_correlation_status():

@@ -50,6 +50,7 @@ def test_deferred_research_bar_prefetch_preserves_symbol_mapping(monkeypatch):
         {"symbol": "BBB-USDT", "provider": "bingx", "persist_bars_for_forward": True, "bars_5m": []},
         {"symbol": "CCC-USDT", "provider": "binance", "persist_bars_for_forward": True, "bars_5m": [{"timestamp": 3}]},
         {"symbol": "DDD-USDT", "provider": "binance", "persist_bars_for_forward": False, "bars_5m": []},
+        {"symbol": "EEE-USDT", "provider": "binance", "persist_bars_for_forward": False, "bars_5m": [], "diagnostics": {"touch_events": [{"reason": "zone_not_active"}]}},
     ]
     prefetch = run_once._prefetch_missing_research_5m_bars(
         payloads,
@@ -61,9 +62,11 @@ def test_deferred_research_bar_prefetch_preserves_symbol_mapping(monkeypatch):
     assert prefetch[id(payloads[0])] == [{"symbol": "AAAUSDT", "timestamp": 1}]
     assert prefetch[id(payloads[1])] == [{"symbol": "BBB-USDT", "timestamp": 2}]
     assert prefetch[id(payloads[2])] == [{"symbol": "CCCUSDT", "timestamp": 1}]
-    assert prefetch[id(payloads[3])] == [{"symbol": "DDDUSDT", "timestamp": 1}]
+    assert id(payloads[3]) not in prefetch  # No observation can persist these bars.
+    assert prefetch[id(payloads[4])] == [{"symbol": "EEEUSDT", "timestamp": 1}]
     assert len(calls) == 4
     assert {call[0] for call in calls} == {"binance", "bingx"}
+    assert not any("DDD" in call[1] for call in calls)
 
 
 def test_deferred_research_prefetch_uses_bounded_four_worker_pool(monkeypatch):
@@ -126,3 +129,36 @@ def test_missing_credentials_block_helper_uses_imported_callable(monkeypatch):
     monkeypatch.setattr(run_once, "credentials_available", lambda: True)
     preflight = run_once._blocked_private_execution_result()
     assert preflight["status"] == "BLOCKED_PRIVATE_PREFLIGHT"
+
+
+def test_five_minute_trigger_age_uses_close_boundary_not_open():
+    import pandas as pd
+    import run_once
+
+    signal = {
+        "trigger_timeframe": "5m",
+        "trigger_bar_time": "2026-10-20T10:00:00Z",
+        "trigger_bar_close_time": "2026-10-20T10:05:00Z",
+    }
+    age, error = run_once._five_m_trigger_age_minutes(signal, now_ts="2026-10-20T10:14:00Z")
+    assert error is None
+    assert age == 9.0
+
+    # Historical signals without close-boundary metadata retain a safe fallback.
+    legacy = {"trigger_timeframe": "5m", "trigger_bar_time": "2026-10-20T10:00:00Z"}
+    legacy_age, legacy_error = run_once._five_m_trigger_age_minutes(legacy, now_ts="2026-10-20T10:14:00Z")
+    assert legacy_error is None
+    assert legacy_age == 14.0
+
+
+def test_zone_lookup_fallback_key_matches_visit_key_without_zone_id():
+    import run_once
+    from event_engine import research
+
+    zone = {"origin_ts_ms": 1_760_000_000_000, "top": 101.1234567890123, "btm": 99.9876543210987}
+    key = run_once._zone_visit_key(zone, "DEMAND")
+    assert research._zone_lookup([zone], [])[key] is zone
+
+    old_zone = {"start": 7, "top": 101.25, "btm": 99.75}
+    old_key = run_once._zone_visit_key(old_zone, "SUPPLY")
+    assert research._zone_lookup([], [old_zone])[old_key] is old_zone
