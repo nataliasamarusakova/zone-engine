@@ -7,7 +7,6 @@ import json
 import logging
 import math
 import time
-import zlib
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -286,16 +285,14 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def _load_bars(*, symbols: set[str] | None = None) -> dict[str, pd.DataFrame]:
-    """Load live 5m bars plus immutable recovery/pruned journals.
+    """Load current market bars and verified retention-pruned deltas only.
 
-    The working JSONL is retained as the highest-priority source. Older bars that
-    were safely compacted are read from gzip *pruned deltas* and the one-time
-    recovery seed; full snapshots are intentionally skipped because they duplicate
-    kept and pruned rows. All sources are deduplicated by symbol/provider/timestamp.
+    A clean source checkout deliberately contains no historical recovery seeds.
+    Older rows retained by the normal retention pipeline remain available from
+    data/retention_archive; the live JSONL wins when timestamps overlap.
     """
     bar_path = Path(research.MARKET_BARS_5M_PATH)
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
-    providers_by_symbol: dict[str, set[str]] = defaultdict(set)
     source_priority = 0
 
     def add_row(row: dict[str, Any], priority: int) -> None:
@@ -306,148 +303,41 @@ def _load_bars(*, symbols: set[str] | None = None) -> dict[str, pd.DataFrame]:
         row_copy = dict(row)
         row_copy["_archive_source_priority"] = priority
         grouped[(symbol, provider)].append(row_copy)
-        providers_by_symbol[symbol].add(provider)
 
-    def read_gzip_jsonl(path: Path, priority: int, expected: dict[str, Any] | None = None) -> int:
+    def read_pruned_delta(path: Path, priority: int) -> int:
         count = 0
-        source_rows = 0
-        source_bytes = 0
-        digest = hashlib.sha256()
-        if expected is not None:
-            try:
-                expected_compressed_bytes = int(expected["compressed_bytes"])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise ValueError(f"{path}: invalid compressed_bytes in recovery-seed manifest") from exc
-            if path.stat().st_size != expected_compressed_bytes:
-                raise ValueError(
-                    f"{path}: compressed byte-count mismatch "
-                    f"(expected {expected_compressed_bytes}, got {path.stat().st_size})"
-                )
         try:
-            # Binary mode is deliberate: seed SHA-256 and source-byte counts are
-            # defined over the exact uncompressed JSONL bytes, not normalized text.
-            with gzip.open(path, "rb") as fh:
-                for line_no, raw_line in enumerate(fh, 1):
-                    digest.update(raw_line)
-                    source_bytes += len(raw_line)
-                    if not raw_line.strip():
+            with gzip.open(path, "rt", encoding="utf-8") as handle:
+                for line_no, line in enumerate(handle, 1):
+                    if not line.strip():
                         continue
                     try:
-                        row = json.loads(raw_line)
-                    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-                        if expected is not None:
-                            raise ValueError(f"{path}:{line_no}: invalid JSON/UTF-8 in verified recovery seed") from exc
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
                         log.error("[RESEARCH_ARCHIVE_CORRUPT] path=%s line=%d reason=invalid_json", path, line_no)
                         continue
-                    if not isinstance(row, dict):
-                        if expected is not None:
-                            raise ValueError(f"{path}:{line_no}: non-object row in verified recovery seed")
-                        continue
-                    source_rows += 1
-                    if row.get("record_type") not in (None, "", "MARKET_BAR"):
-                        continue
-                    add_row(row, priority)
-                    count += 1
-        except (OSError, EOFError, gzip.BadGzipFile, zlib.error) as exc:
-            if expected is not None:
-                raise ValueError(f"{path}: recovery seed cannot be read: {exc}") from exc
+                    if isinstance(row, dict) and row.get("record_type") in (None, "", "MARKET_BAR"):
+                        add_row(row, priority)
+                        count += 1
+        except (OSError, EOFError, gzip.BadGzipFile) as exc:
             log.error("[RESEARCH_ARCHIVE_UNREADABLE] path=%s error=%s", path, exc)
-            return count
-
-        if expected is not None:
-            expected_sha = str(expected.get("source_sha256", "")).lower()
-            if digest.hexdigest() != expected_sha:
-                raise ValueError(
-                    f"{path}: source SHA-256 mismatch "
-                    f"(expected {expected_sha}, got {digest.hexdigest()})"
-                )
-            try:
-                expected_source_bytes = int(expected["source_bytes"])
-                expected_source_rows = int(expected["source_rows"])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise ValueError(f"{path}: invalid source byte/row count in recovery-seed manifest") from exc
-            if source_bytes != expected_source_bytes:
-                raise ValueError(
-                    f"{path}: source byte-count mismatch "
-                    f"(expected {expected_source_bytes}, got {source_bytes})"
-                )
-            if source_rows != expected_source_rows:
-                raise ValueError(
-                    f"{path}: source row-count mismatch "
-                    f"(expected {expected_source_rows}, got {source_rows})"
-                )
         return count
 
-    def _expected_seed_metadata(archive: Path, seed_root: Path) -> dict[str, Any] | None:
-        """Return manifest checks for packaged bootstrap bars; legacy fallback is optional."""
-        bootstrap_root = (PROJECT_ROOT / "bootstrap" / "research_history_seed").resolve()
-        is_bootstrap_seed = archive.resolve().is_relative_to(bootstrap_root)
-        manifest_path = archive.parent / "manifest.json"
-        if not manifest_path.is_file():
-            if is_bootstrap_seed:
-                raise ValueError(f"{archive}: packaged recovery seed has no manifest.json")
-            return None
-        if not is_bootstrap_seed:
-            # A legacy runtime seed is a migration fallback; don't break older
-            # deployments that predate the manifest format.
-            return None
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(f"{manifest_path}: cannot read recovery-seed manifest") from exc
-        if not isinstance(manifest, dict) or manifest.get("record_type") != "RESEARCH_HISTORY_RECOVERY_SEED":
-            raise ValueError(f"{manifest_path}: unexpected recovery-seed manifest record_type")
-        files = manifest.get("files")
-        meta = files.get(bar_path.name) if isinstance(files, dict) else None
-        if not isinstance(meta, dict):
-            raise ValueError(f"{manifest_path}: missing metadata for {bar_path.name}")
-        archive_rel = Path(str(meta.get("archive_path", "")))
-        if archive_rel.is_absolute():
-            raise ValueError(f"{manifest_path}: absolute archive path is not allowed")
-        expected_path = (PROJECT_ROOT / archive_rel).resolve()
-        if not expected_path.is_relative_to(seed_root.resolve()) or expected_path != archive.resolve():
-            raise ValueError(f"{manifest_path}: archive_path does not identify {archive}")
-        return meta
-
-    # Immutable recovery seed is shipped separately from runtime data so a source-only
-    # checkout has no stale active positions or journals. Read any legacy data/ fallback
-    # first, then bootstrap last so the packaged, manifest-verified source wins conflicts.
-    seed_roots = [bar_path.parent / "research_history_seed", PROJECT_ROOT / "bootstrap" / "research_history_seed"]
-    seen_seed_paths: set[str] = set()
-    seed_files: list[tuple[Path, Path]] = []
-    for seed_root in seed_roots:
-        if not seed_root.exists():
-            continue
-        for archive in sorted(p for p in seed_root.rglob("*.gz") if p.name.startswith(bar_path.name + ".")):
-            normalized = str(archive.resolve())
-            if normalized not in seen_seed_paths:
-                seen_seed_paths.add(normalized)
-                seed_files.append((archive, seed_root))
-    for archive, seed_root in seed_files:
-        source_priority += 1
-        expected = _expected_seed_metadata(archive, seed_root)
-        read_gzip_jsonl(archive, source_priority, expected=expected)
-
-    # Size-guard and time-retention compaction write deleted rows as gzip deltas.
-    # Read these rows on later clean runners; snapshots themselves duplicate rows
-    # and are kept only as integrity/recovery evidence.
     retention_root = bar_path.parent / "retention_archive"
     delta_files = sorted(
-        p for p in retention_root.rglob("*.gz")
-        if p.name.startswith(bar_path.name + ".pruned")
+        path for path in retention_root.rglob("*.gz")
+        if path.name.startswith(bar_path.name + ".pruned")
     ) if retention_root.exists() else []
     for archive in delta_files:
         source_priority += 1
-        read_gzip_jsonl(archive, source_priority)
+        read_pruned_delta(archive, source_priority)
 
-    # The current working file wins any overlapping timestamp because it can
-    # contain a provider correction or a newly reconciled row.
+    # Current working rows have the highest priority to retain provider corrections.
     source_priority += 1
     if bar_path.exists():
-        with bar_path.open("r", encoding="utf-8") as fh:
-            for line_no, line in enumerate(fh, 1):
-                line = line.strip()
-                if not line:
+        with bar_path.open("r", encoding="utf-8") as handle:
+            for line_no, line in enumerate(handle, 1):
+                if not line.strip():
                     continue
                 try:
                     row = json.loads(line)
@@ -457,10 +347,10 @@ def _load_bars(*, symbols: set[str] | None = None) -> dict[str, pd.DataFrame]:
                 if isinstance(row, dict):
                     add_row(row, source_priority)
 
-    if seed_files or delta_files:
+    if delta_files:
         log.info(
-            "[RESEARCH_BARS_ARCHIVE_LOAD] seed_files=%d pruned_delta_files=%d candidate_symbols=%d rows_loaded=%d",
-            len(seed_files), len(delta_files), len(grouped), sum(len(v) for v in grouped.values()),
+            "[RESEARCH_BARS_ARCHIVE_LOAD] seed_files=0 pruned_delta_files=%d candidate_symbols=%d rows_loaded=%d",
+            len(delta_files), len(grouped), sum(len(items) for items in grouped.values()),
         )
 
     out: dict[str, pd.DataFrame] = {}
@@ -473,22 +363,12 @@ def _load_bars(*, symbols: set[str] | None = None) -> dict[str, pd.DataFrame]:
             df["close_time"] = _timestamp_series_to_utc(df["close_time"])
         else:
             df["close_time"] = df["timestamp"] + pd.Timedelta(minutes=5)
-        for col in ("open", "high", "low", "close", "volume"):
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["timestamp", "close_time", "open", "high", "low", "close", "volume"])
-        df = df.loc[(df["open"] > 0) & (df["high"] > 0) & (df["low"] > 0) & (df["close"] > 0) & (df["volume"] >= 0)]
-        df = df.loc[(df["high"] >= df[["open", "close"]].max(axis=1)) & (df["low"] <= df[["open", "close"]].min(axis=1)) & (df["high"] >= df["low"])]
-        # Select the winning source by timestamp + source priority first. Sorting
-        # close_time ahead of priority could otherwise let an older archived row
-        # override a live correction when the corrected close_time changed.
-        df = df.sort_values(["timestamp", "_archive_source_priority", "close_time"]).drop_duplicates("timestamp", keep="last")
-        df = df.sort_values(["close_time", "timestamp"]).reset_index(drop=True)
-        df = df.drop(columns=["_archive_source_priority"], errors="ignore")
-        key = f"{symbol}|{provider}" if provider else symbol
-        out[key] = df
-        if len(providers_by_symbol[symbol]) == 1:
-            out[symbol] = df
+        df = df.dropna(subset=["timestamp", "close_time"])
+        df = df.sort_values(["timestamp", "_archive_source_priority"]).drop_duplicates(
+            subset=["timestamp"], keep="last"
+        )
+        df = df.drop(columns=["_archive_source_priority"], errors="ignore").reset_index(drop=True)
+        out[f"{symbol}|{provider}"] = df
     return out
 
 

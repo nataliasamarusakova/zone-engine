@@ -3015,9 +3015,12 @@ def test_workflow_persists_runtime_state_in_verified_artifact_not_git_snapshots(
     assert "zone-engine-runtime-state" in workflow
     assert "python3 event_engine/runtime_state_bundle.py restore" in workflow
     assert "python event_engine/runtime_state_bundle.py create" in workflow
-    assert "git rm --cached -r -f --ignore-unmatch data/ bootstrap/research_history_seed/" in workflow
+    assert "git rm --cached -r -f --ignore-unmatch data/" in workflow
+    assert "check-legacy" not in workflow
+    assert "EXECUTION_ENABLED: ${{ steps.restore_runtime_state.outputs.mode == 'artifact' && 'true' || 'false' }}" in workflow
+    assert '.conclusion == "success"' in workflow
     assert "data/*" in gitignore
-    assert "bootstrap/research_history_seed/" in gitignore
+    assert "bootstrap/research_history_seed/" not in gitignore
     assert "git add data/" not in workflow
     assert "schedule:" not in workflow
     assert 'cron: "*/5 * * * *"' not in workflow

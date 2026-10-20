@@ -122,11 +122,10 @@ def test_workflow_does_not_write_research_or_commit_state_after_test_failure(tmp
     by_id = {step.get("id"): step for step in steps if step.get("id")}
 
     assert by_id["tests"]["name"] == "Run tests"
-    assert "steps.quality_gate.outcome == 'success'" in by_id["restore_research_history_seed"]["if"]
-    assert "steps.verify_tests_data.outcome == 'success'" in by_id["restore_research_history_seed"]["if"]
-    seed_warning = next(step for step in steps if step.get("name") == "Report research seed restore status")
-    assert "steps.quality_gate.outcome == 'success'" in seed_warning["if"]
-    assert "steps.restore_research_history_seed.outcome == 'failure'" in seed_warning["if"]
+    assert "restore_research_history_seed" not in by_id
+    assert "research_history_seed" not in (Path(__file__).parent / ".github" / "workflows" / "event-engine.yml").read_text(encoding="utf-8")
+    assert by_id["clean_start_bootstrap"]["if"] == "${{ steps.restore_runtime_state.outputs.mode == 'bootstrap' }}"
+    assert "steps.restore_runtime_state.outputs.mode == 'artifact' && 'true' || 'false'" in by_id["run_engine"]["env"]["EXECUTION_ENABLED"]
     assert "steps.quality_gate.outcome == 'success'" in by_id["research_outcomes"]["if"]
     assert '${{ steps.quality_gate.outcome }}' in by_id["retention_archive_commit_gate"]["run"]
     assert by_id["test_policy"]["id"] == "test_policy"
@@ -143,7 +142,7 @@ def test_workflow_does_not_write_research_or_commit_state_after_test_failure(tmp
     persist_step = next(step for step in steps if step.get("id") == "externalize_runtime_state")
     assert "steps.quality_gate.outcome == 'success'" in persist_step["if"]
     assert "steps.verify_runtime_state_artifact.outcome == 'success'" in persist_step["if"]
-    assert "git rm --cached -r -f --ignore-unmatch data/ bootstrap/research_history_seed/" in persist_step["run"]
+    assert "git rm --cached -r -f --ignore-unmatch data/" in persist_step["run"]
 
     script = by_id["retention_archive_commit_gate"]["run"]
     script = script.replace("${{ steps.quality_gate.outcome }}", "failure")
@@ -218,3 +217,29 @@ def test_full_test_suite_is_skipped_only_when_source_fingerprint_matches(tmp_pat
     marker.write_text("{}", encoding="utf-8")
     out, _ = run_policy("same")
     assert "run_tests=true" in out
+
+
+def test_runtime_state_is_not_externalized_until_uploaded_bundle_and_retention_archive_are_verified():
+    import yaml
+
+    workflow_path = Path(__file__).parent / ".github" / "workflows" / "event-engine.yml"
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    steps = workflow["jobs"]["run"]["steps"]
+    by_id = {step.get("id"): step for step in steps if step.get("id")}
+
+    detect_legacy = by_id["legacy_runtime_state"]
+    verify_bundle = by_id["verify_uploaded_runtime_state_bundle"]
+    externalize = by_id["externalize_runtime_state"]
+    assert "git ls-files -- data/" in detect_legacy["run"]
+    assert "bootstrap/research_history_seed" not in detect_legacy["run"]
+    assert "steps.verify_runtime_state_artifact.outcome == 'success'" in verify_bundle["if"]
+    assert "steps.legacy_runtime_state.outputs.tracked == 'true'" not in verify_bundle["if"]
+    assert 'runtime_state_bundle.py verify --bundle-dir "$tmp_dir"' in verify_bundle["run"]
+    assert "steps.legacy_runtime_state.outputs.tracked == 'true'" in externalize["if"]
+    assert "steps.verify_uploaded_runtime_state_bundle.outcome == 'success'" in externalize["if"]
+    assert "steps.restore_retention_archive.outputs.recovery_safe == 'true'" in externalize["if"]
+    assert "steps.retention_archive_restore_verification.outcome == 'success'" in externalize["if"]
+    assert "steps.restore_retention_archive.outputs.recovery_safe != 'true'" not in externalize["if"]
+    assert steps.index(detect_legacy) < steps.index(by_id["restore_runtime_state"])
+    assert steps.index(verify_bundle) < steps.index(by_id["prune_runtime_state_artifacts"])
+    assert steps.index(verify_bundle) < steps.index(externalize)

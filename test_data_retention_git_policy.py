@@ -4,7 +4,7 @@ from pathlib import Path
 def test_persistent_runtime_data_is_artifact_backed_and_ephemeral_data_is_ignored():
     lines = {line.strip() for line in Path(".gitignore").read_text(encoding="utf-8").splitlines()}
     assert "data/*" in lines
-    assert "bootstrap/research_history_seed/" in lines
+    assert "bootstrap/research_history_seed/" not in lines
     assert "data/scan_history.jsonl" in lines
     assert "data/scan_history.jsonl.*" in lines
     assert "data/zone_engine_diagnostic.log" in lines
@@ -14,8 +14,9 @@ def test_persistent_runtime_data_is_artifact_backed_and_ephemeral_data_is_ignore
 def test_runbook_documents_artifact_backed_runtime_state_migration():
     text = Path("DATA_RETENTION_RUNBOOK.md").read_text(encoding="utf-8")
     assert "zone-engine-runtime-state" in text
-    assert "only then removes the legacy data files from the Git index" in text
-    assert "refuses to run the engine if the newest state artifact is unavailable or invalid" in text
+    assert "guarded clean-start" in text
+    assert "trading remains disabled" in text
+    assert "successful completed event-engine run" in text
 
 
 def test_pytest_has_global_repository_data_isolation():
@@ -56,7 +57,7 @@ def test_size_guard_constants_have_headroom():
 def test_git_policy_externalizes_engine_state_but_keeps_retention_archive_separate():
     lines = {line.strip() for line in Path(".gitignore").read_text(encoding="utf-8").splitlines()}
     assert "data/*" in lines
-    assert "bootstrap/research_history_seed/" in lines
+    assert "bootstrap/research_history_seed/" not in lines
     assert "data/retention_archive/" in lines
 
 
@@ -320,49 +321,46 @@ def test_size_guard_has_lossless_backstop_for_unparseable_or_excess_recent_5m_ro
     assert kept_ids | archived_ids == original_ids
 
 def test_clean_checkout_can_restore_runtime_state_from_verified_bundle(tmp_path):
-    """A clean checkout restores the same persistent state from its artifact bundle."""
+    """A clean checkout restores required state without any legacy seed directory."""
     import json
 
     from event_engine.runtime_state_bundle import create_bundle, restore_bundle, REQUIRED_FILES
 
     root = tmp_path / "source"
     data = root / "data"
-    seed = root / "bootstrap" / "research_history_seed"
     for relative in REQUIRED_FILES:
-        path = data / relative.removeprefix("data/") if relative.startswith("data/") else root / relative
+        path = data / relative.removeprefix("data/")
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"path": relative}) + "\n", encoding="utf-8")
+        if relative.endswith(".jsonl"):
+            path.write_text("", encoding="utf-8")
+        else:
+            path.write_text(json.dumps({"path": relative}) + "\n", encoding="utf-8")
     (data / "active_trades.json").write_text(
-        '{"version": 1, "events": {"E1": {"symbol": "TEST-USDT"}}}\n', encoding="utf-8"
+        '{"E1": {"event_id": "E1", "symbol": "TEST-USDT", "direction": "LONG"}}\n', encoding="utf-8"
     )
     (data / "research_outcome_state.json").write_text(
-        '{"version": 2, "processed_observation_ids": ["OBS1"]}\n', encoding="utf-8"
+        '{"schema_version": 1, "processed_observation_ids": ["OBS1"]}\n', encoding="utf-8"
     )
     (data / "trades.jsonl").write_text('{"record_type":"TRADE_OPEN","event_id":"E1"}\n', encoding="utf-8")
     (data / "scan_history.jsonl").write_text('{"ephemeral":true}\n', encoding="utf-8")
     (data / "zone_engine_diagnostic.log").write_text("diagnostic\n", encoding="utf-8")
     (data / "retention_archive").mkdir()
     (data / "retention_archive" / "snapshot.jsonl.gz").write_bytes(b"separately managed")
-    for rel in REQUIRED_FILES:
-        if rel.endswith(".gz"):
-            path = root / rel
-            path.write_bytes(b"compressed historical seed placeholder")
 
     bundle = tmp_path / "runtime-state-bundle"
-    create_bundle(data_dir=data, seed_dir=seed, output_dir=bundle)
+    create_bundle(data_dir=data, output_dir=bundle)
 
     clean = tmp_path / "clean-checkout"
     clean_data = clean / "data"
-    clean_seed = clean / "bootstrap" / "research_history_seed"
     clean_data.mkdir(parents=True)
     (clean_data / "stale-state.json").write_text("stale\n", encoding="utf-8")
-    restore_bundle(bundle_dir=bundle, data_dir=clean_data, seed_dir=clean_seed)
+    restore_bundle(bundle_dir=bundle, data_dir=clean_data)
 
-    assert json.loads((clean_data / "active_trades.json").read_text(encoding="utf-8"))["events"]["E1"]["symbol"] == "TEST-USDT"
+    assert json.loads((clean_data / "active_trades.json").read_text(encoding="utf-8"))["E1"]["symbol"] == "TEST-USDT"
     assert json.loads((clean_data / "research_outcome_state.json").read_text(encoding="utf-8"))["processed_observation_ids"] == ["OBS1"]
     assert (clean_data / "trades.jsonl").exists()
     assert not (clean_data / "scan_history.jsonl").exists()
     assert not (clean_data / "zone_engine_diagnostic.log").exists()
     assert not (clean_data / "retention_archive").exists()
     assert not (clean_data / "stale-state.json").exists()
-    assert (clean_seed / "2026-10-16" / "manifest.json").exists()
+    assert not (clean / "bootstrap").exists()

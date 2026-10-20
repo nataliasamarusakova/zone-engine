@@ -76,35 +76,28 @@ def test_observation_cursor_rejects_same_size_middle_rewrite(tmp_path):
     assert _cursor_is_valid(path, cursor) is False
 
 
-def test_forward_bars_merge_recovery_seed_pruned_deltas_and_live_values(monkeypatch, tmp_path):
+def test_forward_bars_loads_retention_deltas_and_live_rows_without_legacy_seed(monkeypatch, tmp_path):
     from event_engine import research
     from research_forward import _load_bars
 
     data_dir = tmp_path / "data"
     live_path = data_dir / "market_bars_5m.jsonl"
-    seed_dir = data_dir / "research_history_seed" / "2026-10-16"
     delta_dir = data_dir / "retention_archive" / "run1" / "market_bars_5m.jsonl" / "pruned"
-    seed_dir.mkdir(parents=True)
     delta_dir.mkdir(parents=True)
+    legacy_seed = data_dir / "research_history_seed" / "2026-10-16"
+    legacy_seed.mkdir(parents=True)
 
     t0 = 1_760_000_000_000
     t1 = t0 + 5 * 60_000
     t2 = t1 + 5 * 60_000
-    seed_path = seed_dir / "market_bars_5m.jsonl.before_2026-10-16.jsonl.gz"
-    with gzip.open(seed_path, "wt", encoding="utf-8") as fh:
-        fh.write(json.dumps(_bar(t0, 100.0)) + "\n")
-        fh.write(json.dumps(_bar(t1, 101.0, symbol="OTHER-USDT")) + "\n")
     delta_path = delta_dir / "market_bars_5m.jsonl.pruned.0001.jsonl.gz"
     with gzip.open(delta_path, "wt", encoding="utf-8") as fh:
         fh.write(json.dumps(_bar(t1, 102.0)) + "\n")
+    # Old recovery-seed directories must not affect forward research after clean start.
+    with gzip.open(legacy_seed / "market_bars_5m.jsonl.legacy.jsonl.gz", "wt", encoding="utf-8") as fh:
+        fh.write(json.dumps(_bar(t0, 99.0)) + "\n")
     data_dir.mkdir(parents=True, exist_ok=True)
-    live_t0 = _bar(t0, 100.5)
-    # Live correction wins even when its close_time differs and sorts earlier.
-    live_t0["close_time"] = t0 + 4 * 60_000
-    live_path.write_text(
-        json.dumps(live_t0) + "\n" + json.dumps(_bar(t2, 103.0)) + "\n",
-        encoding="utf-8",
-    )
+    live_path.write_text(json.dumps(_bar(t0, 100.5)) + "\n" + json.dumps(_bar(t2, 103.0)) + "\n", encoding="utf-8")
     monkeypatch.setattr(research, "MARKET_BARS_5M_PATH", live_path)
 
     bars = _load_bars(symbols={"TEST-USDT"})
@@ -113,82 +106,6 @@ def test_forward_bars_merge_recovery_seed_pruned_deltas_and_live_values(monkeypa
     assert len(df) == 3
     assert list(df["close"]) == pytest.approx([100.5, 102.0, 103.0])
     assert df["timestamp"].is_monotonic_increasing
-
-
-def test_bootstrap_recovery_seed_wins_over_legacy_data_seed(monkeypatch, tmp_path):
-    from event_engine import research
-    import research_forward
-
-    repo = tmp_path / "repo"
-    data_dir = repo / "data"
-    bootstrap = repo / "bootstrap" / "research_history_seed" / "2026-10-16"
-    legacy = data_dir / "research_history_seed" / "2026-10-15"
-    bootstrap.mkdir(parents=True)
-    legacy.mkdir(parents=True)
-    bars_path = data_dir / "market_bars_5m.jsonl"
-    bars_path.parent.mkdir(parents=True, exist_ok=True)
-    bars_path.write_text("", encoding="utf-8")
-    t0 = 1_760_000_000_000
-    with gzip.open(bootstrap / "market_bars_5m.jsonl.before.jsonl.gz", "wt", encoding="utf-8") as fh:
-        fh.write(json.dumps(_bar(t0, 101.0)) + "\n")
-    with gzip.open(legacy / "market_bars_5m.jsonl.legacy.jsonl.gz", "wt", encoding="utf-8") as fh:
-        fh.write(json.dumps(_bar(t0, 99.0)) + "\n")
-    raw = (bootstrap / "market_bars_5m.jsonl.before.jsonl.gz")
-    import hashlib
-    uncompressed = gzip.decompress(raw.read_bytes())
-    manifest = {
-        "record_type": "RESEARCH_HISTORY_RECOVERY_SEED",
-        "files": {
-            "market_bars_5m.jsonl": {
-                "archive_path": "bootstrap/research_history_seed/2026-10-16/market_bars_5m.jsonl.before.jsonl.gz",
-                "compressed_bytes": raw.stat().st_size,
-                "source_bytes": len(uncompressed),
-                "source_rows": 1,
-                "source_sha256": hashlib.sha256(uncompressed).hexdigest(),
-            }
-        },
-    }
-    (bootstrap / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-    monkeypatch.setattr(research_forward, "PROJECT_ROOT", repo)
-    monkeypatch.setattr(research, "MARKET_BARS_5M_PATH", bars_path)
-
-    bars = research_forward._load_bars(symbols={"TEST-USDT"})
-    assert list(bars["TEST-USDT|binance"]["close"]) == pytest.approx([101.0])
-
-
-def test_bootstrap_recovery_seed_checksum_mismatch_fails_closed(monkeypatch, tmp_path):
-    from event_engine import research
-    import research_forward
-
-    repo = tmp_path / "repo"
-    data_dir = repo / "data"
-    seed_dir = repo / "bootstrap" / "research_history_seed" / "2026-10-16"
-    seed_dir.mkdir(parents=True)
-    bars_path = data_dir / "market_bars_5m.jsonl"
-    bars_path.parent.mkdir(parents=True, exist_ok=True)
-    bars_path.write_text("", encoding="utf-8")
-    archive = seed_dir / "market_bars_5m.jsonl.before.jsonl.gz"
-    with gzip.open(archive, "wt", encoding="utf-8") as fh:
-        fh.write(json.dumps(_bar(1_760_000_000_000, 101.0)) + "\n")
-    uncompressed = gzip.decompress(archive.read_bytes())
-    manifest = {
-        "record_type": "RESEARCH_HISTORY_RECOVERY_SEED",
-        "files": {
-            "market_bars_5m.jsonl": {
-                "archive_path": "bootstrap/research_history_seed/2026-10-16/market_bars_5m.jsonl.before.jsonl.gz",
-                "compressed_bytes": archive.stat().st_size,
-                "source_bytes": len(uncompressed),
-                "source_rows": 1,
-                "source_sha256": "0" * 64,
-            }
-        },
-    }
-    (seed_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-    monkeypatch.setattr(research_forward, "PROJECT_ROOT", repo)
-    monkeypatch.setattr(research, "MARKET_BARS_5M_PATH", bars_path)
-
-    with pytest.raises(ValueError, match="source SHA-256 mismatch"):
-        research_forward._load_bars(symbols={"TEST-USDT"})
 
 
 def test_stale_five_minute_trigger_is_rejected_inside_market_submitter(monkeypatch):
@@ -285,7 +202,7 @@ def test_archive_chain_markers_are_protected_from_retention_rewrites():
     from event_engine.data_retention import NEVER_REWRITE_STATE_FILES
 
     assert "retention_archive_state.json" in NEVER_REWRITE_STATE_FILES
-    assert "research_outcomes_restore_state.json" in NEVER_REWRITE_STATE_FILES
+    assert "research_outcomes_restore_state.json" not in NEVER_REWRITE_STATE_FILES
 
 
 def test_retention_archive_generation_names_never_overwrite(monkeypatch, tmp_path):

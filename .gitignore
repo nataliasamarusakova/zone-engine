@@ -4,13 +4,10 @@ __pycache__/
 *.tmp
 *.log
 
-# Runtime journals and research seed are persisted in the self-verifying
-# zone-engine-runtime-state GitHub Actions artifact. They are untracked from Git
-# only after a successful artifact upload, so the first migration run can still
-# bootstrap from the current tracked snapshot.
+# Runtime journals are persisted in the self-verifying zone-engine-runtime-state
+# GitHub Actions artifact. A guarded VST clean-start creates the initial state.
 data/*
 !data/.gitkeep
-bootstrap/research_history_seed/
 
 # Local-only unbounded and ephemeral runtime artifacts.
 data/scan_history.jsonl
