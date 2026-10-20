@@ -3573,6 +3573,45 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                 confirmed_exit_fill_qty is not None
                 and abs(float(confirmed_exit_fill_qty) - init_qty) <= qty_tolerance
             )
+            # A missing residual price at the position snapshot must not keep the
+            # whole trade permanently unverified when the close-time execution
+            # ledger now proves every entry and exit fill.  Upgrade only on exact
+            # quantity coverage, complete per-order evidence, and a confirmed
+            # entry VWAP + gross realized PnL; otherwise remain fail-closed.
+            confirmed_entry_qty = _optional_float(fill_accounting.get("entry_qty_confirmed"))
+            confirmed_entry_vwap = _optional_float(fill_accounting.get("entry_vwap_confirmed"))
+            confirmed_exit_vwap = _optional_float(fill_accounting.get("exit_vwap_confirmed"))
+            confirmed_gross_pnl_abs = _optional_float(fill_accounting.get("gross_realized_pnl_abs"))
+            incomplete_order_ids = fill_accounting.get("incomplete_order_fill_ids")
+            fill_evidence_status = str(fill_accounting.get("status") or "").upper()
+            complete_fill_based_close = bool(
+                position_gone
+                and residual_qty_before_position_disappeared > 0
+                and not residual_exit_verified
+                and fill_evidence_status in {"VERIFIED", "VERIFIED_ORDER_EXECUTION"}
+                and confirmed_entry_qty is not None
+                and abs(confirmed_entry_qty - init_qty) <= qty_tolerance
+                and confirmed_entry_vwap is not None and confirmed_entry_vwap > 0
+                and close_fill_qty_verified
+                and confirmed_exit_vwap is not None and confirmed_exit_vwap > 0
+                and confirmed_gross_pnl_abs is not None
+                and not (isinstance(incomplete_order_ids, list) and incomplete_order_ids)
+            )
+            if complete_fill_based_close:
+                verified_full_trade_pnl_pct = (
+                    confirmed_gross_pnl_abs / (confirmed_entry_vwap * confirmed_entry_qty)
+                ) * 100.0
+                if math.isfinite(verified_full_trade_pnl_pct):
+                    residual_exit_verified = True
+                    realized_qty = init_qty
+                    realized_weighted = verified_full_trade_pnl_pct * init_qty
+                    accounting_diff_qty = 0.0
+                    trade["remaining_qty"] = 0.0
+                    exit_price = confirmed_exit_vwap
+                    close_execution_evidence["authority"] = "EXCHANGE_CONFIRMED_COMPLETE_FILL_ACCOUNTING"
+                    close_execution_evidence["confirmed_exit_qty"] = float(confirmed_exit_fill_qty)
+                    close_execution_evidence["exit_vwap_confirmed"] = float(confirmed_exit_vwap)
+                    close_execution_evidence["exit_vwap_source"] = fill_accounting.get("exit_vwap_source")
             if not residual_exit_verified:
                 accounting_status = "UNVERIFIED_RESIDUAL_EXIT"
             elif close_fill_qty_verified and abs(accounting_diff_qty) <= qty_tolerance:
@@ -3601,6 +3640,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
             )
             realized_pnl_source = (
                 "UNVERIFIED_RESIDUAL_EXIT" if not residual_exit_verified
+                else "confirmed_fill_accounting" if complete_fill_based_close
                 else "executed_tp_or_sl" if (closed_by_tp or sl_exit_price is not None)
                 else (hist_source or "observation_price_estimate")
             )
@@ -3619,6 +3659,9 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                     # exit_price, but explicitly mark it as a tracker-weighted estimate.
                     exit_price = entry_price * (1.0 + final_pnl / 100.0) if direction == "LONG" else entry_price * (1.0 - final_pnl / 100.0)
                     exit_price_semantics = "TRACKER_WEIGHTED_EXIT_ESTIMATE"
+            elif complete_fill_based_close:
+                exit_price = float(fill_accounting["exit_vwap_confirmed"])
+                exit_price_semantics = "CONFIRMED_EXIT_VWAP"
             elif sl_exit_price is not None:
                 exit_price_semantics = "SINGLE_CONFIRMED_EXIT_FILL"
             elif historical_order is not None:
@@ -3626,7 +3669,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
             else:
                 exit_price_semantics = "OBSERVED_PRICE_ESTIMATE"
             planned_risk_pct = _derive_planned_risk_pct(trade)
-            realized_rr = _calc_realized_rr(final_pnl, planned_risk_pct) if final_pnl is not None and realized_pnl_source == "executed_tp_or_sl" else None
+            realized_rr = _calc_realized_rr(final_pnl, planned_risk_pct) if final_pnl is not None and realized_pnl_source in {"executed_tp_or_sl", "confirmed_fill_accounting"} else None
             final_weighted_rr = _calc_realized_rr(final_pnl, planned_risk_pct) if final_pnl is not None and planned_risk_pct and planned_risk_pct > 0 else None
             if final_pnl is not None:
                 projected_rr, realized_rr_component, remaining_rr_component = _weighted_rr_snapshot({**trade, "remaining_qty": 0.0, "realized_pnl_qty": init_qty, "realized_pnl_weighted_sum": final_pnl * init_qty, "hit_legs": hit_legs})
