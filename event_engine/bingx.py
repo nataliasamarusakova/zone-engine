@@ -21,7 +21,7 @@ from decimal import (
     ROUND_DOWN,
     ROUND_FLOOR,
 )
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote, urlencode
 
 import requests
@@ -731,6 +731,11 @@ def get_order(
             return 0.0
         return value if math.isfinite(value) else 0.0
 
+    executed_qty_raw = order.get("executedQty")
+    if executed_qty_raw in (None, ""):
+        executed_qty_raw = order.get("cumQty")
+    executed_qty_known = executed_qty_raw not in (None, "")
+
     return {
         "status": "ok",
         "order_id": str(order.get("orderID") or order.get("orderId") or order_id or ""),
@@ -742,6 +747,7 @@ def get_order(
         "avg_price": _num("avgPrice"),
         "trigger_price": _num("stopPrice"),
         "executed_qty": _num("executedQty", "cumQty"),
+        "executed_qty_known": executed_qty_known,
         "orig_qty": _num("origQty", "quantity"),
         "client_order_id": str(order.get("clientOrderId", client_order_id or "")),
         "time_ms": int(_num("time")) if _num("time") > 0 else None,
@@ -999,6 +1005,7 @@ def open_market(
     attempt_id: str | None = None,
     trigger_bar_time_ms: int | None = None,
     max_trigger_age_minutes: float | None = None,
+    order_identity_callback: Callable[[str], None] | None = None,
 ) -> dict:
     direction = str(direction).upper()
     if direction not in {"LONG", "SHORT"}:
@@ -1038,6 +1045,24 @@ def open_market(
     except Exception as exc:
         return {"status": "error", "error": f"position_mode_query_failed: {exc}", "symbol": bx}
     client_order_id = _new_open_client_order_id(bx, trade_id)
+    # Durable identity breadcrumb before any MARKET POST. This is deliberately
+    # before the final executable-quote gate, so journal I/O never adds latency
+    # between that gate and order submission; persistence failure blocks the entry.
+    if order_identity_callback is not None:
+        try:
+            order_identity_callback(client_order_id)
+        except Exception as exc:
+            # In the engine execution path this breadcrumb is needed to reconcile
+            # an accepted order if the process dies before ORDER_ACK is written.
+            # Fail closed rather than opening a position with no durable owner ID.
+            log.critical("[BINGX] entry order identity persistence failed; blocking MARKET POST: %s", exc)
+            return {
+                "status": "error",
+                "error": f"entry_order_identity_persistence_failed: {type(exc).__name__}: {exc}",
+                "symbol": bx,
+                "client_order_id": client_order_id,
+                "order_submitted": False,
+            }
 
     # Exchange-side idempotency guard: if another worker already submitted this
     # logical event, resolve its existing order instead of placing a second one.
@@ -2405,16 +2430,41 @@ def fetch_research_account_snapshot() -> dict[str, Any]:
         )
         if isinstance(fills, dict) and int(fills.get("code", -1)) == 0:
             raw_data = fills.get("data")
+            raw_rows: list[dict] | None
             if isinstance(raw_data, list):
                 raw_rows = raw_data
             elif isinstance(raw_data, dict):
-                raw_rows = []
+                raw_rows = None
                 for wrapper_key in ("rows", "list", "items", "data"):
                     if isinstance(raw_data.get(wrapper_key), list):
                         raw_rows = raw_data[wrapper_key]
                         break
             else:
+                # A missing/null data payload is not authoritative evidence that
+                # the queried time window had zero fills. Only an explicit list
+                # (including []) or a recognized wrapper can establish emptiness.
+                raw_rows = None
+
+            if raw_rows is None:
+                # Unknown response shape is not equivalent to an empty trading
+                # window. Keep financial totals unknown so INCOME can be used as
+                # a fallback instead of emitting false zeros.
+                result["recent_fill_status"] = "UNRECOGNIZED_RESPONSE_SHAPE"
+                result["recent_fill_error"] = f"unrecognized allFillOrders data type/shape: {type(raw_data).__name__}"
+                result["recent_fill_count"] = None
+                result["recent_fill_financial_status"] = "UNAVAILABLE"
+                result["recent_fill_fee_status"] = "UNAVAILABLE"
+                result["recent_fill_realized_pnl_status"] = "UNAVAILABLE"
+                result["recent_fill_fee_total"] = None
+                result["recent_fill_realized_pnl_total"] = None
+                result["recent_realized_pnl_total"] = None
+                result["recent_realized_pnl_source"] = "UNAVAILABLE"
+                result["recent_fill_source"] = "UNAVAILABLE"
+                result.setdefault("errors", []).append(result["recent_fill_error"])
                 raw_rows = []
+                skip_fill_financial_classification = True
+            else:
+                skip_fill_financial_classification = False
             activity_rows = []
             fee_values: list[float] = []
             realized_values: list[float] = []
@@ -2446,9 +2496,16 @@ def fetch_research_account_snapshot() -> dict[str, Any]:
             result["recent_fill_window_start_ms"] = activity_start_ms
             result["recent_fill_window_end_ms"] = activity_end_ms
             result["recent_fills"] = activity_rows
-            result["recent_fill_count"] = fill_count
-            result["recent_fill_status"] = "EMPTY" if fill_count == 0 else "OK"
-            if fill_count == 0:
+            if skip_fill_financial_classification:
+                # The empty list above is only a parser sentinel; it is not proof
+                # of an empty exchange activity window.
+                pass
+            else:
+                result["recent_fill_count"] = fill_count
+                result["recent_fill_status"] = "EMPTY" if fill_count == 0 else "OK"
+            if skip_fill_financial_classification:
+                pass
+            elif fill_count == 0:
                 result["recent_fill_financial_status"] = "NO_FILLS"
                 result["recent_fill_fee_status"] = "NO_FILLS"
                 result["recent_fill_realized_pnl_status"] = "NO_FILLS"

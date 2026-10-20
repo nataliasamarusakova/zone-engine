@@ -1296,9 +1296,13 @@ def _emergency_close_after_be_failure(symbol: str, direction: str, qty: float, t
         # not call to_bx_symbol() here: that helper can refresh contracts over the
         # network and would turn a supposedly local fallback reconciliation into
         # another network dependency during an emergency path.
-        bx = str(symbol or "").upper()
+        # Local trade keys commonly use `AAA-USDT`, while the exchange's
+        # full-position endpoint may return `AAAUSDT`. Compare compact symbols
+        # here as well as in run_once reconciliation; otherwise a successful
+        # fallback request can be misread as an authoritative flat position.
+        bx = str(symbol or "").strip().upper().replace("-", "")
         for p in rows or []:
-            if str(p.get("symbol", "")).upper() != bx:
+            if str(p.get("symbol", "")).strip().upper().replace("-", "") != bx:
                 continue
             side = str(p.get("positionSide", "")).upper()
             try:
@@ -1345,9 +1349,20 @@ def _emergency_close_after_be_failure(symbol: str, direction: str, qty: float, t
                 "error": f"directional={direct.get('error', 'unknown')}; full_positions={exc}",
             }
 
+    def _finalize_verified_flat(payload: dict) -> dict:
+        """Remove engine-owned residual orders only after exchange flatness is verified."""
+        try:
+            cleanup = _cancel_engine_protection_before_emergency_close(symbol, direction)
+        except Exception as exc:
+            cleanup = {"status": "error", "cancelled": [], "errors": [str(exc)]}
+        payload["cleanup_after_flat_verified"] = cleanup
+        if cleanup.get("status") != "ok":
+            log.error("[TRACKER_BE_CLOSE_CLEANUP_PENDING] %s %s cleanup=%s", symbol, direction, cleanup)
+        return payload
+
     initial = _authoritative_position_read()
     if initial.get("status") == "not_found":
-        return {"status": "already_closed", "attempts": attempts, "remaining_qty": 0.0, "last_known_qty": 0.0}
+        return _finalize_verified_flat({"status": "already_closed", "attempts": attempts, "remaining_qty": 0.0, "last_known_qty": 0.0})
     if initial.get("status") != "found":
         return {
             "status": "close_unverified",
@@ -1359,11 +1374,11 @@ def _emergency_close_after_be_failure(symbol: str, direction: str, qty: float, t
 
     current_qty = abs(_safe_float(initial.get("positionAmt"), qty))
     if current_qty <= 0:
-        return {"status": "already_closed", "attempts": attempts, "remaining_qty": 0.0, "last_known_qty": 0.0}
+        return _finalize_verified_flat({"status": "already_closed", "attempts": attempts, "remaining_qty": 0.0, "last_known_qty": 0.0})
 
-    cleanup_result = _cancel_engine_protection_before_emergency_close(symbol, direction)
-    attempts.append({"cleanup_before_close": cleanup_result})
-
+    # Keep the verified old SL/TP active while the emergency MARKET close is
+    # in flight. Cancelling first creates an avoidable naked-position window if
+    # the close POST or its reconciliation fails.
     try:
         close_result = close_position_market(symbol, direction, current_qty, trade_id=trade_id)
     except Exception as exc:
@@ -1393,7 +1408,7 @@ def _emergency_close_after_be_failure(symbol: str, direction: str, qty: float, t
         verification = _authoritative_position_read()
         last_verification = verification
         if verification.get("status") == "not_found":
-            return {
+            return _finalize_verified_flat({
                 "status": "closed_verified",
                 "attempts": attempts,
                 "verification": verification,
@@ -1401,12 +1416,12 @@ def _emergency_close_after_be_failure(symbol: str, direction: str, qty: float, t
                 "remaining_qty": 0.0,
                 "last_known_qty": 0.0,
                 "order_filled": order_filled,
-            }
+            })
         if verification.get("status") == "found":
             remaining = abs(_safe_float(verification.get("positionAmt"), last_known_qty))
             last_known_qty = remaining
             if remaining <= 1e-12 and (order_filled or accepted_order_id):
-                return {
+                return _finalize_verified_flat({
                     "status": "closed_verified",
                     "attempts": attempts,
                     "verification": verification,
@@ -1414,19 +1429,19 @@ def _emergency_close_after_be_failure(symbol: str, direction: str, qty: float, t
                     "remaining_qty": 0.0,
                     "last_known_qty": 0.0,
                     "order_filled": order_filled,
-                }
+                })
         time.sleep(poll_delay)
 
     final_verification = _authoritative_position_read()
     if final_verification.get("status") == "not_found":
-        return {
+        return _finalize_verified_flat({
             "status": "closed_verified",
             "attempts": attempts,
             "verification": final_verification,
             "remaining_qty": 0.0,
             "last_known_qty": 0.0,
             "order_filled": order_filled,
-        }
+        })
     if final_verification.get("status") == "found":
         confirmed_qty = abs(_safe_float(final_verification.get("positionAmt"), last_known_qty))
         return {
@@ -2815,7 +2830,9 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
             peak_r = (float(trade.get("peak_pnl_pct", 0.0)) / planned_risk_pct) if planned_risk_pct and planned_risk_pct > 0 else 0.0
 
             # Retry a failed TP1 -> BE transition while the position remains open.
-            if "tp1" in set(trade.get("hit_legs", [])) and not trade.get("be_activated") and rem_qty > 0:
+            previous_be_rollback = trade.get("be_failure_rollback") if isinstance(trade.get("be_failure_rollback"), dict) else {}
+            previous_be_close_verified = str(previous_be_rollback.get("status", "")).lower() in {"closed_verified", "already_closed"}
+            if "tp1" in set(trade.get("hit_legs", [])) and not trade.get("be_activated") and rem_qty > 0 and not previous_be_close_verified:
                 old_sl = trade.get("sl_order", {}) if isinstance(trade.get("sl_order"), dict) else {}
                 old_sl_id = old_sl.get("order_id")
                 old_sl_price = _safe_float(old_sl.get("stop_price"), 0.0) or None
@@ -2823,16 +2840,32 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                     tracker_timings, "be_retry", _move_sl_to_break_even,
                     symbol, direction, entry_price, rem_qty, old_sl_id,
                     str(event_id).replace("EVT_", ""), old_sl_price=old_sl_price,
+                    owner_event_id=str(event_id),
                 )
-                if retry.get("status") == "created":
+                retry_status = str(retry.get("status", "")).lower()
+                if retry_status in {"created", "created_cleanup_pending"}:
                     trade["sl_order"] = retry
                     trade["be_activated"] = True
                     trade["be_required"] = False
-                    trade["be_last_error"] = None
+                    trade["be_last_error"] = retry.get("error") if retry_status == "created_cleanup_pending" else None
                     trade["be_activation_ts"] = trade.get("be_activation_ts") or now_ms
+                    trade["be_order_id"] = retry.get("order_id")
+                    pending_old_sl_id = retry.get("old_sl_cleanup_pending_order_id")
+                    if pending_old_sl_id:
+                        trade["sl_cleanup_pending"] = {
+                            "old_order_id": str(pending_old_sl_id),
+                            "since_ts": now_ms,
+                            "last_error": retry.get("error"),
+                        }
+                    else:
+                        trade.pop("sl_cleanup_pending", None)
                 else:
                     trade["be_required"] = True
                     trade["be_last_error"] = retry.get("error")
+                    rollback = retry.get("rollback") if isinstance(retry.get("rollback"), dict) else None
+                    if rollback and str(rollback.get("status", "")).lower() in {"closed_verified", "already_closed"}:
+                        trade["be_failure_rollback"] = rollback
+                        trade["be_failure_rollback_verified_ts"] = now_ms
 
             # Проверка исполнения Тейк-Профитов
             for tp_index, tp in enumerate(tp_orders_for_evidence):
@@ -3247,7 +3280,11 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
             sl_exit_price, _ = _timed_tracker_call(
                 tracker_timings, "exit_sl_order", _get_exit_from_sl, symbol, sl_order_id,
             )
-            historical_source = None
+            # Default the historical source for every exit path. Verified BE
+            # rollback and verified emergency-close branches intentionally skip
+            # historical-order lookup, but downstream accounting still reads this
+            # variable to distinguish a confirmed fill from an estimate.
+            hist_source = None
             historical_order = None
             if sl_exit_price is not None:
                 exit_price = sl_exit_price

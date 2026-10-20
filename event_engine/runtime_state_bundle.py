@@ -26,6 +26,7 @@ MANIFEST_NAME = "runtime-state-manifest.json"
 # part of the portable snapshot. The retention archive must be restored and verified
 # independently before size-guard compaction can run.
 EXCLUDED_DATA_FILES = {
+    ".gitkeep",
     "zone_engine_diagnostic.log",
     "scan_history.jsonl",
 }
