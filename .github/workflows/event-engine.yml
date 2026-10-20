@@ -107,7 +107,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tracked_paths="$(git ls-files -- data/)"
+          tracked_paths="$(git ls-files -- data/ | grep -vx 'data/.gitkeep' || true)"
           if [ -n "$tracked_paths" ]; then
             echo "tracked=true" >> "$GITHUB_OUTPUT"
             echo "Legacy runtime state is still tracked in Git; migration must verify its replacement artifact before untracking it."
@@ -899,6 +899,10 @@ jobs:
           # --cached keeps the just-uploaded, verified working state on disk. The
           # next clean runner restores it from the artifact before any trading step.
           git rm --cached -r -f --ignore-unmatch data/
+          # Keep the empty directory visible in Git without committing runtime state.
+          mkdir -p data
+          touch data/.gitkeep
+          git add -f data/.gitkeep
           if git diff --cached --quiet; then
             echo "Runtime state is already externalized; no Git data snapshot is needed."
             exit 0
