@@ -67,7 +67,6 @@ NEVER_REWRITE_STATE_FILES = {
     "actions.jsonl",
     "signal_history.jsonl",
     "runtime_version.json",
-    "research_outcomes_restore_state.json",
     "retention_archive_state.json",
 }
 

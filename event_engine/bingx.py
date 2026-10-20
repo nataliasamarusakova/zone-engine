@@ -52,6 +52,7 @@ POSITION_PATH = os.environ.get("BINGX_POSITIONS_PATH", "/openApi/swap/v2/user/po
 LEVERAGE_PATH = "/openApi/swap/v2/trade/leverage"
 POSITION_MODE_PATH = "/openApi/swap/v1/positionSide/dual"
 OPEN_ORDERS_PATH = "/openApi/swap/v2/trade/openOrders"
+TWAP_OPEN_ORDERS_PATH = "/openApi/swap/v1/twap/openOrders"
 BOOK_TICKER_PATH = "/openApi/swap/v2/quote/bookTicker"
 TICKER_PATH = "/openApi/swap/v2/quote/ticker"
 DEPTH_PATH = "/openApi/swap/v2/quote/depth"
@@ -617,7 +618,79 @@ def get_positions(*, timeout_sec: float | None = None, retryable: bool = True) -
     )
     if resp.get("code") != 0:
         raise RuntimeError(f"[BINGX] get_positions failed: code={resp.get('code')} msg={resp.get('msg')}")
-    return _normalize_orders_list(resp)
+    data = resp.get("data")
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("positions", "position"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                return [value]
+        if "positionAmt" in data and "symbol" in data:
+            return [data]
+    raise RuntimeError("[BINGX] get_positions returned an unrecognized response shape; refusing to assume the account is flat")
+
+
+def get_all_open_orders(*, timeout_sec: float | None = None, retryable: bool = True) -> list[dict]:
+    """Fetch all open swap orders for clean-start safety checks.
+
+    The symbol parameter is intentionally omitted so the exchange can return the
+    account-wide open-order set. Any API error fails closed at the caller.
+    """
+    resp = _request(
+        "GET",
+        OPEN_ORDERS_PATH,
+        {},
+        signed=True,
+        timeout_sec=timeout_sec,
+        retryable=retryable,
+    )
+    if resp.get("code") != 0:
+        raise RuntimeError(f"[BINGX] get_all_open_orders failed: code={resp.get('code')} msg={resp.get('msg')}")
+    data = resp.get("data")
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("orders", "order"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                return [value]
+        # A single order object is accepted, but an unrecognized object is not
+        # interpreted as an empty account.
+        if "orderId" in data or "clientOrderId" in data:
+            return [data]
+    raise RuntimeError("[BINGX] get_all_open_orders returned an unrecognized response shape; refusing clean start")
+
+
+def get_all_open_twap_orders(*, timeout_sec: float | None = None, retryable: bool = True) -> list[dict]:
+    """Fetch account-wide open TWAP strategy orders for clean-start safety checks."""
+    resp = _request(
+        "GET",
+        TWAP_OPEN_ORDERS_PATH,
+        {},
+        signed=True,
+        timeout_sec=timeout_sec,
+        retryable=retryable,
+    )
+    if resp.get("code") != 0:
+        raise RuntimeError(f"[BINGX] get_all_open_twap_orders failed: code={resp.get('code')} msg={resp.get('msg')}")
+    data = resp.get("data")
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("orders", "list"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                return [value]
+        if "mainOrderId" in data or "orderId" in data:
+            return [data]
+    raise RuntimeError("[BINGX] get_all_open_twap_orders returned an unrecognized response shape; refusing clean start")
 
 
 def get_order(

@@ -19,7 +19,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 BUNDLE_FORMAT = "zone-engine-runtime-state"
-BUNDLE_SCHEMA_VERSION = 1
+BUNDLE_SCHEMA_VERSION = 2
 MANIFEST_NAME = "runtime-state-manifest.json"
 
 # Files managed by a separate retention-artifact chain or generated locally are not
@@ -57,16 +57,10 @@ REQUIRED_FILES = (
     "data/research_manifest.json",
     "data/research_outcome_state.json",
     "data/research_outcomes.jsonl",
-    "data/research_outcomes_restore_state.json",
     "data/zone_observations.jsonl",
     # Retention state/manifest are persisted here; the archive payload itself is separate.
     "data/data_retention_manifest.json",
-    "data/retention_archive_state.json",
     "data/runtime_version.json",
-    # Immutable seed history required to keep forward research reproducible.
-    "bootstrap/research_history_seed/2026-10-16/manifest.json",
-    "bootstrap/research_history_seed/2026-10-16/market_bars_5m.jsonl.before_2026-10-16.jsonl.gz",
-    "bootstrap/research_history_seed/2026-10-16/research_outcomes.jsonl.before_2026-10-16.jsonl.gz",
 )
 
 
@@ -93,48 +87,41 @@ def _is_excluded_data_path(relative: Path) -> bool:
     return False
 
 
-def _collect_source_files(data_dir: Path, seed_dir: Path) -> list[tuple[Path, str]]:
+def _collect_source_files(data_dir: Path) -> list[tuple[Path, str]]:
     result: list[tuple[Path, str]] = []
     if not data_dir.is_dir():
         raise RuntimeError(f"Runtime data directory is missing: {data_dir}")
-    if not seed_dir.is_dir():
-        raise RuntimeError(f"Research history seed directory is missing: {seed_dir}")
-
     for path in sorted(data_dir.rglob("*")):
         rel = path.relative_to(data_dir)
+        if rel.parts and rel.parts[0] == "research_history_seed":
+            raise RuntimeError(f"Legacy research recovery seed is not allowed in a clean runtime: {path}")
         if _is_excluded_data_path(rel):
             continue
         if path.is_symlink():
             raise RuntimeError(f"Refusing to bundle symlink in runtime data: {path}")
         if path.is_file():
             result.append((path, (Path("data") / rel).as_posix()))
-
-    for path in sorted(seed_dir.rglob("*")):
-        if path.is_symlink():
-            raise RuntimeError(f"Refusing to bundle symlink in research seed: {path}")
-        if path.is_file():
-            rel = path.relative_to(seed_dir)
-            result.append((path, (Path("bootstrap") / "research_history_seed" / rel).as_posix()))
-
     return sorted(result, key=lambda item: item[1])
 
 
 def create_bundle(
-    *, data_dir: Path, seed_dir: Path, output_dir: Path,
+    *, data_dir: Path, output_dir: Path,
     source_commit: str = "", run_id: str = "",
 ) -> dict[str, Any]:
+    data_dir = Path(data_dir)
+    output_dir = Path(output_dir)
+    if data_dir.is_symlink() or output_dir.is_symlink():
+        raise RuntimeError("Runtime data and bundle output paths must not be symlinks")
     data_dir = data_dir.resolve()
-    seed_dir = seed_dir.resolve()
     output_dir = output_dir.resolve()
-    if _paths_overlap(output_dir, data_dir) or _paths_overlap(output_dir, seed_dir):
-        raise RuntimeError("Bundle output must be outside runtime data and seed directories")
+    if _paths_overlap(output_dir, data_dir):
+        raise RuntimeError("Bundle output must be outside runtime data")
 
     if output_dir.exists():
         shutil.rmtree(output_dir)
     (output_dir / "data").mkdir(parents=True)
-    (output_dir / "bootstrap" / "research_history_seed").mkdir(parents=True)
 
-    source_files = _collect_source_files(data_dir, seed_dir)
+    source_files = _collect_source_files(data_dir)
     records: list[dict[str, Any]] = []
     for source, relative in source_files:
         target = output_dir / Path(relative)
@@ -169,21 +156,6 @@ def create_bundle(
     return manifest
 
 
-def check_legacy_snapshot(*, data_dir: Path, seed_dir: Path) -> None:
-    data_dir = data_dir.resolve()
-    seed_dir = seed_dir.resolve()
-    missing = []
-    for relative in REQUIRED_FILES:
-        if relative.startswith("data/"):
-            candidate = data_dir / relative.removeprefix("data/")
-        else:
-            candidate = seed_dir / Path(*PurePosixPath(relative).parts[2:])
-        if not candidate.is_file() or candidate.is_symlink():
-            missing.append(relative)
-    if missing:
-        raise RuntimeError("Legacy runtime snapshot is incomplete: " + ", ".join(sorted(missing)))
-    print(f"Legacy runtime snapshot is complete: {len(REQUIRED_FILES)} required files")
-
 
 def _validate_required_paths(paths: set[str]) -> None:
     missing = sorted(set(REQUIRED_FILES) - paths)
@@ -192,6 +164,9 @@ def _validate_required_paths(paths: set[str]) -> None:
 
 
 def verify_bundle(bundle_dir: Path) -> dict[str, Any]:
+    bundle_dir = Path(bundle_dir)
+    if bundle_dir.is_symlink():
+        raise RuntimeError(f"Refusing symlinked runtime-state bundle directory: {bundle_dir}")
     bundle_dir = bundle_dir.resolve()
     manifest_path = bundle_dir / MANIFEST_NAME
     if not manifest_path.is_file() or manifest_path.is_symlink():
@@ -216,8 +191,8 @@ def verify_bundle(bundle_dir: Path) -> dict[str, Any]:
         parsed = PurePosixPath(rel)
         if parsed.is_absolute() or ".." in parsed.parts or "\\" in rel:
             raise RuntimeError(f"Unsafe runtime-state manifest path: {rel!r}")
-        if not (rel.startswith("data/") or rel.startswith("bootstrap/research_history_seed/")):
-            raise RuntimeError(f"Unexpected path in runtime-state bundle: {rel!r}")
+        if not rel.startswith("data/") or rel.startswith("data/research_history_seed/"):
+            raise RuntimeError(f"Unexpected path in clean runtime-state bundle: {rel!r}")
         if rel in expected:
             raise RuntimeError(f"Duplicate path in runtime-state manifest: {rel}")
         size = record.get("size_bytes")
@@ -255,54 +230,38 @@ def verify_bundle(bundle_dir: Path) -> dict[str, Any]:
     return manifest
 
 
-def restore_bundle(*, bundle_dir: Path, data_dir: Path, seed_dir: Path) -> None:
+def restore_bundle(*, bundle_dir: Path, data_dir: Path) -> None:
+    bundle_dir = Path(bundle_dir)
+    data_dir = Path(data_dir)
+    if bundle_dir.is_symlink() or data_dir.is_symlink():
+        raise RuntimeError("Runtime bundle and restore target paths must not be symlinks")
     bundle_dir = bundle_dir.resolve()
     data_dir = data_dir.resolve()
-    seed_dir = seed_dir.resolve()
     verify_bundle(bundle_dir)
+    if _paths_overlap(bundle_dir, data_dir):
+        raise RuntimeError("Bundle path must not overlap restore target")
 
-    if data_dir == seed_dir or data_dir in seed_dir.parents or seed_dir in data_dir.parents:
-        raise RuntimeError("Runtime data and research seed targets must be separate directories")
-    if _paths_overlap(bundle_dir, data_dir) or _paths_overlap(bundle_dir, seed_dir):
-        raise RuntimeError("Bundle path must not overlap restore targets")
-
-    # Stage both directory trees before replacing either target, then retain backups
-    # so a local filesystem failure can be rolled back before the bot starts.
     data_dir.parent.mkdir(parents=True, exist_ok=True)
-    seed_dir.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="zone-runtime-restore-") as temporary:
         tmp = Path(temporary)
         staged_data = tmp / "staged-data"
-        staged_seed = tmp / "staged-seed"
         shutil.copytree(bundle_dir / "data", staged_data)
-        shutil.copytree(bundle_dir / "bootstrap" / "research_history_seed", staged_seed)
         backup_data = tmp / "backup-data"
-        backup_seed = tmp / "backup-seed"
         had_data = data_dir.exists()
-        had_seed = seed_dir.exists()
-        moved_data = moved_seed = installed_data = installed_seed = False
+        moved_data = installed_data = False
         try:
             if had_data:
                 data_dir.rename(backup_data)
                 moved_data = True
-            if had_seed:
-                seed_dir.rename(backup_seed)
-                moved_seed = True
             staged_data.rename(data_dir)
             installed_data = True
-            staged_seed.rename(seed_dir)
-            installed_seed = True
         except Exception:
-            if installed_seed and seed_dir.exists():
-                shutil.rmtree(seed_dir)
             if installed_data and data_dir.exists():
                 shutil.rmtree(data_dir)
             if moved_data and backup_data.exists():
                 backup_data.rename(data_dir)
-            if moved_seed and backup_seed.exists():
-                backup_seed.rename(seed_dir)
             raise
-    print("Restored verified runtime state and research-history seed from artifact.")
+    print("Restored verified runtime state from artifact.")
 
 
 def _snapshot_excluded(relative: Path) -> bool:
@@ -310,6 +269,9 @@ def _snapshot_excluded(relative: Path) -> bool:
 
 
 def data_snapshot(data_dir: Path) -> dict[str, dict[str, Any]]:
+    data_dir = Path(data_dir)
+    if data_dir.is_symlink():
+        raise RuntimeError(f"Refusing symlinked runtime data directory in snapshot: {data_dir}")
     if not data_dir.is_dir():
         raise RuntimeError(f"Runtime data directory is missing: {data_dir}")
     inventory: dict[str, dict[str, Any]] = {}
@@ -367,14 +329,9 @@ def main(argv: list[str] | None = None) -> int:
 
     create = sub.add_parser("create", help="Build a self-verifying runtime-state bundle")
     create.add_argument("--data-dir", type=Path, default=Path("data"))
-    create.add_argument("--seed-dir", type=Path, default=Path("bootstrap/research_history_seed"))
     create.add_argument("--output-dir", type=Path, default=Path("runtime-state-bundle"))
     create.add_argument("--source-commit", default=os.environ.get("GITHUB_SHA", ""))
     create.add_argument("--run-id", default=os.environ.get("GITHUB_RUN_ID", ""))
-
-    legacy = sub.add_parser("check-legacy", help="Confirm a complete legacy Git state exists before first migration")
-    legacy.add_argument("--data-dir", type=Path, default=Path("data"))
-    legacy.add_argument("--seed-dir", type=Path, default=Path("bootstrap/research_history_seed"))
 
     verify = sub.add_parser("verify", help="Verify a downloaded bundle without restoring it")
     verify.add_argument("--bundle-dir", type=Path, required=True)
@@ -382,7 +339,6 @@ def main(argv: list[str] | None = None) -> int:
     restore = sub.add_parser("restore", help="Verify and restore an artifact bundle")
     restore.add_argument("--bundle-dir", type=Path, required=True)
     restore.add_argument("--data-dir", type=Path, default=Path("data"))
-    restore.add_argument("--seed-dir", type=Path, default=Path("bootstrap/research_history_seed"))
 
     snapshot = sub.add_parser("snapshot", help="Snapshot persistent runtime data before pytest")
     snapshot.add_argument("--data-dir", type=Path, default=Path("data"))
@@ -396,15 +352,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "create":
             create_bundle(
-                data_dir=args.data_dir, seed_dir=args.seed_dir, output_dir=args.output_dir,
+                data_dir=args.data_dir, output_dir=args.output_dir,
                 source_commit=args.source_commit, run_id=args.run_id,
             )
-        elif args.command == "check-legacy":
-            check_legacy_snapshot(data_dir=args.data_dir, seed_dir=args.seed_dir)
         elif args.command == "verify":
             verify_bundle(args.bundle_dir)
         elif args.command == "restore":
-            restore_bundle(bundle_dir=args.bundle_dir, data_dir=args.data_dir, seed_dir=args.seed_dir)
+            restore_bundle(bundle_dir=args.bundle_dir, data_dir=args.data_dir)
         elif args.command == "snapshot":
             write_data_snapshot(data_dir=args.data_dir, output_path=args.output)
         elif args.command == "verify-unchanged":
