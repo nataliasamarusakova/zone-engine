@@ -22,6 +22,7 @@ from event_engine.bingx import (
     get_position_directional,
     get_positions,
     get_order,
+    credentials_available,
     get_all_orders,
     get_fill_orders,
     get_open_protection_directional,
@@ -1164,20 +1165,22 @@ def format_tp_hit_message(
 
 def format_trade_closed_message(
     name: str, symbol: str, direction: str, entry_price: float, exit_price: float,
-    pnl_pct: float, realized_rr: float | None, planned_rr: float | None,
+    pnl_pct: float | None, realized_rr: float | None, planned_rr: float | None,
     duration_min: float, peak_pnl: float, max_drawdown: float,
     exit_reason: str, event_type: str, timeframe: str = "1h",
 ) -> str:
-    is_win = pnl_pct >= 0.0
-    emoji = "💚" if is_win else "💔"
-    pnl_sign = "+" if pnl_pct > 0 else ""
+    is_confirmed = pnl_pct is not None
+    is_win = is_confirmed and pnl_pct >= 0.0
+    emoji = "💚" if is_win else "💔" if is_confirmed else "⚪"
+    pnl_sign = "+" if is_confirmed and pnl_pct > 0 else ""
+    pnl_text = f"{pnl_sign}{pnl_pct:.2f}%" if is_confirmed else "не подтверждён"
     realized_rr_text = f"{realized_rr:.3f}" if realized_rr is not None else "—"
     planned_rr_text = f"{planned_rr:.3f}" if planned_rr is not None else "—"
 
     lines = [
         f"{emoji} <b>{_display_symbol(symbol)} — сделка закрыта</b>",
         "",
-        f"Вход <code>{entry_price:.8g}</code> → Выход <code>{exit_price:.8g}</code>   <b>{pnl_sign}{pnl_pct:.2f}%</b>",
+        f"Вход <code>{entry_price:.8g}</code> → Выход <code>{exit_price:.8g}</code>   <b>{pnl_text}</b>",
         f"Realized R:R: <b>{realized_rr_text}</b> · Planned Weighted R:R: <b>{planned_rr_text}</b>",
         f"Держали <b>{duration_min:.1f} мин</b> · пик <b>+{peak_pnl:.2f}%</b> · просадка <b>{max_drawdown:.2f}%</b>",
         f"Вход: <code>{event_type}</code> · TF <b>{str(timeframe or '1h').lower()}</b>",
@@ -1187,7 +1190,7 @@ def format_trade_closed_message(
     return "\n".join(lines)
 
 
-def _cancel_old_sl_verified(symbol: str, direction: str, order_id: str, max_attempts: int = 3) -> tuple[bool, str]:
+def _cancel_old_sl_verified(symbol: str, direction: str, order_id: str, max_attempts: int = 3, *, owner_event_id: str | None = None) -> tuple[bool, str]:
     """Cancel an SL order and verify it actually disappeared (audit fix B4).
 
     Returns (cancelled, message). After failing DELETE attempts we re-query
@@ -1195,14 +1198,45 @@ def _cancel_old_sl_verified(symbol: str, direction: str, order_id: str, max_atte
     an error code while the order is in fact gone.
     """
     last_error = ""
+    # Resolve ownership before DELETE. Never cancel a manual/user SL merely
+    # because its ID was copied into local trade state by an older version.
+    try:
+        current = get_open_protection_directional(symbol, direction)
+    except Exception as exc:
+        return False, f"ownership preflight failed: {exc}"
+    if current.get("status") != "ok":
+        return False, f"ownership preflight unavailable: {current.get('error', 'openOrders unavailable')}"
+    matched = next((o for o in current.get("sl_orders", []) if str(o.get("orderId", "")) == str(order_id)), None)
+    if matched is None:
+        return True, "already_gone_from_open_orders"
+    if not str(matched.get("clientOrderId", "")).upper().startswith("EVT_"):
+        return False, "refusing to cancel non-engine/manual SL"
+    try:
+        active = _load_active_trades_required()
+        owners = _order_ids_owned_by_other_trades(active, {str(order_id)}, exclude_event_id=str(owner_event_id or ""))
+    except Exception as exc:
+        return False, f"ownership state unavailable: {exc}"
+    if owners:
+        return False, f"refusing to cancel SL owned by other active trade: {owners}"
     for attempt in range(max_attempts):
         try:
             resp = cancel_order(symbol, order_id)
         except Exception as exc:
             resp = {"code": -1, "msg": str(exc)}
         if isinstance(resp, dict) and resp.get("code") in (0, "0"):
-            return True, "cancelled"
-        last_error = str(resp.get("msg", resp)) if isinstance(resp, dict) else str(resp)
+            try:
+                after = get_open_protection_directional(symbol, direction)
+            except Exception as exc:
+                after = {"status": "error", "error": str(exc)}
+            if after.get("status") == "ok":
+                open_ids = {str(o.get("orderId", "")) for o in (after.get("sl_orders", []) + after.get("tp_orders", []))}
+                if str(order_id) not in open_ids:
+                    return True, "cancelled_verified_absent"
+                last_error = "cancel acknowledged but SL remains visible in openOrders"
+            else:
+                last_error = f"cancel acknowledged but openOrders verification failed: {after.get('error', 'unknown')}"
+        else:
+            last_error = str(resp.get("msg", resp)) if isinstance(resp, dict) else str(resp)
         if attempt + 1 < max_attempts:
             time.sleep(0.3 * (attempt + 1))
 
@@ -1477,7 +1511,11 @@ def _is_valid_break_even_stop(order: dict, direction: str, entry_price: float, q
     # get_open_protection_directional filters positionSide to LONG/SHORT/BOTH;
     # when the exchange includes the field, reject any contradictory value.
     position_side = str(order.get("positionSide", "")).upper()
-    if position_side not in {str(direction).upper(), "BOTH"}:
+    try:
+        expected_position_side = position_side_param(direction)
+    except Exception:
+        return False
+    if position_side != expected_position_side:
         return False
     side = str(order.get("side", "")).upper()
     expected_side = "SELL" if str(direction).upper() == "LONG" else "BUY"
@@ -1557,7 +1595,7 @@ def _move_sl_to_break_even(
                 old_cancelled = True
                 cancel_note = ""
                 if old_sl_id and existing_id and str(old_sl_id) != existing_id:
-                    old_cancelled, cancel_note = _cancel_old_sl_verified(symbol, direction, str(old_sl_id))
+                    old_cancelled, cancel_note = _cancel_old_sl_verified(symbol, direction, str(old_sl_id), owner_event_id=owner_event_id or trade_id)
                 if not old_cancelled:
                     log.warning(
                         "[TRACKER] BE already in place for %s but old SL %s cancel failed: %s; "
@@ -1762,7 +1800,7 @@ def _move_sl_to_break_even(
     # than closing a safely protected position.
     old_cleanup_error = None
     if old_sl_id and str(old_sl_id) != new_order_id:
-        old_cancelled, cancel_note = _cancel_old_sl_verified(symbol, direction, str(old_sl_id))
+        old_cancelled, cancel_note = _cancel_old_sl_verified(symbol, direction, str(old_sl_id), owner_event_id=owner_event_id or trade_id)
         if not old_cancelled:
             old_cleanup_error = f"old SL cleanup failed: {cancel_note}"
             log.error("[TRACKER] %s %s: BE verified but old SL cleanup failed: %s", direction, symbol, cancel_note)
@@ -2051,6 +2089,24 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
     if trade.get("exit_order_id"):
         order_roles[str(trade["exit_order_id"])] = order_roles.get(str(trade["exit_order_id"]), "EXIT")
 
+    # Emergency rollback MARKET orders are nested in durable evidence. Include
+    # every known order ID so their actual fills can complete the whole-trade PnL.
+    def _collect_emergency_order_ids(node: Any) -> None:
+        if isinstance(node, dict):
+            for key in ("order_id", "orderId", "orderID"):
+                value = node.get(key)
+                if value not in (None, ""):
+                    order_roles.setdefault(str(value), "EXIT")
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    _collect_emergency_order_ids(value)
+        elif isinstance(node, list):
+            for value in node:
+                _collect_emergency_order_ids(value)
+
+    _collect_emergency_order_ids(trade.get("be_failure_rollback"))
+    _collect_emergency_order_ids(trade.get("verified_emergency_close"))
+
     base = {
         "fills": [],
         "order_execution_evidence": [],
@@ -2059,6 +2115,7 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
         "fill_query_mode": "AGGREGATE",
         "exact_order_queries_attempted": [],
         "exact_order_query_errors": {},
+        "incomplete_order_fill_ids": [],
     }
     if not symbol or not order_roles:
         return {**base, "status": "NO_ORDER_IDS"}
@@ -2090,12 +2147,37 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
         relevant_map[_fill_key(row)] = row
 
     # The aggregate endpoint is not guaranteed to surface every order for a
-    # busy account. Retry each known order that is absent from the aggregate set.
+    # busy account. Retry absent orders, and also retry orders whose observed fill
+    # quantity is lower than exchange executedQty (partial/truncated aggregate).
     aggregate_order_ids = {str(row.get("order_id", "")) for row in relevant_map.values()}
     exact_attempts: list[str] = []
     exact_errors: dict[str, str] = {}
+    incomplete_order_fill_ids: list[str] = []
+    expected_qty_by_order: dict[str, float] = {}
+    order_evidence_cache: dict[str, dict[str, Any]] = {}
     for order_id in sorted(order_roles):
-        if order_id in aggregate_order_ids:
+        rows_for_order = [row for row in relevant_map.values() if str(row.get("order_id", "")) == order_id]
+        had_any_fill_rows = bool(rows_for_order)
+        observed_qty = sum(abs(_safe_float(row.get("qty"), 0.0)) for row in rows_for_order)
+        needs_exact = order_id not in aggregate_order_ids
+        # Order status gives us the authoritative executedQty needed to detect a
+        # truncated aggregate response. Cache it so missing-fill fallback below
+        # doesn't issue a duplicate request for the same order.
+        execution_evidence = None
+        if credentials_available():
+            try:
+                execution_evidence = _get_order_execution_evidence(symbol, order_id, entry_ts=entry_ts)
+            except Exception as exc:
+                execution_evidence = {"status": "error", "error": f"{type(exc).__name__}:{exc}"}
+            if isinstance(execution_evidence, dict):
+                order_evidence_cache[order_id] = execution_evidence
+        if isinstance(execution_evidence, dict) and execution_evidence.get("status") == "ok":
+            expected_qty = _optional_float(execution_evidence.get("executed_qty"))
+            if expected_qty is not None:
+                expected_qty_by_order[order_id] = expected_qty
+                if expected_qty > observed_qty + max(1e-10, expected_qty * 1e-6):
+                    needs_exact = True
+        if not needs_exact:
             continue
         exact_attempts.append(order_id)
         try:
@@ -2103,12 +2185,22 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
         except Exception as exc:
             exact_rows = []
             exact_errors[order_id] = f"{type(exc).__name__}:{exc}"
+        exact_rows_added = 0
         for fill in exact_rows if isinstance(exact_rows, list) else []:
             if str(fill.get("order_id", "")) != order_id:
                 continue
             row = dict(fill)
             row["role"] = order_roles.get(order_id, "UNKNOWN")
             relevant_map[_fill_key(row)] = row
+            exact_rows_added += 1
+        expected_qty = expected_qty_by_order.get(order_id)
+        if expected_qty is not None:
+            observed_after_exact = sum(
+                abs(_safe_float(row.get("qty"), 0.0))
+                for row in relevant_map.values() if str(row.get("order_id", "")) == order_id
+            )
+            if (had_any_fill_rows or exact_rows_added > 0) and expected_qty > observed_after_exact + max(1e-10, expected_qty * 1e-6):
+                incomplete_order_fill_ids.append(order_id)
 
     relevant = list(relevant_map.values())
 
@@ -2120,10 +2212,14 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
     for order_id in sorted(order_roles):
         if order_id in fill_order_ids:
             continue
-        try:
-            info = _get_order_execution_evidence(symbol, order_id, entry_ts=entry_ts)
-        except Exception as exc:
-            info = {"status": "error", "error": f"{type(exc).__name__}:{exc}"}
+        info = order_evidence_cache.get(order_id)
+        if info is None and not credentials_available():
+            continue
+        if info is None:
+            try:
+                info = _get_order_execution_evidence(symbol, order_id, entry_ts=entry_ts)
+            except Exception as exc:
+                info = {"status": "error", "error": f"{type(exc).__name__}:{exc}"}
         if not isinstance(info, dict) or info.get("status") != "ok":
             continue
         executed_qty = _safe_float(info.get("executed_qty"), 0.0)
@@ -2180,6 +2276,11 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
 
     entry_execution_complete = _complete_exec(entry_exec)
     exit_execution_complete = _complete_exec(exit_exec)
+    if incomplete_order_fill_ids:
+        if any(order_roles.get(order_id) == "ENTRY" for order_id in incomplete_order_fill_ids):
+            entry_execution_complete = False
+        if any(order_roles.get(order_id) != "ENTRY" for order_id in incomplete_order_fill_ids):
+            exit_execution_complete = False
     entry_qty = sum(float(row["qty"]) for row in entry_exec if row.get("qty") is not None)
     exit_qty = sum(float(row["qty"]) for row in exit_exec if row.get("qty") is not None)
     entry_vwap = (
@@ -2188,7 +2289,7 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
     )
 
     gross_realized_pnl_abs = None
-    if entry_vwap is not None and exit_execution_complete and direction in {"LONG", "SHORT"}:
+    if entry_vwap is not None and exit_execution_complete and direction in {"LONG", "SHORT"} and not incomplete_order_fill_ids:
         gross_realized_pnl_abs = 0.0
         for row in exit_exec:
             q = float(row["qty"])
@@ -2197,8 +2298,8 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
 
     # Financial totals remain fill-ledger-only. An order-level execution response
     # has no authoritative fee/realizedPnl fields and must not be treated as one.
-    fee_complete = bool(relevant) and _all_present_numeric(relevant, "fee") and not order_execution_evidence
-    realized_complete = bool(relevant) and _all_present_numeric(relevant, "realized_pnl") and not order_execution_evidence
+    fee_complete = bool(relevant) and _all_present_numeric(relevant, "fee") and not order_execution_evidence and not incomplete_order_fill_ids
+    realized_complete = bool(relevant) and _all_present_numeric(relevant, "realized_pnl") and not order_execution_evidence and not incomplete_order_fill_ids
     exchange_realized_pnl_abs = sum(float(_optional_float(f.get("realized_pnl"))) for f in relevant) if realized_complete else None
     entry_fee_raw = exit_fee_raw = fee_raw_total = fees_paid_abs = None
     if fee_complete:
@@ -2246,7 +2347,7 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
 
     exit_vwap_confirmed = (
         sum(float(row["qty"]) * float(row["price"]) for row in exit_exec) / exit_qty
-        if exit_execution_complete and exit_qty > 0 else None
+        if exit_execution_complete and exit_qty > 0 and not incomplete_order_fill_ids else None
     )
     exit_sources = {str(row.get("source") or "").upper() for row in exit_exec}
     if exit_vwap_confirmed is None:
@@ -2260,12 +2361,12 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
     else:
         exit_vwap_source = "UNAVAILABLE"
     execution_qty_status = (
-        "VERIFIED" if entry_execution_complete and exit_execution_complete and exit_qty >= entry_qty - qty_tolerance
+        "VERIFIED" if entry_execution_complete and exit_execution_complete and exit_qty >= entry_qty - qty_tolerance and not incomplete_order_fill_ids
         else "PARTIAL_OR_UNVERIFIED"
     )
     status = (
-        "VERIFIED" if entry_execution_complete and exit_execution_complete and not order_execution_evidence
-        else "VERIFIED_ORDER_EXECUTION" if entry_execution_complete and exit_execution_complete
+        "VERIFIED" if entry_execution_complete and exit_execution_complete and not order_execution_evidence and not incomplete_order_fill_ids
+        else "VERIFIED_ORDER_EXECUTION" if entry_execution_complete and exit_execution_complete and not incomplete_order_fill_ids
         else "PARTIAL_ACCOUNTING"
     )
     return {
@@ -2304,6 +2405,7 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
         "aggregate_query_error": aggregate_error,
         "exact_order_queries_attempted": exact_attempts,
         "exact_order_query_errors": exact_errors,
+        "incomplete_order_fill_ids": sorted(set(incomplete_order_fill_ids)),
     }
 
 
@@ -2717,7 +2819,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
             if isinstance(pending_cleanup, dict) and pending_cleanup.get("old_order_id"):
                 try:
                     cleanup_ok, cleanup_note = _cancel_old_sl_verified(
-                        symbol, direction, str(pending_cleanup["old_order_id"]),
+                        symbol, direction, str(pending_cleanup["old_order_id"]), owner_event_id=str(event_id),
                     )
                 except Exception as cleanup_exc:
                     cleanup_ok, cleanup_note = False, str(cleanup_exc)
@@ -2848,6 +2950,19 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                     trade["be_activated"] = True
                     trade["be_required"] = False
                     trade["be_last_error"] = retry.get("error") if retry_status == "created_cleanup_pending" else None
+                    tp1_fill_event = next((
+                        x for x in reversed(trade.get("tp_fill_events", []))
+                        if isinstance(x, dict) and str(x.get("leg", "")).upper() == "TP1"
+                    ), None)
+                    tp1_trigger_ts = (
+                        _optional_float((tp1_fill_event or {}).get("fill_time_ms"))
+                        or _optional_float((tp1_fill_event or {}).get("order_update_time_ms"))
+                        or _optional_float((tp1_fill_event or {}).get("ts"))
+                    )
+                    trade["be_trigger_ts"] = trade.get("be_trigger_ts") or (int(tp1_trigger_ts) if tp1_trigger_ts else now_ms)
+                    trade["be_trigger_peak_r"] = trade.get("be_trigger_peak_r") if trade.get("be_trigger_peak_r") is not None else peak_r
+                    trade["be_trigger_rule"] = trade.get("be_trigger_rule") or "tp1_filled"
+                    trade["be_trigger_price"] = trade.get("be_trigger_price") or _safe_float(retry.get("stop_price"), entry_price)
                     trade["be_activation_ts"] = trade.get("be_activation_ts") or now_ms
                     trade["be_order_id"] = retry.get("order_id")
                     pending_old_sl_id = retry.get("old_sl_cleanup_pending_order_id")
@@ -3479,9 +3594,14 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                 "weighted_pnl_pct": (realized_weighted / realized_qty) if realized_qty > 0 else None,
             }
 
-            final_pnl = (realized_weighted / init_qty) if (init_qty > 0 and realized_qty > 0) else current_pnl
+            partial_pnl_contribution = (realized_weighted / init_qty) if (init_qty > 0 and realized_qty > 0) else None
+            final_pnl = (
+                partial_pnl_contribution if residual_exit_verified and partial_pnl_contribution is not None
+                else current_pnl if residual_exit_verified else None
+            )
             realized_pnl_source = (
-                "executed_tp_or_sl" if (closed_by_tp or sl_exit_price is not None)
+                "UNVERIFIED_RESIDUAL_EXIT" if not residual_exit_verified
+                else "executed_tp_or_sl" if (closed_by_tp or sl_exit_price is not None)
                 else (hist_source or "observation_price_estimate")
             )
             exit_price_semantics = "UNAVAILABLE"
@@ -3506,9 +3626,12 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
             else:
                 exit_price_semantics = "OBSERVED_PRICE_ESTIMATE"
             planned_risk_pct = _derive_planned_risk_pct(trade)
-            realized_rr = _calc_realized_rr(final_pnl, planned_risk_pct) if realized_pnl_source == "executed_tp_or_sl" else None
-            final_weighted_rr = _calc_realized_rr(final_pnl, planned_risk_pct) if planned_risk_pct and planned_risk_pct > 0 else None
-            projected_rr, realized_rr_component, remaining_rr_component = _weighted_rr_snapshot({**trade, "remaining_qty": 0.0, "realized_pnl_qty": init_qty, "realized_pnl_weighted_sum": final_pnl * init_qty, "hit_legs": hit_legs})
+            realized_rr = _calc_realized_rr(final_pnl, planned_risk_pct) if final_pnl is not None and realized_pnl_source == "executed_tp_or_sl" else None
+            final_weighted_rr = _calc_realized_rr(final_pnl, planned_risk_pct) if final_pnl is not None and planned_risk_pct and planned_risk_pct > 0 else None
+            if final_pnl is not None:
+                projected_rr, realized_rr_component, remaining_rr_component = _weighted_rr_snapshot({**trade, "remaining_qty": 0.0, "realized_pnl_qty": init_qty, "realized_pnl_weighted_sum": final_pnl * init_qty, "hit_legs": hit_legs})
+            else:
+                projected_rr = realized_rr_component = remaining_rr_component = None
             effective_rr_at_close = final_weighted_rr if final_weighted_rr is not None else projected_rr
             trade["effective_weighted_rr"] = effective_rr_at_close
             trade["realized_weighted_rr"] = final_weighted_rr
@@ -3609,6 +3732,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                 trade["time_to_be_activation_min"] = max(0.0, (int(trade["be_activation_ts"]) - entry_ts) / 60000.0)
 
             trade["remaining_qty"] = 0.0
+            trade["realized_pnl_pct_confirmed_partial"] = partial_pnl_contribution if not residual_exit_verified else None
             trade["realized_pnl_pct"] = final_pnl
             trade["realized_pnl_qty"] = realized_qty
             trade["realized_pnl_weighted_sum"] = realized_weighted
@@ -3702,7 +3826,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                 _calc_trade_pnl_pct(entry_price, cur_price, direction)
                 if not residual_exit_verified else None
             )
-            emoji = "💚" if final_pnl >= 0.0 else "💔"
+            emoji = "💚" if final_pnl is not None and final_pnl >= 0.0 else "💔" if final_pnl is not None else "⚪"
             close_record = {
                 "record_type": "TRADE_CLOSE",
                 "event_id": event_id,
@@ -3723,6 +3847,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                 "exit_leg_vwap_confirmed": close_execution_evidence.get("exit_vwap_confirmed"),
                 "exit_leg_vwap_source": close_execution_evidence.get("exit_vwap_source"),
                 "realized_pnl_pct": final_pnl,
+                "realized_pnl_pct_confirmed_partial": partial_pnl_contribution if not residual_exit_verified else None,
                 "realized_rr": realized_rr,
                 "realized_pnl_source": realized_pnl_source,
                 "effective_weighted_rr": _safe_float(trade.get("effective_weighted_rr"), planned_rr),

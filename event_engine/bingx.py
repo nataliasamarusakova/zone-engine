@@ -295,7 +295,11 @@ def _request(
                         # can produce a different byte representation from the string
                         # that was signed. Send the signed canonical string verbatim.
                         if signed:
-                            canonical = _canonical_params({k: v for k, v in request_params.items() if k != "signature"})
+                            # Validate the exact same signed-value constraints for POST
+                            # bodies as for GET query strings before canonicalization/signing.
+                            signed_values = {k: v for k, v in request_params.items() if k != "signature"}
+                            _validate_signed_values(signed_values)
+                            canonical = _canonical_params(signed_values)
                             body = f"{canonical}&signature={signature}"
                             headers["Content-Type"] = "application/x-www-form-urlencoded"
                         else:
@@ -1451,6 +1455,10 @@ def get_open_protection_directional(
     direction = str(direction).upper()
     if not bx_symbol:
         return {"status": "error", "error": "contract_not_found", "tp_orders": [], "sl_orders": []}
+    try:
+        expected_position_side = position_side_param(direction)
+    except Exception as exc:
+        return {"status": "error", "error": f"position mode unavailable: {exc}", "tp_orders": [], "sl_orders": []}
 
     resp = _request(
         "GET",
@@ -1466,8 +1474,11 @@ def get_open_protection_directional(
     sl_orders = []
 
     for order in _normalize_orders_list(resp):
+        # Include both plausible directional labels so reconciliation can see and
+        # clean stale engine-owned orders. Every adoption/verification path below
+        # still requires the exact account-mode positionSide.
         position_side = str(order.get("positionSide", "")).upper()
-        if position_side not in (direction, "BOTH"):
+        if position_side not in {direction, "BOTH"}:
             continue
 
         order_type = str(order.get("type", "")).upper()
@@ -1693,7 +1704,20 @@ def _normalize_tp_levels(tp_levels: list) -> list[dict]:
     return normalized
 
 
-def _tp_leg_from_order(order: dict, expected_leg: str, expected_price: float, price_precision: int, trade_id: str | None = None) -> bool:
+def _tp_leg_from_order(order: dict, expected_leg: str, expected_price: float, price_precision: int, trade_id: str | None = None, direction: str | None = None) -> bool:
+    # Existing exchange orders are reusable only if both the close side and
+    # account-mode positionSide match the position they are meant to protect.
+    if direction not in {"LONG", "SHORT"}:
+        return False
+    expected_side = "SELL" if direction == "LONG" else "BUY"
+    if str(order.get("side", "")).upper() != expected_side:
+        return False
+    try:
+        expected_position_side = position_side_param(direction)
+    except Exception:
+        return False
+    if str(order.get("positionSide", "")).upper() != expected_position_side:
+        return False
     order_type = str(order.get("type", "")).upper()
     if order_type not in {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"}:
         return False
@@ -1716,7 +1740,7 @@ def _tp_leg_from_order(order: dict, expected_leg: str, expected_price: float, pr
         if client_id == f"EVT_{_trade_digest(trade_id)}_{expected_leg}":
             return actual_formatted == expected_formatted
 
-    if f"_{expected_leg}_" in f"_{client_id}_":
+    if client_id.startswith("EVT_") and f"_{expected_leg}_" in f"_{client_id}_":
         return actual_formatted == expected_formatted
     return False
 
@@ -2788,9 +2812,16 @@ def _verify_open_order(
                 qty = _order_qty(order)
                 actual_price = float(order.get("stopPrice", 0) or order.get("price", 0) or 0)
                 type_ok = str(order.get("type", "")).upper() == expected_kind
+                expected_side = "SELL" if str(direction).upper() == "LONG" else "BUY"
+                side_ok = str(order.get("side", "")).upper() == expected_side
+                try:
+                    expected_position_side = position_side_param(direction)
+                except Exception:
+                    expected_position_side = None
+                position_side_ok = bool(expected_position_side) and str(order.get("positionSide", "")).upper() == expected_position_side
                 price_ok = _format_price(actual_price, price_precision) == _format_price(expected_price, price_precision)
                 qty_ok = _qty_matches_position(qty, expected_qty)
-                if type_ok and price_ok and qty_ok:
+                if type_ok and side_ok and position_side_ok and price_ok and qty_ok:
                     return {"status": "verified", "order": order, "attempt": attempt + 1}
         if attempt + 1 < max(1, max_attempts):
             time.sleep(0.25 * (attempt + 1))
@@ -2944,9 +2975,18 @@ def ensure_directional_protection(
         if sl_price <= 0 or sl_qty <= 0:
             continue
 
+        expected_side = "SELL" if direction == "LONG" else "BUY"
+        side_matches = str(sl.get("side", "")).upper() == expected_side
+        try:
+            expected_position_side = position_side_param(direction)
+        except Exception:
+            expected_position_side = None
+        position_side_matches = bool(expected_position_side) and str(sl.get("positionSide", "")).upper() == expected_position_side
         protective_side = (sl_price <= avg_price) if direction == "LONG" else (sl_price >= avg_price)
         qty_matches = _qty_matches_position(sl_qty, position_qty)
-        if protective_side and qty_matches and valid_existing_sl is None:
+        client_id = str(sl.get("clientOrderId", "")).upper()
+        engine_owned = client_id.startswith("EVT_")
+        if protective_side and side_matches and position_side_matches and qty_matches and engine_owned and valid_existing_sl is None:
             valid_existing_sl = sl
             continue
 
@@ -2954,9 +2994,8 @@ def ensure_directional_protection(
         # must never remain alongside a newly-created protective SL. Manual
         # orders are intentionally left untouched; the engine only cleans its
         # own EVT_* protection orders.
-        client_id = str(sl.get("clientOrderId", ""))
         order_id = str(sl.get("orderId", ""))
-        if order_id and client_id.upper().startswith("EVT_"):
+        if order_id and engine_owned:
             engine_owned_invalid_sl_ids.append(order_id)
 
     if engine_owned_invalid_sl_ids:
@@ -2972,6 +3011,8 @@ def ensure_directional_protection(
             "client_order_id": str(sl.get("clientOrderId", "")),
             "stop_price": float(sl.get("stopPrice", 0) or sl.get("price", 0) or 0),
             "qty": float(sl.get("origQty", 0) or sl.get("quantity", 0) or position_qty),
+            "side": str(sl.get("side", "")).upper(),
+            "positionSide": str(sl.get("positionSide", "")).upper(),
             "protection_order_verified": True,
             "execution_verified": None,
         }
@@ -3024,6 +3065,8 @@ def ensure_directional_protection(
                 "client_order_id": order.get("clientOrderId") or client_order_id,
                 "stop_price": float(order.get("stopPrice", 0) or order.get("price", 0) or sl_price),
                 "qty": _order_qty(order),
+                "side": str(order.get("side", "")).upper(),
+                "positionSide": str(order.get("positionSide", "")).upper(),
                 "protection_order_verified": True,
                 "execution_verified": None,
             }
@@ -3034,6 +3077,8 @@ def ensure_directional_protection(
                 "client_order_id": order.get("clientOrderId") or client_order_id,
                 "stop_price": sl_price,
                 "qty": position_qty,
+                "side": "SELL" if direction == "LONG" else "BUY",
+                "positionSide": position_side_param(direction),
                 "protection_order_verified": True,
                 "execution_verified": None,
             }
@@ -3142,7 +3187,7 @@ def ensure_directional_protection(
 
         existing_leg = None
         for order in existing_tp:
-            if _tp_leg_from_order(order, leg, tp_price, price_precision, trade_id):
+            if _tp_leg_from_order(order, leg, tp_price, price_precision, trade_id, direction):
                 existing_leg = order
                 break
 
@@ -3377,6 +3422,17 @@ def _validate_sl_order_for_position(order: dict, direction: str, avg_price: floa
         return False
 
     direction = str(direction).upper()
+    if direction not in {"LONG", "SHORT"}:
+        return False
+    expected_side = "SELL" if direction == "LONG" else "BUY"
+    if str(order.get("side", "")).upper() != expected_side:
+        return False
+    try:
+        expected_position_side = position_side_param(direction)
+    except Exception:
+        return False
+    if str(order.get("positionSide", "")).upper() != expected_position_side:
+        return False
     if position_qty is not None and not _qty_matches_position(qty, float(position_qty)):
         return False
 

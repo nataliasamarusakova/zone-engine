@@ -76,6 +76,10 @@ def initialize_empty_runtime(data_dir: Path) -> None:
     if data_dir.exists():
         shutil.rmtree(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
+    # The empty tracked placeholder is repository structure, not runtime state.
+    # Recreate it after replacing the directory so CI policy tests and clean checkouts
+    # keep data/ present even though runtime snapshots intentionally exclude it.
+    (data_dir / ".gitkeep").touch(exist_ok=True)
     json_defaults: dict[str, Any] = {
         "active_trades.json": {},
         "event_execution_claims.json": {},

@@ -283,6 +283,9 @@ def restore_bundle(*, bundle_dir: Path, data_dir: Path) -> None:
                 moved_data = True
             staged_data.rename(data_dir)
             installed_data = True
+            # .gitkeep is intentionally excluded from snapshots; preserve the
+            # checkout's empty-directory marker across artifact restoration.
+            (data_dir / ".gitkeep").touch(exist_ok=True)
         except Exception:
             if installed_data and data_dir.exists():
                 shutil.rmtree(data_dir)
