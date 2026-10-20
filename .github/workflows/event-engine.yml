@@ -65,8 +65,9 @@ jobs:
       TREND_FILTER_SLOPE_LOOKBACK_4H: "6"
       TREND_FILTER_HISTORY_BUFFER_BARS: "12"
       TREND_FILTER_REQUIRE_PERSISTENCE: "false"
-      ENTRY_CONTEXT_TELEMETRY_ENABLED: "true"
+      ENTRY_CONTEXT_TELEMETRY_ENABLED: "false"
       ENTRY_CONTEXT_DEPTH_LEVELS: "20"
+      REQUEST_TIMING_METRICS: "false"
       ENTRY_CONTEXT_TRADES_LIMIT: "100"
       ENTRY_CONTEXT_HTTP_TIMEOUT_SEC: "2.0"
       # Research must never add the four-endpoint microstructure sweep to the
@@ -165,19 +166,39 @@ jobs:
                 echo "::error::Could not verify the workflow result for runtime-state artifact id=$candidate_artifact_id; refusing to guess or initialize empty state."
                 exit 1
               fi
-              if jq -e --argjson expected_workflow_id "$workflow_id" '
+              if ! jq -e --argjson expected_workflow_id "$workflow_id" '
                 .workflow_id == $expected_workflow_id
                 and .head_branch == "main"
                 and .event == "repository_dispatch"
                 and .status == "completed"
-                and .conclusion == "success"
               ' >/dev/null <<< "$run_json"; then
+                echo "Ignoring runtime-state artifact id=$candidate_artifact_id because it is not from a completed event-engine run on main."
+                continue
+              fi
+              # A later workflow step (for example Git externalization) can fail
+              # after the state bundle has been created, uploaded and checksum-verified.
+              # Do not discard that newer snapshot solely because the overall run
+              # conclusion is failure: trust it only when all state-critical steps
+              # independently completed successfully.
+              trusted_state_steps="false"
+              if jobs_json="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/actions/runs/${candidate_run_id}/jobs?per_page=100" 2>/dev/null)"; then
+                if jq -e '
+                  [.[].jobs[]?.steps[]?] as $steps
+                  | ($steps | any(.name == "Run engine" and .conclusion == "success"))
+                  and ($steps | any(.name == "Prepare self-verifying runtime-state bundle" and .conclusion == "success"))
+                  and ($steps | any(.name == "Verify runtime-state artifact is durable" and .conclusion == "success"))
+                  and ($steps | any(.name == "Download and verify uploaded runtime-state bundle" and .conclusion == "success"))
+                ' >/dev/null <<< "$jobs_json"; then
+                  trusted_state_steps="true"
+                fi
+              fi
+              if [ "$(jq -r '.conclusion // ""' <<< "$run_json")" = "success" ] || [ "$trusted_state_steps" = "true" ]; then
                 artifact_id="$candidate_artifact_id"
                 run_id="$candidate_run_id"
                 selected_created_at="$candidate_created_at"
                 break
               fi
-              echo "Ignoring runtime-state artifact id=$candidate_artifact_id because it is not from a successful event-engine run on main."
+              echo "Ignoring runtime-state artifact id=$candidate_artifact_id because neither the full run nor its state-critical steps succeeded."
             done <<< "$artifact_candidates"
           fi
 
