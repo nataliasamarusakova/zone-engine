@@ -687,7 +687,7 @@ def _execution_outcome_category(status: str) -> str:
         return "PROTECTION_FAILURE"
     if "UNVERIFIED" in value or "TIMEOUT" in value:
         return "EXECUTION_UNVERIFIED"
-    if value in {"ENTRY_NOT_FILLED", "SKIPPED_MIN_QTY", "SKIPPED_TP_MIN_QTY", "SKIPPED_INVALID_SETUP", "SKIPPED_STALE_SIGNAL", "EXECUTION_QUOTE_UNAVAILABLE", "BLOCKED_PROTECTION_PREFLIGHT"}:
+    if value in {"ENTRY_NOT_FILLED", "SKIPPED_MIN_QTY", "SKIPPED_TP_MIN_QTY", "SKIPPED_INVALID_SETUP", "SKIPPED_STALE_SIGNAL", "EXECUTION_QUOTE_UNAVAILABLE", "BLOCKED_PROTECTION_PREFLIGHT", "BLOCKED_PRIVATE_PREFLIGHT"}:
         return "EXECUTION_BLOCKED"
     if value in {"ERROR", "OPENED", "DISABLED", "BLOCKED_MISSING_CREDENTIALS"} or value.endswith("_FAILED") or value.startswith("FAILED"):
         return "EXECUTION_FAILURE"
@@ -1566,7 +1566,7 @@ def _process_5m_zone_visits(
                         "structure_room_R": (structural_distance / research_risk_abs) if research_risk_abs else None,
                     })
             try:
-                signal = _build_5m_zone_signal(symbol, direction, zone, bar, prev, df_1h, demand, supply, zs, df_5m=x)
+                signal = _build_5m_zone_signal(symbol, direction, zone, bar, prev, df_1h, demand, supply, state, df_5m=x)
             except ValueError as exc:
                 reason = str(exc)
                 zs.update({"state": "LOCKED", "lock_reason": reason, "trigger_event_id": None})
@@ -2263,6 +2263,12 @@ def reconcile_all_open_positions() -> bool:
                     "error": f"ensure_directional_protection raised: {type(protection_exc).__name__}: {protection_exc}",
                 }
                 log.exception("[RECON_PROTECTION_EXCEPTION] %s %s event=%s; escalating to emergency close", symbol, side, event_id)
+            if tp_recovery_pending and result.get("status") == "PROTECTED" and not result.get("tp_orders"):
+                # A confirmed SL alone is not a complete TP recovery. Keep the SL,
+                # but make the incomplete state visible to reconciliation and block
+                # new entries until tracker books the recovered fill and restores TP.
+                result["status"] = "SL_ONLY"
+                result["error"] = "tp_recovery_pending: TP recreation deferred until recovered fill is booked"
             if result.get("status") in {"PROTECTED", "SL_ONLY"}:
                 updated = update_active_trade_protection(
                     symbol, side, result.get("tp_orders", []), result.get("sl_result", {}),
@@ -2756,7 +2762,12 @@ def _emergency_close_and_verify(symbol: str, direction: str, qty: float, trade_i
         response = close_result.get("response")
         if close_result.get("status") == "error" and isinstance(response, dict):
             code = response.get("code")
-            return code not in (None, 0, "0")
+            # _request uses -1 as a local sentinel for missing credentials,
+            # transport errors and timeouts. That is not an exchange rejection: the
+            # MARKET POST outcome is unknown, so reconcile only and never resubmit.
+            if str(code) == "-1" or code in (None, 0, "0"):
+                return False
+            return True
         order_id = _order_id_from_close(close_result)
         if not order_id:
             return False
@@ -3674,7 +3685,14 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         signed_entry_slippage_pct = float("inf")
         execution_slippage_pct = float("inf")
 
-    if execution_slippage_pct > MAX_ENTRY_SLIPPAGE_PCT:
+    idempotent_replay = bool(isinstance(order, dict) and order.get("idempotency") == "existing_client_order_resolved_before_post")
+    if idempotent_replay:
+        # The position may have been filled before this scan and the preflight quote
+        # is not contemporaneous with that fill. Do not convert current mark-to-market
+        # loss into entry slippage and prematurely liquidate a valid existing position.
+        execution_slippage_pct = None
+        signed_entry_slippage_pct = None
+    if execution_slippage_pct is not None and execution_slippage_pct > MAX_ENTRY_SLIPPAGE_PCT:
         reason = f"execution_slippage_pct={execution_slippage_pct:.4f}% > {MAX_ENTRY_SLIPPAGE_PCT:.4f}%"
         log.critical("[SAFETY_CLOSE] %s %s | %s", symbol, direction, reason)
         close_result, cleanup = _emergency_close_preserving_protection(symbol, direction, qty, event_id)
@@ -4206,6 +4224,7 @@ def main() -> None:
     #    prevent public market analysis from running.
     private_preflight_started = time.perf_counter()
     private_ready = _private_layer_ready()
+    private_layer_available = private_ready
     if private_ready:
         try:
             _load_active_trades_file(fresh_runtime_start=fresh_runtime_start)
@@ -5026,8 +5045,13 @@ def main() -> None:
             signal.get("tp1"), signal.get("tp2"), signal.get("event_id"),
         )
         if not private_ready:
-            blocked = {"status": "BLOCKED_MISSING_CREDENTIALS", "error": "BingX private credentials are unavailable"}
-            log.error("[EXEC_BLOCKED] %s %s: missing BingX private credentials", signal["symbol"], signal["type"])
+            credentials_ok = bool(bingx.credentials_available())
+            blocked = (
+                {"status": "BLOCKED_MISSING_CREDENTIALS", "error": "BingX private credentials are unavailable"}
+                if not credentials_ok else
+                {"status": "BLOCKED_PRIVATE_PREFLIGHT", "error": "BingX private execution is blocked by state integrity or reconciliation preflight; inspect [LIVE_BLOCKED_*] logs"}
+            )
+            log.error("[EXEC_BLOCKED] %s %s: %s", signal["symbol"], signal["type"], blocked["error"])
             _append_jsonl(TRADES_PATH, {
                 "record_type": "TRADE_BLOCKED",
                 "event_id": signal["event_id"],
@@ -5145,7 +5169,7 @@ def main() -> None:
             )
         elif execution_status != "opened_protected":
             log.error("[EXEC_FAILED] %s %s | status=%s | error=%s | order=%s", signal["symbol"], signal["type"], execution_status, execution.get("error"), execution.get("order"))
-            if execution_status not in {"DISABLED", "BLOCKED_MISSING_CREDENTIALS"}:
+            if execution_status not in {"DISABLED", "BLOCKED_MISSING_CREDENTIALS", "BLOCKED_PRIVATE_PREFLIGHT"}:
                 terminal_failure = _is_terminal_execution_failure(execution)
                 _mark_failed_signal(
                     signal["event_id"], execution_status, execution.get("error", ""),
@@ -5219,7 +5243,7 @@ def main() -> None:
     log.info("[PERF_STAGE] stage=save_scan seconds=%.3f", time.perf_counter() - scan_saved_started)
     # Final tracking checkpoint: orders/positions can change during scan/execution.
     # This remains a full pass with existing error handling and protection checks.
-    if private_ready:
+    if private_layer_available:
         tracker_started = time.perf_counter()
         try:
             with request_metrics.phase("final_tracker"):

@@ -5,12 +5,13 @@ from event_engine import bingx
 
 def test_existing_verified_protection_uses_one_open_orders_snapshot(monkeypatch):
     """Already protected positions should not do a redundant second openOrders call."""
-    sl = {"orderId": "SL1", "clientOrderId": "EVT_TEST_SL", "type": "STOP_MARKET", "stopPrice": "90.0", "origQty": "1.0"}
-    tp1 = {"orderId": "TP1", "clientOrderId": "EVT_TEST_TP1", "type": "TAKE_PROFIT_MARKET", "stopPrice": "103.0", "origQty": "0.5"}
-    tp2 = {"orderId": "TP2", "clientOrderId": "EVT_TEST_TP2", "type": "TAKE_PROFIT_MARKET", "stopPrice": "106.0", "origQty": "0.5"}
+    sl = {"orderId": "SL1", "clientOrderId": "EVT_TEST_SL", "type": "STOP_MARKET", "stopPrice": "90.0", "origQty": "1.0", "side":"SELL", "positionSide":"LONG"}
+    tp1 = {"orderId": "TP1", "clientOrderId": "EVT_TEST_TP1", "type": "TAKE_PROFIT_MARKET", "stopPrice": "103.0", "origQty": "0.5", "side":"SELL", "positionSide":"LONG"}
+    tp2 = {"orderId": "TP2", "clientOrderId": "EVT_TEST_TP2", "type": "TAKE_PROFIT_MARKET", "stopPrice": "106.0", "origQty": "0.5", "side":"SELL", "positionSide":"LONG"}
     calls = []
 
     monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)
+    monkeypatch.setattr(bingx, "get_position_mode", lambda **kwargs: "HEDGE")
     monkeypatch.setattr(bingx, "get_contract", lambda symbol: {"quantityPrecision": 3, "pricePrecision": 1, "tradeMinQuantity": 0.001})
     monkeypatch.setattr(bingx, "get_open_protection_directional", lambda *args, **kwargs: (calls.append((args, kwargs)) or {"status": "ok", "sl_orders": [sl], "tp_orders": [tp1, tp2]}))
     monkeypatch.setattr(bingx, "_request", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no order writes expected")))

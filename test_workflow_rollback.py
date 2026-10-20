@@ -42,6 +42,7 @@ def test_commit_gate_blocks_compaction_when_archive_is_empty_and_rollback_was_sk
     substitutions = {
         "${{ steps.quality_gate.outcome }}": "success",
         "${{ steps.verify_tests_data.outcome }}": "success",
+        "${{ steps.run_engine.outcome }}": "success",
         "${{ steps.restore_pre_compaction_snapshots.outcome }}": "skipped",
         "${{ steps.restore_pre_compaction_snapshots.outputs.restored_any }}": "",
         "${{ steps.size_guard.outcome }}": "success",
@@ -84,6 +85,7 @@ def test_commit_gate_allows_empty_archive_when_size_guard_did_not_compact(tmp_pa
     substitutions = {
         "${{ steps.quality_gate.outcome }}": "success",
         "${{ steps.verify_tests_data.outcome }}": "success",
+        "${{ steps.run_engine.outcome }}": "success",
         "${{ steps.restore_pre_compaction_snapshots.outcome }}": "skipped",
         "${{ steps.restore_pre_compaction_snapshots.outputs.restored_any }}": "",
         "${{ steps.size_guard.outcome }}": "success",
@@ -243,3 +245,16 @@ def test_runtime_state_is_not_externalized_until_uploaded_bundle_and_retention_a
     assert steps.index(detect_legacy) < steps.index(by_id["restore_runtime_state"])
     assert steps.index(verify_bundle) < steps.index(by_id["prune_runtime_state_artifacts"])
     assert steps.index(verify_bundle) < steps.index(externalize)
+
+
+def test_failed_engine_run_cannot_advance_runtime_state_or_retention_archive():
+    import yaml
+    workflow = yaml.safe_load((Path(__file__).parent / ".github" / "workflows" / "event-engine.yml").read_text(encoding="utf-8"))
+    steps = workflow["jobs"]["run"]["steps"]
+    by_id = {step.get("id"): step for step in steps if step.get("id")}
+    for step_id in ("size_guard", "mark_retention_archive", "upload_retention_archive", "retention_archive_commit_gate", "prepare_runtime_state_bundle"):
+        assert "steps.run_engine.outcome == 'success'" in by_id[step_id].get("if", "") or (
+            step_id == "retention_archive_commit_gate" and "run_engine_outcome" in by_id[step_id]["run"]
+        )
+    restore = by_id["restore_runtime_state"]["run"]
+    assert '.conclusion == "success"' in restore

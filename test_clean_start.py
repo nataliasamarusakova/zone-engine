@@ -76,6 +76,7 @@ def test_clean_start_fails_closed_when_open_twap_orders_exist(monkeypatch):
 def test_clean_start_initializes_required_files_without_recovery_seeds(tmp_path):
     data = tmp_path / "data"
     clean_start.initialize_empty_runtime(data)
+    assert (data / ".gitkeep").is_file()
     for relative in REQUIRED_FILES:
         assert (data / Path(relative).relative_to("data")).is_file(), relative
     assert json.loads((data / "active_trades.json").read_text(encoding="utf-8")) == {}

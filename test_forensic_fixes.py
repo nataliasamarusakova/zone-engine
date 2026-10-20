@@ -308,3 +308,193 @@ def test_tracker_local_tp_fallback_is_not_double_counted_for_repeated_partial_ev
     assert len(evidence["rows"]) == 1
     assert evidence["rows"][0]["executed_qty"] == pytest.approx(0.5)
     assert evidence["rows"][0]["avg_price"] == pytest.approx(103.2)
+
+
+def test_emergency_close_transport_sentinel_minus_one_never_resubmits(monkeypatch):
+    import run_once
+
+    close_calls = []
+    reads = iter([
+        {"status": "found", "positionAmt": 1.0},
+        {"status": "found", "positionAmt": 1.0},
+    ])
+    monkeypatch.setattr(run_once, "get_position_directional", lambda *a, **k: next(reads, {"status": "found", "positionAmt": 1.0}))
+    monkeypatch.setattr(run_once, "close_position_market", lambda *a, **k: close_calls.append(1) or {
+        "status": "error", "response": {"code": -1, "msg": "ReadTimeout: outcome unknown"}
+    })
+    monkeypatch.setattr(run_once, "get_order", lambda *a, **k: {"status": "error", "error": "no order id"})
+    monkeypatch.setattr(run_once.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setenv("EMERGENCY_CLOSE_ATTEMPTS", "4")
+    monkeypatch.setenv("EMERGENCY_CLOSE_VERIFY_POLLS", "2")
+
+    result = run_once._emergency_close_and_verify("AAA-USDT", "LONG", 1.0, "EVT_UNKNOWN_CLOSE")
+    assert result["status"] == "close_unverified"
+    assert len(close_calls) == 1
+
+
+def test_cancel_old_sl_refuses_manual_order_without_delete(monkeypatch):
+    from event_engine import tracker
+
+    deleted = []
+    monkeypatch.setattr(tracker, "get_open_protection_directional", lambda *a, **k: {
+        "status": "ok", "sl_orders": [{
+            "orderId": "MANUAL-1", "clientOrderId": "user-stop", "type": "STOP_MARKET",
+            "side": "SELL", "positionSide": "BOTH", "stopPrice": "99", "origQty": "0.5",
+        }], "tp_orders": [],
+    })
+    monkeypatch.setattr(tracker, "cancel_order", lambda *a, **k: deleted.append(a) or {"code": 0})
+
+    cancelled, reason = tracker._cancel_old_sl_verified("AAA-USDT", "LONG", "MANUAL-1", owner_event_id="EVT_X")
+    assert cancelled is False
+    assert "manual SL" in reason
+    assert deleted == []
+
+
+def test_emergency_rollback_order_ids_are_included_in_fill_accounting(monkeypatch):
+    from event_engine import tracker
+
+    calls = []
+    def fills(symbol, start_ms, end_ms, *, order_id=None, limit=1000):
+        calls.append(order_id)
+        rows = [
+            {"order_id":"ENTRY1", "qty":1.0, "price":100.0, "fee":None, "realized_pnl":None, "time_ms":100},
+            {"order_id":"TP1", "qty":0.5, "price":103.0, "fee":None, "realized_pnl":None, "time_ms":200},
+        ]
+        return [x for x in rows if order_id is None or x["order_id"] == order_id]
+    monkeypatch.setattr(tracker, "get_fill_orders", fills)
+    monkeypatch.setattr(tracker, "get_order", lambda *a, **k: {"status":"error", "error":"not available"})
+    trade = {
+        "symbol":"AAA-USDT", "direction":"LONG", "entry_ts":1,
+        "entry_order":{"order_id":"ENTRY1"},
+        "tp_fill_events":[{"order_id":"TP1", "leg":"TP1"}],
+        "be_failure_rollback":{"status":"closed_verified", "attempts":[
+            {"response":{"code":0, "data":{"order":{"orderId":"EMERGENCY1"}}}}
+        ]},
+    }
+    result = tracker._collect_trade_fill_accounting(trade, 1000)
+    assert "EMERGENCY1" in result["order_ids"]
+    assert "EMERGENCY1" in result["exact_order_queries_attempted"]
+    assert "EMERGENCY1" in calls
+
+
+def test_unverified_residual_close_does_not_publish_partial_tp_pnl_as_final(tmp_path, monkeypatch):
+    import json
+    from event_engine import tracker
+
+    active_path = tmp_path / "active_trades.json"
+    trades_path = tmp_path / "trades.jsonl"
+    actions_path = tmp_path / "actions.jsonl"
+    trade = {
+        "event_id":"EVT_PARTIAL_UNVERIFIED", "symbol":"AAA-USDT", "direction":"LONG", "name":"AAA",
+        "entry_price":100.0, "initial_qty":1.0, "remaining_qty":0.5, "entry_ts":1, "closed":False,
+        "entry_order":{"order_id":"ENTRY1"}, "tp_orders":[], "sl_order":{},
+        "hit_legs":["tp1"], "tp_filled_qty":{"tp1":0.5}, "realized_pnl_qty":0.5,
+        "realized_pnl_weighted_sum":1.5, "tp_fill_events":[{
+            "order_id":"TP1", "leg":"TP1", "delta_qty":0.5, "executed_qty_total":0.5,
+            "avg_price":103.0, "pnl_pct":3.0, "ts":200, "fill_time_ms":200,
+        }],
+        "be_failure_rollback":{"status":"closed_verified", "attempts":[
+            {"response":{"code":0, "data":{"order":{"orderId":"EMERGENCY1", "executedQty":"0.5", "avgPrice":"99"}}}}
+        ]},
+        "peak_pnl_pct":3.0, "mae_pct":-1.0, "max_drawdown_pct":-1.0,
+        "planned_risk_pct":10.0, "planned_weighted_rr":0.45, "effective_weighted_rr":0.45,
+        "setup":{}, "tp_levels":[], "effective_tp_levels":[],
+    }
+    active_path.write_text(json.dumps({trade["event_id"]:trade}), encoding="utf-8")
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", active_path)
+    monkeypatch.setattr(tracker, "TRADES_PATH", trades_path)
+    monkeypatch.setattr(tracker, "ACTIONS_PATH", actions_path)
+    monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: {"status":"not_found"})
+    monkeypatch.setattr(tracker, "fetch_klines", lambda *a, **k: [])
+    monkeypatch.setattr(tracker, "get_fill_orders", lambda symbol, start, end, *, order_id=None, limit=1000: [
+        row for row in [
+            {"order_id":"ENTRY1", "qty":1.0, "price":100.0, "fee":None, "realized_pnl":None, "time_ms":100},
+            {"order_id":"TP1", "qty":0.5, "price":103.0, "fee":None, "realized_pnl":None, "time_ms":200},
+        ] if order_id is None or row["order_id"] == order_id
+    ])
+    monkeypatch.setattr(tracker, "get_order", lambda *a, **k: {"status":"error", "error":"no fill evidence"})
+    monkeypatch.setattr(tracker, "get_all_orders", lambda *a, **k: [])
+    sent = []
+    monkeypatch.setattr(tracker, "send_tg", lambda text: sent.append(text) or True)
+
+    tracker.update_active_trades(position_snapshot=[])
+    close = next(json.loads(line) for line in trades_path.read_text(encoding="utf-8").splitlines() if json.loads(line).get("record_type") == "TRADE_CLOSE")
+    assert close["realized_pnl_reconciliation"]["status"] == "UNVERIFIED_RESIDUAL_EXIT"
+    assert close["realized_pnl_pct"] is None
+    assert close["realized_pnl_source"] == "UNVERIFIED_RESIDUAL_EXIT"
+    assert close["realized_pnl_pct_confirmed_partial"] == 1.5
+    assert close["realized_rr"] is None
+    assert sent and "не подтверждён" in sent[0]
+
+
+def test_partial_aggregate_fill_response_forces_partial_accounting(monkeypatch):
+    from event_engine import tracker
+
+    def fills(symbol, start_ms, end_ms, *, order_id=None, limit=1000):
+        rows = [
+            {"order_id":"ENTRY1", "qty":1.0, "price":100.0, "fee":-0.1, "realized_pnl":0.0, "time_ms":100},
+            {"order_id":"EXIT1", "qty":0.5, "price":102.0, "fee":-0.1, "realized_pnl":1.0, "time_ms":200},
+        ]
+        return [row for row in rows if order_id is None or row["order_id"] == order_id]
+
+    monkeypatch.setattr(tracker, "credentials_available", lambda: True)
+    monkeypatch.setattr(tracker, "get_fill_orders", fills)
+    monkeypatch.setattr(tracker, "_get_order_execution_evidence", lambda symbol, order_id, **kwargs: {
+        "status":"ok", "order_id":order_id, "order_status":"PARTIALLY_FILLED", "executed_qty":1.0,
+        "avg_price":102.0, "time_ms":200, "update_time_ms":200,
+    } if order_id == "EXIT1" else {"status":"ok", "order_id":order_id, "order_status":"FILLED", "executed_qty":1.0, "avg_price":100.0})
+
+    result = tracker._collect_trade_fill_accounting({
+        "symbol":"AAA-USDT", "direction":"LONG", "entry_ts":1,
+        "entry_order":{"order_id":"ENTRY1"}, "exit_order_id":"EXIT1",
+    }, 1000)
+    assert result["incomplete_order_fill_ids"] == ["EXIT1"]
+    assert result["status"] == "PARTIAL_ACCOUNTING"
+    assert result["confirmed_exit_qty"] is None
+    assert result["gross_realized_pnl_abs"] is None
+    assert result["fees_paid_abs"] is None
+
+
+def test_zone_forensics_and_be_retry_keep_the_state_they_report():
+    from pathlib import Path
+    import inspect
+    from event_engine import tracker
+    import run_once
+
+    run_source = Path(inspect.getsourcefile(run_once)).read_text(encoding="utf-8")
+    tracker_source = inspect.getsource(tracker.update_active_trades)
+    assert "private_layer_available = private_ready" in run_source
+    assert "if private_layer_available:" in run_source
+    assert "BLOCKED_PRIVATE_PREFLIGHT" in run_source
+    assert "_build_5m_zone_signal(symbol, direction, zone, bar, prev, df_1h, demand, supply, state, df_5m=x)" in run_source
+    retry_branch = tracker_source.split('if retry_status in {"created", "created_cleanup_pending"}:', 1)[1].split("elif retry_status", 1)[0]
+    for key in ("be_trigger_ts", "be_trigger_peak_r", "be_trigger_rule", "be_trigger_price"):
+        assert f'trade["{key}"]' in retry_branch
+
+
+def test_cancel_ack_is_not_called_verified_while_order_remains_open(monkeypatch, tmp_path):
+    import json
+    from event_engine import tracker
+
+    active_path = tmp_path / "active_trades.json"
+    active_path.write_text(json.dumps({"EVT_CURRENT": {
+        "event_id":"EVT_CURRENT", "symbol":"AAA-USDT", "direction":"LONG", "closed":False,
+        "sl_order":{"order_id":"SL1"}, "tp_orders":[],
+    }}), encoding="utf-8")
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", active_path)
+    still_open = {"status":"ok", "sl_orders":[{
+        "orderId":"SL1", "clientOrderId":"EVT_CURRENT_SL", "type":"STOP_MARKET",
+        "side":"SELL", "positionSide":"BOTH", "stopPrice":"99", "origQty":"1",
+    }], "tp_orders":[]}
+    snapshots = iter([still_open, still_open, still_open])
+    monkeypatch.setattr(tracker, "get_open_protection_directional", lambda *a, **k: next(snapshots, still_open))
+    deleted = []
+    monkeypatch.setattr(tracker, "cancel_order", lambda *a, **k: deleted.append(a) or {"code":0})
+    monkeypatch.setattr(tracker.time, "sleep", lambda *a, **k: None)
+
+    cancelled, reason = tracker._cancel_old_sl_verified(
+        "AAA-USDT", "LONG", "SL1", max_attempts=1, owner_event_id="EVT_CURRENT"
+    )
+    assert cancelled is False
+    assert "remains visible" in reason
+    assert len(deleted) == 1

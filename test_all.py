@@ -642,6 +642,33 @@ def test_bingx_signed_post_uses_exact_canonical_body(monkeypatch):
     assert captured["headers"]["Content-Type"] == "application/x-www-form-urlencoded"
 
 
+
+
+def test_signed_post_rejects_query_metacharacters_before_network(monkeypatch):
+    from event_engine import bingx
+    class Session:
+        def __init__(self): self.calls = []
+        def request(self, **kwargs): self.calls.append(kwargs); raise AssertionError("network must not be called")
+    session = Session()
+    monkeypatch.setattr(bingx, "SESSION", session)
+    monkeypatch.setattr(bingx, "_get_fast_session", lambda: session)
+    monkeypatch.setenv("BINGX_API_KEY", "k")
+    monkeypatch.setenv("BINGX_SECRET_KEY", "s")
+    out = bingx._request("POST", "/foo", {"symbol": "AAA&side=SELL"}, signed=True, retryable=False)
+    assert out["code"] == -1
+    assert "forbidden query character" in out["msg"]
+    assert session.calls == []
+
+
+def test_tp_identity_rejects_wrong_side_and_wrong_position_mode(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "position_side_param", lambda direction: "BOTH")
+    good = {"type":"TAKE_PROFIT_MARKET", "side":"SELL", "positionSide":"BOTH", "stopPrice":"103", "clientOrderId":"EVT_TEST_TP1"}
+    assert bingx._tp_leg_from_order(good, "TP1", 103, 2, direction="LONG")
+    assert not bingx._tp_leg_from_order({**good, "side":"BUY"}, "TP1", 103, 2, direction="LONG")
+    assert not bingx._tp_leg_from_order({**good, "positionSide":"LONG"}, "TP1", 103, 2, direction="LONG")
+
+
 def test_bingx_min_qty_is_nonfatal_skip(monkeypatch):
     from event_engine import bingx
     monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)
@@ -1886,20 +1913,26 @@ def test_open_market_blocks_two_tp_min_quantity_before_order(monkeypatch):
     assert out["status"] == "skipped_tp_min_qty"
 
 
-def test_sl_order_validation_is_one_sided_and_be_allows_entry():
+def test_sl_order_validation_is_one_sided_and_be_allows_entry(monkeypatch):
     from event_engine import bingx
-    assert bingx._validate_sl_order_for_position({"type":"STOP_MARKET","stopPrice":"99","origQty":"1"}, "LONG", 100.0)
-    assert bingx._validate_sl_order_for_position({"type":"STOP_MARKET","stopPrice":"100","origQty":"1"}, "LONG", 100.0)
-    assert bingx._validate_sl_order_for_position({"type":"STOP_MARKET","stopPrice":"100","origQty":"1"}, "SHORT", 100.0)
-    assert not bingx._validate_sl_order_for_position({"type":"STOP_MARKET","stopPrice":"100.2","origQty":"1"}, "LONG", 100.0)
-    assert bingx._validate_sl_order_for_position({"type":"STOP_MARKET","stopPrice":"101","origQty":"1"}, "SHORT", 100.0)
-    assert not bingx._validate_sl_order_for_position({"type":"STOP_MARKET","stopPrice":"99.8","origQty":"1"}, "SHORT", 100.0)
+    monkeypatch.setattr(bingx, "position_side_param", lambda direction: "BOTH")
+    def sl(price, direction):
+        return {"type":"STOP_MARKET", "stopPrice":str(price), "origQty":"1", "side":"SELL" if direction == "LONG" else "BUY", "positionSide":"BOTH"}
+    assert bingx._validate_sl_order_for_position(sl(99, "LONG"), "LONG", 100.0)
+    assert bingx._validate_sl_order_for_position(sl(100, "LONG"), "LONG", 100.0)
+    assert bingx._validate_sl_order_for_position(sl(100, "SHORT"), "SHORT", 100.0)
+    assert not bingx._validate_sl_order_for_position(sl(100.2, "LONG"), "LONG", 100.0)
+    assert bingx._validate_sl_order_for_position(sl(101, "SHORT"), "SHORT", 100.0)
+    assert not bingx._validate_sl_order_for_position(sl(99.8, "SHORT"), "SHORT", 100.0)
+    assert not bingx._validate_sl_order_for_position({**sl(99, "LONG"), "side":"BUY"}, "LONG", 100.0)
 
 def test_workflow_risk_cap_is_not_accidentally_25_percent():
     from pathlib import Path
     workflow = Path('.github/workflows/event-engine.yml').read_text(encoding='utf-8')
     assert 'MAX_SIGNAL_RISK_PCT: "10.00"' in workflow
     assert 'MAX_SIGNAL_RISK_PCT: "25"' not in workflow
+    assert 'BINGX_LEVERAGE: "3"' in workflow
+    assert 'BINGX_MAX_LEVERAGE: "3"' in workflow
 
 def test_signal_risk_cap_hard_clamped(monkeypatch):
     import importlib
@@ -1935,10 +1968,11 @@ def test_request_does_not_fallback_post_after_network_error(monkeypatch):
     assert len(session.calls) == 1
 
 
-def test_sl_validator_covers_full_position_qty():
+def test_sl_validator_covers_full_position_qty(monkeypatch):
     from event_engine import bingx
-    good = {"type": "STOP_MARKET", "stopPrice": "99", "origQty": "1.0"}
-    bad = {"type": "STOP_MARKET", "stopPrice": "99", "origQty": "0.5"}
+    monkeypatch.setattr(bingx, "position_side_param", lambda direction: "BOTH")
+    good = {"type": "STOP_MARKET", "stopPrice": "99", "origQty": "1.0", "side":"SELL", "positionSide":"BOTH"}
+    bad = {"type": "STOP_MARKET", "stopPrice": "99", "origQty": "0.5", "side":"SELL", "positionSide":"BOTH"}
     assert bingx._validate_sl_order_for_position(good, "LONG", 100.0, 1.0)
     assert not bingx._validate_sl_order_for_position(bad, "LONG", 100.0, 1.0)
 
@@ -2375,7 +2409,9 @@ def test_tracker_uses_exchange_qty_as_remaining_qty(monkeypatch, tmp_path):
 
 
 def test_be_existing_with_old_sl_cancel_failure_is_not_success(monkeypatch):
-    from event_engine import tracker
+    from event_engine import tracker, bingx
+    monkeypatch.setattr(bingx, "position_side_param", lambda direction: direction)
+    monkeypatch.setattr(tracker, "position_side_param", lambda direction: direction)
     monkeypatch.setattr(tracker, "to_bx_symbol", lambda s: s)
     monkeypatch.setattr(tracker, "get_contract", lambda s: {"quantityPrecision": 3, "pricePrecision": 2})
     monkeypatch.setattr(tracker, "get_open_protection_directional", lambda *a, **k: {
@@ -2417,7 +2453,8 @@ def test_be_restore_requires_exchange_verification(monkeypatch):
 
 
 def test_be_failure_without_restore_triggers_emergency_close(monkeypatch):
-    from event_engine import tracker
+    from event_engine import tracker, bingx
+    monkeypatch.setattr(bingx, "position_side_param", lambda direction: direction)
     monkeypatch.setattr(tracker, "to_bx_symbol", lambda s: s)
     monkeypatch.setattr(tracker, "get_contract", lambda s: {"quantityPrecision": 3, "pricePrecision": 2})
     monkeypatch.setattr(tracker, "position_side_param", lambda direction: "LONG")
@@ -2522,6 +2559,7 @@ def test_execution_outcome_categories_separate_technical_failures():
     assert run_once._execution_outcome_category("opened_then_emergency_closed") == "EMERGENCY_EXIT"
     assert run_once._execution_outcome_category("entry_state_unverified") == "EXECUTION_UNVERIFIED"
     assert run_once._execution_outcome_category("blocked_protection_preflight") == "PROTECTION_FAILURE"
+    assert run_once._execution_outcome_category("BLOCKED_PRIVATE_PREFLIGHT") == "EXECUTION_BLOCKED"
     assert run_once._trade_event_record_type("opened_protected") == "TRADE_OPEN"
     assert run_once._trade_event_record_type("opened_then_emergency_closed") == "TRADE_OPEN"
     assert run_once._trade_event_record_type("skipped_stale_signal") == "ENTRY_ATTEMPT"
@@ -2827,15 +2865,16 @@ def test_tracker_sends_negative_close_notification(monkeypatch, tmp_path):
 
 
 def test_be_failure_keeps_verified_old_sl_without_duplicate_restore(monkeypatch):
-    from event_engine import tracker
+    from event_engine import tracker, bingx
+    monkeypatch.setattr(bingx, "position_side_param", lambda direction: "LONG")
     monkeypatch.setattr(tracker, "to_bx_symbol", lambda s: s)
     monkeypatch.setattr(tracker, "get_contract", lambda s: {"quantityPrecision": 3, "pricePrecision": 2})
     monkeypatch.setattr(tracker, "position_side_param", lambda direction: "LONG")
     calls = []
 
     protection_states = iter([
-        {"status": "ok", "sl_orders": [{"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1", "clientOrderId": "EVT_OLD_SL"}], "tp_orders": []},
-        {"status": "ok", "sl_orders": [{"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1", "clientOrderId": "EVT_OLD_SL"}], "tp_orders": []},
+        {"status": "ok", "sl_orders": [{"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1", "clientOrderId": "EVT_OLD_SL", "side":"SELL", "positionSide":"LONG"}], "tp_orders": []},
+        {"status": "ok", "sl_orders": [{"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1", "clientOrderId": "EVT_OLD_SL", "side":"SELL", "positionSide":"LONG"}], "tp_orders": []},
     ])
     monkeypatch.setattr(tracker, "get_open_protection_directional", lambda *a, **k: next(protection_states))
     monkeypatch.setattr(tracker, "_request", lambda method, path, params: calls.append((method, params)) or {"code": 99, "msg": "BE rejected"})
@@ -2854,19 +2893,20 @@ def test_be_failure_keeps_verified_old_sl_without_duplicate_restore(monkeypatch)
 
 
 def test_be_create_then_cleanup_keeps_verified_be_when_old_cancel_unverified(monkeypatch):
-    from event_engine import tracker
+    from event_engine import tracker, bingx
+    monkeypatch.setattr(bingx, "position_side_param", lambda direction: "LONG")
     monkeypatch.setattr(tracker, "to_bx_symbol", lambda s: s)
     monkeypatch.setattr(tracker, "get_contract", lambda s: {"quantityPrecision": 3, "pricePrecision": 2})
     monkeypatch.setattr(tracker, "position_side_param", lambda direction: "LONG")
     states = iter([
-        {"status": "ok", "sl_orders": [{"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1"}], "tp_orders": []},
+        {"status": "ok", "sl_orders": [{"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1", "clientOrderId":"EVT_OLD_SL", "side":"SELL", "positionSide":"LONG"}], "tp_orders": []},
         {"status": "ok", "sl_orders": [
-            {"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1"},
+            {"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1", "clientOrderId":"EVT_OLD_SL", "side":"SELL", "positionSide":"LONG"},
             {"orderId": "BE1", "type": "STOP_MARKET", "stopPrice": "100", "origQty": "1", "clientOrderId": "EVT_BE_T", "positionSide": "LONG", "side": "SELL"},
         ], "tp_orders": []},
         # _cancel_old_sl_verified must verify the old order still exists -> failure.
         {"status": "ok", "sl_orders": [
-            {"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1"},
+            {"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1", "clientOrderId":"EVT_OLD_SL", "side":"SELL", "positionSide":"LONG"},
             {"orderId": "BE1", "type": "STOP_MARKET", "stopPrice": "100", "origQty": "1", "clientOrderId": "EVT_BE_T", "positionSide": "LONG", "side": "SELL"},
         ], "tp_orders": []},
     ])
@@ -2998,20 +3038,23 @@ def test_runtime_state_paths_are_project_root_relative(tmp_path, monkeypatch):
 
 def test_be_sl_at_entry_is_valid_protection(monkeypatch):
     from event_engine import bingx
-    sl = {"type": "STOP_MARKET", "stopPrice": "100", "origQty": "1"}
-    assert bingx._validate_sl_order_for_position(sl, "LONG", 100.0, 1.0) is True
-    assert bingx._validate_sl_order_for_position(sl, "SHORT", 100.0, 1.0) is True
+    monkeypatch.setattr(bingx, "position_side_param", lambda direction: "BOTH")
+    sl_long = {"type": "STOP_MARKET", "stopPrice": "100", "origQty": "1", "side":"SELL", "positionSide":"BOTH"}
+    sl_short = {"type": "STOP_MARKET", "stopPrice": "100", "origQty": "1", "side":"BUY", "positionSide":"BOTH"}
+    assert bingx._validate_sl_order_for_position(sl_long, "LONG", 100.0, 1.0) is True
+    assert bingx._validate_sl_order_for_position(sl_short, "SHORT", 100.0, 1.0) is True
 
 
 def test_be_verification_polls_after_eventual_consistency(monkeypatch):
-    from event_engine import tracker
+    from event_engine import tracker, bingx
+    monkeypatch.setattr(bingx, "position_side_param", lambda direction: direction)
     monkeypatch.setattr(tracker, "to_bx_symbol", lambda s: s)
     monkeypatch.setattr(tracker, "get_contract", lambda s: {"quantityPrecision": 3, "pricePrecision": 2})
     monkeypatch.setattr(tracker, "position_side_param", lambda direction: "LONG")
     states = iter([
-        {"status": "ok", "sl_orders": [{"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1"}], "tp_orders": []},
-        {"status": "ok", "sl_orders": [{"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1"}], "tp_orders": []},
-        {"status": "ok", "sl_orders": [{"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1"}, {"orderId": "BE1", "type": "STOP_MARKET", "stopPrice": "100", "origQty": "0.5", "positionSide": "LONG", "side": "SELL"}], "tp_orders": []},
+        {"status": "ok", "sl_orders": [{"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1", "clientOrderId":"EVT_OLD_SL", "side":"SELL", "positionSide":"LONG"}], "tp_orders": []},
+        {"status": "ok", "sl_orders": [{"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1", "clientOrderId":"EVT_OLD_SL", "side":"SELL", "positionSide":"LONG"}], "tp_orders": []},
+        {"status": "ok", "sl_orders": [{"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1", "clientOrderId":"EVT_OLD_SL", "side":"SELL", "positionSide":"LONG"}, {"orderId": "BE1", "type": "STOP_MARKET", "stopPrice": "100", "origQty": "0.5", "positionSide": "LONG", "side": "SELL"}], "tp_orders": []},
         {"status": "ok", "sl_orders": [{"orderId": "BE1", "type": "STOP_MARKET", "stopPrice": "100", "origQty": "0.5", "positionSide": "LONG", "side": "SELL"}], "tp_orders": []},
     ])
     monkeypatch.setattr(tracker, "get_open_protection_directional", lambda *a, **k: next(states))
@@ -3024,13 +3067,14 @@ def test_be_verification_polls_after_eventual_consistency(monkeypatch):
 
 
 def test_be_failure_accepts_full_size_old_sl_for_residual_position(monkeypatch):
-    from event_engine import tracker
+    from event_engine import tracker, bingx
+    monkeypatch.setattr(bingx, "position_side_param", lambda direction: direction)
     monkeypatch.setattr(tracker, "to_bx_symbol", lambda s: s)
     monkeypatch.setattr(tracker, "get_contract", lambda s: {"quantityPrecision": 3, "pricePrecision": 2})
     monkeypatch.setattr(tracker, "position_side_param", lambda direction: "LONG")
     states = iter([
-        {"status": "ok", "sl_orders": [{"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1"}], "tp_orders": []},
-        {"status": "ok", "sl_orders": [{"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1"}], "tp_orders": []},
+        {"status": "ok", "sl_orders": [{"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1", "clientOrderId":"EVT_OLD_SL", "side":"SELL", "positionSide":"LONG"}], "tp_orders": []},
+        {"status": "ok", "sl_orders": [{"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1", "clientOrderId":"EVT_OLD_SL", "side":"SELL", "positionSide":"LONG"}], "tp_orders": []},
     ])
     monkeypatch.setattr(tracker, "get_open_protection_directional", lambda *a, **k: next(states))
     monkeypatch.setattr(tracker, "_request", lambda method, path, params: {"code": 99, "msg": "BE rejected"})
@@ -4856,6 +4900,7 @@ def test_build_5m_zone_signal_without_5m_baseline_does_not_fabricate_volume_rati
 
 def test_tracker_exact_order_fill_fallback_and_order_execution_evidence(monkeypatch):
     from event_engine import tracker
+    monkeypatch.setattr(tracker, "credentials_available", lambda: True)
     calls = []
 
     def fake_fill(symbol, start, end, *, order_id=None, limit=1000):
@@ -4915,7 +4960,7 @@ def test_protection_creation_does_not_mark_open_order_as_execution_fill(monkeypa
             {"orderId": "OLD_TP", "clientOrderId": "EVT_OLD", "origQty": "0.5", "stopPrice": "110"},
         ]},
         {"status": "ok", "sl_orders": [
-            {"orderId": "SL_NEW", "clientOrderId": "EVT_TEST_SL", "origQty": "1.0", "stopPrice": "90.0", "type": "STOP_MARKET"},
+            {"orderId": "SL_NEW", "clientOrderId": "EVT_TEST_SL", "origQty": "1.0", "stopPrice": "90.0", "type": "STOP_MARKET", "side":"SELL", "positionSide":"LONG"},
         ], "tp_orders": []},
     ])
     monkeypatch.setattr(bingx, "get_open_protection_directional", lambda *args, **kwargs: next(protection_states))
@@ -5161,10 +5206,10 @@ def test_bingx_short_final_gate_uses_economic_adverse_drift(monkeypatch):
 def test_bingx_tp_geometry_accepts_exchange_price_precision_rounding(monkeypatch):
     from event_engine import bingx
     states = iter([
-        {"status":"ok","sl_orders":[{"orderId":"SL1","clientOrderId":"EVT_SL","type":"STOP_MARKET","stopPrice":"90.0","origQty":"1.0"}],"tp_orders":[]},
-        {"status":"ok","sl_orders":[{"orderId":"SL1","clientOrderId":"EVT_SL","type":"STOP_MARKET","stopPrice":"90.0","origQty":"1.0"}],"tp_orders":[
-            {"orderId":"TP1","clientOrderId":"EVT_TP1","type":"TAKE_PROFIT_MARKET","stopPrice":"103.1267","origQty":"0.5"},
-            {"orderId":"TP2","clientOrderId":"EVT_TP2","type":"TAKE_PROFIT_MARKET","stopPrice":"106.1304","origQty":"0.5"},
+        {"status":"ok","sl_orders":[{"orderId":"SL1","clientOrderId":"EVT_SL","type":"STOP_MARKET","stopPrice":"90.0","origQty":"1.0","side":"SELL","positionSide":"LONG"}],"tp_orders":[]},
+        {"status":"ok","sl_orders":[{"orderId":"SL1","clientOrderId":"EVT_SL","type":"STOP_MARKET","stopPrice":"90.0","origQty":"1.0","side":"SELL","positionSide":"LONG"}],"tp_orders":[
+            {"orderId":"TP1","clientOrderId":"EVT_TP1","type":"TAKE_PROFIT_MARKET","stopPrice":"103.1267","origQty":"0.5","side":"SELL","positionSide":"LONG"},
+            {"orderId":"TP2","clientOrderId":"EVT_TP2","type":"TAKE_PROFIT_MARKET","stopPrice":"106.1304","origQty":"0.5","side":"SELL","positionSide":"LONG"},
         ]},
     ])
     monkeypatch.setattr(bingx, "get_open_protection_directional", lambda *a, **k: next(states))
@@ -5173,11 +5218,11 @@ def test_bingx_tp_geometry_accepts_exchange_price_precision_rounding(monkeypatch
     monkeypatch.setattr(bingx, "_current_close_price", lambda symbol: 100.0)
     def fake_verify(symbol, direction, **kwargs):
         if kwargs["order_kind"] == "STOP_MARKET":
-            order = {"orderId":"SL1","clientOrderId":kwargs["client_order_id"],"type":"STOP_MARKET","stopPrice":kwargs["expected_price"],"origQty":kwargs["expected_qty"]}
+            order = {"orderId":"SL1","clientOrderId":kwargs["client_order_id"],"type":"STOP_MARKET","stopPrice":kwargs["expected_price"],"origQty":kwargs["expected_qty"],"side":"SELL","positionSide":"LONG"}
         elif kwargs["client_order_id"].endswith("_TP1"):
-            order = {"orderId":"TP1","clientOrderId":kwargs["client_order_id"],"type":"TAKE_PROFIT_MARKET","stopPrice":"103.1267","origQty":kwargs["expected_qty"]}
+            order = {"orderId":"TP1","clientOrderId":kwargs["client_order_id"],"type":"TAKE_PROFIT_MARKET","stopPrice":"103.1267","origQty":kwargs["expected_qty"],"side":"SELL","positionSide":"LONG"}
         else:
-            order = {"orderId":"TP2","clientOrderId":kwargs["client_order_id"],"type":"TAKE_PROFIT_MARKET","stopPrice":"106.1304","origQty":kwargs["expected_qty"]}
+            order = {"orderId":"TP2","clientOrderId":kwargs["client_order_id"],"type":"TAKE_PROFIT_MARKET","stopPrice":"106.1304","origQty":kwargs["expected_qty"],"side":"SELL","positionSide":"LONG"}
         return {"status":"verified","order":order}
     monkeypatch.setattr(bingx, "_verify_open_order", fake_verify)
     monkeypatch.setattr(bingx, "_request", lambda method,path,params=None,**kwargs: {"code":0,"data":{"order":params or {}}})
@@ -5213,14 +5258,14 @@ def test_initial_protection_never_market_closes_crossed_tp(monkeypatch):
     from event_engine import bingx
     states = iter([
         {"status": "ok", "sl_orders": [], "tp_orders": []},
-        {"status": "ok", "sl_orders": [{"orderId":"SL1","clientOrderId":"EVT_TEST_SL","type":"STOP_MARKET","stopPrice":"90.0","origQty":"1.0"}], "tp_orders": []},
+        {"status": "ok", "sl_orders": [{"orderId":"SL1","clientOrderId":"EVT_TEST_SL","type":"STOP_MARKET","stopPrice":"90.0","origQty":"1.0","side":"SELL","positionSide":"LONG"}], "tp_orders": []},
     ])
     monkeypatch.setattr(bingx, "get_open_protection_directional", lambda *a, **k: next(states))
     monkeypatch.setattr(bingx, "get_contract", lambda *a, **k: {"symbol": "AAA-USDT", "status": 1, "apiStateOpen": "true", "pricePrecision": 4, "quantityPrecision": 2, "tradeMinQuantity": 0.01})
     monkeypatch.setattr(bingx, "contract_exists", lambda *a, **k: True)
     monkeypatch.setattr(bingx, "get_position_mode", lambda *a, **k: "HEDGE")
     monkeypatch.setattr(bingx, "_current_close_price", lambda symbol: 106.0)
-    monkeypatch.setattr(bingx, "_request", lambda *a, **k: {"code": 0, "data": {"order": {"orderId": "SL1", "clientOrderId": "EVT_TEST_SL", "type": "STOP_MARKET", "stopPrice": "90.0", "origQty": "1.0"}}})
+    monkeypatch.setattr(bingx, "_request", lambda *a, **k: {"code": 0, "data": {"order": {"orderId": "SL1", "clientOrderId": "EVT_TEST_SL", "type": "STOP_MARKET", "stopPrice": "90.0", "origQty": "1.0", "side":"SELL", "positionSide":"LONG"}}})
     out = bingx.ensure_directional_protection("AAA-USDT", "LONG", 100.0, 1.0, 10.0, [{"leg":"tp1","pnl_pct":3.0,"close_fraction":0.5},{"leg":"tp2","pnl_pct":6.0,"close_fraction":0.5}], trade_id="EVT_CROSSED_TP")
     assert out["status"] == "PROTECTION_FAILED"
     assert out["failure_class"] == "TP_TARGET_CROSSED_BEFORE_PROTECTION"
@@ -5229,8 +5274,8 @@ def test_initial_protection_never_market_closes_crossed_tp(monkeypatch):
 def test_protection_postcondition_rejects_wrong_tp_price(monkeypatch):
     from event_engine import bingx
     states = iter([
-        {"status":"ok","sl_orders":[{"orderId":"SL1","clientOrderId":"EVT_SL","type":"STOP_MARKET","stopPrice":"90.0","origQty":"1.0"}],"tp_orders":[]},
-        {"status":"ok","sl_orders":[{"orderId":"SL1","clientOrderId":"EVT_SL","type":"STOP_MARKET","stopPrice":"90.0","origQty":"1.0"}],"tp_orders":[]},
+        {"status":"ok","sl_orders":[{"orderId":"SL1","clientOrderId":"EVT_SL","type":"STOP_MARKET","stopPrice":"90.0","origQty":"1.0","side":"SELL","positionSide":"LONG"}],"tp_orders":[]},
+        {"status":"ok","sl_orders":[{"orderId":"SL1","clientOrderId":"EVT_SL","type":"STOP_MARKET","stopPrice":"90.0","origQty":"1.0","side":"SELL","positionSide":"LONG"}],"tp_orders":[]},
     ])
     monkeypatch.setattr(bingx,"get_open_protection_directional",lambda *a,**k:next(states))
     monkeypatch.setattr(bingx,"get_position_mode",lambda *a,**k:"HEDGE")
@@ -5875,3 +5920,63 @@ def test_tracker_be_retry_persists_verified_rollback_and_classifies_exit(tmp_pat
     close_rows = [json.loads(line) for line in trades_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert close_rows[-1]["record_type"] == "TRADE_CLOSE"
     assert close_rows[-1]["exit_reason"] == "EMERGENCY_CLOSE_AFTER_BE_FAILURE"
+
+
+def test_manual_sl_is_not_adopted_as_engine_protection(monkeypatch):
+    from event_engine import bingx
+
+    manual = {"orderId":"MANUAL-1", "clientOrderId":"user-stop", "type":"STOP_MARKET", "stopPrice":"90", "origQty":"1", "side":"SELL", "positionSide":"LONG"}
+    engine = {"orderId":"ENGINE-SL", "clientOrderId":"EVT_TEST_SL", "type":"STOP_MARKET", "stopPrice":"90", "origQty":"1", "side":"SELL", "positionSide":"LONG"}
+    snapshots = iter([
+        {"status":"ok", "sl_orders":[manual], "tp_orders":[]},
+        {"status":"ok", "sl_orders":[manual, engine], "tp_orders":[]},
+    ])
+    deleted = []
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda s: s)
+    monkeypatch.setattr(bingx, "get_contract", lambda s: {"symbol":"AAA-USDT", "quantityPrecision":3, "pricePrecision":2, "tradeMinQuantity":0.001})
+    monkeypatch.setattr(bingx, "get_position_mode", lambda **k: "HEDGE")
+    monkeypatch.setattr(bingx, "get_open_protection_directional", lambda *a, **k: next(snapshots))
+    monkeypatch.setattr(bingx, "_current_close_price", lambda s: 100.0)
+    monkeypatch.setattr(bingx, "_request", lambda method, path, params=None, **k: {"code":0, "data":{"order":{"orderId":"ENGINE-SL", "clientOrderId":params.get("clientOrderId")}}})
+    monkeypatch.setattr(bingx, "cancel_order", lambda *a, **k: deleted.append(a) or {"code":0})
+
+    result = bingx.ensure_directional_protection("AAA-USDT", "LONG", 100.0, 1.0, 10.0, [], trade_id="EVT_TEST")
+    assert result["status"] == "PROTECTED"
+    assert result["sl_result"]["order_id"] == "ENGINE-SL"
+    assert deleted == []
+
+
+def test_idempotent_existing_entry_does_not_trigger_fresh_quote_slippage_close(monkeypatch):
+    import run_once
+    signal = {
+        "event_id":"EVT_IDEMPOTENT_SLIP", "symbol":"TEST-USDT", "type":"LONG",
+        "entry":100.0, "sl":90.0, "tp1":103.0, "tp2":106.0, "risk_pct":10.0,
+        "score":75, "atr":2.0, "zone":{"kind":"DEMAND", "btm":95.0, "top":100.0},
+        "target":{"obstacle_price":112.0},
+    }
+    quote = {"status":"ok", "symbol":"TEST-USDT", "bid":99.9, "ask":100.0, "spread_pct":0.1,
+             "quote_observed_at_ms":int(time.time()*1000), "quote_exchange_time_ms":int(time.time()*1000)}
+    monkeypatch.setattr(run_once, "MAX_ENTRY_SLIPPAGE_PCT", 1.0)
+    monkeypatch.setattr(run_once, "_validate_trade_geometry", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {"status":"ok", "sl_orders":[], "tp_orders":[]})
+    monkeypatch.setattr(run_once, "get_execution_quote", lambda *a, **k: dict(quote))
+    monkeypatch.setattr(run_once, "_build_setup", lambda s: {"zone":{"kind":"DEMAND"}})
+    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: {
+        "status":"opened", "symbol":"TEST-USDT", "order_id":"OLD-FILL", "idempotency":"existing_client_order_resolved_before_post",
+        "execution_quote":dict(quote),
+    })
+    monkeypatch.setattr(run_once, "wait_for_position_fill_directional", lambda *a, **k: {"status":"found", "avgPrice":102.5, "positionAmt":1.0})
+    monkeypatch.setattr(run_once, "ensure_directional_protection", lambda *a, **k: {
+        "status":"PROTECTED", "sl_result":{"status":"verified", "order_id":"SL1", "stop_price":92.25, "qty":1.0},
+        "tp_orders":[{"leg":"TP1","status":"verified","order_id":"TP1"},{"leg":"TP2","status":"verified","order_id":"TP2"}],
+        "effective_tp_levels":[{"leg":"TP1","pnl_pct":3.0,"close_fraction":0.5},{"leg":"TP2","pnl_pct":6.0,"close_fraction":0.5}],
+        "effective_weighted_rr":0.45,
+    })
+    monkeypatch.setattr(run_once, "register_active_trade", lambda *a, **k: True)
+    monkeypatch.setattr(run_once, "_append_execution_ledger", lambda *a, **k: True)
+    monkeypatch.setattr(run_once.telemetry, "record_order_event", lambda *a, **k: None)
+    monkeypatch.setattr(run_once, "_emergency_close_preserving_protection", lambda *a, **k: pytest.fail("idempotent replay must not be closed for quote-relative mark-to-market loss"))
+
+    result = run_once.execute_new_position(signal)
+    assert result["status"] == "opened_protected"
+    assert result["execution_snapshot"]["execution_slippage_pct"] is None

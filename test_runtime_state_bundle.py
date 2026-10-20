@@ -59,6 +59,7 @@ def test_runtime_state_bundle_roundtrip_is_verified_and_excludes_ephemeral_files
     assert not (fresh_data / "stale-state.json").exists()
     assert not (fresh_data / "retention_archive").exists()
     assert not (fresh_data / "scan_history.jsonl").exists()
+    assert (fresh_data / ".gitkeep").is_file()
 
 
 def test_runtime_state_bundle_rejects_pre_clean_start_schema(tmp_path):

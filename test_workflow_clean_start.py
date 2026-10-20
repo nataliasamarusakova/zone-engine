@@ -28,7 +28,7 @@ def test_self_verifying_completed_event_engine_runs_are_candidates_and_old_schem
     workflow = (Path(__file__).parent / ".github" / "workflows" / "event-engine.yml").read_text(encoding="utf-8")
     restore_script = workflow.split("- name: Restore latest durable runtime-state artifact", 1)[1].split("- name: Set up Python", 1)[0]
     assert '.status == "completed"' in restore_script
-    assert '.conclusion == "success"' not in restore_script
+    assert '.conclusion == "success"' in restore_script
     assert '.event == "repository_dispatch"' in restore_script
     assert 'select(.name == "zone-engine-runtime-state")] | length' in restore_script
     assert "possibly expired/ineligible artifacts" in restore_script

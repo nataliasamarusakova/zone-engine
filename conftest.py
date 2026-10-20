@@ -6,7 +6,10 @@ import pytest
 @pytest.fixture(autouse=True)
 def isolate_repository_research_data(monkeypatch, tmp_path):
     """Never allow pytest research tests to mutate the repository's production data/."""
-    from event_engine import research
+    from event_engine import research, bingx
+    # Default deterministic unit-test account mode is one-way; tests that exercise
+    # hedge mode explicitly override the cache or mock position_side_param.
+    bingx._POSITION_MODE_CACHE.update({"ts": 9999999999, "dual": False})
 
     runtime_data = tmp_path / "research-data"
     runtime_data.mkdir(parents=True, exist_ok=True)
