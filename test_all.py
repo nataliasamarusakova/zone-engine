@@ -1896,6 +1896,11 @@ def test_tracker_close_once_is_idempotent(tmp_path, monkeypatch):
 
 def test_open_market_blocks_two_tp_min_quantity_before_order(monkeypatch):
     from event_engine import bingx
+    # Keep this sizing test deterministic when CI supplies a conservative
+    # runtime leverage (e.g. 3x). The test specifically exercises qty == one
+    # exchange minimum, which is insufficient to split into two TP legs.
+    monkeypatch.setattr(bingx, "LEVERAGE", 10)
+    monkeypatch.setattr(bingx, "MAX_LEVERAGE", 10)
     monkeypatch.setenv("BINGX_MARGIN_USDT", "1")
     monkeypatch.setattr(bingx, "get_contract", lambda symbol: {
         "symbol": "BNB-USDT", "quantityPrecision": 2, "tradeMinQuantity": 0.01,
