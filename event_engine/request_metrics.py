@@ -15,7 +15,7 @@ from collections import Counter
 from contextlib import contextmanager
 from typing import Any, Callable, Iterator
 
-_ENABLED = os.environ.get("REQUEST_TIMING_METRICS", "true").strip().lower() not in {"0", "false", "no", "off"}
+_ENABLED = os.environ.get("REQUEST_TIMING_METRICS", "false").strip().lower() not in {"0", "false", "no", "off"}
 _MAX_SAMPLES_PER_KEY = 10_000
 _LOCK = threading.RLock()
 _LOCAL = threading.local()
@@ -123,6 +123,8 @@ def instrument_scan_symbol(function: Callable[..., Any]) -> Callable[..., Any]:
     """Decorate scan_one while preserving its AST-visible body for existing audits/tests."""
     @wraps(function)
     def wrapped(symbol: str, *args: Any, **kwargs: Any) -> Any:
+        if not _ENABLED:
+            return function(symbol, *args, **kwargs)
         started = time.perf_counter()
         outcome = "exception"
         try:
@@ -228,7 +230,6 @@ def snapshot() -> dict[str, Any]:
 def log_summary(logger: Any, *, max_request_groups: int = 40, max_slowest_items: int = 10) -> None:
     """Emit endpoint-level latency distributions and slowest local operations."""
     if not _ENABLED:
-        logger.info("[REQUEST_METRICS] disabled=true reason=REQUEST_TIMING_METRICS")
         return
 
     data = snapshot()

@@ -104,6 +104,8 @@ def _tracker_parallel_first_tp_read_enabled() -> bool:
 
 
 def _record_tracker_elapsed(timings: dict[str, dict[str, float]], name: str, elapsed: float) -> None:
+    if not request_metrics.enabled():
+        return
     elapsed = max(0.0, float(elapsed))
     bucket = timings.setdefault(name, {"calls": 0.0, "seconds": 0.0, "max_seconds": 0.0})
     bucket["calls"] += 1
@@ -115,13 +117,15 @@ def _fetch_tp_evidence_timed(
     symbol: str, order_id: str, entry_ts: int, phase_name: str,
 ) -> tuple[dict | None, float, Exception | None]:
     """Fetch one read-only TP status in a worker with isolated retry/session context."""
-    started = time.perf_counter()
+    started = time.perf_counter() if request_metrics.enabled() else None
     try:
         with request_metrics.phase(phase_name), request_metrics.symbol_context(symbol), thread_local_retry_session():
             value = _get_order_execution_evidence(symbol, order_id, entry_ts=entry_ts)
-        return value, max(0.0, time.perf_counter() - started), None
+        elapsed = max(0.0, time.perf_counter() - started) if started is not None else 0.0
+        return value, elapsed, None
     except Exception as exc:
-        return None, max(0.0, time.perf_counter() - started), exc
+        elapsed = max(0.0, time.perf_counter() - started) if started is not None else 0.0
+        return None, elapsed, exc
 
 
 def _timed_tracker_call(
@@ -131,7 +135,9 @@ def _timed_tracker_call(
     *args,
     **kwargs,
 ):
-    """Measure one tracker operation without changing its return/error behavior."""
+    """Measure one tracker operation only when request timing diagnostics are enabled."""
+    if not request_metrics.enabled():
+        return function(*args, **kwargs)
     started = time.perf_counter()
     try:
         return function(*args, **kwargs)
@@ -140,7 +146,9 @@ def _timed_tracker_call(
 
 
 def _log_tracker_timings(timings: dict[str, dict[str, float]], total_seconds: float, active_trades: int) -> None:
-    """Emit one compact diagnostic line; these measurements never gate trading."""
+    """Emit one compact diagnostic line only in explicit timing-diagnostic mode."""
+    if not request_metrics.enabled():
+        return
     pieces = [
         f"total_s={max(0.0, total_seconds):.3f}",
         f"active_trades={max(0, int(active_trades))}",
@@ -1564,6 +1572,82 @@ def _is_valid_break_even_stop(order: dict, direction: str, entry_price: float, q
     return True
 
 
+def _cancel_conflicted_be_if_old_sl_verified(
+    symbol: str,
+    direction: str,
+    entry_price: float,
+    qty: float,
+    old_sl_id: str | None,
+    be_order_id: str,
+    be_client_id: str,
+    price_precision: int,
+) -> dict[str, Any]:
+    """Best-effort cleanup of this event's just-created BE order on owner conflict.
+
+    The new BE is cancelled only when its exact order ID + unique client ID are
+    visible AND a separate, quantity-covering old SL is verified both before
+    and after cancellation. If that proof is unavailable, leave exchange-side
+    protection untouched and let the normal BE retry/reconciliation surface it.
+    """
+    if not old_sl_id:
+        return {"verified": False, "status": "deferred", "error": "old SL id unavailable"}
+
+    def _find_protection(snapshot: dict[str, Any]) -> tuple[dict | None, dict | None]:
+        all_orders = list(snapshot.get("sl_orders", [])) + list(snapshot.get("tp_orders", []))
+        candidate = next((
+            order for order in all_orders
+            if str(order.get("orderId") or order.get("order_id") or "") == str(be_order_id)
+            and str(order.get("clientOrderId") or "").upper() == str(be_client_id).upper()
+        ), None)
+        old = next((
+            order for order in snapshot.get("sl_orders", [])
+            if str(order.get("orderId") or order.get("order_id") or "") == str(old_sl_id)
+        ), None)
+        return candidate, old
+
+    def _old_sl_covers(old: dict | None) -> bool:
+        if not isinstance(old, dict) or not _validate_sl_order_for_position(old, direction, entry_price, None):
+            return False
+        old_qty = _safe_float(old.get("origQty") or old.get("quantity"), 0.0)
+        return old_qty > 0 and old_qty + max(qty * 0.01, 1e-12) >= qty
+
+    try:
+        before = get_open_protection_directional(symbol, direction)
+    except Exception as exc:
+        return {"verified": False, "status": "deferred", "error": f"pre-cancel openOrders failed: {exc}"}
+    if before.get("status") != "ok":
+        return {"verified": False, "status": "deferred", "error": f"pre-cancel openOrders unavailable: {before.get('error', 'unknown')}"}
+    new_order, old_sl = _find_protection(before)
+    if not _old_sl_covers(old_sl):
+        return {"verified": False, "status": "deferred", "error": "old SL not independently verified to cover the live residual"}
+    if new_order is None:
+        return {"verified": True, "status": "new_BE_already_absent", "error": None}
+    if not _is_valid_break_even_stop(new_order, direction, entry_price, qty, price_precision):
+        return {"verified": False, "status": "deferred", "error": "matched client ID did not pass BE validation"}
+
+    try:
+        cancel_order(symbol, str(be_order_id))
+    except Exception as exc:
+        cancel_error = f"cancel request raised: {type(exc).__name__}: {exc}"
+    else:
+        cancel_error = ""
+
+    try:
+        after = get_open_protection_directional(symbol, direction)
+    except Exception as exc:
+        return {"verified": False, "status": "cleanup_pending", "error": f"post-cancel verification failed: {exc}"}
+    if after.get("status") != "ok":
+        return {"verified": False, "status": "cleanup_pending", "error": f"post-cancel openOrders unavailable: {after.get('error', 'unknown')}"}
+    remaining_be, old_sl_after = _find_protection(after)
+    if remaining_be is None and _old_sl_covers(old_sl_after):
+        return {"verified": True, "status": "cancelled_verified", "error": cancel_error or None}
+    return {
+        "verified": False,
+        "status": "cleanup_pending",
+        "error": cancel_error or "BE order remains visible or old SL no longer passes verification",
+    }
+
+
 def _move_sl_to_break_even(
     symbol: str, direction: str, entry_price: float, qty: float, old_sl_id: str | None, trade_id: str | None = None,
     old_sl_price: float | None = None, owner_event_id: str | None = None,
@@ -1616,11 +1700,19 @@ def _move_sl_to_break_even(
                         current_trades, {existing_id}, exclude_event_id=str(owner_event_id or trade_id or "")
                     )
                     if owners:
+                        cleanup = (
+                            _cancel_conflicted_be_if_old_sl_verified(
+                                symbol, direction, entry_price, qty, old_sl_id, existing_id,
+                                be_client_id, price_precision,
+                            )
+                            if cid == be_client_id.upper()
+                            else {"verified": False, "status": "deferred", "error": "conflicting order is not identified by this event's unique client ID"}
+                        )
                         conflict_ids = sorted(owners)
                         telemetry.record_state_conflict(
                             event_id=owner_event_id or trade_id, attempt_id=None, position_id=owner_event_id or trade_id,
                             order_id=existing_id, symbol=symbol, direction=direction, conflict_type="BE_ORDER_OWNERSHIP_CONFLICT",
-                            message=f"existing BE stop is already owned by another active event: {owners}; keeping current SL untouched",
+                            message=f"existing BE stop is already owned by another active event: {owners}; cleanup={cleanup.get('status')}; old SL is kept",
                             owner_event_ids=[str(owner_event_id or trade_id or "")] + sorted({eid for ids in owners.values() for eid in ids}),
                             conflicting_order_ids=conflict_ids, leg="BE_SL",
                         )
@@ -1631,6 +1723,9 @@ def _move_sl_to_break_even(
                             "client_order_id": cid or be_client_id,
                             "stop_price": entry_price,
                             "safety_action": "old_sl_kept",
+                            "orphaned_order_cleanup_pending": bool(cid == be_client_id.upper() and not cleanup.get("verified")),
+                            "orphaned_order_cleanup_status": cleanup.get("status"),
+                            "orphaned_order_cleanup_error": cleanup.get("error"),
                         }
                 old_cancelled = True
                 cancel_note = ""
@@ -1817,11 +1912,14 @@ def _move_sl_to_break_even(
         current_trades, {new_order_id}, exclude_event_id=str(owner_event_id or trade_id or "")
     )
     if owners:
+        cleanup = _cancel_conflicted_be_if_old_sl_verified(
+            symbol, direction, entry_price, qty, old_sl_id, new_order_id, be_client_id, price_precision,
+        )
         conflict_ids = sorted(owners)
         telemetry.record_state_conflict(
             event_id=owner_event_id or trade_id, attempt_id=None, position_id=owner_event_id or trade_id,
             order_id=new_order_id, symbol=symbol, direction=direction, conflict_type="BE_ORDER_OWNERSHIP_CONFLICT",
-            message=f"new BE order id collides with another active event: {owners}; old SL will remain",
+            message=f"new BE order id collides with another active event: {owners}; cleanup={cleanup.get('status')}; old SL is kept",
             owner_event_ids=[str(owner_event_id or trade_id or "")] + sorted({eid for ids in owners.values() for eid in ids}),
             conflicting_order_ids=conflict_ids, leg="BE_SL",
         )
@@ -1832,6 +1930,9 @@ def _move_sl_to_break_even(
             "client_order_id": order.get("clientOrderId") or be_client_id,
             "stop_price": entry_price,
             "safety_action": "old_sl_kept",
+            "orphaned_order_cleanup_pending": not bool(cleanup.get("verified")),
+            "orphaned_order_cleanup_status": cleanup.get("status"),
+            "orphaned_order_cleanup_error": cleanup.get("error"),
         }
 
     # The BE stop is now proven to exist, so the position never becomes naked.
@@ -2811,7 +2912,7 @@ def _reconciliation_status(local_qty: float, exchange_qty: float, base_status: s
 
 
 def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None:
-    tracker_perf_started = time.perf_counter()
+    tracker_perf_started = time.perf_counter() if request_metrics.enabled() else None
     tracker_timings: dict[str, dict[str, float]] = {}
     # Reconciliation is a live-state operation. Once the engine has reached this
     # stage, missing state must fail closed rather than be interpreted as an empty
@@ -4069,7 +4170,8 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
         )
     finally:
         tp_read_executor.shutdown(wait=True)
-        _log_tracker_timings(
-            tracker_timings, time.perf_counter() - tracker_perf_started,
-            sum(1 for trade in trades.values() if isinstance(trade, dict) and not trade.get("closed", False)),
-        )
+        if tracker_perf_started is not None:
+            _log_tracker_timings(
+                tracker_timings, time.perf_counter() - tracker_perf_started,
+                sum(1 for trade in trades.values() if isinstance(trade, dict) and not trade.get("closed", False)),
+            )

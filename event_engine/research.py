@@ -1582,15 +1582,22 @@ def build_observation_from_touch_event(
 
 
 def _zone_lookup(demand: list[dict[str, Any]], supply: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Index zones with the same fallback identity used by run_once zone visits."""
     out: dict[str, dict[str, Any]] = {}
-    for zone in demand:
-        zid = str(zone.get("zone_id", ""))
-        key = f"DEMAND:{zid}" if zid else f"DEMAND:{zone.get('origin_ts_ms')}:{zone.get('top')}:{zone.get('btm')}"
-        out[key] = zone
-    for zone in supply:
-        zid = str(zone.get("zone_id", ""))
-        key = f"SUPPLY:{zid}" if zid else f"SUPPLY:{zone.get('origin_ts_ms')}:{zone.get('top')}:{zone.get('btm')}"
-        out[key] = zone
+    for kind, zones in (("DEMAND", demand), ("SUPPLY", supply)):
+        for zone in zones:
+            zid = str(zone.get("zone_id", "")).strip()
+            if zid:
+                key = f"{kind}:{zid}"
+            else:
+                origin_ts_ms = int(zone.get("origin_ts_ms", -1) or -1)
+                top = float(zone.get("top", 0.0))
+                bottom = float(zone.get("btm", 0.0))
+                if origin_ts_ms > 0:
+                    key = f"{kind}:ORIGIN:{origin_ts_ms}:{top:.12f}:{bottom:.12f}"
+                else:
+                    key = f"{kind}:{int(zone.get('start', -1))}:{top:.12f}:{bottom:.12f}"
+            out[key] = zone
     return out
 
 

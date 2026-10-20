@@ -832,6 +832,11 @@ def calculate_counterfactual_outcomes(
     and re-sorting the same market history for each observation.
     """
     shadow = ((observation.get("features") or {}).get("shadow_experiments") or {})
+    # Production observations persist the complete snapshot envelope returned by
+    # build_entry_snapshot(). Older tests/journals may contain only the flat
+    # experiments mapping, so support both forms without mutating the source.
+    if isinstance(shadow, dict) and isinstance(shadow.get("experiments"), dict):
+        shadow = shadow["experiments"]
     direction = str(observation.get("direction", "")).upper()
     entry = _finite(observation.get("reference_price"))
     source_ts = _parse_ts(
