@@ -606,3 +606,50 @@ def test_complete_emergency_exit_fills_upgrade_residual_pnl_from_unverified_to_c
     assert close["realized_pnl_pct"] == pytest.approx(1.0)
     assert close["realized_pnl_pct_confirmed_partial"] is None
     assert close["realized_pnl_source"] == "confirmed_fill_accounting"
+
+
+def test_entry_not_filled_is_terminal_and_recovered_from_trade_journal(tmp_path, monkeypatch):
+    import run_once
+
+    assert run_once._is_terminal_execution_failure({"status": "entry_not_filled"}) is True
+    journal = tmp_path / "trades.jsonl"
+    journal.write_text(json.dumps({
+        "event_id": "EVT_NO_FILL", "result": {"status": "entry_not_filled"},
+    }) + "\n", encoding="utf-8")
+    monkeypatch.setattr(run_once, "TRADES_PATH", journal)
+    assert "EVT_NO_FILL" in run_once._load_terminal_event_ids()
+
+
+def test_displacement_rejection_is_case_insensitive_for_zone_retirement():
+    import run_once
+
+    assert run_once._is_stale_entry_rejection({
+        "status": "SKIPPED_STALE_SIGNAL",
+        "error": "signal_price_displacement_pct=1.25 exceeds limit",
+    }) is True
+    assert run_once._is_stale_entry_rejection({
+        "status": "SKIPPED_STALE_SIGNAL", "error": "other reject",
+    }) is False
+
+
+def test_reconciliation_risk_uses_setup_fallback_and_never_guesses_one_percent():
+    import run_once
+
+    assert run_once._reconciliation_stop_loss_pct({
+        "planned_risk_pct": None, "setup": {"risk_pct": "10.0"},
+    }) == 10.0
+    assert run_once._reconciliation_stop_loss_pct({
+        "planned_risk_pct": "corrupt", "setup": {"risk_pct": 10.0},
+    }) == 10.0
+    assert run_once._reconciliation_stop_loss_pct({
+        "planned_risk_pct": "corrupt", "setup": {"risk_pct": "also-corrupt"},
+    }) is None
+
+
+def test_entry_timestamp_observed_after_fill_is_passed_into_trade_registration():
+    import inspect
+    import run_once
+
+    source = inspect.getsource(run_once.execute_new_position)
+    assert "fill_observed_ts_ms = int(fill_observed_ts.timestamp() * 1000)" in source
+    assert "entry_ts_ms=fill_observed_ts_ms" in source

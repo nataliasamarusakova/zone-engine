@@ -105,3 +105,32 @@ def test_phase_is_thread_local_and_operation_summary_is_recorded(caplog: pytest.
 
     assert "[OP_TIMING] operation=scan_symbol count=2" in caplog.text
     assert "[OP_SLOWEST] operation=scan_symbol label=BBBUSDT seconds=0.750 outcome=error" in caplog.text
+
+
+def test_metrics_keep_exact_operation_average_and_late_slowest_items(monkeypatch, caplog):
+    monkeypatch.setattr(request_metrics, "_MAX_SAMPLES_PER_KEY", 2)
+    request_metrics.reset()
+    for label, seconds in (("fast-1", 0.01), ("fast-2", 0.02), ("very-slow-later", 99.0)):
+        request_metrics.record_operation("scan_symbol", label, seconds)
+        request_metrics._record_request(
+            phase="scan_symbol", service="bingx", endpoint="/test", method="GET",
+            seconds=seconds, outcome="200", failed=False,
+        )
+
+    snap = request_metrics.snapshot()
+    operation = snap["operations"]["scan_symbol"]
+    request = next(row for row in snap["requests"] if row["endpoint"] == "/test")
+    assert operation["count"] == 3
+    assert operation["total_seconds"] == pytest.approx(99.03)
+    assert len(operation["samples"]) == 2
+    assert [item["label"] for item in operation["items"]][0] == "very-slow-later"
+    assert request["count"] == 3
+    assert request["total_seconds"] == pytest.approx(99.03)
+    assert request["max_seconds"] == pytest.approx(99.0)
+    assert len(request["samples"]) == 2
+    assert snap["http_details"][0]["seconds"] == pytest.approx(99.0)
+
+    with caplog.at_level(logging.INFO):
+        request_metrics.log_summary(logging.getLogger("request_metrics_bounded_test"))
+    assert "avg_s=33.010" in caplog.text
+    assert "label=very-slow-later seconds=99.000" in caplog.text

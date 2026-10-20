@@ -6104,3 +6104,53 @@ def test_be_ownership_conflict_cleans_only_our_new_order_when_old_sl_is_verified
     assert result["orphaned_order_cleanup_pending"] is False
     assert calls == [("AAA-USDT", "BE1")]
     assert [o["orderId"] for o in exchange_orders] == ["OLD1"]
+
+
+def test_mfe_mae_uses_post_entry_close_for_candle_overlapping_entry():
+    from event_engine import tracker
+
+    trade = {
+        "entry_price": 100.0, "direction": "LONG", "entry_ts": 1_000,
+        "planned_risk_pct": 1.0, "peak_pnl_pct": 0.0, "mae_pct": 0.0,
+        "max_drawdown_pct": 0.0,
+    }
+    tracker._update_mfe_mae(trade, [{
+        "open_time": 900, "close_time": 1_200,
+        "open": 100.0, "high": 110.0, "low": 90.0, "close": 102.0,
+    }])
+    # The intrabar extremes may predate entry, but the close is a confirmed
+    # post-entry observation and must not be discarded with the entire candle.
+    assert trade["peak_pnl_pct"] == pytest.approx(2.0)
+    assert trade["mae_pct"] == pytest.approx(0.0)
+
+
+def test_adverse_filled_tp_leg_is_excluded_from_remaining_rr():
+    from event_engine import tracker
+
+    trade = {
+        "initial_qty": 1.0,
+        "remaining_qty": 0.5,
+        "planned_risk_pct": 10.0,
+        "realized_pnl_qty": 0.5,
+        "realized_pnl_weighted_sum": -0.5,
+        "hit_legs": [],
+        "completed_tp_legs": ["tp1"],
+        "tp_levels": [
+            {"leg": "tp1", "pnl_pct": 3.0, "close_fraction": 0.5},
+            {"leg": "tp2", "pnl_pct": 6.0, "close_fraction": 0.5},
+        ],
+    }
+    effective, realized, remaining = tracker._weighted_rr_snapshot(trade)
+    assert realized == pytest.approx(-0.05)
+    assert remaining == pytest.approx(0.6)
+    assert effective == pytest.approx(0.25)
+
+
+def test_tp1_trigger_timestamp_prefers_fill_time_in_both_be_paths():
+    from event_engine import tracker
+
+    trade = {"tp_fill_events": [{
+        "leg": "tp1", "ts": 500, "order_update_time_ms": 450, "fill_time_ms": 400,
+    }]}
+    assert tracker._tp1_fill_timestamp_ms(trade, 999) == 400
+    assert tracker._tp1_fill_timestamp_ms({"tp_fill_events": []}, 999) == 999

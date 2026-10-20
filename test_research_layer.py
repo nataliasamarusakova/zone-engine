@@ -1733,3 +1733,48 @@ def test_deferred_account_context_refreshes_prebuilt_shadow_snapshot_for_both_jo
     counterfactuals = [json.loads(line) for line in (tmp_path / "counterfactual_experiments.jsonl").read_text().splitlines()]
     assert observations[0]["features"]["shadow_experiments"]["experiments"]["CF_CORRELATION"]["status"] == "NO_OPEN_PEERS"
     assert counterfactuals[0]["snapshot"]["experiments"]["CF_CORRELATION"]["status"] == "NO_OPEN_PEERS"
+
+
+def test_non_batch_scan_does_not_consume_bars_when_observation_write_fails(tmp_path: Path, monkeypatch):
+    """A failed observation append must leave source-bar cursors untouched."""
+    for name in [
+        "ZONE_OBSERVATIONS_PATH", "MARKET_BARS_1H_PATH", "MARKET_BARS_5M_PATH",
+        "RESEARCH_BAR_CURSORS_PATH", "RESEARCH_MANIFEST_PATH", "RESEARCH_ERRORS_PATH",
+    ]:
+        monkeypatch.setattr(research, name, tmp_path / getattr(research, name).name)
+    monkeypatch.setattr(research, "RESEARCH_ENABLED", True)
+    monkeypatch.setattr(research, "_PERSISTENCE_BATCH", None)
+    monkeypatch.setattr(research, "_OBSERVATION_SEEN_IDS", None)
+    monkeypatch.setattr(research, "_OBSERVATION_SEEN_IDS_PATH", None)
+    monkeypatch.setattr(research, "_observation_from_signal", lambda signal, **kwargs: {
+        "observation_id": "OBS_WRITE_FAIL", "event_type": "SIGNAL_CREATED", "symbol": "AAA-USDT",
+    })
+    monkeypatch.setattr(research.shadow, "build_entry_snapshot", lambda *args, **kwargs: {})
+    monkeypatch.setattr(research, "record_counterfactual_snapshot", lambda *args, **kwargs: None)
+    persisted_bars = []
+    monkeypatch.setattr(research, "persist_market_bars", lambda *args, **kwargs: persisted_bars.append(args) or 1)
+
+    original_append = research._append_jsonl_locked
+
+    def fail_observation_append(path, rows):
+        if path == research.ZONE_OBSERVATIONS_PATH:
+            raise OSError("simulated observation write failure")
+        return original_append(path, rows)
+
+    monkeypatch.setattr(research, "_append_jsonl_locked", fail_observation_append)
+    source_bar = {
+        "timestamp": "2026-01-01T00:00:00+00:00", "open": 100.0,
+        "high": 101.0, "low": 99.0, "close": 100.5, "volume": 10.0,
+    }
+    result = research.record_scan_symbol(
+        scan_id="SCAN_WRITE_FAIL", symbol="AAA-USDT", strategy_version="v1",
+        code_commit_sha="abc", provider="binance", source="test",
+        bars_1h=[source_bar], bars_5m=[], df_1h=pd.DataFrame(), demand=[], supply=[],
+        diagnostics={}, symbol_state={}, signals=[{"event_id": "EVT_WRITE_FAIL", "symbol": "AAA-USDT"}],
+        persist_bars_for_forward=True,
+    )
+
+    assert result["observations"] == 0
+    assert result["bars_1h"] == result["bars_5m"] == 0
+    assert persisted_bars == []
+    assert not (tmp_path / "research_bar_cursors.json").exists()

@@ -623,6 +623,7 @@ def _load_terminal_event_ids() -> set[str]:
         "opened_emergency_close_unverified",
         "opened_registration_failed_close_unverified",
         "entry_state_unverified",
+        "entry_not_filled",
     }
     for line in TRADES_PATH.read_text(encoding="utf-8").splitlines():
         try:
@@ -2185,8 +2186,23 @@ def reconcile_all_open_positions() -> bool:
             continue
 
         event_id, trade = candidates[0]
-        stop_loss_pct = float(trade.get("planned_risk_pct") or 1.0)
         setup = trade.get("setup", {}) if isinstance(trade.get("setup"), dict) else {}
+        stop_loss_pct = _reconciliation_stop_loss_pct(trade)
+        if stop_loss_pct is None:
+            unresolved = True
+            log.critical(
+                "[RECON_RISK_STATE_UNTRUSTED] event=%s symbol=%s side=%s; "
+                "planned risk is missing or invalid, leaving exchange protection untouched and blocking entries",
+                event_id, symbol, side,
+            )
+            telemetry.record_state_conflict(
+                event_id=event_id, attempt_id=trade.get("attempt_id"), position_id=trade.get("position_id") or event_id,
+                order_id=None, symbol=symbol, direction=side,
+                conflict_type="INVALID_PLANNED_RISK_STATE",
+                message="cannot safely rebuild directional protection without a valid planned_risk_pct or setup.risk_pct",
+                owner_event_ids=[event_id],
+            )
+            continue
         tp_levels = setup.get("tp_levels") if isinstance(setup.get("tp_levels"), list) else None
         if not tp_levels:
             tp_levels = [
@@ -3093,10 +3109,20 @@ def _emergency_execution_status(close_result: dict[str, Any] | None) -> str:
     return "opened_emergency_close_unverified"
 
 
+def _is_stale_entry_rejection(execution: dict[str, Any]) -> bool:
+    """Whether a rejected stale entry should release its pending zone visit."""
+    status = str(execution.get("status", "")).lower()
+    error = str(execution.get("error", ""))
+    return (
+        execution.get("stale_trigger_reason") in {"5m_trigger_too_old", "invalid_5m_trigger_time"}
+        or (status == "skipped_stale_signal" and "signal_price_displacement_pct" in error)
+    )
+
+
 def _is_terminal_execution_failure(execution: dict[str, Any]) -> bool:
     status = str(execution.get("status", "")).lower()
     error = str(execution.get("error", "")).lower()
-    if status in {"skipped_stale_signal", "skipped_tp_min_qty", "skipped_min_qty", "skipped_invalid_setup", "opened_then_emergency_closed", "opened_emergency_close_unverified", "opened_registration_failed_close_unverified", "entry_state_unverified"}:
+    if status in {"skipped_stale_signal", "skipped_tp_min_qty", "skipped_min_qty", "skipped_invalid_setup", "opened_then_emergency_closed", "opened_emergency_close_unverified", "opened_registration_failed_close_unverified", "entry_state_unverified", "entry_not_filled"}:
         return True
     terminal_fragments = (
         "risk_pct_above_limit",
@@ -3108,6 +3134,27 @@ def _is_terminal_execution_failure(execution: dict[str, Any]) -> bool:
         "calculated quantity is <= 0",
     )
     return any(fragment in error for fragment in terminal_fragments)
+
+
+def _reconciliation_stop_loss_pct(trade: dict[str, Any]) -> float | None:
+    """Return a trustworthy saved stop-risk percentage for protection repair.
+
+    Prefer the canonical active-trade field, then the immutable setup snapshot.
+    Never guess a materially different fallback such as 1% when state is missing
+    or corrupt: callers must fail closed rather than rebuild protection at a
+    potentially incorrect distance.
+    """
+    setup = trade.get("setup") if isinstance(trade.get("setup"), dict) else {}
+    for candidate in (trade.get("planned_risk_pct"), setup.get("risk_pct")):
+        if candidate in (None, "") or isinstance(candidate, bool):
+            continue
+        try:
+            value = float(candidate)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(value) and value > 0:
+            return value
+    return None
 
 
 def _elapsed_seconds(start_ts: Any, end_ts: Any) -> float | None:
@@ -3664,6 +3711,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
             }
 
     fill_observed_ts = pd.Timestamp.now(tz="UTC")
+    fill_observed_ts_ms = int(fill_observed_ts.timestamp() * 1000)
     signal["fill_observed_ts"] = fill_observed_ts.isoformat()
     avg_price = float(position["avgPrice"])
     qty = abs(float(position["positionAmt"]))
@@ -3678,7 +3726,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         status="FILL_OBSERVED",
         exchange_fill_price=avg_price,
         executed_qty=qty,
-        fill_observed_ts_ms=int(fill_observed_ts.timestamp() * 1000),
+        fill_observed_ts_ms=fill_observed_ts_ms,
         position_side=direction,
     )
     pre_entry_bid = float(execution_quote["bid"])
@@ -3964,6 +4012,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
             score=float(signal.get("score", 0.0)),
             setup={**setup, "protection_status": protection.get("status"), "protection_result": protection},
             requested_entry_price=entry_price,
+            entry_ts_ms=fill_observed_ts_ms,
         )
     except ActiveTradeStateCorrupt as exc:
         registered = False
@@ -5205,11 +5254,7 @@ def main() -> None:
         if execution_status in {"opened_emergency_close_unverified", "opened_registration_failed_close_unverified", "entry_state_unverified"}:
             private_ready = False
             log.critical("[LIVE_BLOCKED_EXECUTION_STATE] status=%s symbol=%s direction=%s; no further entries this cycle", execution_status, signal.get("symbol"), signal.get("type"))
-        execution_error_text = str(execution.get("error", ""))
-        rejected_stale_entry = (
-            execution.get("stale_trigger_reason") in {"5m_trigger_too_old", "invalid_5m_trigger_time"}
-            or (execution_status == "skipped_stale_signal" and "signal_price_displacement_pct" in execution_error_text)
-        )
+        rejected_stale_entry = _is_stale_entry_rejection(execution)
         if rejected_stale_entry:
             if _clear_stale_pending_zone_visit(zone_visit_state, signal):
                 _save_zone_visit_state(zone_visit_state)
