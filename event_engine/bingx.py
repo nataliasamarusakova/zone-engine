@@ -920,14 +920,28 @@ def has_open_position(symbol: str, direction: str) -> bool:
     for p in positions:
         if str(p.get("symbol", "")).upper() != bx:
             continue
-        side = str(p.get("positionSide", p.get("positionAmt", ""))).upper()
+        position_side = str(p.get("positionSide", "")).upper()
+        if position_side in {"LONG", "SHORT"}:
+            explicit_side = position_side
+        elif position_side == "BOTH":
+            explicit_side = ""  # one-way direction comes from the signed amount
+        else:
+            explicit_side = str(p.get("side", "")).upper()
         try:
             amt = float(p.get("positionAmt", 0) or 0)
         except Exception:
             amt = 0.0
-
-        if amt != 0 and (want in side or (want == "LONG" and amt > 0) or (want == "SHORT" and amt < 0)):
-            return True
+        if amt == 0:
+            continue
+        # In hedge mode the explicit LONG/SHORT side is authoritative; signed
+        # amount is used to infer direction only for one-way BOTH positions.
+        if explicit_side in {"LONG", "SHORT"}:
+            if explicit_side == want:
+                return True
+            continue
+        if position_side == "BOTH" or not position_side:
+            if (want == "LONG" and amt > 0) or (want == "SHORT" and amt < 0):
+                return True
     return False
 
 
@@ -2390,7 +2404,17 @@ def fetch_research_account_snapshot() -> dict[str, Any]:
             signed=True, timeout_sec=min(5.0, float(os.environ.get("RESEARCH_ACCOUNT_TIMEOUT_SEC", "5"))), retryable=False,
         )
         if isinstance(fills, dict) and int(fills.get("code", -1)) == 0:
-            raw_rows = fills.get("data") if isinstance(fills.get("data"), list) else []
+            raw_data = fills.get("data")
+            if isinstance(raw_data, list):
+                raw_rows = raw_data
+            elif isinstance(raw_data, dict):
+                raw_rows = []
+                for wrapper_key in ("rows", "list", "items", "data"):
+                    if isinstance(raw_data.get(wrapper_key), list):
+                        raw_rows = raw_data[wrapper_key]
+                        break
+            else:
+                raw_rows = []
             activity_rows = []
             fee_values: list[float] = []
             realized_values: list[float] = []
@@ -2879,20 +2903,8 @@ def ensure_directional_protection(
             engine_owned_invalid_sl_ids.append(order_id)
 
     if engine_owned_invalid_sl_ids:
-        for old_id in engine_owned_invalid_sl_ids:
-            try:
-                cancel_resp = cancel_order(symbol, old_id)
-            except Exception as exc:
-                return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "error": f"engine SL cleanup failed for {old_id}: {exc}"}
-            if not isinstance(cancel_resp, dict) or cancel_resp.get("code") not in (0, "0"):
-                return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "error": f"engine SL cleanup failed for {old_id}: {cancel_resp}"}
-
-        post_cleanup = get_open_protection_directional(symbol, direction)
-        if post_cleanup.get("status") != "ok":
-            return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "error": "engine SL cleanup could not be verified"}
-        remaining_ids = {str(o.get("orderId", "")) for o in post_cleanup.get("sl_orders", [])}
-        if any(old_id in remaining_ids for old_id in engine_owned_invalid_sl_ids):
-            return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "error": "engine SL cleanup not visible on exchange"}
+        # Keep the old engine SL as a safety net until a valid replacement has
+        # been created and independently observed on the exchange.
         sl_requery_required = True
 
     if valid_existing_sl is not None:
@@ -2994,6 +3006,24 @@ def ensure_directional_protection(
             "tp_orders": [],
             "error": "SL created but not visible on exchange",
         }
+
+    # Only now that a valid SL is exchange-visible may stale engine-owned SLs
+    # be cancelled. If cleanup fails, return an explicit failure rather than
+    # silently leaving ambiguous duplicate protection behind.
+    if engine_owned_invalid_sl_ids:
+        for old_id in engine_owned_invalid_sl_ids:
+            try:
+                cancel_resp = cancel_order(symbol, old_id)
+            except Exception as exc:
+                return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "sl_result": sl_result, "tp_orders": [], "error": f"engine SL cleanup failed for {old_id}: {exc}"}
+            if not isinstance(cancel_resp, dict) or cancel_resp.get("code") not in (0, "0"):
+                return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "sl_result": sl_result, "tp_orders": [], "error": f"engine SL cleanup failed for {old_id}: {cancel_resp}"}
+        post_cleanup = get_open_protection_directional(symbol, direction)
+        if post_cleanup.get("status") != "ok":
+            return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "sl_result": sl_result, "tp_orders": [], "error": "engine SL cleanup could not be verified"}
+        remaining_ids = {str(o.get("orderId", "")) for o in post_cleanup.get("sl_orders", [])}
+        if any(old_id in remaining_ids for old_id in engine_owned_invalid_sl_ids):
+            return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "sl_result": sl_result, "tp_orders": [], "error": "engine SL cleanup not visible on exchange"}
 
     if not tp_levels_norm:
         return {

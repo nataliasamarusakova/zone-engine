@@ -163,6 +163,32 @@ def _validate_required_paths(paths: set[str]) -> None:
         raise RuntimeError("Runtime-state bundle is missing required files: " + ", ".join(missing))
 
 
+def _validate_critical_json_state(data_dir: Path) -> None:
+    """Reject checksummed but semantically unusable critical state files."""
+    expected_roots = {
+        "active_trades.json": dict,
+        "event_execution_claims.json": dict,
+        "failed_signals.json": dict,
+        "zone_visit_state.json": dict,
+        "research_bar_cursors.json": dict,
+        "research_outcome_state.json": dict,
+        "research_manifest.json": dict,
+        "data_retention_manifest.json": dict,
+    }
+    for name, expected_type in expected_roots.items():
+        path = data_dir / name
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"Critical runtime state {name} is not valid JSON: {exc}") from exc
+        if not isinstance(value, expected_type):
+            raise RuntimeError(f"Critical runtime state {name} must have root type {expected_type.__name__}")
+        if name == "active_trades.json" and any(not isinstance(row, dict) for row in value.values()):
+            raise RuntimeError("Critical runtime state active_trades.json contains a non-object trade record")
+        if name == "event_execution_claims.json" and any(not isinstance(row, dict) for row in value.values()):
+            raise RuntimeError("Critical runtime state event_execution_claims.json contains a non-object claim record")
+
+
 def verify_bundle(bundle_dir: Path) -> dict[str, Any]:
     bundle_dir = Path(bundle_dir)
     if bundle_dir.is_symlink():
@@ -226,6 +252,7 @@ def verify_bundle(bundle_dir: Path) -> dict[str, Any]:
             raise RuntimeError(f"Runtime-state file size mismatch: {rel}")
         if _sha256(path) != record["sha256"]:
             raise RuntimeError(f"Runtime-state SHA-256 mismatch: {rel}")
+    _validate_critical_json_state(bundle_dir / "data")
     print(f"Verified runtime-state bundle: files={len(expected)}")
     return manifest
 

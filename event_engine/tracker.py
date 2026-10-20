@@ -312,6 +312,25 @@ def _save_active_trades(trades: dict[str, dict]) -> None:
         _write_active_trades_unlocked(trades)
 
 
+def record_verified_emergency_close(event_id: str, close_result: dict, *, reason: str) -> bool:
+    """Persist verified flatness for an existing owner so tracker can close it honestly."""
+    if not isinstance(close_result, dict) or str(close_result.get("status", "")).lower() != "closed_verified":
+        return False
+    with _active_trades_lock():
+        trades = _load_active_trades_required()
+        trade = trades.get(str(event_id))
+        if not isinstance(trade, dict) or trade.get("closed") is True:
+            return False
+        trade["verified_emergency_close"] = {
+            "status": "closed_verified",
+            "reason": str(reason),
+            "verified_at_ms": int(time.time() * 1000),
+            "evidence": close_result,
+        }
+        _write_active_trades_unlocked(trades)
+    return True
+
+
 def _save_active_trades_after_reconciliation(
     original_trades: dict[str, dict],
     updated_trades: dict[str, dict],
@@ -443,25 +462,31 @@ def _send_tracker_notification(kind: str, event_id: str, text: str, *, symbol: s
     except Exception as exc:
         ok = False
         log.error("[TG_%s_FAILED] event=%s symbol=%s leg=%s error=%s", kind, event_id, symbol, leg or "", exc)
+        try:
+            _append_action_record({
+                "ts": int(time.time() * 1000),
+                "action": kind,
+                "event_id": str(event_id),
+                "symbol": symbol,
+                "leg": leg,
+                "telegram_ok": False,
+                "error": str(exc),
+            })
+        except Exception as journal_exc:
+            log.error("[TRACKER_ACTION_JOURNAL_FAILED] event=%s kind=%s error=%s", event_id, kind, journal_exc)
+        return False
+
+    try:
         _append_action_record({
             "ts": int(time.time() * 1000),
             "action": kind,
             "event_id": str(event_id),
             "symbol": symbol,
             "leg": leg,
-            "telegram_ok": False,
-            "error": str(exc),
+            "telegram_ok": ok,
         })
-        return False
-
-    _append_action_record({
-        "ts": int(time.time() * 1000),
-        "action": kind,
-        "event_id": str(event_id),
-        "symbol": symbol,
-        "leg": leg,
-        "telegram_ok": ok,
-    })
+    except Exception as journal_exc:
+        log.error("[TRACKER_ACTION_JOURNAL_FAILED] event=%s kind=%s error=%s", event_id, kind, journal_exc)
     if not ok:
         log.error("[TG_%s_FAILED] event=%s symbol=%s leg=%s send() returned False", kind, event_id, symbol, leg or "")
     else:
@@ -1423,6 +1448,29 @@ def _emergency_close_after_be_failure(symbol: str, direction: str, qty: float, t
         "order_filled": order_filled,
     }
 
+def _is_valid_break_even_stop(order: dict, direction: str, entry_price: float, qty: float, price_precision: int) -> bool:
+    """Validate a BE stop's type, exact trigger price and live-position quantity."""
+    if not isinstance(order, dict):
+        return False
+    order_id = str(order.get("orderId") or order.get("order_id") or "")
+    if not order_id or not _validate_sl_order_for_position(order, direction, entry_price, qty):
+        return False
+    stop_price = _safe_float(order.get("stopPrice") or order.get("price"), 0.0)
+    tolerance = max(0.5 * (10 ** (-max(0, int(price_precision)))), entry_price * 1e-8)
+    if abs(stop_price - entry_price) > tolerance:
+        return False
+    # get_open_protection_directional filters positionSide to LONG/SHORT/BOTH;
+    # when the exchange includes the field, reject any contradictory value.
+    position_side = str(order.get("positionSide", "")).upper()
+    if position_side not in {str(direction).upper(), "BOTH"}:
+        return False
+    side = str(order.get("side", "")).upper()
+    expected_side = "SELL" if str(direction).upper() == "LONG" else "BUY"
+    if side != expected_side:
+        return False
+    return True
+
+
 def _move_sl_to_break_even(
     symbol: str, direction: str, entry_price: float, qty: float, old_sl_id: str | None, trade_id: str | None = None,
     old_sl_price: float | None = None, owner_event_id: str | None = None,
@@ -1465,10 +1513,9 @@ def _move_sl_to_break_even(
     if verified.get("status") == "ok":
         for order in verified.get("sl_orders", []):
             cid = str(order.get("clientOrderId", "")).upper()
-            order_price = _safe_float(order.get("stopPrice") or order.get("price"), 0.0)
-            price_matches = order_price > 0 and abs(order_price - entry_price) / max(entry_price, 1e-12) < 0.002
-
-            if be_client_id.upper() in cid or price_matches:
+            # A client ID is only an identity hint, not proof that this is a valid
+            # BE stop. Price, order type, side/position-side and quantity must match.
+            if _is_valid_break_even_stop(order, direction, entry_price, qty, price_precision):
                 existing_id = str(order.get("orderId", ""))
                 if existing_id:
                     current_trades = _load_active_trades_required()
@@ -1521,16 +1568,16 @@ def _move_sl_to_break_even(
         if not old_sl_price or old_sl_price <= 0 or abs(old_sl_price - entry_price) / max(entry_price, 1e-12) < 1e-9:
             return False
         restore_side = "SELL" if direction == "LONG" else "BUY"
-        restore_params = {
-            "symbol": bx,
-            "side": restore_side,
-            "positionSide": position_side_param(direction),
-            "type": "STOP_MARKET",
-            "stopPrice": _format_price(old_sl_price, price_precision),
-            "quantity": _format_qty(qty, precision),
-            "clientOrderId": f"EVT_BE_RST_{trade_token}",
-        }
         try:
+            restore_params = {
+                "symbol": bx,
+                "side": restore_side,
+                "positionSide": position_side_param(direction),
+                "type": "STOP_MARKET",
+                "stopPrice": _format_price(old_sl_price, price_precision),
+                "quantity": _format_qty(qty, precision),
+                "clientOrderId": f"EVT_BE_RST_{trade_token}",
+            }
             restore_resp = _request("POST", ORDER_PATH, restore_params)
         except Exception:
             return False
@@ -1655,7 +1702,12 @@ def _move_sl_to_break_even(
         except Exception as exc:
             verified_after = {"status": "error", "error": str(exc)}
         if verified_after.get("status") == "ok":
-            if any(str(o.get("orderId", "")) == new_order_id for o in verified_after.get("sl_orders", [])):
+            if any(
+                str(o.get("orderId", "")) == new_order_id
+                and _is_valid_break_even_stop(o, direction, entry_price, qty, price_precision)
+                and str(o.get("clientOrderId") or be_client_id).upper() == be_client_id.upper()
+                for o in verified_after.get("sl_orders", [])
+            ):
                 found = True
                 break
         if attempt + 1 < polls:
@@ -1709,6 +1761,7 @@ def _move_sl_to_break_even(
     if old_cleanup_error:
         result["error"] = old_cleanup_error
         result["old_sl_cleanup_pending"] = True
+        result["old_sl_cleanup_pending_order_id"] = str(old_sl_id) if old_sl_id else None
     return result
 
 
@@ -2154,6 +2207,9 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
         if x.get("role") != "ENTRY" and _optional_float(x.get("update_time_ms") or x.get("time_ms")) is not None
         and int(_optional_float(x.get("update_time_ms") or x.get("time_ms"))) > 0
     ]
+    # Keep true fill time authoritative when fills exist. A later order update is
+    # lifecycle metadata, not proof that execution happened at that later time;
+    # use order update time only as an explicitly labeled fallback when no fills exist.
     if fill_exit_ts:
         last_exit_fill_ts_ms = max(fill_exit_ts)
         last_exit_execution_timestamp_source = "FILL_TIME"
@@ -2642,6 +2698,23 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                 updated_trades[event_id] = trade
                 continue
 
+            pending_cleanup = trade.get("sl_cleanup_pending")
+            if isinstance(pending_cleanup, dict) and pending_cleanup.get("old_order_id"):
+                try:
+                    cleanup_ok, cleanup_note = _cancel_old_sl_verified(
+                        symbol, direction, str(pending_cleanup["old_order_id"]),
+                    )
+                except Exception as cleanup_exc:
+                    cleanup_ok, cleanup_note = False, str(cleanup_exc)
+                if cleanup_ok:
+                    trade.pop("sl_cleanup_pending", None)
+                    log.info("[TRACKER_SL_CLEANUP] event=%s old_sl=%s cancellation verified", event_id, pending_cleanup.get("old_order_id"))
+                else:
+                    pending_cleanup["last_attempt_ts"] = now_ms
+                    pending_cleanup["last_error"] = str(cleanup_note)
+                    trade["sl_cleanup_pending"] = pending_cleanup
+                    log.error("[TRACKER_SL_CLEANUP_PENDING] event=%s old_sl=%s error=%s", event_id, pending_cleanup.get("old_order_id"), cleanup_note)
+
             hit_legs = set(trade.get("hit_legs", []))
             filled_by_leg = {str(k): max(0.0, _safe_float(v)) for k, v in (trade.get("tp_filled_qty", {}) or {}).items()}
             realized_qty = max(0.0, _safe_float(trade.get("realized_pnl_qty", 0.0)))
@@ -2939,6 +3012,13 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
 
                 if order_status == "FILLED" and leg not in hit_legs and tp_ok:
                     hit_legs.add(leg)
+                    # Persist idempotency markers before side effects that may fail.
+                    trade["hit_legs"] = sorted(hit_legs)
+                    trade["tp_filled_qty"] = dict(filled_by_leg)
+                    rr_effective_now, rr_realized_now, rr_remaining_now = _weighted_rr_snapshot(trade)
+                    trade["effective_weighted_rr"] = rr_effective_now
+                    trade["realized_weighted_rr"] = rr_realized_now
+                    trade["remaining_weighted_rr"] = rr_remaining_now
                     rem_pct = rem_qty / init_qty * 100.0 if init_qty > 0 else 0.0
 
                     log.info(
@@ -2997,6 +3077,15 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                                 trade["be_last_error"] = "BE order ownership conflict"
                             else:
                                 trade["sl_order"] = new_sl
+                                pending_old_sl_id = new_sl.get("old_sl_cleanup_pending_order_id")
+                                if pending_old_sl_id:
+                                    trade["sl_cleanup_pending"] = {
+                                        "old_order_id": str(pending_old_sl_id),
+                                        "since_ts": now_ms,
+                                        "last_error": new_sl.get("error"),
+                                    }
+                                else:
+                                    trade.pop("sl_cleanup_pending", None)
                                 trade["be_activated"] = True
                                 trade["be_trigger_ts"] = trade.get("be_trigger_ts") or now_ms
                                 trade["be_trigger_peak_r"] = peak_r
@@ -3026,6 +3115,10 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                         else:
                             trade["be_required"] = True
                             trade["be_last_error"] = new_sl.get("error")
+                            rollback = new_sl.get("rollback") if isinstance(new_sl.get("rollback"), dict) else None
+                            if rollback and str(rollback.get("status", "")).lower() in {"closed_verified", "already_closed"}:
+                                trade["be_failure_rollback"] = rollback
+                                trade["be_failure_rollback_verified_ts"] = now_ms
                             telemetry.record_protection_event(
                                 event_id=event_id,
                                 attempt_id=trade.get("attempt_id") or ((trade.get("setup") or {}).get("attempt_id") if isinstance(trade.get("setup"), dict) else None),
@@ -3049,6 +3142,12 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
 
             trade["hit_legs"] = sorted(hit_legs)
             trade["tp_filled_qty"] = filled_by_leg
+            # Recompute after hit_legs is persisted; the earlier per-fill snapshot
+            # ran before a newly FILLED leg was added and could count its target twice.
+            rr_effective, rr_realized, rr_remaining = _weighted_rr_snapshot(trade)
+            trade["effective_weighted_rr"] = rr_effective
+            trade["realized_weighted_rr"] = rr_realized
+            trade["remaining_weighted_rr"] = rr_remaining
             pending_legs = {
                 str(x.get("leg", "")) for x in trade.get("tp_orders", [])
                 if isinstance(x, dict) and x.get("recovered_execution_pending")
@@ -3129,6 +3228,11 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
 
             qty_tolerance = max(1e-12, init_qty * 1e-8)
             closed_by_tp = _is_full_tp_close(position_gone, realized_qty, init_qty, hit_legs)
+            be_rollback = trade.get("be_failure_rollback") if isinstance(trade.get("be_failure_rollback"), dict) else {}
+            verified_emergency_close = trade.get("verified_emergency_close") if isinstance(trade.get("verified_emergency_close"), dict) else {}
+            be_rollback_verified = str(be_rollback.get("status", "")).lower() in {"closed_verified", "already_closed"}
+            emergency_close_verified = str(verified_emergency_close.get("status", "")).lower() == "closed_verified"
+            verified_flatness = be_rollback_verified or emergency_close_verified
 
             if not position_gone and not closed_by_tp:
                 updated_trades[event_id] = trade
@@ -3150,6 +3254,12 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                 exit_reason = _classify_confirmed_stop_exit_reason(trade, sl_order_id, sl_order)
             elif closed_by_tp:
                 exit_reason = "TAKE_PROFIT_FULL"
+            elif position_gone and be_rollback_verified:
+                exit_reason = "EMERGENCY_CLOSE_AFTER_BE_FAILURE"
+                trade["exit_evidence_source"] = "BE_FAILURE_ROLLBACK_POSITION_ABSENCE_VERIFIED"
+            elif position_gone and emergency_close_verified:
+                exit_reason = str(verified_emergency_close.get("reason") or "VERIFIED_EMERGENCY_CLOSE")
+                trade["exit_evidence_source"] = "EMERGENCY_CLOSE_POSITION_ABSENCE_VERIFIED"
             elif position_gone:
                 hist_px, hist_reason, hist_source, historical_order = _timed_tracker_call(
                     tracker_timings, "historical_exit_lookup", _reconcile_historical_exit_order,
@@ -3184,6 +3294,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                 position_gone
                 and sl_exit_price is None
                 and not closed_by_tp
+                and not verified_flatness
                 and historical_order is None
                 and residual_qty_to_preserve > qty_tolerance_for_close
             ):
@@ -3250,7 +3361,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                     local_be_activated=bool(trade.get("be_activated")),
                     local_exit_reason=exit_reason,
                     position_gone=True,
-                    close_evidence_status=("CONFIRMED" if sl_exit_price is not None or closed_by_tp or historical_order is not None else "NO_RESIDUAL_QTY"),
+                    close_evidence_status=("CONFIRMED" if sl_exit_price is not None or closed_by_tp or historical_order is not None or verified_flatness else "NO_RESIDUAL_QTY"),
                 )
 
             if exit_price <= 0:
@@ -3260,7 +3371,17 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
             if sl_exit_price is not None or closed_by_tp:
                 residual_exit_verified = True
             if position_gone and residual_qty_before_position_disappeared > 0 and init_qty > 0:
-                if historical_order is not None or sl_exit_price is not None or closed_by_tp:
+                if closed_by_tp:
+                    # Full TP accounting already reconciled the entire initial quantity.
+                    # A stale pre-disappearance rem_qty must not be booked a second time.
+                    trade["remaining_qty"] = 0.0
+                    residual_exit_verified = True
+                elif verified_flatness:
+                    # Closure is confirmed, but no verified fill price was recovered.
+                    # Clear lifecycle ownership without inventing residual realized PnL.
+                    trade["remaining_qty"] = 0.0
+                    residual_exit_verified = False
+                elif historical_order is not None or sl_exit_price is not None:
                     residual_pnl = _calc_trade_pnl_pct(entry_price, exit_price, direction)
                     realized_weighted += residual_qty_before_position_disappeared * residual_pnl
                     realized_qty += residual_qty_before_position_disappeared
@@ -3567,7 +3688,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                 "realized_pnl_pct": final_pnl,
                 "realized_rr": realized_rr,
                 "realized_pnl_source": realized_pnl_source,
-                "effective_weighted_rr": planned_rr,
+                "effective_weighted_rr": _safe_float(trade.get("effective_weighted_rr"), planned_rr),
                 "planned_weighted_rr": _safe_float(trade.get("planned_weighted_rr"), planned_rr),
                 "realized_weighted_rr": final_weighted_rr,
                 "remaining_weighted_rr": None,

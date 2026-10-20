@@ -533,6 +533,48 @@ def _compact_reconciliation_size_guard(path: Path, *, now: datetime, run_root: P
     return applied
 
 
+def _restore_chunked_snapshot(path: Path, snapshot: dict[str, Any], archive_root: Path) -> None:
+    """Restore one file from its just-created snapshot after a mid-policy exception."""
+    chunks = snapshot.get("chunks") if isinstance(snapshot, dict) else None
+    if not isinstance(chunks, list) or not chunks:
+        raise RuntimeError(f"cannot roll back {path}: snapshot chunks are missing")
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.rollback.", suffix=".tmp", dir=str(path.parent))
+    temp_path = Path(temp_name)
+    digest = hashlib.sha256()
+    total_bytes = 0
+    try:
+        with os.fdopen(fd, "wb") as out:
+            for chunk_info in chunks:
+                if not isinstance(chunk_info, dict) or not chunk_info.get("path"):
+                    raise RuntimeError(f"cannot roll back {path}: malformed snapshot chunk")
+                chunk_path = Path(str(chunk_info["path"]))
+                if not chunk_path.is_absolute():
+                    chunk_path = PROJECT_ROOT / chunk_path
+                chunk_path = chunk_path.resolve()
+                try:
+                    chunk_path.relative_to(Path(archive_root).resolve())
+                except ValueError as exc:
+                    raise RuntimeError(f"snapshot chunk is outside archive root: {chunk_path}") from exc
+                if not chunk_path.is_file():
+                    raise RuntimeError(f"snapshot chunk is missing: {chunk_path}")
+                with gzip.open(chunk_path, "rb") as src:
+                    for raw_line in src:
+                        out.write(raw_line)
+                        digest.update(raw_line)
+                        total_bytes += len(raw_line)
+            out.flush()
+            os.fsync(out.fileno())
+        if total_bytes != int(snapshot.get("source_bytes", -1)) or digest.hexdigest() != str(snapshot.get("source_sha256", "")):
+            raise RuntimeError(f"snapshot content verification failed while rolling back {path}")
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def _apply_size_guard_to_file(path: Path, *, now: datetime, archive_root: Path, pending_ids: set[str], pending_bar_cutoffs: dict[str, datetime], protected_observation_ids: set[str], protected_refs: set[str]) -> dict[str, Any]:
     if not path.exists() or path.stat().st_size < GITHUB_SIZE_GUARD_BYTES:
         return {"path": str(path.relative_to(PROJECT_ROOT)), "triggered": False, "bytes_before": path.stat().st_size if path.exists() else 0}
@@ -548,38 +590,45 @@ def _apply_size_guard_to_file(path: Path, *, now: datetime, archive_root: Path, 
 
         applied: list[dict[str, Any]] = []
         current = before
-        for name, policy in _size_guard_plan(path, now=now, pending_ids=pending_ids, pending_bar_cutoffs=pending_bar_cutoffs, protected_observation_ids=protected_observation_ids, protected_refs=protected_refs):
-            if current["bytes"] <= GITHUB_SIZE_TARGET_BYTES:
-                break
-            # Each escalation pass must have its own immutable delta directory.
-            # Otherwise a later pass writes the same ``*.pruned.jsonl.gz`` name
-            # and overwrites the rows removed by an earlier pass in this run.
-            result = _compact_jsonl(
-                path,
-                lambda _line, row, policy=policy: policy(row),
-                archive_root=run_root / "pruned" / f"policy-{len(applied) + 1:02d}-{name}",
-                snapshot=False,
-                lock_held=True,
-            )
-            applied.append({"policy": name, **result})
-            current = _file_meta(path)
-            if current["bytes"] <= GITHUB_SIZE_TARGET_BYTES:
-                break
-
-        if path.name == "position_reconciliation.jsonl" and current["bytes"] >= GITHUB_SIZE_GUARD_BYTES:
-            recon_results = _compact_reconciliation_size_guard(path, now=now, run_root=run_root, before=before)
-            for item in recon_results:
-                applied.append({"policy": "reconciliation_safe_history_compaction", **item})
+        try:
+            for name, policy in _size_guard_plan(path, now=now, pending_ids=pending_ids, pending_bar_cutoffs=pending_bar_cutoffs, protected_observation_ids=protected_observation_ids, protected_refs=protected_refs):
+                if current["bytes"] <= GITHUB_SIZE_TARGET_BYTES:
+                    break
+                # Each escalation pass must have its own immutable delta directory.
+                # Otherwise a later pass writes the same ``*.pruned.jsonl.gz`` name
+                # and overwrites the rows removed by an earlier pass in this run.
+                result = _compact_jsonl(
+                    path,
+                    lambda _line, row, policy=policy: policy(row),
+                    archive_root=run_root / "pruned" / f"policy-{len(applied) + 1:02d}-{name}",
+                    snapshot=False,
+                    lock_held=True,
+                )
+                applied.append({"policy": name, **result})
                 current = _file_meta(path)
                 if current["bytes"] <= GITHUB_SIZE_TARGET_BYTES:
                     break
 
+            if path.name == "position_reconciliation.jsonl" and current["bytes"] >= GITHUB_SIZE_GUARD_BYTES:
+                recon_results = _compact_reconciliation_size_guard(path, now=now, run_root=run_root, before=before)
+                for item in recon_results:
+                    applied.append({"policy": "reconciliation_safe_history_compaction", **item})
+                    current = _file_meta(path)
+                    if current["bytes"] <= GITHUB_SIZE_TARGET_BYTES:
+                        break
+        except Exception:
+            # A file may have gone through one successful compaction policy before
+            # a later policy failed. Restore this file before propagating the error.
+            _restore_chunked_snapshot(path, snapshot, archive_root)
+            raise
+
+    failure_reason = None
     if current["bytes"] >= GITHUB_SIZE_GUARD_BYTES:
         attempted = ", ".join(
             f"{item.get('policy', 'unknown')}={item.get('bytes_after', '?')}B"
             for item in applied
         ) or "no compaction policy applied"
-        raise RuntimeError(
+        failure_reason = (
             f"size guard could not reduce {rel} below {GITHUB_SIZE_GUARD_BYTES} bytes "
             f"(remaining={current['bytes']} bytes; target={GITHUB_SIZE_TARGET_BYTES}; "
             f"policies=[{attempted}]); refusing to risk unarchived data loss. "
@@ -588,6 +637,8 @@ def _apply_size_guard_to_file(path: Path, *, now: datetime, archive_root: Path, 
     return {
         "path": str(rel),
         "triggered": True,
+        "failed": failure_reason is not None,
+        "error": failure_reason,
         "bytes_before": before["bytes"],
         "bytes_after": current["bytes"],
         "rows_before": before["rows"],
@@ -623,17 +674,44 @@ def apply_size_guard(*, now: datetime | None = None, archive_root: Path | None =
         DATA_DIR / "market_context.jsonl",
     ]
     results = {"schema_version": 1, "mode": "size_guard", "started_at": now.isoformat(), "files": {}}
+    manifest_path = DATA_DIR / "data_retention_manifest.json"
+    temp_manifest = manifest_path.with_name(manifest_path.name + ".tmp")
+
+    def persist_progress() -> None:
+        temp_manifest.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp_manifest, manifest_path)
+
+    # Start with an empty current-run manifest so a prior run's snapshots can
+    # never be mistaken for rollback material for this run.
+    persist_progress()
+    failure_reason = None
     for path in candidates:
-        results["files"][path.name] = _apply_size_guard_to_file(
-            path, now=now, archive_root=run_root, pending_ids=pending_ids,
-            pending_bar_cutoffs=pending_bar_cutoffs,
-            protected_observation_ids=protected_observation_ids, protected_refs=protected_refs,
-        )
+        try:
+            file_result = _apply_size_guard_to_file(
+                path, now=now, archive_root=run_root, pending_ids=pending_ids,
+                pending_bar_cutoffs=pending_bar_cutoffs,
+                protected_observation_ids=protected_observation_ids, protected_refs=protected_refs,
+            )
+        except Exception as exc:
+            results["files"][path.name] = {"path": f"data/{path.name}", "triggered": False, "failed": True, "error": f"file-level compaction rolled back: {type(exc).__name__}: {exc}"}
+            results["status"] = "failed"
+            results["finished_at"] = _utc_now().isoformat()
+            persist_progress()
+            raise
+        results["files"][path.name] = file_result
+        persist_progress()
+        if file_result.get("failed"):
+            failure_reason = str(file_result.get("error") or f"size guard failed for {path.name}")
+            break
     _validate_state_unchanged(state_before)
     results["protected_state"] = _validate_state_before()
     results["finished_at"] = _utc_now().isoformat()
-    manifest_path = DATA_DIR / "data_retention_manifest.json"
-    manifest_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+    results["status"] = "failed" if failure_reason else "complete"
+    # Persist final snapshot pointers before reporting failure, so workflow rollback
+    # can restore every file already compacted in this run.
+    persist_progress()
+    if failure_reason:
+        raise RuntimeError(failure_reason)
     return results
 
 
