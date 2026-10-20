@@ -494,7 +494,7 @@ def pending_forward_symbols(*, horizon_hours: float = 24.0) -> set[str]:
     return out
 
 
-def record_zone_observations(records: Iterable[dict[str, Any]]) -> int:
+def record_zone_observations(records: Iterable[dict[str, Any]], *, raise_on_error: bool = False) -> int:
     global _OBSERVATION_SEEN_IDS, _OBSERVATION_SEEN_IDS_PATH
     if not RESEARCH_ENABLED:
         return 0
@@ -559,6 +559,8 @@ def record_zone_observations(records: Iterable[dict[str, Any]]) -> int:
                 _bump_manifest("observation_duplicates_skipped", skipped)
             return count
         except Exception as exc:
+            if raise_on_error:
+                raise
             _record_error("zone_observation_write", ZONE_OBSERVATIONS_PATH, exc)
             _bump_manifest("persistence_errors", 1)
             return 0
@@ -2027,18 +2029,6 @@ def record_scan_symbol(
         except Exception as exc:
             _record_error("counterfactual_snapshot_build", COUNTERFACTUAL_EXPERIMENTS_PATH, exc, symbol=symbol)
 
-    # Persist raw market bars only when this symbol produced at least one research observation.
-    # This keeps the low-level API safe even when called directly, and prevents irrelevant
-    # 5m/1h universe history from growing the research journals.
-    if observations or persist_bars_for_forward:
-        counts["bars_1h"] = persist_market_bars(
-            symbol, "1h", bars_1h, provider=provider, source=source, scan_id=scan_id, code_commit_sha=code_commit_sha
-        )
-        if closed_5m:
-            counts["bars_5m"] = persist_market_bars(
-                symbol, "5m", closed_5m, provider=provider, source=source, scan_id=scan_id, code_commit_sha=code_commit_sha
-            )
-
     account_context_persisted = bool(account_context and account_context.get("account_context_id")) and bool(account_context.get("persisted", True))
     account_context_age_ms_at_decision = None
     if account_context:
@@ -2065,8 +2055,25 @@ def record_scan_symbol(
             observation["market_context_age_ms_at_decision"] = market_context.get("context_age_ms_at_decision")
         observation["account_context_age_ms_at_decision"] = account_context_age_ms_at_decision
 
+    observations_persisted = True
     try:
-        counts["observations"] = record_zone_observations(observations)
+        # In non-batch mode, make observation persistence authoritative before
+        # advancing any market-bar cursor. Batch mode buffers both and keeps the
+        # same ordering at flush time.
+        counts["observations"] = record_zone_observations(observations, raise_on_error=True)
     except Exception as exc:
+        observations_persisted = False
         _record_error("scan_symbol_observation_batch", ZONE_OBSERVATIONS_PATH, exc, symbol=symbol)
+        _bump_manifest("persistence_errors", 1)
+
+    # Persist source bars only after observations have committed (or been safely
+    # buffered). A failed observation write must not advance its source cursor.
+    if observations_persisted and (observations or persist_bars_for_forward):
+        counts["bars_1h"] = persist_market_bars(
+            symbol, "1h", bars_1h, provider=provider, source=source, scan_id=scan_id, code_commit_sha=code_commit_sha
+        )
+        if closed_5m:
+            counts["bars_5m"] = persist_market_bars(
+                symbol, "5m", closed_5m, provider=provider, source=source, scan_id=scan_id, code_commit_sha=code_commit_sha
+            )
     return counts

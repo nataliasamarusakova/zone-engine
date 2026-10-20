@@ -6,8 +6,10 @@ service/phase/method/endpoint so slow API calls can be separated from local work
 """
 from __future__ import annotations
 
+import heapq
 import math
 import os
+import random
 from functools import wraps
 import threading
 import time
@@ -20,8 +22,11 @@ _MAX_SAMPLES_PER_KEY = 10_000
 _LOCK = threading.RLock()
 _LOCAL = threading.local()
 _REQUESTS: dict[tuple[str, str, str, str], dict[str, Any]] = {}
-_HTTP_DETAILS: list[dict[str, Any]] = []
+# Top-K heaps retain genuinely slow calls, not merely the first K calls.
+# Heap entries are (seconds, sequence, detail) so equal durations never compare dicts.
+_HTTP_DETAILS: list[tuple[float, int, dict[str, Any]]] = []
 _OPERATIONS: dict[str, dict[str, Any]] = {}
+_DETAIL_SEQUENCE = 0
 
 
 def enabled() -> bool:
@@ -73,10 +78,40 @@ def phase(name: str) -> Iterator[None]:
 
 def reset() -> None:
     """Start a fresh timing window, normally at the beginning of run_once.main()."""
+    global _DETAIL_SEQUENCE
     with _LOCK:
         _REQUESTS.clear()
         _HTTP_DETAILS.clear()
         _OPERATIONS.clear()
+        _DETAIL_SEQUENCE = 0
+
+
+def _reservoir_sample(stat: dict[str, Any], seconds: float) -> None:
+    """Keep a bounded unbiased sample for percentile estimation."""
+    samples = stat["samples"]
+    seen = int(stat["count"])
+    if len(samples) < _MAX_SAMPLES_PER_KEY:
+        samples.append(seconds)
+        return
+    if _MAX_SAMPLES_PER_KEY <= 0:
+        return
+    slot = random.randrange(seen)
+    if slot < _MAX_SAMPLES_PER_KEY:
+        samples[slot] = seconds
+
+
+def _retain_slowest(heap: list[tuple[float, int, dict[str, Any]]], item: dict[str, Any]) -> None:
+    """Keep at most K slowest records in a min-heap."""
+    global _DETAIL_SEQUENCE
+    limit = max(0, int(_MAX_SAMPLES_PER_KEY))
+    if limit == 0:
+        return
+    _DETAIL_SEQUENCE += 1
+    ranked = (float(item["seconds"]), _DETAIL_SEQUENCE, item)
+    if len(heap) < limit:
+        heapq.heappush(heap, ranked)
+    elif ranked[:2] > heap[0][:2]:
+        heapq.heapreplace(heap, ranked)
 
 
 def timed_request(
@@ -150,14 +185,12 @@ def record_operation(name: str, label: str, seconds: float, *, outcome: str = "o
         "outcome": str(outcome),
     }
     with _LOCK:
-        stat = _OPERATIONS.setdefault(str(name), {"count": 0, "samples": [], "outcomes": Counter(), "items": []})
+        stat = _OPERATIONS.setdefault(str(name), {"count": 0, "total_seconds": 0.0, "samples": [], "outcomes": Counter(), "items": []})
         stat["count"] += 1
+        stat["total_seconds"] += entry["seconds"]
         stat["outcomes"][entry["outcome"]] += 1
-        if len(stat["samples"]) < _MAX_SAMPLES_PER_KEY:
-            stat["samples"].append(entry["seconds"])
-        # Keep bounded detail for slowest-item reporting.
-        if len(stat["items"]) < _MAX_SAMPLES_PER_KEY:
-            stat["items"].append(entry)
+        _reservoir_sample(stat, entry["seconds"])
+        _retain_slowest(stat["items"], entry)
 
 
 def _record_request(
@@ -175,19 +208,17 @@ def _record_request(
         stat["total_seconds"] += seconds
         stat["max_seconds"] = max(stat["max_seconds"], seconds)
         stat["outcomes"][outcome] += 1
-        if len(stat["samples"]) < _MAX_SAMPLES_PER_KEY:
-            stat["samples"].append(seconds)
-        if len(_HTTP_DETAILS) < _MAX_SAMPLES_PER_KEY:
-            _HTTP_DETAILS.append({
-                "phase": phase,
-                "symbol": current_symbol(),
-                "service": service,
-                "method": method,
-                "endpoint": endpoint,
-                "seconds": seconds,
-                "outcome": outcome,
-                "failed": failed,
-            })
+        _reservoir_sample(stat, seconds)
+        _retain_slowest(_HTTP_DETAILS, {
+            "phase": phase,
+            "symbol": current_symbol(),
+            "service": service,
+            "method": method,
+            "endpoint": endpoint,
+            "seconds": seconds,
+            "outcome": outcome,
+            "failed": failed,
+        })
 
 
 def _percentile(values: list[float], percentile: float) -> float:
@@ -219,11 +250,12 @@ def snapshot() -> dict[str, Any]:
         for name, value in _OPERATIONS.items():
             operations[name] = {
                 "count": value["count"],
+                "total_seconds": value["total_seconds"],
                 "samples": list(value["samples"]),
                 "outcomes": dict(value["outcomes"]),
-                "items": [dict(item) for item in value["items"]],
+                "items": [dict(item) for _, _, item in sorted(value["items"], reverse=True)],
             }
-        http_details = [dict(item) for item in _HTTP_DETAILS]
+        http_details = [dict(item) for _, _, item in sorted(_HTTP_DETAILS, reverse=True)]
     return {"enabled": _ENABLED, "requests": requests, "operations": operations, "http_details": http_details}
 
 
@@ -264,7 +296,7 @@ def log_summary(logger: Any, *, max_request_groups: int = 40, max_slowest_items:
         samples = stat["samples"]
         logger.info(
             "[OP_TIMING] operation=%s count=%d avg_s=%.3f p50_s=%.3f p95_s=%.3f outcomes=%s",
-            name, stat["count"], sum(samples) / len(samples) if samples else 0.0,
+            name, stat["count"], stat["total_seconds"] / stat["count"] if stat["count"] else 0.0,
             _percentile(samples, 0.50), _percentile(samples, 0.95),
             dict(sorted(stat["outcomes"].items())),
         )

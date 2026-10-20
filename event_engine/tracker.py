@@ -1999,11 +1999,13 @@ def _weighted_rr_snapshot(trade: dict) -> tuple[float | None, float | None, floa
     realized_rr_component = (realized_weighted / init_qty) / risk_pct if realized_qty > 0 else 0.0
 
     hit_legs = {str(x) for x in (trade.get("hit_legs") or [])}
+    completed_legs = {str(x) for x in (trade.get("completed_tp_legs") or [])}
+    consumed_legs = hit_legs | completed_legs
     tp_levels = trade.get("tp_levels") if isinstance(trade.get("tp_levels"), list) else []
     remaining_qty = max(_safe_float(trade.get("remaining_qty"), 0.0), 0.0)
     remaining_rr_component = 0.0
     if remaining_qty > 0 and tp_levels:
-        remaining = [x for x in tp_levels if str(x.get("leg", "")) not in hit_legs and _safe_float(x.get("pnl_pct"), 0.0) > 0]
+        remaining = [x for x in tp_levels if str(x.get("leg", "")) not in consumed_legs and _safe_float(x.get("pnl_pct"), 0.0) > 0]
         if remaining:
             raw_weights = [max(0.0, _safe_float(x.get("close_fraction"), 0.0)) for x in remaining]
             weight_sum = sum(raw_weights)
@@ -2037,6 +2039,20 @@ def _derive_planned_risk_pct(trade: dict) -> float | None:
     return None
 
 
+def _tp1_fill_timestamp_ms(trade: dict, fallback_ms: int) -> int:
+    """Use confirmed TP1 fill/update time consistently in both BE paths."""
+    events = trade.get("tp_fill_events") if isinstance(trade.get("tp_fill_events"), list) else []
+    event = next((
+        item for item in reversed(events)
+        if isinstance(item, dict) and str(item.get("leg", "")).upper() == "TP1"
+    ), None)
+    for key in ("fill_time_ms", "order_update_time_ms", "ts"):
+        value = _optional_float((event or {}).get(key))
+        if value is not None and value > 0:
+            return int(value)
+    return int(fallback_ms)
+
+
 def _calc_realized_rr(pnl_pct: float, risk_pct: float | None) -> float | None:
     if risk_pct is None or risk_pct <= 0:
         return None
@@ -2057,10 +2073,22 @@ def _update_mfe_mae(trade: dict, candles: list[dict]) -> None:
     for candle in sorted(candles, key=lambda x: int(_safe_float(x.get("open_time"), x.get("close_time", 0)))):
         open_ts = int(_safe_float(candle.get("open_time"), 0.0))
         close_ts = int(_safe_float(candle.get("close_time"), 0.0))
-        if entry_ts and ((open_ts and open_ts < entry_ts) or (not open_ts and close_ts <= entry_ts)):
+        close = _safe_float(candle.get("close"), 0.0)
+        # Ignore candles that definitively closed before entry. If entry overlaps
+        # the candle, OHLC cannot tell whether its extremes were pre- or post-fill.
+        # The close is a known post-entry observation, so use it for this candle
+        # instead of discarding all movement or attributing unknown extremes.
+        overlapping_entry_candle = bool(entry_ts and open_ts and open_ts < entry_ts and close_ts > entry_ts)
+        timestamp_ambiguous_candle = bool(entry_ts and not open_ts and close_ts > entry_ts)
+        if entry_ts and ((close_ts and close_ts <= entry_ts) or ((open_ts and open_ts < entry_ts) and close_ts <= 0)):
             continue
-        high = _safe_float(candle.get("high"), 0.0)
-        low = _safe_float(candle.get("low"), 0.0)
+        if overlapping_entry_candle or timestamp_ambiguous_candle:
+            if close <= 0:
+                continue
+            high = low = close
+        else:
+            high = _safe_float(candle.get("high"), 0.0)
+            low = _safe_float(candle.get("low"), 0.0)
         if high <= 0 or low <= 0:
             continue
         if direction == "LONG":
@@ -3091,16 +3119,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                     trade["be_activated"] = True
                     trade["be_required"] = False
                     trade["be_last_error"] = retry.get("error") if retry_status == "created_cleanup_pending" else None
-                    tp1_fill_event = next((
-                        x for x in reversed(trade.get("tp_fill_events", []))
-                        if isinstance(x, dict) and str(x.get("leg", "")).upper() == "TP1"
-                    ), None)
-                    tp1_trigger_ts = (
-                        _optional_float((tp1_fill_event or {}).get("fill_time_ms"))
-                        or _optional_float((tp1_fill_event or {}).get("order_update_time_ms"))
-                        or _optional_float((tp1_fill_event or {}).get("ts"))
-                    )
-                    trade["be_trigger_ts"] = trade.get("be_trigger_ts") or (int(tp1_trigger_ts) if tp1_trigger_ts else now_ms)
+                    trade["be_trigger_ts"] = trade.get("be_trigger_ts") or _tp1_fill_timestamp_ms(trade, now_ms)
                     trade["be_trigger_peak_r"] = trade.get("be_trigger_peak_r") if trade.get("be_trigger_peak_r") is not None else peak_r
                     trade["be_trigger_rule"] = trade.get("be_trigger_rule") or "tp1_filled"
                     trade["be_trigger_price"] = trade.get("be_trigger_price") or _safe_float(retry.get("stop_price"), entry_price)
@@ -3184,6 +3203,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                 order_status = str(order_info.get("order_status", "")).upper()
                 if order_status not in {"PARTIALLY_FILLED", "FILLED"}:
                     continue
+                leg_already_hit = leg in hit_legs
 
                 executed_qty = max(0.0, _safe_float(order_info.get("executed_qty", 0.0)))
                 previous_qty = max(0.0, _safe_float(filled_by_leg.get(leg, 0.0)))
@@ -3240,6 +3260,17 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                 realized_qty += delta_qty
                 realized_weighted += delta_qty * pnl_tp
                 filled_by_leg[leg] = executed_qty
+                if order_status == "FILLED" and not leg_already_hit:
+                    # Execution status consumes the target for RR projections even
+                    # if its fill is adverse. Keep `hit_legs` reserved for validated
+                    # TP hits because it also gates TP1 -> break-even activation.
+                    completed_legs = {str(value) for value in (trade.get("completed_tp_legs") or [])}
+                    completed_legs.add(leg)
+                    trade["completed_tp_legs"] = sorted(completed_legs)
+                    if tp_ok:
+                        hit_legs.add(leg)
+                        trade["hit_legs"] = sorted(hit_legs)
+                    trade["tp_filled_qty"] = dict(filled_by_leg)
 
                 trade["remaining_qty"] = rem_qty
                 trade["realized_pnl_qty"] = realized_qty
@@ -3299,7 +3330,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                         owner_event_ids=[event_id], leg=leg, entry_price=entry_price, fill_price=exec_price, pnl_pct=pnl_tp,
                     )
 
-                if order_status == "FILLED" and leg not in hit_legs and tp_ok:
+                if order_status == "FILLED" and not leg_already_hit and tp_ok:
                     hit_legs.add(leg)
                     # Persist idempotency markers before side effects that may fail.
                     trade["hit_legs"] = sorted(hit_legs)
@@ -3376,7 +3407,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                                 else:
                                     trade.pop("sl_cleanup_pending", None)
                                 trade["be_activated"] = True
-                                trade["be_trigger_ts"] = trade.get("be_trigger_ts") or now_ms
+                                trade["be_trigger_ts"] = trade.get("be_trigger_ts") or _tp1_fill_timestamp_ms(trade, now_ms)
                                 trade["be_trigger_peak_r"] = peak_r
                                 trade["be_trigger_rule"] = "tp1_filled"
                                 trade["be_activation_ts"] = now_ms
