@@ -1167,11 +1167,30 @@ def open_market(
         return {"status": "skipped_stale_signal", "error": f"signal_drift_pct={signal_drift_pct:.4f}% > {max_entry_slippage_pct:.4f}% at final order gate", "symbol": bx, "execution_quote": final_quote, "signal_drift_pct": signal_drift_pct, "signal_price": float(price), "execution_reference_price": sizing_price}
 
     # Recompute quantity from the final quote, not from a quote captured before leverage/idempotency calls.
-    qty = (MARGIN_USDT * leverage) / max(sizing_price * mult, 1e-12)
-    q = Decimal(str(qty)).quantize(Decimal(1).scaleb(-prec), rounding=ROUND_DOWN)
+    raw_qty = (MARGIN_USDT * leverage) / max(sizing_price * mult, 1e-12)
+    q = Decimal(str(raw_qty)).quantize(Decimal(1).scaleb(-prec), rounding=ROUND_DOWN)
     qty = float(q)
     if qty <= 0:
-        return {"status": "error", "error": "calculated quantity is <= 0", "symbol": bx, "qty": qty, "min_qty": min_qty, "leverage": leverage, "sizing_price": sizing_price, "execution_quote": final_quote}
+        # A positive theoretical size can round down to zero at contract precision.
+        # When exchange minimum quantity is known, this is a safe admission skip,
+        # not an execution error: do not attempt to set leverage or submit MARKET.
+        if min_qty > 0:
+            required_margin = (min_qty * sizing_price * mult) / max(leverage, 1)
+            return {
+                "status": "skipped_min_qty",
+                "error": f"qty={qty} rounds to zero at quantityPrecision={prec}; min_qty={min_qty}",
+                "reason": "exchange_min_quantity",
+                "symbol": bx,
+                "qty": qty,
+                "raw_qty": raw_qty,
+                "min_qty": min_qty,
+                "required_margin_usdt": required_margin,
+                "configured_margin_usdt": MARGIN_USDT,
+                "leverage": leverage,
+                "sizing_price": sizing_price,
+                "execution_quote": final_quote,
+            }
+        return {"status": "error", "error": "calculated quantity is <= 0", "symbol": bx, "qty": qty, "raw_qty": raw_qty, "min_qty": min_qty, "leverage": leverage, "sizing_price": sizing_price, "execution_quote": final_quote}
     if min_qty > 0 and qty < min_qty:
         required_margin = (min_qty * sizing_price * mult) / max(leverage, 1)
         return {"status": "skipped_min_qty", "error": f"qty={qty} < min_qty={min_qty} at configured leverage={leverage}", "reason": "exchange_min_quantity", "symbol": bx, "qty": qty, "min_qty": min_qty, "required_margin_usdt": required_margin, "configured_margin_usdt": MARGIN_USDT, "leverage": leverage, "sizing_price": sizing_price, "execution_quote": final_quote}
