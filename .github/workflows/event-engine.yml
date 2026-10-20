@@ -22,8 +22,8 @@ jobs:
       BINGX_ENV: vst
       BINGX_BASE_URL: https://open-api-vst.bingx.com
       BINGX_MARGIN_USDT: "1"
-      BINGX_LEVERAGE: "10"
-      BINGX_MAX_LEVERAGE: "10"
+      BINGX_LEVERAGE: "3"
+      BINGX_MAX_LEVERAGE: "3"
       EXECUTION_ENABLED: "true"
       MAX_SCAN_SYMBOLS: "0"
       WATCHLIST_ONLY: "false"
@@ -170,13 +170,14 @@ jobs:
                 and .head_branch == "main"
                 and .event == "repository_dispatch"
                 and .status == "completed"
+                and .conclusion == "success"
               ' >/dev/null <<< "$run_json"; then
                 artifact_id="$candidate_artifact_id"
                 run_id="$candidate_run_id"
                 selected_created_at="$candidate_created_at"
                 break
               fi
-              echo "Ignoring runtime-state artifact id=$candidate_artifact_id because it is not from a completed event-engine run on main."
+              echo "Ignoring runtime-state artifact id=$candidate_artifact_id because it is not from a successful event-engine run on main."
             done <<< "$artifact_candidates"
           fi
 
@@ -621,7 +622,7 @@ jobs:
 
       - name: Pre-commit data size guard
         id: size_guard
-        if: ${{ always() && steps.restore_retention_archive.outputs.recovery_safe == 'true' && steps.retention_archive_restore_verification.outcome == 'success' }}
+        if: ${{ success() && steps.run_engine.outcome == 'success' && steps.restore_retention_archive.outputs.recovery_safe == 'true' && steps.retention_archive_restore_verification.outcome == 'success' }}
         env:
           DATA_RETENTION_SIZE_GUARD_BYTES: "90000000"
           DATA_RETENTION_SIZE_TARGET_BYTES: "80000000"
@@ -632,7 +633,7 @@ jobs:
 
       - name: Decide whether retention archive upload is needed
         id: retention_archive_upload_decision
-        if: ${{ always() && steps.size_guard.outcome == 'success' && steps.restore_retention_archive.outputs.recovery_safe == 'true' && steps.retention_archive_restore_verification.outcome == 'success' }}
+        if: ${{ success() && steps.run_engine.outcome == 'success' && steps.size_guard.outcome == 'success' && steps.restore_retention_archive.outputs.recovery_safe == 'true' && steps.retention_archive_restore_verification.outcome == 'success' }}
         run: >-
           python -m event_engine.retention_archive --decide-upload
           --archive-dir data/retention_archive
@@ -642,7 +643,7 @@ jobs:
 
       - name: Upload cumulative retention archive for next clean runner
         id: upload_retention_archive
-        if: ${{ always() && steps.retention_archive_upload_decision.outcome == 'success' && steps.retention_archive_upload_decision.outputs.archive_upload_required == 'true' && steps.restore_retention_archive.outputs.recovery_safe == 'true' && steps.retention_archive_restore_verification.outcome == 'success' }}
+        if: ${{ success() && steps.run_engine.outcome == 'success' && steps.retention_archive_upload_decision.outcome == 'success' && steps.retention_archive_upload_decision.outputs.archive_upload_required == 'true' && steps.restore_retention_archive.outputs.recovery_safe == 'true' && steps.retention_archive_restore_verification.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: zone-engine-retention-archive
@@ -653,7 +654,7 @@ jobs:
 
       - name: Mark retention archive upload durable
         id: mark_retention_archive
-        if: ${{ always() && steps.upload_retention_archive.outcome == 'success' && steps.restore_retention_archive.outputs.recovery_safe == 'true' && steps.retention_archive_restore_verification.outcome == 'success' }}
+        if: ${{ success() && steps.run_engine.outcome == 'success' && steps.upload_retention_archive.outcome == 'success' && steps.restore_retention_archive.outputs.recovery_safe == 'true' && steps.retention_archive_restore_verification.outcome == 'success' }}
         run: >-
           python -m event_engine.retention_archive --mark-upload
           --archive-dir data/retention_archive
@@ -664,7 +665,7 @@ jobs:
 
       - name: Restore pre-compaction journals if retention archive upload failed
         id: restore_pre_compaction_snapshots
-        if: ${{ always() && (steps.size_guard.outcome == 'success' || steps.size_guard.outcome == 'failure') && (steps.size_guard.outcome == 'failure' || steps.retention_archive_upload_decision.outcome != 'success' || (steps.retention_archive_upload_decision.outputs.archive_upload_required == 'true' && steps.upload_retention_archive.outcome != 'success')) }}
+        if: ${{ always() && steps.run_engine.outcome == 'success' && (steps.size_guard.outcome == 'success' || steps.size_guard.outcome == 'failure') && (steps.size_guard.outcome == 'failure' || steps.retention_archive_upload_decision.outcome != 'success' || (steps.retention_archive_upload_decision.outputs.archive_upload_required == 'true' && steps.upload_retention_archive.outcome != 'success')) }}
         shell: bash
         run: |
           set -euo pipefail
@@ -688,6 +689,11 @@ jobs:
           fi
           if [ "$verify_tests_data_outcome" != "success" ]; then
             echo "::error::Runtime-data isolation verification did not pass (outcome=$verify_tests_data_outcome); refusing to commit persistent state."
+            exit 1
+          fi
+          run_engine_outcome="${{ steps.run_engine.outcome }}"
+          if [ "$run_engine_outcome" != "success" ]; then
+            echo "::error::Engine run did not succeed (outcome=$run_engine_outcome); retention archive and runtime-state artifacts will not be advanced as a mismatched pair."
             exit 1
           fi
           rollback_outcome="${{ steps.restore_pre_compaction_snapshots.outcome }}"
@@ -779,7 +785,7 @@ jobs:
 
       - name: Prepare self-verifying runtime-state bundle
         id: prepare_runtime_state_bundle
-        if: ${{ !cancelled() && steps.quality_gate.outcome == 'success' && steps.verify_tests_data.outcome == 'success' && (steps.restore_runtime_state.outputs.mode != 'bootstrap' || steps.run_engine.outcome == 'success') && (steps.size_guard.outcome == 'success' || steps.restore_pre_compaction_snapshots.outcome == 'success' || (steps.size_guard.outcome == 'skipped' && (steps.restore_retention_archive.outputs.recovery_safe != 'true' || steps.retention_archive_restore_verification.outcome != 'success'))) && (steps.retention_archive_commit_gate.outcome == 'success' || steps.restore_pre_compaction_snapshots.outcome == 'success' || (steps.size_guard.outcome == 'skipped' && (steps.restore_retention_archive.outputs.recovery_safe != 'true' || steps.retention_archive_restore_verification.outcome != 'success'))) }}
+        if: ${{ !cancelled() && steps.run_engine.outcome == 'success' && steps.quality_gate.outcome == 'success' && steps.verify_tests_data.outcome == 'success' && (steps.restore_runtime_state.outputs.mode != 'bootstrap' || steps.run_engine.outcome == 'success') && (steps.size_guard.outcome == 'success' || steps.restore_pre_compaction_snapshots.outcome == 'success' || (steps.size_guard.outcome == 'skipped' && (steps.restore_retention_archive.outputs.recovery_safe != 'true' || steps.retention_archive_restore_verification.outcome != 'success'))) && (steps.retention_archive_commit_gate.outcome == 'success' || steps.restore_pre_compaction_snapshots.outcome == 'success' || (steps.size_guard.outcome == 'skipped' && (steps.restore_retention_archive.outputs.recovery_safe != 'true' || steps.retention_archive_restore_verification.outcome != 'success'))) }}
         run: >-
           python event_engine/runtime_state_bundle.py create
           --data-dir data
