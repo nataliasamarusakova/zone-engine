@@ -99,3 +99,30 @@ def test_deferred_research_prefetch_uses_bounded_four_worker_pool(monkeypatch):
     assert len(result) == len(payloads)
     assert max_active == 4
     assert max_active <= 4
+
+
+def test_deferred_research_uses_extended_prefetch_instead_of_short_trigger_history():
+    import run_once
+
+    trigger_history = [{"timestamp": i} for i in range(144)]
+    extended_history = [{"timestamp": i} for i in range(300)]
+    chosen = run_once._prefer_longer_research_5m_history(trigger_history, extended_history)
+
+    assert len(chosen) == 300
+    assert chosen[0] == extended_history[0]
+    # A failed/empty extension must not erase the history already available.
+    assert run_once._prefer_longer_research_5m_history(trigger_history, []) == trigger_history
+    # Equal-sized results do not replace already-loaded rows unnecessarily.
+    assert run_once._prefer_longer_research_5m_history(trigger_history, list(trigger_history)) == trigger_history
+
+
+def test_missing_credentials_block_helper_uses_imported_callable(monkeypatch):
+    import run_once
+
+    monkeypatch.setattr(run_once, "credentials_available", lambda: False)
+    missing = run_once._blocked_private_execution_result()
+    assert missing["status"] == "BLOCKED_MISSING_CREDENTIALS"
+
+    monkeypatch.setattr(run_once, "credentials_available", lambda: True)
+    preflight = run_once._blocked_private_execution_result()
+    assert preflight["status"] == "BLOCKED_PRIVATE_PREFLIGHT"

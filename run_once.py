@@ -44,7 +44,7 @@ from event_engine.bingx import (
     open_market,
     wait_for_position_fill_directional,
 )
-from event_engine.signals import STRATEGY_VERSION, SWING_LEN, TP1_PCT, TP2_PCT, generate_zone_signals, score_zone_signal, _nearest_opposing_level, _signal_forensics
+from event_engine.signals import STRATEGY_VERSION, SWING_LEN, MIN_BARS as SIGNALS_MIN_BARS, TP1_PCT, TP2_PCT, generate_zone_signals, score_zone_signal, _nearest_opposing_level, _signal_forensics
 from event_engine.version import ENGINE_VERSION
 from event_engine.fundamental_assets import FUNDAMENTAL_ASSET_SYMBOLS
 from event_engine.telegram import format_signal, send as send_tg
@@ -1848,6 +1848,16 @@ def _update_active_trades_with_snapshot() -> None:
         update_active_trades(position_snapshot=snapshot)
     else:
         update_active_trades()
+
+
+def _blocked_private_execution_result() -> dict[str, str]:
+    """Describe why execution is blocked without importing the BingX module alias."""
+    if not credentials_available():
+        return {"status": "BLOCKED_MISSING_CREDENTIALS", "error": "BingX private credentials are unavailable"}
+    return {
+        "status": "BLOCKED_PRIVATE_PREFLIGHT",
+        "error": "BingX private execution is blocked by state integrity or reconciliation preflight; inspect [LIVE_BLOCKED_*] logs",
+    }
 
 
 def _private_layer_ready() -> bool:
@@ -4076,6 +4086,16 @@ def _fetch_missing_research_5m_bars(payload: dict[str, Any], analysis_meta: dict
             return fetch_binance_klines(binance_symbol, "5m", limit=limit, retryable=False) or []
 
 
+def _prefer_longer_research_5m_history(
+    existing_bars: list[dict] | None,
+    prefetched_bars: list[dict] | None,
+) -> list[dict]:
+    """Use the more complete 5m history; never discard a successful extension fetch."""
+    existing = list(existing_bars or [])
+    prefetched = list(prefetched_bars or [])
+    return prefetched if len(prefetched) > len(existing) else existing
+
+
 def _prefetch_missing_research_5m_bars(
     payload_batch: list[dict[str, Any]],
     analysis_meta: dict[str, dict],
@@ -4463,7 +4483,7 @@ def main() -> None:
             else:
                 bars = fetch_binance_klines(binance_symbol, "1h", limit=KLINE_LIMIT_1H, retryable=False)
                 source_name = "binance_spot"
-            min_bars = SWING_LEN * 2 + 10
+            min_bars = max(SWING_LEN * 2 + 10, SIGNALS_MIN_BARS)
             if len(bars) < min_bars:
                 return {
                     "symbol": symbol, "current_price": None, "price_position": "INSUFFICIENT_DATA",
@@ -4473,6 +4493,16 @@ def main() -> None:
                 }
 
             df, supply, demand, signals = generate_zone_signals(pd.DataFrame(bars), symbol=symbol, mode=DIAGNOSTICS_MODE)
+            # The provider payload may include the still-forming 1H candle. The
+            # strategy drops it before counting MIN_BARS, so classify a 70-raw / 69-closed
+            # history as insufficient data rather than misleadingly reporting "no zones".
+            if len(df) < SIGNALS_MIN_BARS:
+                return {
+                    "symbol": symbol, "current_price": None, "price_position": "INSUFFICIENT_DATA",
+                    "fresh_signal": "—", "active_demand": 0, "active_supply": 0,
+                    "zones": {"demand": [], "supply": []}, "last_signal_count": 0,
+                    "error": f"insufficient_closed_1h_candles:{len(df)}<{SIGNALS_MIN_BARS}", "signals": [],
+                }
             latest_price = float(df["close"].iloc[-1])
             bingx_price = _bingx_last_price(contract)
             latest_closed_idx = len(df) - 1
@@ -5060,12 +5090,7 @@ def main() -> None:
             signal.get("tp1"), signal.get("tp2"), signal.get("event_id"),
         )
         if not private_ready:
-            credentials_ok = bool(bingx.credentials_available())
-            blocked = (
-                {"status": "BLOCKED_MISSING_CREDENTIALS", "error": "BingX private credentials are unavailable"}
-                if not credentials_ok else
-                {"status": "BLOCKED_PRIVATE_PREFLIGHT", "error": "BingX private execution is blocked by state integrity or reconciliation preflight; inspect [LIVE_BLOCKED_*] logs"}
-            )
+            blocked = _blocked_private_execution_result()
             log.error("[EXEC_BLOCKED] %s %s: %s", signal["symbol"], signal["type"], blocked["error"])
             _append_jsonl(TRADES_PATH, {
                 "record_type": "TRADE_BLOCKED",
@@ -5358,7 +5383,7 @@ def main() -> None:
             )
             with research.batch_persistence() as persistence_result:
                 for payload in payload_batch:
-                    bars_5m = list(payload.get("bars_5m") or prefetched_bars.get(id(payload), []) or [])
+                    bars_5m = _prefer_longer_research_5m_history(payload.get("bars_5m"), prefetched_bars.get(id(payload)))
                     try:
                         counts = research.record_scan_symbol(
                             scan_id=scan_id, symbol=payload["symbol"], strategy_version=payload["strategy_version"],

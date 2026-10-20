@@ -380,13 +380,34 @@ def _load_bars(*, symbols: set[str] | None = None) -> dict[str, pd.DataFrame]:
     return out
 
 
-def _path_gap_count(bars: pd.DataFrame, observation_ts: pd.Timestamp, target_ts: pd.Timestamp) -> int:
+def _first_expected_bar_open_ns(observation_ts_ns: int, decision_boundary_kind: str | None = None) -> int:
+    """Return the first expected candle open from the recorded boundary semantics.
+
+    For current observations the timestamp is a closed 5m trigger/event boundary;
+    at a grid-aligned boundary, the next candle opens at that very timestamp. Legacy
+    rows without boundary metadata keep the historical strict-next-bar convention.
+    """
+    interval_ns = 5 * 60 * 1_000_000_000
+    kind = str(decision_boundary_kind or "").upper()
+    if kind in {"CLOSED_5M_TRIGGER_CLOSE", "CLOSED_5M_EVENT_CLOSE"}:
+        return ((observation_ts_ns + interval_ns - 1) // interval_ns) * interval_ns
+    return ((observation_ts_ns // interval_ns) + 1) * interval_ns
+
+
+def _path_gap_count(
+    bars: pd.DataFrame,
+    observation_ts: pd.Timestamp,
+    target_ts: pd.Timestamp,
+    decision_boundary_kind: str | None = None,
+) -> int:
     """Count missing 5m bars up to target_ts using candle-open timestamps."""
     path = bars.loc[(bars["timestamp"] >= observation_ts) & (bars["close_time"] <= target_ts), ["timestamp", "close_time"]].sort_values("timestamp")
     if path.empty:
         return 0
-    next_expected = observation_ts.floor("5min") + pd.Timedelta(minutes=5)
-    first_delta = path.iloc[0]["timestamp"] - next_expected
+    interval_ns = 5 * 60 * 1_000_000_000
+    first_expected_ns = _first_expected_bar_open_ns(int(observation_ts.value), decision_boundary_kind)
+    first_expected = pd.Timestamp(first_expected_ns, unit="ns", tz="UTC")
+    first_delta = path.iloc[0]["timestamp"] - first_expected
     gaps = max(0, int(round(first_delta.total_seconds() / 300.0)))
     diffs = path["timestamp"].diff().dropna()
     for delta in diffs:
@@ -394,12 +415,17 @@ def _path_gap_count(bars: pd.DataFrame, observation_ts: pd.Timestamp, target_ts:
     return gaps
 
 
-def _path_gap_count_indexed(index: _BarIndex, observation_ts_ns: int, target_ts_ns: int) -> int:
+def _path_gap_count_indexed(
+    index: _BarIndex,
+    observation_ts_ns: int,
+    target_ts_ns: int,
+    decision_boundary_kind: str | None = None,
+) -> int:
     start = index.start_at_timestamp(observation_ts_ns)
     end = index.end_at_close(target_ts_ns)
+    interval_ns = 5 * 60 * 1_000_000_000
+    first_expected_ns = _first_expected_bar_open_ns(observation_ts_ns, decision_boundary_kind)
     if end <= start:
-        interval_ns = 5 * 60 * 1_000_000_000
-        first_expected_ns = ((observation_ts_ns // interval_ns) + 1) * interval_ns
         last_expected_ns = target_ts_ns - interval_ns
         if last_expected_ns < first_expected_ns:
             return 0
@@ -407,10 +433,9 @@ def _path_gap_count_indexed(index: _BarIndex, observation_ts_ns: int, target_ts_
     ts = index.ts_ns[start:end]
     if ts.size == 0:
         return 0
-    next_expected_ns = ((observation_ts_ns // (5 * 60 * 1_000_000_000)) + 1) * (5 * 60 * 1_000_000_000)
-    gaps = max(0, int(round((int(ts[0]) - next_expected_ns) / (5 * 60 * 1_000_000_000))))
+    gaps = max(0, int(round((int(ts[0]) - first_expected_ns) / interval_ns)))
     if ts.size > 1:
-        diffs = np.diff(ts) // (5 * 60 * 1_000_000_000)
+        diffs = np.diff(ts) // interval_ns
         gaps += int(np.maximum(diffs - 1, 0).sum())
     return gaps
 
@@ -506,7 +531,7 @@ def _calculate_forward_outcome_indexed(
     if require_complete_24h:
         if last_close_ns < horizon_24_ns:
             return None
-        gap_count_24h = _path_gap_count_indexed(index, obs_ns, horizon_24_ns)
+        gap_count_24h = _path_gap_count_indexed(index, obs_ns, horizon_24_ns, observation.get("decision_boundary_kind"))
         if gap_count_24h:
             return None
     result: dict[str, Any] = {
@@ -539,7 +564,7 @@ def _calculate_forward_outcome_indexed(
     for minutes in MFE_MAE_HORIZONS:
         target_ns = obs_ns + int(minutes * 60 * 1_000_000_000)
         end = index.end_at_close(target_ns)
-        gap_count = _path_gap_count_indexed(index, obs_ns, target_ns)
+        gap_count = _path_gap_count_indexed(index, obs_ns, target_ns, observation.get("decision_boundary_kind"))
         path_complete = (end > future_start) and last_close_ns >= target_ns and gap_count == 0
         if path_complete:
             highs = index.high[future_start:end]
@@ -558,7 +583,7 @@ def _calculate_forward_outcome_indexed(
         result[f"censored_path_{minutes}m"] = not path_complete
 
     result["forward_gap_count_24h"] = (
-        gap_count_24h if gap_count_24h is not None else _path_gap_count_indexed(index, obs_ns, horizon_24_ns)
+        gap_count_24h if gap_count_24h is not None else _path_gap_count_indexed(index, obs_ns, horizon_24_ns, observation.get("decision_boundary_kind"))
     )
     result["forward_path_complete_24h"] = result["forward_gap_count_24h"] == 0 and last_close_ns >= horizon_24_ns
     # Counterfactual experiments use only the persisted pre-entry snapshot plus

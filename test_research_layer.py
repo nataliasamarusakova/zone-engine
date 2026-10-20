@@ -1638,3 +1638,98 @@ def test_bar_index_aliases_reuse_same_frame_but_keep_provider_histories_separate
     assert indexed["TEST-USDT|binance"] is indexed["TEST-USDT"]
     assert indexed["TEST-USDT|bingx"] is not indexed["TEST-USDT|binance"]
     assert indexed["TEST-USDT|binance"].n == indexed["TEST-USDT|bingx"].n == 20
+
+
+def test_forward_path_gap_counts_missing_first_bar_at_aligned_observation_boundary():
+    import research_forward
+
+    observation = pd.Timestamp("2026-10-20T10:05:00Z")
+    target = pd.Timestamp("2026-10-20T10:20:00Z")
+
+    def bars_at(minutes):
+        rows = []
+        for minute in minutes:
+            ts = observation + pd.Timedelta(minutes=minute)
+            rows.append({
+                "timestamp": ts, "close_time": ts + pd.Timedelta(minutes=5),
+                "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1.0,
+            })
+        return pd.DataFrame(rows)
+
+    complete = bars_at([0, 5, 10])
+    missing_first = bars_at([5, 10])
+    assert research_forward._path_gap_count(complete, observation, target, "CLOSED_5M_TRIGGER_CLOSE") == 0
+    assert research_forward._path_gap_count(missing_first, observation, target, "CLOSED_5M_TRIGGER_CLOSE") == 1
+
+    complete_idx = research_forward._BarIndex(complete)
+    missing_idx = research_forward._BarIndex(missing_first)
+    assert research_forward._path_gap_count_indexed(complete_idx, observation.value, target.value, "CLOSED_5M_TRIGGER_CLOSE") == 0
+    assert research_forward._path_gap_count_indexed(missing_idx, observation.value, target.value, "CLOSED_5M_TRIGGER_CLOSE") == 1
+
+
+def test_forward_path_gap_ceil_boundary_for_non_aligned_observation():
+    import research_forward
+
+    observation = pd.Timestamp("2026-10-20T10:05:01Z")
+    target = pd.Timestamp("2026-10-20T10:20:00Z")
+    rows = []
+    for minute in [10, 15]:
+        ts = pd.Timestamp("2026-10-20T10:00:00Z") + pd.Timedelta(minutes=minute)
+        rows.append({"timestamp": ts, "close_time": ts + pd.Timedelta(minutes=5),
+                     "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1.0})
+    frame = pd.DataFrame(rows)
+    # 10:10 is the first eligible candle after 10:05:01, so no gap should be reported.
+    assert research_forward._path_gap_count(frame, observation, target, "CLOSED_5M_TRIGGER_CLOSE") == 0
+    index = research_forward._BarIndex(frame)
+    assert research_forward._path_gap_count_indexed(index, observation.value, target.value, "CLOSED_5M_TRIGGER_CLOSE") == 0
+
+
+def test_deferred_account_context_refreshes_prebuilt_shadow_snapshot_for_both_journals(tmp_path, monkeypatch):
+    import json
+    from event_engine import research
+
+    for name in [
+        "ZONE_OBSERVATIONS_PATH", "MARKET_BARS_1H_PATH", "MARKET_BARS_5M_PATH",
+        "RESEARCH_BAR_CURSORS_PATH", "RESEARCH_MANIFEST_PATH", "RESEARCH_ERRORS_PATH",
+        "COUNTERFACTUAL_EXPERIMENTS_PATH", "ACCOUNT_CONTEXT_PATH",
+    ]:
+        monkeypatch.setattr(research, name, tmp_path / getattr(research, name).name)
+
+    df = _df_1h()
+    ts = pd.Timestamp("2026-01-03T00:05:00Z")
+    bar = {"timestamp": ts, "open": 101.0, "high": 105.0, "low": 99.0, "close": 104.0, "volume": 2000.0}
+    zone = {"zone_id": "Z_AC_SHADOW", "top": 105.0, "btm": 95.0, "poi": 100.0,
+            "origin_ts_ms": int(df["timestamp"].iloc[0].timestamp() * 1000), "age_bars": 10}
+    stale_snapshot = {"experiments": {"CF_CORRELATION": {"status": "CONTEXT_UNAVAILABLE"}}, "applied": False}
+    signal = {
+        "event_id": "E_AC_SHADOW", "symbol": "TEST-USDT", "type": "LONG",
+        "trigger_bar_time": ts.isoformat(), "decision_boundary_ts": "2026-01-03T00:10:00Z",
+        "entry": 104.0, "sl": 93.6, "tp1": 107.12, "tp2": 110.24,
+        "zone": zone, "zone_visit": {"visit_id": "V_AC_SHADOW", "touch_count_before_trigger": 0},
+        "entry_bar": bar, "previous_bar": {}, "target": {"obstacle_price": 120.0},
+        "trigger": {"zone_trigger_mode": "zone"}, "shadow_experiments": stale_snapshot,
+    }
+    account = {"account_context_id": "AC_SHADOW", "captured_at_ms": int(ts.timestamp() * 1000),
+               "persisted": True, "positions": []}
+    calls = []
+
+    def build_snapshot(signal_arg, *, df_5m, df_1h, account_context, decision_ts):
+        calls.append((account_context, decision_ts))
+        status = "NO_OPEN_PEERS" if account_context is not None else "CONTEXT_UNAVAILABLE"
+        return {"experiments": {"CF_CORRELATION": {"status": status}}, "applied": False}
+
+    monkeypatch.setattr(research.shadow, "build_entry_snapshot", build_snapshot)
+    result = research.record_scan_symbol(
+        scan_id="S_AC_SHADOW", symbol="TEST-USDT", strategy_version="v1", code_commit_sha="abc",
+        provider="binance", source="binance_spot", bars_1h=df.to_dict("records"), bars_5m=[bar], df_1h=df,
+        demand=[zone], supply=[], diagnostics={"touch_events": [], "rearm_events": [], "zones": {}},
+        symbol_state={}, signals=[signal], decision_ts="2026-01-03T00:10:00Z", account_context=account,
+    )
+    assert result["observations"] == 1
+    assert calls and calls[0][0]["account_context_id"] == "AC_SHADOW"
+    assert signal["shadow_experiments"]["experiments"]["CF_CORRELATION"]["status"] == "NO_OPEN_PEERS"
+
+    observations = [json.loads(line) for line in (tmp_path / "zone_observations.jsonl").read_text().splitlines()]
+    counterfactuals = [json.loads(line) for line in (tmp_path / "counterfactual_experiments.jsonl").read_text().splitlines()]
+    assert observations[0]["features"]["shadow_experiments"]["experiments"]["CF_CORRELATION"]["status"] == "NO_OPEN_PEERS"
+    assert counterfactuals[0]["snapshot"]["experiments"]["CF_CORRELATION"]["status"] == "NO_OPEN_PEERS"

@@ -184,3 +184,37 @@ def test_first_tp_read_overlaps_klines_but_state_processing_remains_safe(monkeyp
     assert updated["remaining_qty"] == pytest.approx(1.0)
     assert updated["hit_legs"] == []
     assert updated["closed"] is False
+
+
+def test_tracker_close_pnl_log_value_handles_unconfirmed_pnl():
+    from event_engine import tracker
+
+    assert tracker._pnl_log_value(None) == "unconfirmed"
+    assert tracker._pnl_log_value(1.234) == "+1.23%"
+    assert tracker._pnl_log_value(-0.125) == "-0.12%"
+
+
+def test_tracker_clears_unverified_absence_only_after_positive_exchange_position():
+    from event_engine import tracker
+
+    trade = {
+        "position_absence_unverified": True,
+        "position_absence_unverified_ts": 1000,
+        "position_absence_unverified_last_seen_ts": 2000,
+        "position_absence_unverified_qty": 0.5,
+        "position_absence_unverified_reason": "no_confirmed_residual_exit_order",
+        "position_absence_unverified_alerted": True,
+    }
+    assert not tracker._clear_position_absence_unverified_if_position_found(
+        trade, exchange_qty=0.0, now_ms=3000, qty_tolerance=1e-8,
+    )
+    assert trade["position_absence_unverified"] is True
+
+    assert tracker._clear_position_absence_unverified_if_position_found(
+        trade, exchange_qty=0.4, now_ms=4000, qty_tolerance=1e-8,
+    )
+    assert "position_absence_unverified" not in trade
+    assert "position_absence_unverified_last_seen_ts" not in trade
+    assert trade["position_absence_unverified_first_seen_ts"] == 1000
+    assert trade["position_absence_unverified_resolved_ts"] == 4000
+    assert trade["position_absence_unverified_resolution_reason"] == "exchange_position_reappeared"

@@ -149,3 +149,24 @@ def test_runtime_state_bundle_rejects_checksumming_corrupt_active_trade_json(tmp
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(RuntimeError, match="active_trades.json must have root type dict"):
         verify_bundle(bundle)
+
+
+def test_restore_staging_directory_is_created_on_target_filesystem(tmp_path, monkeypatch):
+    import event_engine.runtime_state_bundle as runtime_bundle
+
+    source = _make_complete_state(tmp_path / "source")
+    bundle = tmp_path / "bundle"
+    create_bundle(data_dir=source, output_dir=bundle)
+    target = tmp_path / "checkout" / "data"
+    target.parent.mkdir(parents=True)
+    original_tempdir = runtime_bundle.tempfile.TemporaryDirectory
+    captured = {}
+
+    def tracking_tempdir(*args, **kwargs):
+        captured["dir"] = Path(kwargs["dir"]).resolve() if kwargs.get("dir") else None
+        return original_tempdir(*args, **kwargs)
+
+    monkeypatch.setattr(runtime_bundle.tempfile, "TemporaryDirectory", tracking_tempdir)
+    restore_bundle(bundle_dir=bundle, data_dir=target)
+    assert captured["dir"] == target.parent.resolve()
+    assert (target / "active_trades.json").is_file()
