@@ -3341,26 +3341,32 @@ def _settle_entry_order_before_protection(
                 }
             if current_status in active_statuses:
                 if not cancel_attempted:
-                    if not order_id:
-                        last_error = "active entry order has no orderId to cancel"
-                    else:
-                        try:
+                    try:
+                        if order_id:
                             cancel_order(symbol, order_id)
-                            last_error = "entry remainder cancellation requested; awaiting terminal order state"
-                        except Exception as exc:
-                            last_error = f"entry cancellation request failed: {type(exc).__name__}: {exc}"
-                        cancel_attempted = True
+                        elif client_order_id:
+                            cancel_order(symbol, client_order_id=client_order_id)
+                        else:
+                            raise RuntimeError("active entry order has neither orderId nor clientOrderId")
+                        last_error = "entry remainder cancellation requested; awaiting terminal order state"
+                    except Exception as exc:
+                        last_error = f"entry cancellation request failed: {type(exc).__name__}: {exc}"
+                    cancel_attempted = bool(order_id or client_order_id)
                 else:
                     last_error = f"entry order remains active after cancellation: {current_status}"
             else:
                 last_error = f"unrecognized entry order status={current_status or 'EMPTY'}"
         else:
             last_error = str((state or {}).get("error") or "entry order query returned no authoritative state")
-            if order_id and not cancel_attempted:
-                # A failed GET does not prove the order is absent. Attempt cancel by
-                # its already-known server order ID, then keep polling GET for proof.
+            if (order_id or client_order_id) and not cancel_attempted:
+                # A failed GET does not prove the order is absent. Cancel by the
+                # server ID when known; otherwise use the durable clientOrderId,
+                # which BingX also accepts for DELETE /trade/order.
                 try:
-                    cancel_order(symbol, order_id)
+                    if order_id:
+                        cancel_order(symbol, order_id)
+                    else:
+                        cancel_order(symbol, client_order_id=client_order_id)
                 except Exception as exc:
                     last_error += f"; cancellation attempt: {type(exc).__name__}: {exc}"
                 cancel_attempted = True

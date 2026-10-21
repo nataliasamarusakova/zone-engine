@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -172,3 +174,28 @@ def test_restore_staging_directory_is_created_on_target_filesystem(tmp_path, mon
     restore_bundle(bundle_dir=bundle, data_dir=target)
     assert captured["dir"] == target.parent.resolve()
     assert (target / "active_trades.json").is_file()
+
+
+def test_runtime_state_bundle_snapshot_cli_supports_direct_script_invocation(tmp_path):
+    """The workflow invokes this file directly, without ``python -m`` package context."""
+    data = _make_complete_state(tmp_path / "source")
+    snapshot = tmp_path / "zone-engine-data-before-tests.json"
+    project_root = Path(__file__).resolve().parent
+    script = project_root / "event_engine" / "runtime_state_bundle.py"
+
+    result = subprocess.run(
+        [
+            sys.executable, str(script), "snapshot",
+            "--data-dir", str(data), "--output", str(snapshot),
+        ],
+        cwd=project_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Snapshotted runtime data before tests:" in result.stdout
+    payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 1
+    assert "trades.jsonl" in payload["files"]

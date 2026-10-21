@@ -594,6 +594,8 @@ def test_bingx_one_way_uses_both_position_side(monkeypatch):
 def test_bingx_signed_post_contains_source_key(monkeypatch):
     import requests
     from event_engine import bingx
+    # This test exercises serialization against a mocked session, not live exchange I/O.
+    monkeypatch.setenv("ZONE_ENGINE_TESTS_ISOLATED", "0")
 
     monkeypatch.setenv("BINGX_API_KEY", "key")
     monkeypatch.setenv("BINGX_SECRET_KEY", "secret")
@@ -620,6 +622,8 @@ def test_bingx_signed_post_contains_source_key(monkeypatch):
 
 def test_bingx_signed_post_uses_exact_canonical_body(monkeypatch):
     from event_engine import bingx
+    # This test exercises serialization against a mocked session, not live exchange I/O.
+    monkeypatch.setenv("ZONE_ENGINE_TESTS_ISOLATED", "0")
     monkeypatch.setenv("BINGX_API_KEY", "key")
     monkeypatch.setenv("BINGX_SECRET_KEY", "secret")
     captured = {}
@@ -646,6 +650,8 @@ def test_bingx_signed_post_uses_exact_canonical_body(monkeypatch):
 
 def test_signed_post_rejects_query_metacharacters_before_network(monkeypatch):
     from event_engine import bingx
+    # This test exercises serialization against a mocked session, not live exchange I/O.
+    monkeypatch.setenv("ZONE_ENGINE_TESTS_ISOLATED", "0")
     class Session:
         def __init__(self): self.calls = []
         def request(self, **kwargs): self.calls.append(kwargs); raise AssertionError("network must not be called")
@@ -1990,6 +1996,8 @@ def test_run_once_hard_caps_production_risk(monkeypatch):
 
 def test_request_does_not_fallback_post_after_network_error(monkeypatch):
     from event_engine import bingx
+    # This test exercises serialization against a mocked session, not live exchange I/O.
+    monkeypatch.setenv("ZONE_ENGINE_TESTS_ISOLATED", "0")
     class Session:
         def __init__(self): self.calls=[]
         def request(self, **kwargs):
@@ -2056,6 +2064,8 @@ def test_be_uses_detected_one_way_position_side(monkeypatch):
 
 def test_signed_get_and_delete_use_explicit_query(monkeypatch):
     from event_engine import bingx
+    # This test exercises serialization against a mocked session, not live exchange I/O.
+    monkeypatch.setenv("ZONE_ENGINE_TESTS_ISOLATED", "0")
     monkeypatch.setenv("BINGX_API_KEY", "key")
     monkeypatch.setenv("BINGX_SECRET_KEY", "secret")
     captured = []

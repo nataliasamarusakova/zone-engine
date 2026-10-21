@@ -26,6 +26,8 @@ def test_shared_telemetry_reconciliation_journal_is_isolated_from_repo_data():
 
 def test_thread_local_retry_session_uses_isolated_session_and_keeps_default(monkeypatch):
     from event_engine import bingx
+    # Requests below use two fake sessions to test routing/session isolation only.
+    monkeypatch.setenv("ZONE_ENGINE_TESTS_ISOLATED", "0")
 
     class FakeResponse:
         status_code = 200

@@ -296,3 +296,74 @@ def test_filled_entry_without_original_quantity_evidence_is_not_trusted(monkeypa
     )
     assert result["status"] == "unverified"
     assert "without consistent executedQty/origQty evidence" in result["error"]
+
+
+def test_cancel_order_can_use_client_order_id_when_exchange_order_id_is_unknown(monkeypatch):
+    from event_engine import bingx
+
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda _symbol: "AAA-USDT")
+    captured = {}
+
+    def fake_request(method, path, params, *, signed=False, **_kwargs):
+        captured.update(method=method, path=path, params=dict(params), signed=signed)
+        return {"code": 0}
+
+    monkeypatch.setattr(bingx, "_request", fake_request)
+    result = bingx.cancel_order("AAA-USDT", client_order_id="EVT_ENTRY_UNKNOWN_ID")
+
+    assert result["code"] == 0
+    assert captured == {
+        "method": "DELETE",
+        "path": bingx.ORDER_PATH,
+        "params": {"symbol": "AAA-USDT", "clientOrderId": "EVT_ENTRY_UNKNOWN_ID"},
+        "signed": True,
+    }
+
+
+def test_settle_entry_attempts_cancel_by_client_id_when_get_is_unavailable_and_order_id_missing(monkeypatch):
+    import run_once
+
+    cancel_calls = []
+    monkeypatch.setattr(run_once, "get_order", lambda *a, **k: {
+        "status": "error", "error": "temporary openOrder timeout",
+    })
+    monkeypatch.setattr(
+        run_once, "cancel_order",
+        lambda symbol, order_id=None, *, client_order_id=None: cancel_calls.append(
+            (symbol, order_id, client_order_id)
+        ) or {"code": 0},
+    )
+    monkeypatch.setattr(run_once.time, "sleep", lambda *_: None)
+
+    result = run_once._settle_entry_order_before_protection(
+        "AAA-USDT", {
+            "status": "entry_pending", "client_order_id": "EVT_ENTRY_UNKNOWN_ID",
+            "order_status": "PARTIALLY_FILLED", "executed_qty": 0.3,
+        }, timeout_sec=0.5,
+    )
+
+    assert result["status"] == "unverified"
+    assert result["cancel_attempted"] is True
+    assert cancel_calls == [("AAA-USDT", None, "EVT_ENTRY_UNKNOWN_ID")]
+
+
+def test_low_level_signed_request_is_blocked_even_with_leaked_credentials(monkeypatch):
+    from event_engine import bingx
+
+    calls = []
+    class Session:
+        def request(self, **kwargs):
+            calls.append(kwargs)
+            raise AssertionError("isolated test mode must not reach the HTTP session")
+
+    monkeypatch.setattr(bingx, "SESSION", Session())
+    monkeypatch.setattr(bingx, "_get_fast_session", lambda: Session())
+    monkeypatch.setenv("BINGX_API_KEY", "leaked-test-key")
+    monkeypatch.setenv("BINGX_SECRET_KEY", "leaked-test-secret")
+    monkeypatch.setenv("ZONE_ENGINE_TESTS_ISOLATED", "1")
+
+    out = bingx._request("GET", "/private-test", {"symbol": "AAA-USDT"}, signed=True)
+
+    assert out["code"] == -1
+    assert "disabled in isolated test mode" in out["msg"]
+    assert calls == []
