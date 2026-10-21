@@ -1896,8 +1896,8 @@ def test_tracker_close_once_is_idempotent(tmp_path, monkeypatch):
 
 def test_open_market_blocks_two_tp_min_quantity_before_order(monkeypatch):
     from event_engine import bingx
-    # Set the sizing inputs explicitly. CI's workflow now runs at 3x, so relying
-    # on import-time environment constants made this test accidentally size zero.
+    # Set the sizing inputs explicitly to exercise the low-leverage/minimum-TP
+    # guard independent of the workflow's production leverage setting.
     monkeypatch.setenv("BINGX_MARGIN_USDT", "3.34")
     monkeypatch.setattr(bingx, "MARGIN_USDT", 3.34)
     monkeypatch.setattr(bingx, "LEVERAGE", 3)
@@ -1967,8 +1967,8 @@ def test_workflow_risk_cap_is_not_accidentally_25_percent():
     workflow = Path('.github/workflows/event-engine.yml').read_text(encoding='utf-8')
     assert 'MAX_SIGNAL_RISK_PCT: "10.00"' in workflow
     assert 'MAX_SIGNAL_RISK_PCT: "25"' not in workflow
-    assert 'BINGX_LEVERAGE: "3"' in workflow
-    assert 'BINGX_MAX_LEVERAGE: "3"' in workflow
+    assert 'BINGX_LEVERAGE: "10"' in workflow
+    assert 'BINGX_MAX_LEVERAGE: "10"' in workflow
 
 def test_signal_risk_cap_hard_clamped(monkeypatch):
     import importlib

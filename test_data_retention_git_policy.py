@@ -21,7 +21,9 @@ def test_runbook_documents_artifact_backed_runtime_state_migration():
     assert "trading remains disabled" in text
     assert "self-verifying runtime-state artifact" in text
     assert "completed, successful event-engine run" in text
-    assert "Artifacts from failed runs are not selected" in text
+    assert "Runtime-state artifacts from failed runs are not selected" in text
+    assert "last_uploaded_by_run_id" in text
+    assert "archive-upload and marker-update steps both completed successfully" in text
 
 
 def test_pytest_has_global_repository_data_isolation():
@@ -45,7 +47,7 @@ def test_workflow_runs_size_guard_before_runtime_state_artifact_upload():
     assert text.index("Pre-commit data size guard") < text.index("Upload durable runtime-state artifact")
     assert 'EXECUTION_REQUIRE_EXCHANGE_TIMESTAMP: "true"' in text
     assert 'EXECUTION_UNKNOWN_QUOTE_AGE_POLICY: "block"' in text
-    assert "Restore cumulative retention archive from previous successful runs" in text
+    assert "Restore fingerprint-matched cumulative retention archive" in text
     assert "Upload cumulative retention archive for next clean runner" in text
     assert 'repos/${GITHUB_REPOSITORY}/actions/artifacts?name=zone-engine-retention-archive&per_page=100' in text
     assert 'gh run download "$run_id" --name zone-engine-retention-archive' in text
