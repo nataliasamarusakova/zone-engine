@@ -200,6 +200,69 @@ def _append_jsonl_locked(path: Path, records: Iterable[dict[str, Any]]) -> int:
     return len(rows)
 
 
+def _market_bar_identity(row: dict[str, Any]) -> tuple[str, str, str, str]:
+    """Stable identity for a market bar, independent of the journaling attempt."""
+    return (
+        str(row.get("symbol", "")).upper(),
+        str(row.get("timeframe", "")).lower(),
+        str(row.get("provider", "")).lower(),
+        str(row.get("timestamp", "")),
+    )
+
+
+def _append_market_bars_idempotent_locked(path: Path, records: Iterable[dict[str, Any]]) -> int:
+    """Append only market bars not already present in the JSONL journal.
+
+    Bars are durable before their cursor is committed. If that cursor write fails,
+    the next scan retries the same bars. Deduplicating under the journal's file lock
+    makes that retry safe and still lets the caller advance the cursor after it has
+    verified that every requested bar is already on disk or was appended now.
+
+    Returns the number of newly appended rows; returns zero if all rows were already
+    persisted. Raises on read/write errors so callers do not commit a cursor blindly.
+    """
+    rows = [sanitize(row) for row in records]
+    if not rows:
+        return 0
+
+    with _FileLock(path):
+        existing: set[tuple[str, str, str, str]] = set()
+        if path.exists():
+            with path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    text = line.strip()
+                    if not text:
+                        continue
+                    try:
+                        saved = json.loads(text)
+                    except json.JSONDecodeError:
+                        # A previously interrupted final JSONL write must not be
+                        # mistaken for a known bar. The valid rows around it remain
+                        # available for de-duplication; malformed rows are handled by
+                        # the normal research-journal validation tooling.
+                        continue
+                    if isinstance(saved, dict):
+                        existing.add(_market_bar_identity(saved))
+
+        fresh: list[dict[str, Any]] = []
+        for row in rows:
+            identity = _market_bar_identity(row)
+            if identity in existing:
+                continue
+            fresh.append(row)
+            existing.add(identity)
+
+        if not fresh:
+            return 0
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            for row in fresh:
+                fh.write(json.dumps(row, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+    return len(fresh)
+
+
 def _load_json(path: Path, default: Any) -> Any:
     try:
         if not path.exists():
@@ -335,10 +398,12 @@ def _flush_persistence_batch(state: dict[str, Any]) -> dict[str, Any]:
             if not rows:
                 continue
             try:
-                written = _append_jsonl_locked(path, rows)
+                # The cursor write may fail after the bars have been fsynced.
+                # Replaying the batch must therefore be idempotent by bar identity.
+                written = _append_market_bars_idempotent_locked(path, rows)
+                successful_timeframes.add(timeframe)
+                result["bars_1h_written" if timeframe == "1h" else "bars_5m_written"] = written
                 if written:
-                    successful_timeframes.add(timeframe)
-                    result["bars_1h_written" if timeframe == "1h" else "bars_5m_written"] = written
                     counter = "market_bars_1h_written" if timeframe == "1h" else "market_bars_5m_written"
                     manifest_deltas[counter] = manifest_deltas.get(counter, 0) + written
             except Exception as exc:
@@ -810,9 +875,11 @@ def persist_market_bars(
             _PERSISTENCE_BATCH["market_bars"][tf].extend(fresh)
             _update_cursor(key, {"last_timestamp": fresh[-1]["timestamp"], "last_bar_id": fresh[-1]["bar_id"], "updated_at": _now_iso(), "scan_id": scan_id})
             return len(fresh)
-        written = _append_jsonl_locked(path, fresh)
+        written = _append_market_bars_idempotent_locked(path, fresh)
+        # Even when all candidate bars were already present from a prior run whose
+        # cursor write failed, the successful idempotent check lets us repair cursor.
+        _update_cursor(key, {"last_timestamp": fresh[-1]["timestamp"], "last_bar_id": fresh[-1]["bar_id"], "updated_at": _now_iso(), "scan_id": scan_id})
         if written:
-            _update_cursor(key, {"last_timestamp": fresh[-1]["timestamp"], "last_bar_id": fresh[-1]["bar_id"], "updated_at": _now_iso(), "scan_id": scan_id})
             _bump_manifest(f"market_bars_{tf}_written", written)
         return written
     except Exception as exc:

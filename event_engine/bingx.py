@@ -65,6 +65,11 @@ COMMISSION_RATE_PATH = "/openApi/swap/v2/user/commissionRate"
 INCOME_PATH = "/openApi/swap/v2/user/income"
 FORCE_ORDERS_PATH = "/openApi/swap/v2/trade/forceOrders"
 ALL_FILL_ORDERS_PATH = "/openApi/swap/v2/trade/allFillOrders"
+ALL_ORDERS_MAX_LIMIT = 1000
+ALL_ORDERS_MAX_WINDOW_MS = 7 * 24 * 60 * 60 * 1000 - 1
+_ALL_ORDERS_MIN_REQUEST_INTERVAL_SEC = 0.21  # official endpoint limit: 5 requests/s
+_ALL_ORDERS_REQUEST_LOCK = threading.Lock()
+_ALL_ORDERS_LAST_REQUEST_AT = 0.0
 
 # BingX has returned allFillOrders payloads both as a list and as an object
 # containing a fill row/row list. Keep normalization conservative: an explicit
@@ -928,25 +933,124 @@ def cancel_order(symbol: str, order_id: str | int) -> dict:
 
 
 
+def _request_all_orders(params: dict[str, Any]) -> dict:
+    """Serialize historical-order queries under BingX's per-endpoint rate limit."""
+    global _ALL_ORDERS_LAST_REQUEST_AT
+    with _ALL_ORDERS_REQUEST_LOCK:
+        now = time.monotonic()
+        wait = _ALL_ORDERS_MIN_REQUEST_INTERVAL_SEC - (now - _ALL_ORDERS_LAST_REQUEST_AT)
+        if wait > 0:
+            time.sleep(wait)
+        _ALL_ORDERS_LAST_REQUEST_AT = time.monotonic()
+        return _request("GET", "/openApi/swap/v2/trade/allOrders", params, signed=True)
+
+
 def get_all_orders(
     symbol: str,
     start_time_ms: int | None = None,
     end_time_ms: int | None = None,
-    limit: int = 100,
+    limit: int = 1000,
 ) -> list[dict]:
-    """Fetch recent historical orders used for deterministic exit reconciliation."""
+    """Fetch complete historical-order coverage for the requested time range.
+
+    BingX ``allOrders`` supports at most 1000 rows per request and limits a
+    ``startTime``/``endTime`` query to seven days. A full page is treated as
+    potentially truncated: the time range is recursively split until each leaf
+    query is below the limit. If a saturated range cannot be split, raise instead
+    of silently presenting incomplete history as complete.
+    """
     bx = to_bx_symbol(symbol)
     if not bx:
         return []
-    params: dict[str, Any] = {"symbol": bx, "limit": min(max(int(limit), 1), 100)}
-    if start_time_ms is not None:
-        params["startTime"] = int(start_time_ms)
-    if end_time_ms is not None:
-        params["endTime"] = int(end_time_ms)
-    resp = _request("GET", "/openApi/swap/v2/trade/allOrders", params, signed=True)
-    if not isinstance(resp, dict) or resp.get("code") != 0:
-        return []
-    return _normalize_orders_list(resp)
+    try:
+        page_limit = min(max(int(limit), 1), ALL_ORDERS_MAX_LIMIT)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid allOrders limit: {limit!r}") from exc
+
+    start = int(start_time_ms) if start_time_ms is not None else None
+    end = int(end_time_ms) if end_time_ms is not None else None
+    if start is not None and end is not None and end < start:
+        raise ValueError(f"allOrders end_time_ms {end} is before start_time_ms {start}")
+
+    max_window_ms = ALL_ORDERS_MAX_WINDOW_MS
+
+    def fetch_window(window_start: int | None, window_end: int | None) -> list[dict]:
+        params: dict[str, Any] = {"symbol": bx, "limit": page_limit}
+        if window_start is not None:
+            params["startTime"] = int(window_start)
+        if window_end is not None:
+            params["endTime"] = int(window_end)
+        resp = _request_all_orders(params)
+        if not isinstance(resp, dict):
+            raise RuntimeError("BingX allOrders returned a non-object response")
+        try:
+            response_code = int(resp.get("code", -1))
+        except (TypeError, ValueError):
+            response_code = -1
+        if response_code != 0:
+            raise RuntimeError(
+                f"BingX allOrders failed: code={response_code} msg={resp.get('msg')} "
+                f"range={window_start}..{window_end}"
+            )
+        rows = _normalize_orders_list(resp)
+        if len(rows) < page_limit:
+            return rows
+        if window_start is None or window_end is None or window_end <= window_start:
+            raise RuntimeError(
+                "BingX allOrders result reached the requested limit and the range "
+                f"cannot be split safely (limit={page_limit}, range={window_start}..{window_end})"
+            )
+        midpoint = (window_start + window_end) // 2
+        if midpoint < window_start or midpoint >= window_end:
+            raise RuntimeError(
+                "BingX allOrders result may be truncated at millisecond resolution "
+                f"(limit={page_limit}, range={window_start}..{window_end})"
+            )
+        left = fetch_window(window_start, midpoint)
+        right = fetch_window(midpoint + 1, window_end)
+        return left + right
+
+    all_rows: list[dict] = []
+    if start is not None and end is not None:
+        chunk_start = start
+        while chunk_start <= end:
+            chunk_end = min(end, chunk_start + max_window_ms)
+            all_rows.extend(fetch_window(chunk_start, chunk_end))
+            chunk_start = chunk_end + 1
+    else:
+        all_rows.extend(fetch_window(start, end))
+
+    # Time-range recursion should not overlap, but de-duplicate defensively by
+    # exchange order identity so boundary semantics or API quirks cannot duplicate
+    # one historical order in reconciliation.
+    def order_timestamp(item: dict, fields: tuple[str, ...]) -> int:
+        for field in fields:
+            try:
+                value = float(item.get(field) or 0)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value) and value > 0:
+                return int(value)
+        return 0
+
+    unique: dict[str, dict] = {}
+    for row in all_rows:
+        order_id = row.get("orderId", row.get("orderID", row.get("order_id")))
+        client_id = row.get("clientOrderId", row.get("client_order_id"))
+        if order_id not in (None, ""):
+            identity = f"order:{order_id}"
+        elif client_id not in (None, ""):
+            identity = f"client:{str(client_id).upper()}"
+        else:
+            identity = "row:" + json.dumps(row, sort_keys=True, default=str, separators=(",", ":"))
+        existing = unique.get(identity)
+        if existing is None or order_timestamp(row, ("updateTime", "time", "createTime")) >= order_timestamp(existing, ("updateTime", "time", "createTime")):
+            unique[identity] = row
+
+    return sorted(
+        unique.values(),
+        key=lambda item: order_timestamp(item, ("time", "createTime", "updateTime")),
+    )
 
 
 def close_position_market(symbol: str, direction: str, qty: float, *, reduce_only: bool = True, trade_id: str | None = None, attempt_id: str | None = None) -> dict:
@@ -1046,7 +1150,7 @@ def _find_recent_order_by_client_id(symbol: str, client_order_id: str, lookback_
             symbol,
             start_time_ms=max(0, int(time.time() * 1000) - int(lookback_ms)),
             end_time_ms=int(time.time() * 1000) + 5_000,
-            limit=100,
+            limit=1000,
         )
     except Exception:
         return None

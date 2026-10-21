@@ -2824,7 +2824,7 @@ def _reconcile_historical_exit_order(
     start = max(0, int(entry_ts) - 30_000)
     end = int(time.time() * 1000) + 30_000
     try:
-        orders = get_all_orders(symbol, start, end, limit=100)
+        orders = get_all_orders(symbol, start, end, limit=1000)
     except Exception as exc:
         log.warning("[TRACKER] historical order reconciliation failed for %s: %s", symbol, exc)
         return None, None, None, None
