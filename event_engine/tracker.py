@@ -38,6 +38,8 @@ from event_engine.bingx import (
     POSITION_PATH,
     position_side_param,
     _validate_sl_order_for_position,
+    _repair_client_order_id,
+    _client_order_id_matches_base,
     thread_local_retry_session,
 )
 from event_engine.telegram import send as send_tg
@@ -1652,10 +1654,11 @@ def _move_sl_to_break_even(
     symbol: str, direction: str, entry_price: float, qty: float, old_sl_id: str | None, trade_id: str | None = None,
     old_sl_price: float | None = None, owner_event_id: str | None = None,
 ) -> dict:
-    """Move the stop-loss to break-even without ever holding two SL orders.
+    """Move the stop-loss to break-even without leaving an unprotected window.
 
-    Safety rule: never create an unprotected window. The exchange-visible
-    sequence is:
+    A verified replacement may briefly coexist with the old stop while cleanup
+    is pending; avoiding an unprotected position takes priority over temporary
+    duplicate protective orders. The exchange-visible sequence is:
 
       Step 1: if a BE SL already exists -> keep it, then remove any old SL.
       Step 2: create the new BE STOP_MARKET while the old SL still protects the
@@ -1684,9 +1687,26 @@ def _move_sl_to_break_even(
         return {"status": "error", "error": "invalid BE parameters", "order_id": "", "stop_price": entry_price}
 
     trade_token = str(trade_id) if trade_id else uuid.uuid4().hex.upper()[:16]
-    be_client_id = f"EVT_BE_{trade_token}"
+    base_be_client_id = f"EVT_BE_{trade_token}"
+    be_client_id = base_be_client_id
 
     verified = get_open_protection_directional(symbol, direction)
+    if not isinstance(verified, dict) or verified.get("status") != "ok":
+        # Do not post while the exchange order book cannot be inspected: the
+        # canonical BE clientOrderId might still be occupied by a stale order.
+        return {
+            "status": "error",
+            "error": f"cannot inspect existing protection before BE repair: {verified.get('error', 'openOrders unavailable') if isinstance(verified, dict) else 'invalid response'}",
+            "order_id": "",
+            "stop_price": entry_price,
+            "safety_action": "existing_protection_unchanged",
+        }
+    invalid_be_order_ids = [
+        str(order.get("orderId", "")) for order in verified.get("sl_orders", [])
+        if str(order.get("orderId", ""))
+        and _client_order_id_matches_base(order.get("clientOrderId", ""), base_be_client_id)
+        and not _is_valid_break_even_stop(order, direction, entry_price, qty, price_precision)
+    ]
     if verified.get("status") == "ok":
         for order in verified.get("sl_orders", []):
             cid = str(order.get("clientOrderId", "")).upper()
@@ -1726,6 +1746,22 @@ def _move_sl_to_break_even(
                             "orphaned_order_cleanup_pending": bool(cid == be_client_id.upper() and not cleanup.get("verified")),
                             "orphaned_order_cleanup_status": cleanup.get("status"),
                             "orphaned_order_cleanup_error": cleanup.get("error"),
+                        }
+                for stale_be_id in invalid_be_order_ids:
+                    if str(stale_be_id) == existing_id:
+                        continue
+                    stale_cancelled, stale_note = _cancel_old_sl_verified(
+                        symbol, direction, str(stale_be_id), owner_event_id=owner_event_id or trade_id,
+                    )
+                    if not stale_cancelled:
+                        return {
+                            "status": "created_cleanup_pending",
+                            "error": f"valid BE exists but stale BE cleanup failed: {stale_note}",
+                            "order_id": existing_id,
+                            "client_order_id": cid or be_client_id,
+                            "stop_price": entry_price,
+                            "old_sl_cleanup_pending": True,
+                            "old_sl_cleanup_pending_order_id": str(stale_be_id),
                         }
                 old_cancelled = True
                 cancel_note = ""
@@ -1855,6 +1891,10 @@ def _move_sl_to_break_even(
             "rollback": rollback,
         }
 
+    # Never retry the canonical BE ID while a malformed order using it remains
+    # open. Keep the stale stop until a uniquely identified replacement is
+    # verified on the exchange.
+    be_client_id = _repair_client_order_id(base_be_client_id) if invalid_be_order_ids else base_be_client_id
     sl_side = "SELL" if direction == "LONG" else "BUY"
     params = {
         "symbol": bx,
@@ -1936,9 +1976,27 @@ def _move_sl_to_break_even(
         }
 
     # The BE stop is now proven to exist, so the position never becomes naked.
-    # Remove the obsolete engine SL afterwards. If cancellation cannot be
-    # proven, retain the verified BE stop and surface cleanup as an error rather
-    # than closing a safely protected position.
+    # Clean malformed BE orders for this event only after the replacement has
+    # been verified. An unresolved duplicate stays explicitly pending; it must
+    # not trigger an emergency close while the new BE is already confirmed.
+    for stale_be_id in invalid_be_order_ids:
+        if str(stale_be_id) == new_order_id:
+            continue
+        stale_cancelled, stale_note = _cancel_old_sl_verified(
+            symbol, direction, str(stale_be_id), owner_event_id=owner_event_id or trade_id,
+        )
+        if not stale_cancelled:
+            return {
+                "status": "created_cleanup_pending",
+                "order_id": new_order_id,
+                "client_order_id": order.get("clientOrderId") or be_client_id,
+                "stop_price": entry_price,
+                "error": f"new BE verified but stale BE cleanup failed: {stale_note}",
+                "old_sl_cleanup_pending": True,
+                "old_sl_cleanup_pending_order_id": str(stale_be_id),
+            }
+
+    # Remove the obsolete original SL only after the verified BE is in place.
     old_cleanup_error = None
     if old_sl_id and str(old_sl_id) != new_order_id:
         old_cancelled, cancel_note = _cancel_old_sl_verified(symbol, direction, str(old_sl_id), owner_event_id=owner_event_id or trade_id)
@@ -2001,13 +2059,49 @@ def _weighted_rr_snapshot(trade: dict) -> tuple[float | None, float | None, floa
     hit_legs = {str(x) for x in (trade.get("hit_legs") or [])}
     completed_legs = {str(x) for x in (trade.get("completed_tp_legs") or [])}
     consumed_legs = hit_legs | completed_legs
-    tp_levels = trade.get("tp_levels") if isinstance(trade.get("tp_levels"), list) else []
+    planned_tp_levels = trade.get("tp_levels") if isinstance(trade.get("tp_levels"), list) else []
+    setup = trade.get("setup") if isinstance(trade.get("setup"), dict) else {}
+    protection_result = setup.get("protection_result") if isinstance(setup.get("protection_result"), dict) else {}
+    # Exchange-rounded quantities/fractions are authoritative for the remaining
+    # targets. Legacy migration may seed effective_tp_levels with planned 50/50
+    # targets, so prefer candidates that carry actual order quantities first.
+    candidates = [
+        trade.get("effective_tp_levels"),
+        setup.get("effective_tp_levels"),
+        protection_result.get("effective_tp_levels"),
+    ]
+    effective_candidates = [candidate for candidate in candidates if isinstance(candidate, list) and candidate]
+    tp_levels = next((
+        candidate for candidate in effective_candidates
+        if any(isinstance(level, dict) and _safe_float(level.get("qty"), 0.0) > 0 for level in candidate)
+    ), None)
+    if tp_levels is None and effective_candidates:
+        planned_fractions = {
+            str(level.get("leg", "")): _safe_float(level.get("close_fraction"), 0.0)
+            for level in planned_tp_levels if isinstance(level, dict)
+        }
+        tp_levels = next((
+            candidate for candidate in effective_candidates
+            if any(
+                isinstance(level, dict)
+                and str(level.get("leg", "")) in planned_fractions
+                and abs(_safe_float(level.get("close_fraction"), 0.0) - planned_fractions[str(level.get("leg", ""))]) > 1e-9
+                for level in candidate
+            )
+        ), None)
+    if tp_levels is None:
+        tp_levels = planned_tp_levels
     remaining_qty = max(_safe_float(trade.get("remaining_qty"), 0.0), 0.0)
     remaining_rr_component = 0.0
     if remaining_qty > 0 and tp_levels:
-        remaining = [x for x in tp_levels if str(x.get("leg", "")) not in consumed_legs and _safe_float(x.get("pnl_pct"), 0.0) > 0]
+        remaining = [x for x in tp_levels if isinstance(x, dict) and str(x.get("leg", "")) not in consumed_legs and _safe_float(x.get("pnl_pct"), 0.0) > 0]
         if remaining:
-            raw_weights = [max(0.0, _safe_float(x.get("close_fraction"), 0.0)) for x in remaining]
+            raw_weights = [
+                max(0.0, _safe_float(x.get("qty"), 0.0))
+                if _safe_float(x.get("qty"), 0.0) > 0
+                else max(0.0, _safe_float(x.get("close_fraction"), 0.0))
+                for x in remaining
+            ]
             weight_sum = sum(raw_weights)
             if weight_sum <= 0:
                 raw_weights = [1.0] * len(remaining)
@@ -2939,6 +3033,34 @@ def _reconciliation_status(local_qty: float, exchange_qty: float, base_status: s
     return "FOUND" if math.isclose(local, exchange, rel_tol=rel_tol, abs_tol=abs_tol) else "FOUND_QTY_MISMATCH"
 
 
+def _clear_completed_tp_recovery_markers(trade: dict[str, Any]) -> bool:
+    """Clear recovery blockers once recovered fills are authoritatively booked.
+
+    A completed but adverse TP fill consumes a target without becoming a
+    validated hit (which remains the gate for TP1 -> BE). Therefore recovery
+    completion must use completed_tp_legs ∪ hit_legs, not hit_legs alone.
+    Unfilled or unverified recovered orders remain pending.
+    """
+    if not isinstance(trade, dict):
+        return False
+    tp_orders = trade.get("tp_orders") if isinstance(trade.get("tp_orders"), list) else []
+    pending_legs = {
+        str(item.get("leg", "")) for item in tp_orders
+        if isinstance(item, dict) and item.get("recovered_execution_pending")
+    }
+    if not pending_legs:
+        return False
+    completed_legs = {str(value) for value in (trade.get("completed_tp_legs") or [])}
+    completed_legs.update(str(value) for value in (trade.get("hit_legs") or []))
+    if not pending_legs.issubset(completed_legs):
+        return False
+    trade["tp_recovery_pending"] = False
+    for item in tp_orders:
+        if isinstance(item, dict) and str(item.get("leg", "")) in pending_legs:
+            item.pop("recovered_execution_pending", None)
+    return True
+
+
 def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None:
     tracker_perf_started = time.perf_counter() if request_metrics.enabled() else None
     tracker_timings: dict[str, dict[str, float]] = {}
@@ -3468,15 +3590,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
             trade["effective_weighted_rr"] = rr_effective
             trade["realized_weighted_rr"] = rr_realized
             trade["remaining_weighted_rr"] = rr_remaining
-            pending_legs = {
-                str(x.get("leg", "")) for x in trade.get("tp_orders", [])
-                if isinstance(x, dict) and x.get("recovered_execution_pending")
-            }
-            if pending_legs and pending_legs.issubset(hit_legs):
-                trade["tp_recovery_pending"] = False
-                for x in trade.get("tp_orders", []):
-                    if isinstance(x, dict) and str(x.get("leg", "")) in pending_legs:
-                        x.pop("recovered_execution_pending", None)
+            _clear_completed_tp_recovery_markers(trade)
 
             # Re-read the position after processing TP order status. A TP can
             # fill between the first position snapshot and the order query loop;

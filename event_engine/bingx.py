@@ -1826,6 +1826,92 @@ def build_sl_client_order_id(trade_id: str | None = None) -> str:
     return "EVT_SL"
 
 
+def _repair_client_order_id(base_client_order_id: str) -> str:
+    """Create a bounded, unique ID for a replacement protection order.
+
+    Protection repairs must not reuse an ID while a stale order with that ID may
+    still be open. Keep the normal ID unchanged for first placement/retries; only
+    repairs use this alternate form. The digest in a shortened stem prevents two
+    long base IDs from collapsing to the same 30-character prefix.
+    """
+    base = str(base_client_order_id or "EVT_REPAIR").upper()
+    if len(base) <= 30:
+        stem = base
+    else:
+        stem = f"{base[:21]}_{hashlib.sha256(base.encode('utf-8')).hexdigest().upper()[:8]}"
+    suffix = f"_R{uuid.uuid4().hex.upper()[:8]}"
+    return f"{stem[:30]}{suffix}"[:40]
+
+
+def _client_order_id_matches_base(client_order_id: str, base_client_order_id: str) -> bool:
+    """Match a canonical clientOrderId and repair IDs derived from it."""
+    client_id = str(client_order_id or "").upper()
+    base = str(base_client_order_id or "").upper()
+    if not client_id or not base:
+        return False
+    if client_id == base:
+        return True
+    if not re.search(r"_R[0-9A-F]{8}$", client_id):
+        return False
+    stem = client_id[:-10]
+    if len(base) <= 30:
+        return stem == base
+    expected_stem = f"{base[:21]}_{hashlib.sha256(base.encode('utf-8')).hexdigest().upper()[:8]}"
+    return stem == expected_stem
+
+
+def _cancel_engine_protection_orders_verified(
+    symbol: str, direction: str, order_ids: list[str], *, attempts: int = 4,
+) -> tuple[bool, str | None]:
+    """Cancel known engine-owned protective orders and verify exchange absence.
+
+    The caller must have identified these IDs as belonging to the repaired TP
+    leg/SL. A cancel acknowledgement alone is insufficient because cancellation
+    may be asynchronous; openOrders is polled before success is reported.
+    """
+    unique_ids = list(dict.fromkeys(str(value) for value in order_ids if str(value)))
+    for order_id in unique_ids:
+        try:
+            before = get_open_protection_directional(symbol, direction)
+        except Exception as exc:
+            return False, f"pre-cancel openOrders failed for {order_id}: {exc}"
+        if not isinstance(before, dict) or before.get("status") != "ok":
+            return False, f"pre-cancel openOrders unavailable for {order_id}"
+        all_orders = list(before.get("sl_orders", [])) + list(before.get("tp_orders", []))
+        matched = next((item for item in all_orders if str(item.get("orderId", "")) == order_id), None)
+        if matched is None:
+            continue
+        if not str(matched.get("clientOrderId", "")).upper().startswith("EVT_"):
+            return False, f"refusing to cancel non-engine order {order_id}"
+        try:
+            cancel_order(symbol, order_id)
+        except Exception as exc:
+            # Still verify the exchange state: a timeout can occur after the
+            # exchange accepted the cancellation.
+            log.warning("[BINGX] cancel request raised for stale protection %s: %s", order_id, exc)
+        absent = False
+        last_error = "cancel not yet visible as absent"
+        for attempt in range(max(1, attempts)):
+            if attempt:
+                time.sleep(0.15 * attempt)
+            try:
+                after = get_open_protection_directional(symbol, direction)
+            except Exception as exc:
+                last_error = f"post-cancel openOrders failed: {exc}"
+                continue
+            if not isinstance(after, dict) or after.get("status") != "ok":
+                last_error = "post-cancel openOrders unavailable"
+                continue
+            after_orders = list(after.get("sl_orders", [])) + list(after.get("tp_orders", []))
+            if not any(str(item.get("orderId", "")) == order_id for item in after_orders):
+                absent = True
+                break
+            last_error = f"order {order_id} remains visible after cancellation"
+        if not absent:
+            return False, last_error
+    return True, None
+
+
 def _allocate_tp_quantities(position_qty: float, precision: int, min_qty: float, fractions: list[float]) -> list[float]:
     if position_qty <= 0:
         raise ValueError("position_qty must be > 0")
@@ -1928,7 +2014,12 @@ def _tp_leg_from_order(order: dict, expected_leg: str, expected_price: float, pr
     actual_formatted = _format_price(actual_price, price_precision)
 
     if trade_id:
-        if client_id == f"EVT_{_trade_digest(trade_id)}_{expected_leg}":
+        base_client_order_id = f"EVT_{_trade_digest(trade_id)}_{expected_leg}"
+        # Repair IDs retain the canonical leg identity with a unique _Rxxxxxxxx
+        # suffix. Recognize those IDs as the same logical TP leg; otherwise every
+        # later reconciliation would treat a successfully repaired TP as stale
+        # and replace it again on every run.
+        if _client_order_id_matches_base(client_id, base_client_order_id):
             return actual_formatted == expected_formatted
 
     if client_id.startswith("EVT_") and f"_{expected_leg}_" in f"_{client_id}_":
@@ -3190,7 +3281,14 @@ def ensure_directional_protection(
     else:
         sl_requery_required = True
         sl_price = avg_price * (1.0 - stop_loss_pct / 100.0) if direction == "LONG" else avg_price * (1.0 + stop_loss_pct / 100.0)
-        client_order_id = build_sl_client_order_id(trade_id)
+        base_client_order_id = build_sl_client_order_id(trade_id)
+        # Keep the old invalid SL alive until its replacement is visible. If an
+        # engine-owned invalid SL already exists, its deterministic client ID may
+        # still be occupied at BingX; use a unique repair ID for the replacement.
+        client_order_id = (
+            _repair_client_order_id(base_client_order_id)
+            if engine_owned_invalid_sl_ids else base_client_order_id
+        )
         current_price = _current_close_price(symbol)
         if current_price is not None:
             sl_side_valid = (sl_price < current_price) if direction == "LONG" else (sl_price > current_price)
@@ -3284,19 +3382,20 @@ def ensure_directional_protection(
     # be cancelled. If cleanup fails, return an explicit failure rather than
     # silently leaving ambiguous duplicate protection behind.
     if engine_owned_invalid_sl_ids:
-        for old_id in engine_owned_invalid_sl_ids:
-            try:
-                cancel_resp = cancel_order(symbol, old_id)
-            except Exception as exc:
-                return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "sl_result": sl_result, "tp_orders": [], "error": f"engine SL cleanup failed for {old_id}: {exc}"}
-            if not isinstance(cancel_resp, dict) or cancel_resp.get("code") not in (0, "0"):
-                return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "sl_result": sl_result, "tp_orders": [], "error": f"engine SL cleanup failed for {old_id}: {cancel_resp}"}
-        post_cleanup = get_open_protection_directional(symbol, direction)
-        if post_cleanup.get("status") != "ok":
-            return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "sl_result": sl_result, "tp_orders": [], "error": "engine SL cleanup could not be verified"}
-        remaining_ids = {str(o.get("orderId", "")) for o in post_cleanup.get("sl_orders", [])}
-        if any(old_id in remaining_ids for old_id in engine_owned_invalid_sl_ids):
-            return {"status": "SL_UNVERIFIED", "symbol": symbol, "direction": direction, "avg_price": avg_price, "qty": position_qty, "sl_result": sl_result, "tp_orders": [], "error": "engine SL cleanup not visible on exchange"}
+        cleanup_ok, cleanup_error = _cancel_engine_protection_orders_verified(
+            symbol, direction, engine_owned_invalid_sl_ids,
+        )
+        if not cleanup_ok:
+            return {
+                "status": "SL_UNVERIFIED",
+                "symbol": symbol,
+                "direction": direction,
+                "avg_price": avg_price,
+                "qty": position_qty,
+                "sl_result": sl_result,
+                "tp_orders": [],
+                "error": f"engine SL cleanup could not be verified: {cleanup_error}",
+            }
 
     if not tp_levels_norm:
         return {
@@ -3348,6 +3447,7 @@ def ensure_directional_protection(
         }
 
     tp_results = []
+    tp_cleanup_errors: list[dict[str, str]] = []
     current_price = None
     current_price_checked = False
 
@@ -3356,24 +3456,41 @@ def ensure_directional_protection(
         pnl_pct = float(level["pnl_pct"])
         tp_price = avg_price * (1.0 + pnl_pct / 100.0) if direction == "LONG" else avg_price * (1.0 - pnl_pct / 100.0)
 
-        existing_leg = None
-        for order in existing_tp:
-            if _tp_leg_from_order(order, leg, tp_price, price_precision, trade_id, direction):
-                existing_leg = order
-                break
+        base_client_order_id = build_tp_client_order_id(leg, trade_id)
+        same_leg_orders = [
+            order for order in existing_tp
+            if _client_order_id_matches_base(order.get("clientOrderId", ""), base_client_order_id)
+        ]
+        matching_price_orders = [
+            order for order in existing_tp
+            if _tp_leg_from_order(order, leg, tp_price, price_precision, trade_id, direction)
+        ]
+        existing_leg = matching_price_orders[0] if matching_price_orders else None
+        stale_tp_order_ids: list[str] = []
 
         if existing_leg:
+            existing_order_id = str(existing_leg.get("orderId", ""))
             existing_qty = float(existing_leg.get("origQty", 0) or existing_leg.get("quantity", 0) or 0)
-            # An existing TP is reusable only when both price and quantity match
-            # the current desired leg. Reusing a smaller/older order can leave
-            # part of the position unprotected; reusing a larger one can over-close.
+            # An existing TP is reusable only when both price and quantity match.
+            # Any other orders owned by this same leg are stale duplicates and may
+            # only be removed after a valid replacement/keeper is exchange-visible.
+            stale_tp_order_ids = [
+                str(order.get("orderId", "")) for order in same_leg_orders
+                if str(order.get("orderId", "")) and str(order.get("orderId", "")) != existing_order_id
+            ]
             qty_matches = abs(existing_qty - tp_qty) <= max(tp_qty * 1e-6, 1e-12)
             if qty_matches:
+                if stale_tp_order_ids:
+                    cleanup_ok, cleanup_error = _cancel_engine_protection_orders_verified(
+                        symbol, direction, stale_tp_order_ids,
+                    )
+                    if not cleanup_ok:
+                        tp_cleanup_errors.append({"leg": leg, "error": str(cleanup_error or "stale TP cleanup unverified")})
                 tp_results.append(
                     {
                         "leg": leg,
                         "status": "already_exists",
-                        "order_id": str(existing_leg.get("orderId", "")),
+                        "order_id": existing_order_id,
                         "client_order_id": str(existing_leg.get("clientOrderId", "")),
                         "price": float(existing_leg.get("stopPrice", 0) or existing_leg.get("price", 0) or 0),
                         "qty": existing_qty,
@@ -3384,19 +3501,31 @@ def ensure_directional_protection(
                     }
                 )
                 continue
-
-            old_order_id = str(existing_leg.get("orderId", ""))
-            if old_order_id:
-                cancel_resp = cancel_order(symbol, old_order_id)
-                if not isinstance(cancel_resp, dict) or cancel_resp.get("code") not in (0, "0"):
-                    tp_results.append({
-                        "leg": leg,
-                        "status": "error",
-                        "error": f"stale TP cancel failed: code={cancel_resp.get('code') if isinstance(cancel_resp, dict) else None} msg={cancel_resp.get('msg') if isinstance(cancel_resp, dict) else cancel_resp}",
-                        "qty": tp_qty,
-                        "pnl_pct": pnl_pct,
-                    })
-                    continue
+            # Same-price, wrong-size orders are replaced create-new-first. Do not
+            # cancel the old target before its replacement can be verified.
+            stale_tp_order_ids = [
+                str(order.get("orderId", "")) for order in same_leg_orders
+                if str(order.get("orderId", ""))
+            ]
+            if not stale_tp_order_ids and existing_order_id:
+                # A legacy TP matched by price but does not carry this trade's
+                # canonical ID. Do not cancel an order whose ownership cannot be
+                # established automatically; fail closed instead of risking a
+                # second TP for the same leg.
+                tp_results.append({
+                    "leg": leg, "status": "error",
+                    "error": "existing TP quantity mismatch but clientOrderId ownership is not verifiable",
+                    "qty": tp_qty, "pnl_pct": pnl_pct,
+                })
+                continue
+        else:
+            # Include same-trade TP IDs even when their trigger price is wrong.
+            # The old implementation ignored these, then POSTed with the exact
+            # same deterministic clientOrderId and could remain stuck in SL_ONLY.
+            stale_tp_order_ids = [
+                str(order.get("orderId", "")) for order in same_leg_orders
+                if str(order.get("orderId", ""))
+            ]
 
         if not current_price_checked:
             current_price = _current_close_price(symbol)
@@ -3430,7 +3559,10 @@ def ensure_directional_protection(
                 "failure_class": "TP_TARGET_CROSSED_BEFORE_PROTECTION",
             }
 
-        client_order_id = build_tp_client_order_id(leg, trade_id)
+        client_order_id = (
+            _repair_client_order_id(base_client_order_id)
+            if stale_tp_order_ids else base_client_order_id
+        )
         params = {
             "symbol": bx_symbol,
             "side": "SELL" if direction == "LONG" else "BUY",
@@ -3453,6 +3585,12 @@ def ensure_directional_protection(
                 tp_results.append({"leg": leg, "status": "error", "error": f"code={resp.get('code')} msg={resp.get('msg')}", "qty": tp_qty, "pnl_pct": pnl_pct})
                 continue
             order = verify["order"]
+            if stale_tp_order_ids:
+                cleanup_ok, cleanup_error = _cancel_engine_protection_orders_verified(
+                    symbol, direction, stale_tp_order_ids,
+                )
+                if not cleanup_ok:
+                    tp_cleanup_errors.append({"leg": leg, "error": str(cleanup_error or "stale TP cleanup unverified")})
             tp_results.append({
                 "leg": leg, "status": "reconciled_after_post_error",
                 "order_id": str(order.get("orderId", "")),
@@ -3474,6 +3612,12 @@ def ensure_directional_protection(
             tp_results.append({"leg": leg, "status": "error", "error": "TP acknowledged but not verifiable on exchange", "qty": tp_qty, "pnl_pct": pnl_pct})
             continue
         order = verify["order"]
+        if stale_tp_order_ids:
+            cleanup_ok, cleanup_error = _cancel_engine_protection_orders_verified(
+                symbol, direction, stale_tp_order_ids,
+            )
+            if not cleanup_ok:
+                tp_cleanup_errors.append({"leg": leg, "error": str(cleanup_error or "stale TP cleanup unverified")})
         tp_results.append({
             "leg": leg, "status": "created",
             "order_id": str(order.get("orderId", "")),
@@ -3486,7 +3630,7 @@ def ensure_directional_protection(
     successful_tps = [t for t in tp_results if t.get("status") in {"created", "already_exists", "reconciled_after_post_error"}]
     tp_geometry_valid = True
     tp_qty_valid = True
-    tp_identity_valid = True
+    tp_identity_valid = not bool(tp_cleanup_errors)
     seen_tp_order_ids: set[str] = set()
     for level, expected_qty in zip(tp_levels_norm, desired_qtys):
         leg = str(level["leg"])
@@ -3574,6 +3718,7 @@ def ensure_directional_protection(
             "position_qty": float(position_qty),
         },
         "tp_orders": tp_results,
+        "tp_cleanup_errors": tp_cleanup_errors,
         "sl_result": sl_result,
     }
 

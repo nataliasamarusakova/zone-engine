@@ -26,14 +26,18 @@ _CACHE_TTL = max(60, int(os.environ.get("BINANCE_EXCHANGE_INFO_TTL_SEC", "1800")
 _LOCAL = threading.local()
 
 
-def _session() -> requests.Session:
-    session = getattr(_LOCAL, "session", None)
+def _session(*, retryable: bool = True) -> requests.Session:
+    """Return a thread-local HTTP session with the requested retry policy.
+
+    Separate sessions are necessary because HTTPAdapter retry behavior is fixed
+    when mounted; a per-call flag cannot disable retries on a shared adapter.
+    """
+    cache_key = "session" if retryable else "no_retry_session"
+    session = getattr(_LOCAL, cache_key, None)
     if session is None:
         session = requests.Session()
-        adapter = HTTPAdapter(
-            pool_connections=2,
-            pool_maxsize=2,
-            max_retries=Retry(
+        retry_policy = (
+            Retry(
                 total=2,
                 connect=2,
                 read=2,
@@ -43,17 +47,37 @@ def _session() -> requests.Session:
                 allowed_methods=frozenset({"GET"}),
                 respect_retry_after_header=True,
                 raise_on_status=False,
-            ),
+            )
+            if retryable else Retry(
+                total=0,
+                connect=0,
+                read=0,
+                status=0,
+                backoff_factor=0,
+                allowed_methods=frozenset({"GET"}),
+                raise_on_status=False,
+            )
+        )
+        adapter = HTTPAdapter(
+            pool_connections=2,
+            pool_maxsize=2,
+            max_retries=retry_policy,
         )
         session.mount("https://", adapter)
         session.mount("http://", adapter)
-        _LOCAL.session = session
+        setattr(_LOCAL, cache_key, session)
     return session
 
 
-def _get(path: str, params: dict[str, Any] | None = None, timeout: float = 8.0) -> Any:
+def _get(
+    path: str,
+    params: dict[str, Any] | None = None,
+    timeout: float = 8.0,
+    *,
+    retryable: bool = True,
+) -> Any:
     response = timed_request(
-        "binance", path, "GET", _session().get,
+        "binance", path, "GET", _session(retryable=retryable).get,
         BASE_URL + path, params=params or {}, timeout=timeout,
     )
     response.raise_for_status()
@@ -168,6 +192,7 @@ def fetch_klines(symbol: str, interval: str = "1h", limit: int = 120, *, retryab
         KLINES_PATH,
         {"symbol": bsym, "interval": interval, "limit": int(limit)},
         timeout=float(os.environ.get("BINANCE_HTTP_TIMEOUT_SEC", "10")),
+        retryable=bool(retryable),
     )
     if not isinstance(payload, list):
         raise ValueError("Binance klines payload is not a list")
