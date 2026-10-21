@@ -924,7 +924,9 @@ def _pending_observations() -> list[dict[str, Any]]:
             "replayable": bool(
                 ts is not None
                 and all(meta.get(key) not in (None, "") for key in (
-                    "event_type", "symbol", "direction", "provider", "source",
+                    # Keep this list aligned with research_forward.PENDING_REPLAY_FIELDS;
+                    # both scan_id and observation_id are required by the replay worker.
+                    "observation_id", "scan_id", "event_type", "symbol", "direction", "provider", "source",
                     "observation_ts", "reference_price",
                 ))
             ),

@@ -368,6 +368,55 @@ def _save_active_trades(trades: dict[str, dict]) -> None:
         _write_active_trades_unlocked(trades)
 
 
+def update_active_trade_entry_reconciliation(event_id: str, reconciliation: dict[str, Any]) -> bool:
+    """Persist the latest entry-order settlement evidence for an active owner.
+
+    A market-entry remainder can remain live after an ambiguous response. The
+    reconciliation loop calls this on each cycle so later cancellation/status
+    evidence is durable and can stop retrying only once the exchange is terminal.
+    """
+    if not isinstance(reconciliation, dict):
+        return False
+    state = copy.deepcopy(reconciliation)
+    settled = str(state.get("status", "")).lower() == "settled"
+    with _active_trades_lock():
+        trades = _load_active_trades_required()
+        trade = trades.get(str(event_id))
+        if not isinstance(trade, dict) or trade.get("closed") is True:
+            return False
+        entry_order = trade.get("entry_order") if isinstance(trade.get("entry_order"), dict) else {}
+        entry_order = dict(entry_order)
+        entry_order["entry_reconciliation"] = state
+        order_state = state.get("order_state") if isinstance(state.get("order_state"), dict) else {}
+        for normalized, sources in (
+            ("order_id", ("order_id", "orderId")),
+            ("client_order_id", ("client_order_id", "clientOrderId")),
+            ("order_status", ("order_status", "status")),
+            ("executed_qty", ("executed_qty", "executedQty")),
+            ("orig_qty", ("orig_qty", "origQty")),
+        ):
+            for source in sources:
+                value = order_state.get(source)
+                if value not in (None, ""):
+                    entry_order[normalized] = value
+                    break
+        trade["entry_order"] = entry_order
+        trade["entry_order_reconciliation"] = state
+        trade["entry_remainder_unverified"] = not settled
+        setup = trade.get("setup") if isinstance(trade.get("setup"), dict) else {}
+        setup = dict(setup)
+        setup["entry_order_reconciliation"] = state
+        setup["entry_remainder_unverified"] = not settled
+        if order_state:
+            setup_entry_order = setup.get("entry_order") if isinstance(setup.get("entry_order"), dict) else {}
+            setup_entry_order = dict(setup_entry_order)
+            setup_entry_order.update({k: entry_order[k] for k in ("order_id", "client_order_id", "order_status", "executed_qty", "orig_qty", "entry_reconciliation") if k in entry_order})
+            setup["entry_order"] = setup_entry_order
+        trade["setup"] = setup
+        _write_active_trades_unlocked(trades)
+    return True
+
+
 def record_verified_emergency_close(event_id: str, close_result: dict, *, reason: str) -> bool:
     """Persist verified flatness for an existing owner so tracker can close it honestly."""
     if not isinstance(close_result, dict) or str(close_result.get("status", "")).lower() != "closed_verified":
@@ -3264,6 +3313,25 @@ def _clear_completed_tp_recovery_markers(trade: dict[str, Any]) -> bool:
     return True
 
 
+def _entry_remainder_unverified(trade: dict[str, Any]) -> bool:
+    if not isinstance(trade, dict):
+        return False
+    setup = trade.get("setup") if isinstance(trade.get("setup"), dict) else {}
+    entry_order = trade.get("entry_order") if isinstance(trade.get("entry_order"), dict) else {}
+    state = trade.get("entry_order_reconciliation")
+    if not isinstance(state, dict):
+        state = setup.get("entry_order_reconciliation")
+    if not isinstance(state, dict):
+        state = entry_order.get("entry_reconciliation")
+    state = state if isinstance(state, dict) else {}
+    flag = bool(
+        trade.get("entry_remainder_unverified")
+        or setup.get("entry_remainder_unverified")
+        or str(state.get("status", "")).lower() == "unverified"
+    )
+    return flag and str(state.get("status", "")).lower() != "settled"
+
+
 def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None:
     tracker_perf_started = time.perf_counter() if request_metrics.enabled() else None
     tracker_timings: dict[str, dict[str, float]] = {}
@@ -3337,6 +3405,17 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                 else get_position_directional(symbol, direction)
             )
             pos_status = str(pos.get("status", "")).lower()
+            previous_be_rollback = trade.get("be_failure_rollback") if isinstance(trade.get("be_failure_rollback"), dict) else {}
+            previous_be_close_verified = str(previous_be_rollback.get("status", "")).lower() in {"closed_verified", "already_closed"}
+            if pos_status == "found" and previous_be_close_verified:
+                # A prior verified rollback says the position was flat. A current
+                # positive snapshot contradicts that historical marker, so obtain
+                # a fresh per-symbol read before deciding whether BE should retry.
+                # Do not suppress BE retry or close this trade based on stale data.
+                fresh_after_rollback = get_position_directional(symbol, direction)
+                if isinstance(fresh_after_rollback, dict):
+                    pos = fresh_after_rollback
+                    pos_status = str(pos.get("status", "")).lower()
 
             if pos_status not in {"found", "not_found"}:
                 trade["last_observation_ts"] = now_ms
@@ -3374,7 +3453,27 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                 exchange_avg = _safe_float(pos.get("avgPrice"))
                 if exchange_avg > 0:
                     trade["last_exchange_avg_price"] = exchange_avg
+                rollback_marker = trade.get("be_failure_rollback") if isinstance(trade.get("be_failure_rollback"), dict) else {}
+                if str(rollback_marker.get("status", "")).lower() in {"closed_verified", "already_closed"}:
+                    # Preserve forensic history without letting an old flatness
+                    # result permanently disable BE retry for a live position.
+                    trade["be_failure_rollback_stale"] = rollback_marker
+                    trade["be_failure_rollback_stale_cleared_ts"] = now_ms
+                    trade.pop("be_failure_rollback", None)
+                    trade.pop("be_failure_rollback_verified_ts", None)
             else:
+                if pos_status == "not_found" and _entry_remainder_unverified(trade):
+                    # An unsettled MARKET entry may still fill after a momentary
+                    # flat snapshot. Keep its owner alive; run_once retries cancel
+                    # and settlement before treating absence as a completed close.
+                    trade["last_observation_ts"] = now_ms
+                    trade["entry_remainder_unverified_last_flat_seen_ts"] = now_ms
+                    updated_trades[event_id] = trade
+                    log.critical(
+                        "[TRACKER_ENTRY_REMAINDER_UNSETTLED] event=%s symbol=%s; position currently absent but entry order is not terminal, retaining owner and deferring close",
+                        event_id, symbol,
+                    )
+                    continue
                 # The position is already gone. Keep the last locally tracked
                 # residual quantity available for historical exit/PnL recovery.
                 # The final exchange lookup below will set the live quantity to

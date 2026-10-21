@@ -2018,6 +2018,38 @@ def prepare_protection_capacity(symbol: str, direction: str) -> dict:
             "error": position.get("error", "position state unavailable"),
         }
 
+    # In ONE_WAY, get_position_directional() deliberately reports the opposite
+    # signed position as not_found for the requested direction. That does not
+    # mean the symbol is flat: its BOTH-side SL/TP orders may protect that live
+    # opposite position. Never prune those orders as stale. If mode or opposite
+    # position cannot be established, fail closed before any cancellation.
+    try:
+        position_mode = get_position_mode()
+    except Exception as exc:
+        return {
+            "status": "error", "symbol": symbol, "direction": direction,
+            "error": f"position mode unavailable before protection cleanup: {type(exc).__name__}: {exc}",
+        }
+    if position_mode == "ONE_WAY":
+        opposite_direction = "SHORT" if direction == "LONG" else "LONG"
+        opposite_position = get_position_directional(symbol, opposite_direction)
+        if opposite_position.get("status") == "found":
+            return {
+                "status": "blocked_existing_position",
+                "symbol": symbol,
+                "direction": direction,
+                "position": opposite_position,
+                "error": (
+                    f"ONE_WAY symbol has an existing {opposite_direction} position; "
+                    "refusing to cancel BOTH-side protective orders as stale"
+                ),
+            }
+        if opposite_position.get("status") != "not_found":
+            return {
+                "status": "error", "symbol": symbol, "direction": direction,
+                "error": opposite_position.get("error", "opposite ONE_WAY position state unavailable"),
+            }
+
     existing = get_open_protection_directional(symbol, direction)
     if existing.get("status") != "ok":
         return {"status": "error", "symbol": symbol, "direction": direction, "error": existing.get("error", "openOrders unavailable")}
@@ -3672,14 +3704,38 @@ def ensure_directional_protection(
                 "execution_verified": None,
             }
         else:
+            # A successful POST response only acknowledges submission; it does not
+            # prove this specific replacement is visible. Verify its unique client
+            # ID and exact order geometry before the old SL can be cancelled.
+            verify = _verify_open_order(
+                symbol, direction, client_order_id=client_order_id, order_kind="STOP_MARKET",
+                expected_price=sl_price, expected_qty=position_qty, price_precision=price_precision,
+            )
+            if verify.get("status") != "verified":
+                return {
+                    "status": "SL_UNVERIFIED",
+                    "symbol": symbol,
+                    "bx_symbol": bx_symbol,
+                    "direction": direction,
+                    "avg_price": avg_price,
+                    "qty": position_qty,
+                    "sl_result": {
+                        "status": "unverified", "client_order_id": client_order_id,
+                        "submitted_order_id": str(order.get("orderId", "")),
+                        "protection_order_verified": False,
+                    },
+                    "tp_orders": [],
+                    "error": "SL POST acknowledged but the exact replacement clientOrderId was not visible; old SL retained",
+                }
+            order = verify["order"]
             sl_result = {
                 "status": "created",
                 "order_id": str(order.get("orderId", "")),
                 "client_order_id": order.get("clientOrderId") or client_order_id,
-                "stop_price": sl_price,
-                "qty": position_qty,
-                "side": "SELL" if direction == "LONG" else "BUY",
-                "positionSide": position_side_param(direction),
+                "stop_price": float(order.get("stopPrice", 0) or order.get("price", 0) or sl_price),
+                "qty": _order_qty(order),
+                "side": str(order.get("side", "")).upper(),
+                "positionSide": str(order.get("positionSide", "")).upper(),
                 "protection_order_verified": True,
                 "execution_verified": None,
             }
@@ -3687,7 +3743,15 @@ def ensure_directional_protection(
     if sl_requery_required:
         verified = get_open_protection_directional(symbol, direction)
         verified_sl = list(verified.get("sl_orders", [])) if verified.get("status") == "ok" else []
-        verified_sl_valid = any(_validate_sl_order_for_position(o, direction, avg_price, position_qty) for o in verified_sl)
+        # Do not adopt an old order that merely has compatible side/qty/price as
+        # proof that the new SL exists. The exact client ID verified after POST
+        # must still be visible before we claim protection or clean up stale SLs.
+        expected_verified_client_id = str(sl_result.get("client_order_id") or "").upper()
+        verified_sl_valid = bool(expected_verified_client_id) and any(
+            str(o.get("clientOrderId", "")).upper() == expected_verified_client_id
+            and _validate_sl_order_for_position(o, direction, avg_price, position_qty)
+            for o in verified_sl
+        )
     else:
         # No SL write/cancel occurred after the original successful exchange
         # snapshot. Revalidating the exact observed order locally is equivalent
