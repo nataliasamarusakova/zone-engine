@@ -4788,6 +4788,16 @@ def test_registration_failure_after_protected_entry_rolls_back_and_verifies_clos
     assert out["rollback_verified"] is True
 
 
+def test_isolated_test_mode_ignores_leaked_bingx_credentials(monkeypatch):
+    from event_engine import bingx
+
+    monkeypatch.setenv("BINGX_API_KEY", "unexpected-test-key")
+    monkeypatch.setenv("BINGX_SECRET_KEY", "unexpected-test-secret")
+    monkeypatch.setenv("ZONE_ENGINE_TESTS_ISOLATED", "1")
+
+    assert bingx.credentials_available() is False
+
+
 def test_fill_accounting_never_turns_missing_fee_or_realized_pnl_into_zero(monkeypatch):
     from event_engine import tracker
     monkeypatch.setattr(tracker, "get_fill_orders", lambda *a, **k: [

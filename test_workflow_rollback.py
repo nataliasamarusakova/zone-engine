@@ -124,6 +124,12 @@ def test_workflow_does_not_write_research_or_commit_state_after_test_failure(tmp
     by_id = {step.get("id"): step for step in steps if step.get("id")}
 
     assert by_id["tests"]["name"] == "Run tests"
+    # Job-level credentials are required for the engine, not for unit tests.
+    # Blank step-level values override the job environment and prevent live API
+    # lookups from contaminating mocked execution/accounting evidence.
+    assert by_id["tests"]["env"]["BINGX_API_KEY"] == ""
+    assert by_id["tests"]["env"]["BINGX_SECRET_KEY"] == ""
+    assert by_id["tests"]["env"]["ZONE_ENGINE_TESTS_ISOLATED"] == "1"
     assert "restore_research_history_seed" not in by_id
     assert "research_history_seed" not in (Path(__file__).parent / ".github" / "workflows" / "event-engine.yml").read_text(encoding="utf-8")
     assert by_id["clean_start_bootstrap"]["if"] == "${{ steps.restore_runtime_state.outputs.mode == 'bootstrap' }}"

@@ -1,6 +1,13 @@
 from __future__ import annotations
 
+import os
+
 import pytest
+
+# Unit tests must never make signed calls to the live exchange, even when a
+# developer shell or CI job exports production credentials. Individual tests
+# that need exchange behavior mock the request layer and can still test it.
+os.environ["ZONE_ENGINE_TESTS_ISOLATED"] = "1"
 
 
 @pytest.fixture(autouse=True)
