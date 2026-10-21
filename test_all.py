@@ -4628,6 +4628,40 @@ def test_get_fill_orders_raises_on_exchange_error(monkeypatch):
         raise AssertionError("allFillOrders exchange errors must be distinguishable from no fills")
 
 
+def test_get_fill_orders_parses_single_fill_object_payload(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda s: s)
+    monkeypatch.setattr(bingx, "credentials_available", lambda: True)
+    monkeypatch.setattr(bingx, "_request", lambda *a, **k: {
+        "code": 0,
+        "data": {
+            "tradeId": "T-1", "orderId": "O-1", "symbol": "AAA-USDT",
+            "side": "SELL", "tradePrice": "101.5", "volume": "2",
+            "realizedPnl": "1.25", "commission": "-0.02", "tradeTime": 1767225500000,
+        },
+    })
+    rows = bingx.get_fill_orders("AAA-USDT", 100, 200)
+    assert len(rows) == 1
+    assert rows[0]["trade_id"] == "T-1"
+    assert rows[0]["order_id"] == "O-1"
+    assert rows[0]["price"] == pytest.approx(101.5)
+    assert rows[0]["qty"] == pytest.approx(2.0)
+    assert rows[0]["realized_pnl"] == pytest.approx(1.25)
+    assert rows[0]["fee"] == pytest.approx(-0.02)
+    assert rows[0]["time_ms"] == 1767225500000
+
+
+def test_get_fill_orders_fails_closed_on_unknown_success_shape(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda s: s)
+    monkeypatch.setattr(bingx, "credentials_available", lambda: True)
+    monkeypatch.setattr(bingx, "_request", lambda *a, **k: {
+        "code": 0, "data": {"unexpected_wrapper": [{"orderId": "O-1"}]},
+    })
+    with pytest.raises(RuntimeError, match="unrecognized data shape.*unexpected_wrapper"):
+        bingx.get_fill_orders("AAA-USDT", 100, 200)
+
+
 def test_execute_new_position_blocks_missing_active_state_before_exchange_write(monkeypatch, tmp_path):
     import run_once
     missing_data = tmp_path / "runtime"
@@ -5609,6 +5643,34 @@ def test_directional_protection_keeps_old_engine_sl_until_new_sl_is_verified(mon
     assert result["status"] == "PROTECTED"
     assert events.index(("post", next(value for kind, value in events if kind == "post"))) < events.index(("cancel", "OLD_SL"))
     assert [event for event in events if event[0] == "cancel"] == [("cancel", "OLD_SL")]
+
+
+def test_fetch_research_account_snapshot_parses_single_fill_object(monkeypatch):
+    from event_engine import bingx
+
+    monkeypatch.setattr(bingx, "get_credentials", lambda: ("key", "secret"))
+    def fake_request(method, path, params=None, **kwargs):
+        if path == bingx.BALANCE_PATH:
+            return {"code": 0, "data": {"equity": "1000", "balance": "900"}}
+        if path == bingx.ALL_FILL_ORDERS_PATH:
+            return {"code": 0, "data": {
+                "tradeId": "T-1", "orderId": "O-1", "symbol": "AAA-USDT",
+                "side": "SELL", "price": "101.5", "qty": "2",
+                "realizedPnl": "4.5", "fee": "-0.2", "time": 1767225500000,
+            }}
+        if path in {bingx.INCOME_PATH, bingx.FORCE_ORDERS_PATH, bingx.POSITION_PATH}:
+            return {"code": 0, "data": []}
+        if path == bingx.COMMISSION_RATE_PATH:
+            return {"code": 0, "data": {"commission": {"takerCommissionRate": "0.0005", "makerCommissionRate": "0.0002"}}}
+        return {"code": 0, "data": []}
+
+    monkeypatch.setattr(bingx, "_request", fake_request)
+    snapshot = bingx.fetch_research_account_snapshot()
+    assert snapshot["recent_fill_status"] == "OK"
+    assert snapshot["recent_fill_count"] == 1
+    assert snapshot["recent_fill_fee_total"] == pytest.approx(-0.2)
+    assert snapshot["recent_fill_realized_pnl_total"] == pytest.approx(4.5)
+    assert snapshot["recent_realized_pnl_source"] == "ALL_FILL_ORDERS"
 
 
 def test_fetch_research_account_snapshot_parses_dict_wrapped_all_fill_orders(monkeypatch):
