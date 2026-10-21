@@ -40,10 +40,13 @@ from event_engine.bingx import (
     _validate_sl_order_for_position,
     _repair_client_order_id,
     _client_order_id_matches_base,
+    _add_reduce_only_for_one_way,
+    _cancel_engine_protection_orders_verified,
     thread_local_retry_session,
 )
 from event_engine.telegram import send as send_tg
 from event_engine import request_metrics, telemetry
+from event_engine.state_validation import validate_active_trade_record
 
 log = logging.getLogger("event_engine.tracker")
 _TRACKER_TRADE_CLOSED_LOG_FORMAT = (
@@ -291,10 +294,12 @@ def _load_active_trades(*, allow_missing: bool = True) -> dict[str, dict]:
         if isinstance(data, dict):
             normalized = {}
             for event_id, trade in data.items():
-                if not isinstance(trade, dict):
-                    reason = f"event_id={event_id!r} has non-object trade state"
+                try:
+                    validate_active_trade_record(event_id, trade)
+                except ValueError as exc:
+                    reason = str(exc)
                     _quarantine_state_copy(ACTIVE_TRADES_PATH, reason)
-                    raise ActiveTradeStateCorrupt(reason)
+                    raise ActiveTradeStateCorrupt(reason) from exc
                 t = dict(trade)
                 t.setdefault("mae_pct", 0.0)
                 t.setdefault("max_drawdown_pct", 0.0)
@@ -1954,6 +1959,7 @@ def _move_sl_to_break_even(
                 "quantity": _format_qty(qty, precision),
                 "clientOrderId": f"EVT_BE_RST_{trade_token}",
             }
+            _add_reduce_only_for_one_way(restore_params)
             restore_resp = _request("POST", ORDER_PATH, restore_params)
         except Exception:
             return False
@@ -2057,6 +2063,7 @@ def _move_sl_to_break_even(
         "quantity": _format_qty(qty, precision),
         "clientOrderId": be_client_id,
     }
+    _add_reduce_only_for_one_way(params)
 
     try:
         resp = _request("POST", ORDER_PATH, params)
@@ -3674,7 +3681,9 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                             leg=leg,
                             pnl_pct=pnl_tp,
                             exec_price=exec_price,
-                            closed_qty=delta_qty,
+                            # The notification describes the cumulative execution of this TP leg,
+                    # not only the increment observed in the latest tracker cycle.
+                    closed_qty=executed_qty,
                             remaining_qty=rem_qty,
                             remaining_pct=rem_pct,
                         ),
@@ -4361,6 +4370,32 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                 if not residual_exit_verified else None
             )
             emoji = "💚" if final_pnl is not None and final_pnl >= 0.0 else "💔" if final_pnl is not None else "⚪"
+            pending_cancel_ids = []
+            for tp in (trade.get("tp_orders") if isinstance(trade.get("tp_orders"), list) else []):
+                if not isinstance(tp, dict):
+                    continue
+                if str(tp.get("leg", "")) not in hit_legs and tp.get("order_id"):
+                    pending_cancel_ids.append(str(tp["order_id"]))
+            if sl_order_id:
+                pending_cancel_ids.append(str(sl_order_id))
+            if pending_cancel_ids:
+                cleanup_ok, cleanup_error = _cancel_engine_protection_orders_verified(
+                    symbol, direction, pending_cancel_ids,
+                )
+                if not cleanup_ok:
+                    trade["protection_cleanup_pending"] = {
+                        "order_ids": list(dict.fromkeys(pending_cancel_ids)),
+                        "error": str(cleanup_error or "protection cancellation could not be verified"),
+                        "last_attempt_ts": int(time.time() * 1000),
+                    }
+                    updated_trades[event_id] = trade
+                    log.critical(
+                        "[TRACKER_CLOSE_CLEANUP_PENDING] event=%s %s %s; retaining active local state: %s",
+                        event_id, direction, symbol, cleanup_error,
+                    )
+                    continue
+            trade.pop("protection_cleanup_pending", None)
+
             close_record = {
                 "record_type": "TRADE_CLOSE",
                 "event_id": event_id,
@@ -4488,19 +4523,6 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                 ),
                 symbol=symbol,
             )
-
-            for tp in trade.get("tp_orders", []):
-                if tp.get("leg") not in hit_legs and tp.get("order_id"):
-                    try:
-                        cancel_order(symbol, tp["order_id"])
-                    except Exception:
-                        pass
-
-            if sl_order_id:
-                try:
-                    cancel_order(symbol, sl_order_id)
-                except Exception:
-                    pass
 
         except Exception as exc:
             log.exception("[TRACKER] Fatal trade error for event %s: %s", event_id, exc)

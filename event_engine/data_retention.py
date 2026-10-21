@@ -364,7 +364,7 @@ def _zone_observation_refs(row: dict[str, Any]) -> set[str]:
     return refs
 
 
-def _size_guard_plan(path: Path, *, now: datetime, pending_ids: set[str], pending_bar_cutoffs: dict[str, datetime], protected_observation_ids: set[str], protected_refs: set[str]) -> list[tuple[str, Callable[[dict[str, Any]], bool]]]:
+def _size_guard_plan(path: Path, *, now: datetime, pending_ids: set[str], pending_bar_cutoffs: dict[str, datetime], protected_observation_ids: set[str], protected_refs: set[str], replayable_observation_ids: set[str] | None = None) -> list[tuple[str, Callable[[dict[str, Any]], bool]]]:
     """Return progressively stronger *safe* size-reduction policies.
 
     Policies only archive records that are already outside the audit-critical
@@ -372,6 +372,7 @@ def _size_guard_plan(path: Path, *, now: datetime, pending_ids: set[str], pendin
     touching protected semantics, the workflow fails instead of deleting data.
     """
     name = path.name
+    replayable_observation_ids = replayable_observation_ids or set()
     if name == "market_bars_5m.jsonl":
         hours = [36, 24, 12, 6, 3, 1]
 
@@ -491,6 +492,16 @@ def _size_guard_plan(path: Path, *, now: datetime, pending_ids: set[str], pendin
         # their recent working window expires.
         hours = [72, 36, 24, 12, 6, 3, 1, 0.5, 0.25]
         def recent_policy(row: dict[str, Any], h: float) -> bool:
+            # Unprocessed observations must remain in the live journal until their
+            # replayable pending metadata is durable. If outcome processing fails,
+            # update_outcomes cannot rebuild them from the pruning delta archives.
+            oid = str(row.get("observation_id", ""))
+            # Pending rows with durable replay metadata may be archived: the
+            # outcome worker can reconstruct them from research_outcome_state.
+            # Pending rows without that metadata must stay live because the
+            # outcome worker cannot recover them from zone-observation delta files.
+            if oid and oid in pending_ids and oid not in replayable_observation_ids:
+                return True
             ts = _parse_ts(row.get("observation_ts") or row.get("source_event_ts"))
             return ts is None or ts >= now - timedelta(hours=h)
         return [
@@ -575,15 +586,18 @@ def _restore_chunked_snapshot(path: Path, snapshot: dict[str, Any], archive_root
         raise
 
 
-def _apply_size_guard_to_file(path: Path, *, now: datetime, archive_root: Path, pending_ids: set[str], pending_bar_cutoffs: dict[str, datetime], protected_observation_ids: set[str], protected_refs: set[str]) -> dict[str, Any]:
+def _apply_size_guard_to_file(path: Path, *, now: datetime, archive_root: Path, pending_ids: set[str], pending_bar_cutoffs: dict[str, datetime], protected_observation_ids: set[str], protected_refs: set[str], replayable_observation_ids: set[str] | None = None) -> dict[str, Any]:
     if not path.exists() or path.stat().st_size < GITHUB_SIZE_GUARD_BYTES:
         return {"path": str(path.relative_to(PROJECT_ROOT)), "triggered": False, "bytes_before": path.stat().st_size if path.exists() else 0}
 
     rel = path.relative_to(PROJECT_ROOT)
     run_root = archive_root / path.name
     run_root.mkdir(parents=True, exist_ok=True)
-    before = _file_meta(path)
     with research._FileLock(path):
+        # The metadata and recovery snapshot must describe the same locked bytes.
+        # Reading metadata before taking this lock races with appenders and turns a
+        # harmless concurrent append into a false integrity failure.
+        before = _file_meta(path)
         snapshot = _snapshot_jsonl_chunked_locked(path, run_root / "snapshot")
         if snapshot["source_sha256"] != before["sha256"] or snapshot["source_bytes"] != before["bytes"]:
             raise RuntimeError(f"size-guard snapshot verification failed: {path}")
@@ -591,7 +605,11 @@ def _apply_size_guard_to_file(path: Path, *, now: datetime, archive_root: Path, 
         applied: list[dict[str, Any]] = []
         current = before
         try:
-            for name, policy in _size_guard_plan(path, now=now, pending_ids=pending_ids, pending_bar_cutoffs=pending_bar_cutoffs, protected_observation_ids=protected_observation_ids, protected_refs=protected_refs):
+            for name, policy in _size_guard_plan(
+                path, now=now, pending_ids=pending_ids, pending_bar_cutoffs=pending_bar_cutoffs,
+                protected_observation_ids=protected_observation_ids, protected_refs=protected_refs,
+                replayable_observation_ids=replayable_observation_ids,
+            ):
                 if current["bytes"] <= GITHUB_SIZE_TARGET_BYTES:
                     break
                 # Each escalation pass must have its own immutable delta directory.
@@ -660,6 +678,9 @@ def apply_size_guard(*, now: datetime | None = None, archive_root: Path | None =
     state_before = _validate_state_before()
     pending = _pending_observations()
     pending_ids = {str(row["observation_id"]) for row in pending}
+    replayable_observation_ids = {
+        str(row["observation_id"]) for row in pending if row.get("replayable") is True
+    }
     pending_bar_cutoffs = _pending_bar_cutoffs(
         five_m_cutoff=now - timedelta(hours=36), pending=pending,
     )
@@ -691,6 +712,7 @@ def apply_size_guard(*, now: datetime | None = None, archive_root: Path | None =
                 path, now=now, archive_root=run_root, pending_ids=pending_ids,
                 pending_bar_cutoffs=pending_bar_cutoffs,
                 protected_observation_ids=protected_observation_ids, protected_refs=protected_refs,
+                replayable_observation_ids=replayable_observation_ids,
             )
         except Exception as exc:
             results["files"][path.name] = {"path": f"data/{path.name}", "triggered": False, "failed": True, "error": f"file-level compaction rolled back: {type(exc).__name__}: {exc}"}
@@ -870,49 +892,61 @@ def _max_jsonl_timestamp(path: Path, field: str) -> datetime | None:
 
 
 def _pending_observations() -> list[dict[str, Any]]:
+    """List unprocessed observations and mark only complete v2 metadata replayable.
+
+    Merge the metadata index with the live journal. Returning as soon as the v2
+    dictionary is non-empty would overlook observations appended after the last
+    successful outcome update, exactly the rows for which pruning is dangerous.
+    """
     obs_path = DATA_DIR / "zone_observations.jsonl"
     state_path = DATA_DIR / "research_outcome_state.json"
-    if not state_path.exists():
-        return []
-    state = _read_json(state_path)
+    state = _read_json(state_path) if state_path.exists() else {}
+    processed = {str(value) for value in (state.get("processed_observation_ids") or []) if value}
     pending_state = state.get("pending_observations_v1")
-    if isinstance(pending_state, dict):
-        out: list[dict[str, Any]] = []
-        for oid, meta in pending_state.items():
-            if not isinstance(meta, dict):
-                continue
-            ts = _parse_ts(meta.get("observation_ts"))
-            if ts is None:
-                continue
-            out.append({
-                "observation_id": str(oid),
-                "event_type": str(meta.get("event_type", "")),
-                "observation_ts": ts.isoformat(),
-                "symbol": str(meta.get("symbol", "")).upper(),
-                "replayable": all(meta.get(k) not in (None, "") for k in ("symbol", "direction", "observation_ts", "reference_price")),
-            })
-        if out:
-            return out
-    if not obs_path.exists():
-        return []
-    processed = {str(x) for x in (state.get("processed_observation_ids") or []) if x}
-    pending: list[dict[str, Any]] = []
-    for _, row in _iter_jsonl(obs_path):
-        oid = str(row.get("observation_id", ""))
-        if not oid or oid in processed:
-            continue
-        ts = _parse_ts(row.get("observation_ts"))
-        if ts is None:
-            continue
-        pending.append({
-            "observation_id": oid,
-            "event_type": str(row.get("event_type", "")),
-            "observation_ts": ts.isoformat(),
-            "symbol": str(row.get("symbol", "")).upper(),
-            "replayable": False,
-        })
-    return pending
+    pending_state = pending_state if isinstance(pending_state, dict) else {}
+    by_id: dict[str, dict[str, Any]] = {}
 
+    for oid_raw, meta in pending_state.items():
+        oid = str(oid_raw)
+        if not oid or oid in processed or not isinstance(meta, dict):
+            continue
+        ts = _parse_ts(meta.get("observation_ts"))
+        # Keep incomplete metadata in the result as explicitly non-replayable;
+        # omitting it would let the size guard discard its source row.
+        by_id[oid] = {
+            "observation_id": oid,
+            "event_type": str(meta.get("event_type", "")),
+            "observation_ts": ts.isoformat() if ts is not None else None,
+            "symbol": str(meta.get("symbol", "")).upper(),
+            # Mirror research_forward._pending_meta_is_replayable(): if any
+            # field required to reconstruct an outcome is absent, pruning this
+            # row would destroy the only usable copy of the observation.
+            "replayable": bool(
+                ts is not None
+                and all(meta.get(key) not in (None, "") for key in (
+                    "event_type", "symbol", "direction", "provider", "source",
+                    "observation_ts", "reference_price",
+                ))
+            ),
+        }
+
+    if obs_path.exists():
+        for _, row in _iter_jsonl(obs_path):
+            oid = str(row.get("observation_id", ""))
+            if not oid or oid in processed or oid in by_id:
+                continue
+            ts = _parse_ts(row.get("observation_ts") or row.get("source_event_ts"))
+            by_id[oid] = {
+                "observation_id": oid,
+                "event_type": str(row.get("event_type", "")),
+                "observation_ts": ts.isoformat() if ts is not None else None,
+                "symbol": str(row.get("symbol", "")).upper(),
+                # Live journal row without durable v2 metadata cannot be replayed
+                # after pruning: research_forward reads neither the delta archive
+                # nor the pre-compaction snapshot for zone observations.
+                "replayable": False,
+            }
+    return list(by_id.values())
 
 def _pending_summary(pending: list[dict[str, Any]]) -> dict[str, Any]:
     counts = Counter(str(row.get("event_type", "UNKNOWN")) for row in pending)

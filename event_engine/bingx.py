@@ -1223,6 +1223,59 @@ def has_open_position(symbol: str, direction: str) -> bool:
     return False
 
 
+def has_position_conflict_for_open(symbol: str, direction: str) -> bool:
+    """Return True when a new entry conflicts with an existing venue position.
+
+    In Hedge mode the opposite side is independently maintainable, so only an
+    existing position on the requested side blocks the entry. In One-way mode,
+    *any* non-zero BOTH position blocks a new entry; otherwise an opposite-side
+    market order could reduce/reverse that position instead of opening a clean trade.
+    """
+    bx = to_bx_symbol(symbol)
+    if not bx:
+        raise RuntimeError("cannot verify position: contract symbol is unavailable")
+    want = str(direction).upper()
+    if want not in {"LONG", "SHORT"}:
+        raise ValueError(f"invalid direction={direction!r}")
+    target_symbol = str(bx).strip().upper().replace("-", "").replace("_", "")
+    for p in get_positions():
+        row_symbol = str(p.get("symbol", "")).strip().upper().replace("-", "").replace("_", "")
+        if not row_symbol:
+            raise RuntimeError("position row is missing symbol; cannot verify requested position")
+        if row_symbol != target_symbol:
+            continue
+        position_side = str(p.get("positionSide", "")).upper()
+        if position_side not in {"", "LONG", "SHORT", "BOTH"}:
+            raise RuntimeError(f"position row for {row_symbol} has unrecognized positionSide={position_side!r}")
+        raw_amt = p.get("positionAmt")
+        if raw_amt in (None, ""):
+            raise RuntimeError(f"position row for {row_symbol} is missing positionAmt")
+        try:
+            amount = float(raw_amt)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"position row for {row_symbol} has invalid positionAmt={raw_amt!r}") from exc
+        if not math.isfinite(amount):
+            raise RuntimeError(f"position row for {row_symbol} has non-finite positionAmt")
+        if amount == 0:
+            continue
+        if position_side == "BOTH" or not position_side:
+            return True
+        if position_side == want:
+            return True
+    return False
+
+
+def _add_reduce_only_for_one_way(params: dict[str, Any]) -> dict[str, Any]:
+    """Mark position-closing conditional orders reduce-only only in One-way mode.
+
+    BingX rejects this flag in Hedge mode; in One-way mode it defaults to false,
+    which permits an oversized protective order to reverse a residual position.
+    """
+    if str(params.get("positionSide", "")).upper() == "BOTH":
+        params["reduceOnly"] = "true"
+    return params
+
+
 def _trade_digest(trade_id: str) -> str:
     return hashlib.sha256(str(trade_id).upper().encode()).hexdigest().upper()[:16]
 
@@ -1292,12 +1345,6 @@ def open_market(
         return {"status": "error", "error": "contract_unavailable", "symbol": bx}
 
     try:
-        if has_open_position(symbol, direction):
-            return {"status": "existing_position", "symbol": bx, "direction": direction}
-    except Exception as exc:
-        return {"status": "error", "error": f"position_check_failed: {exc}", "symbol": bx}
-
-    try:
         prec = int(c.get("quantityPrecision") or 0)
         min_qty = float(c.get("tradeMinQuantity") or c.get("minQty") or 0)
         mult = float(c.get("multiplier") or 1)
@@ -1351,9 +1398,13 @@ def open_market(
         )
         if same_order:
             order_status = str(existing_order.get("order_status", "")).upper()
-            if order_status in {"NEW", "PARTIALLY_FILLED", "FILLED"}:
+            try:
+                already_executed_qty = abs(float(existing_order.get("executed_qty") or 0.0))
+            except (TypeError, ValueError):
+                already_executed_qty = 0.0
+            if order_status in {"NEW", "PENDING", "PARTIALLY_FILLED", "FILLED"}:
                 return {
-                    "status": "opened",
+                    "status": "opened" if order_status == "FILLED" else "entry_pending",
                     "symbol": bx,
                     "qty": None,
                     "leverage": leverage,
@@ -1362,22 +1413,60 @@ def open_market(
                     "order_reference_price": None,
                     "order_id": existing_order.get("order_id"),
                     "client_order_id": existing_order.get("client_order_id") or client_order_id,
+                    "order_status": order_status,
+                    "executed_qty": already_executed_qty,
                     "idempotency": "existing_client_order_resolved_before_post",
                     "response": {"code": 0, "data": existing_order},
                     "execution_quote": execution_quote,
                 }
             if order_status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}:
+                if already_executed_qty > 0:
+                    # A terminal cancellation can still have a real partial fill.
+                    # Continue only into position reconciliation/protection; never
+                    # treat it as a clean rejection or submit a replacement order.
+                    return {
+                        "status": "entry_pending", "symbol": bx,
+                        "order_id": existing_order.get("order_id"),
+                        "client_order_id": existing_order.get("client_order_id") or client_order_id,
+                        "order_status": order_status, "executed_qty": already_executed_qty,
+                        "idempotency": "terminal_client_order_with_partial_fill",
+                        "response": {"code": 0, "data": existing_order},
+                        "execution_quote": execution_quote,
+                    }
                 return {
                     "status": "error",
                     "symbol": bx,
                     "error": f"clientOrderId already used by terminal exchange order status={order_status}; refusing reuse",
                     "order_id": existing_order.get("order_id"),
                     "client_order_id": existing_order.get("client_order_id") or client_order_id,
+                    "order_status": order_status,
+                    "executed_qty": 0.0,
                     "idempotency": "terminal_client_order_prevents_reuse",
                     "response": {"code": 0, "data": existing_order},
                     "execution_quote": execution_quote,
                 }
+            # The order exists with our identity but its state is not recognized.
+            # Do not blindly POST a duplicate MARKET order.
+            return {
+                "status": "entry_pending", "symbol": bx,
+                "order_id": existing_order.get("order_id"),
+                "client_order_id": existing_order.get("client_order_id") or client_order_id,
+                "order_status": order_status or "UNKNOWN",
+                "executed_qty": already_executed_qty,
+                "idempotency": "existing_client_order_state_unverified",
+                "response": {"code": 0, "data": existing_order},
+                "execution_quote": execution_quote,
+            }
 
+    # Resolve a pre-existing event order before checking the portfolio conflict.
+    # If this event itself already created a partial position, the idempotency
+    # lookup above must be allowed to reconcile it. New orders are still blocked
+    # whenever the requested portfolio mode has a conflicting live position.
+    try:
+        if has_position_conflict_for_open(symbol, direction):
+            return {"status": "existing_position", "symbol": bx, "direction": direction}
+    except Exception as exc:
+        return {"status": "error", "error": f"position_check_failed: {exc}", "symbol": bx}
 
     # Final venue quote is deliberately obtained after position-mode/idempotency
     # REST calls and before the leverage mutation. This is the quote used for final
@@ -1572,10 +1661,10 @@ def open_market(
                 )
                 if same_order:
                     order_status = str(resolved_order.get("order_status", "")).upper()
-                    if order_status in {"NEW", "PARTIALLY_FILLED", "FILLED"}:
-                        log.warning("[BINGX] Matching active/filled clientOrderId found after transport error; treating MARKET order as resolved.")
+                    if order_status in {"NEW", "PENDING", "PARTIALLY_FILLED", "FILLED"}:
+                        log.warning("[BINGX] Matching active/filled clientOrderId found after transport error; reconciling entry remainder.")
                         return {
-                            "status": "opened",
+                            "status": "opened" if order_status == "FILLED" else "entry_pending",
                             "symbol": bx,
                             "qty": qty,
                             "leverage": leverage,
@@ -1584,6 +1673,8 @@ def open_market(
                             "order_reference_price": sizing_price,
                             "order_id": resolved_order.get("order_id"),
                             "client_order_id": resolved_order.get("client_order_id") or client_order_id,
+                            "order_status": order_status,
+                            "executed_qty": resolved_order.get("executed_qty"),
                             "idempotency": "client_order_id_verified_after_transport_error",
                             "response": response,
                             "execution_quote": execution_quote,
@@ -1591,6 +1682,20 @@ def open_market(
                             "historical_order": resolved_order,
                         }
                     if order_status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}:
+                        try:
+                            resolved_qty = abs(float(resolved_order.get("executed_qty") or 0.0))
+                        except (TypeError, ValueError):
+                            resolved_qty = 0.0
+                        if resolved_qty > 0:
+                            return {
+                                "status": "entry_pending", "symbol": bx,
+                                "order_id": resolved_order.get("order_id"),
+                                "client_order_id": resolved_order.get("client_order_id") or client_order_id,
+                                "order_status": order_status, "executed_qty": resolved_qty,
+                                "idempotency": "terminal_client_order_with_partial_fill",
+                                "response": response, "execution_quote": execution_quote,
+                                "order_submit_at_ms": order_submit_at_ms, "historical_order": resolved_order,
+                            }
                         return {
                             "status": "error",
                             "symbol": bx,
@@ -1604,9 +1709,14 @@ def open_market(
                         }
             historical_order = _find_recent_order_by_client_id(symbol, client_order_id)
             if historical_order is not None:
-                log.warning("[BINGX] Matching historical clientOrderId found after transport error; treating MARKET order as resolved.")
+                historical_status = str(historical_order.get("status") or historical_order.get("orderStatus") or "").upper()
+                try:
+                    historical_qty = abs(float(historical_order.get("executedQty") or historical_order.get("cumQty") or 0.0))
+                except (TypeError, ValueError):
+                    historical_qty = 0.0
+                log.warning("[BINGX] Matching historical clientOrderId found after transport error; reconciling execution state.")
                 return {
-                    "status": "opened",
+                    "status": "opened" if historical_status == "FILLED" else "entry_pending",
                     "symbol": bx,
                     "qty": qty,
                     "leverage": leverage,
@@ -1615,6 +1725,8 @@ def open_market(
                     "order_reference_price": sizing_price,
                     "order_id": historical_order.get("orderId"),
                     "client_order_id": historical_order.get("clientOrderId") or client_order_id,
+                    "order_status": historical_status or "UNKNOWN",
+                    "executed_qty": historical_qty,
                     "idempotency": "client_order_id_verified_after_transport_error",
                     "response": response,
                     "execution_quote": execution_quote,
@@ -1625,7 +1737,7 @@ def open_market(
                 if has_open_position(symbol, direction):
                     log.warning("[BINGX] Position found after transport error with no matching historical order; treating as unresolved-but-opened without re-POST.")
                     return {
-                        "status": "opened",
+                        "status": "entry_pending",
                         "symbol": bx,
                         "qty": qty,
                         "leverage": leverage,
@@ -1634,6 +1746,7 @@ def open_market(
                         "order_reference_price": sizing_price,
                         "order_id": None,
                         "client_order_id": client_order_id,
+                        "order_status": "UNKNOWN",
                         "idempotency": "position_verified_after_transport_error_no_order_match",
                         "response": response,
                         "execution_quote": execution_quote,
@@ -1647,9 +1760,14 @@ def open_market(
     data = response.get("data") or {}
     order = data.get("order") or {}
     order_id = order.get("orderId") or data.get("orderId")
+    order_status = str(order.get("status") or order.get("orderStatus") or "").upper()
+    try:
+        executed_qty = abs(float(order.get("executedQty") or order.get("cumQty") or 0.0))
+    except (TypeError, ValueError):
+        executed_qty = 0.0
 
     return {
-        "status": "opened",
+        "status": "opened" if order_status == "FILLED" else "entry_pending",
         "symbol": bx,
         "qty": qty,
         "leverage": leverage,
@@ -1658,6 +1776,8 @@ def open_market(
         "order_reference_price": sizing_price,
         "order_id": order_id,
         "client_order_id": order.get("clientOrderId") or client_order_id,
+        "order_status": order_status or "UNKNOWN",
+        "executed_qty": executed_qty,
         "response": response,
         "execution_quote": execution_quote,
         "order_submit_at_ms": order_submit_at_ms,
@@ -2272,24 +2392,39 @@ def _parse_top_of_book_payload(resp: Any, symbol: str, source: str) -> tuple[flo
     data = resp.get("data")
     row: dict[str, Any] | None = None
 
+    target_symbol = str(symbol).strip().upper().replace("-", "").replace("_", "")
+
+    def _symbol_matches(row: dict[str, Any]) -> bool:
+        row_symbol = str(row.get("symbol", "")).strip().upper().replace("-", "").replace("_", "")
+        # Some legacy direct-row payloads omit symbol entirely. Accept those only
+        # when shape selection is unambiguous; never accept an explicit mismatch.
+        return not row_symbol or row_symbol == target_symbol
+
     def _select_row(payload: Any) -> dict[str, Any] | None:
         if isinstance(payload, dict):
             nested = payload.get("book_ticker") or payload.get("bookTicker")
             if isinstance(nested, (dict, list)):
-                selected = _select_row(nested)
-                if selected is not None:
-                    return selected
+                # The nested endpoint-specific row is authoritative. If it is
+                # absent or belongs to another symbol, do not fall back to a
+                # parent envelope that might carry stale/ambiguous bid/ask fields.
+                return _select_row(nested)
+            if not _symbol_matches(payload):
+                return None
             return payload
         if isinstance(payload, list):
-            match = next((x for x in payload if isinstance(x, dict) and str(x.get("symbol", "")).upper() == symbol), None)
+            match = next((
+                x for x in payload
+                if isinstance(x, dict)
+                and str(x.get("symbol", "")).strip().upper().replace("-", "").replace("_", "") == target_symbol
+            ), None)
             if match is not None:
                 return match
-            if len(payload) == 1 and isinstance(payload[0], dict):
+            if len(payload) == 1 and isinstance(payload[0], dict) and _symbol_matches(payload[0]):
                 return payload[0]
         return None
 
     row = _select_row(data)
-    if not isinstance(row, dict):
+    if not isinstance(row, dict) or not _symbol_matches(row):
         return None
     try:
         bid = float(row.get("bidPrice", 0) or 0)
@@ -3380,6 +3515,9 @@ def ensure_directional_protection(
 
     valid_existing_sl = None
     engine_owned_invalid_sl_ids: list[str] = []
+    expected_sl_client_id = build_sl_client_order_id(trade_id)
+    expected_be_client_id = f"EVT_BE_{trade_id}" if trade_id else ""
+    expected_be_restore_client_id = f"EVT_BE_RST_{trade_id}" if trade_id else ""
     # A read-only reconciliation can trust the successful open-orders snapshot
     # already fetched above. A second read is required only after we mutate SL
     # state (creation or cleanup); otherwise it doubles private API latency for
@@ -3409,7 +3547,14 @@ def ensure_directional_protection(
         qty_matches = _qty_matches_position(sl_qty, position_qty)
         client_id = str(sl.get("clientOrderId", "")).upper()
         engine_owned = client_id.startswith("EVT_")
-        if protective_side and side_matches and position_side_matches and qty_matches and engine_owned and valid_existing_sl is None:
+        same_trade_sl = _client_order_id_matches_base(client_id, expected_sl_client_id)
+        same_trade_be = bool(expected_be_client_id) and _client_order_id_matches_base(client_id, expected_be_client_id)
+        same_trade_be_restore = bool(expected_be_restore_client_id) and _client_order_id_matches_base(client_id, expected_be_restore_client_id)
+        if (
+            protective_side and side_matches and position_side_matches and qty_matches
+            and engine_owned and (same_trade_sl or same_trade_be or same_trade_be_restore)
+            and valid_existing_sl is None
+        ):
             valid_existing_sl = sl
             continue
 
@@ -3472,6 +3617,7 @@ def ensure_directional_protection(
             "quantity": _format_qty(position_qty, precision),
             "clientOrderId": client_order_id,
         }
+        _add_reduce_only_for_one_way(params)
 
         resp = _request("POST", ORDER_PATH, params)
         order = (resp.get("data") or {}).get("order") or resp.get("data") or {}
@@ -3733,6 +3879,7 @@ def ensure_directional_protection(
             "quantity": _format_qty(tp_qty, precision),
             "clientOrderId": client_order_id,
         }
+        _add_reduce_only_for_one_way(params)
 
         resp = _request("POST", ORDER_PATH, params)
         order = (resp.get("data") or {}).get("order") or resp.get("data") or {}

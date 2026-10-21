@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from .state_validation import validate_active_trade_record
+
 BUNDLE_FORMAT = "zone-engine-runtime-state"
 BUNDLE_SCHEMA_VERSION = 2
 MANIFEST_NAME = "runtime-state-manifest.json"
@@ -184,10 +186,20 @@ def _validate_critical_json_state(data_dir: Path) -> None:
             raise RuntimeError(f"Critical runtime state {name} is not valid JSON: {exc}") from exc
         if not isinstance(value, expected_type):
             raise RuntimeError(f"Critical runtime state {name} must have root type {expected_type.__name__}")
-        if name == "active_trades.json" and any(not isinstance(row, dict) for row in value.values()):
-            raise RuntimeError("Critical runtime state active_trades.json contains a non-object trade record")
+        if name == "active_trades.json":
+            for event_id, row in value.items():
+                try:
+                    validate_active_trade_record(event_id, row)
+                except ValueError as exc:
+                    raise RuntimeError(f"Critical runtime state active_trades.json is malformed: {exc}") from exc
         if name == "event_execution_claims.json" and any(not isinstance(row, dict) for row in value.values()):
             raise RuntimeError("Critical runtime state event_execution_claims.json contains a non-object claim record")
+        if name == "zone_visit_state.json":
+            state_version = value.get("version")
+            if isinstance(state_version, bool) or not isinstance(state_version, int):
+                raise RuntimeError("Critical runtime state zone_visit_state.json has a non-integer version")
+            if not isinstance(value.get("symbols"), dict):
+                raise RuntimeError("Critical runtime state zone_visit_state.json must contain an object symbols field")
 
 
 def verify_bundle(bundle_dir: Path) -> dict[str, Any]:
