@@ -1919,7 +1919,11 @@ def record_scan_symbol(
     bars_1h = list(bars_1h)
     bars_5m = list(bars_5m)
     counts = {"observations": 0, "bars_1h": 0, "bars_5m": 0, "market_context": 0}
-    market_context_persisted = False
+    # None means market context was not collected for this symbol. False is
+    # reserved for a context write that was actually attempted and failed.
+    # Collapsing the two states incorrectly labels every observation as a
+    # persistence failure when rich context collection is disabled.
+    market_context_persisted: bool | None = None
     if account_context and "persisted" not in account_context:
         account_payload = dict(account_context)
         account_payload.update({"scan_id": scan_id, "strategy_version": strategy_version, "code_commit_sha": code_commit_sha})

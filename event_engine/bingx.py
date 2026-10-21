@@ -2722,9 +2722,14 @@ def fetch_research_account_snapshot() -> dict[str, Any]:
                     result["recent_realized_pnl_source"] = "ALL_FILL_ORDERS_PARTIAL_MISSING"
                 result["recent_fill_source"] = "ALL_FILL_ORDERS"
         else:
+            response_code = fills.get("code") if isinstance(fills, dict) else "invalid"
+            response_message = str(fills.get("msg") or "").replace("\r", " ").replace("\n", " ").strip()[:240] if isinstance(fills, dict) else ""
+            fill_error = f"code={response_code}"
+            if response_message:
+                fill_error += f" msg={response_message}"
             result["recent_fill_status"] = "error"
-            result["recent_fill_error"] = f"code={fills.get('code') if isinstance(fills, dict) else 'invalid'}"
-            result.setdefault("errors", []).append(f"fills:code={fills.get('code') if isinstance(fills, dict) else 'invalid'}")
+            result["recent_fill_error"] = fill_error
+            result.setdefault("errors", []).append(f"fills:{fill_error}")
     except Exception as exc:
         result["recent_fill_status"] = "error"
         result["recent_fill_error"] = f"{type(exc).__name__}:{exc}"
