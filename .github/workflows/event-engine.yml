@@ -366,6 +366,11 @@ jobs:
         id: tests
         if: ${{ steps.test_policy.outputs.run_tests == 'true' }}
         env:
+          # The job-level environment contains live BingX credentials for runtime
+          # execution. Never expose them to pytest: accounting tests intentionally
+          # mock fills and must not cross-check against the real exchange.
+          BINGX_API_KEY: ""
+          BINGX_SECRET_KEY: ""
           ZONE_ENGINE_TESTS_ISOLATED: "1"
         run: python -m pytest -q
 
