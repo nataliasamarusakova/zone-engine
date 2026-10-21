@@ -1380,39 +1380,58 @@ def _emergency_close_after_be_failure(symbol: str, direction: str, qty: float, t
         # not call to_bx_symbol() here: that helper can refresh contracts over the
         # network and would turn a supposedly local fallback reconciliation into
         # another network dependency during an emergency path.
-        # Local trade keys commonly use `AAA-USDT`, while the exchange's
-        # full-position endpoint may return `AAAUSDT`. Compare compact symbols
-        # here as well as in run_once reconciliation; otherwise a successful
-        # fallback request can be misread as an authoritative flat position.
-        bx = str(symbol or "").strip().upper().replace("-", "")
-        for p in rows or []:
-            if str(p.get("symbol", "")).strip().upper().replace("-", "") != bx:
+        bx = str(symbol or "").strip().upper().replace("-", "").replace("_", "")
+        for index, p in enumerate(rows or []):
+            if not isinstance(p, dict):
+                return {"status": "error", "error": f"full positions row {index} is not an object", "symbol": bx, "positionSide": wanted}
+            row_symbol = str(p.get("symbol", "")).strip().upper().replace("-", "").replace("_", "")
+            if not row_symbol:
+                return {"status": "error", "error": f"full positions row {index} is missing symbol", "positionSide": wanted}
+            if row_symbol != bx:
                 continue
             side = str(p.get("positionSide", "")).upper()
-            try:
-                raw_amt = float(p.get("positionAmt", 0) or 0)
-                avg_price = float(p.get("avgPrice", 0) or p.get("entryPrice", 0) or 0)
-            except (TypeError, ValueError):
+            if side not in {"LONG", "SHORT", "BOTH"}:
+                return {"status": "error", "error": f"full positions row for {bx} has unrecognized positionSide={side!r}", "symbol": bx, "positionSide": wanted}
+            # A separately labelled opposite hedge leg cannot satisfy the
+            # requested position. Validate the target leg strictly before ever
+            # reporting it absent.
+            if side in {"LONG", "SHORT"} and side != wanted:
                 continue
-            if side == wanted:
-                qty_abs = abs(raw_amt)
-            elif side == "BOTH":
+            try:
+                raw_value = p.get("positionAmt")
+                if raw_value in (None, ""):
+                    raise ValueError("positionAmt is missing")
+                raw_amt = float(raw_value)
+                raw_avg = p.get("avgPrice") or p.get("entryPrice")
+                avg_price = float(raw_avg or 0)
+            except (TypeError, ValueError) as exc:
+                return {"status": "error", "error": f"malformed full-position row for {bx}: {exc}", "symbol": bx, "positionSide": wanted}
+            if not math.isfinite(raw_amt) or not math.isfinite(avg_price):
+                return {"status": "error", "error": f"non-finite full-position values for {bx}", "symbol": bx, "positionSide": wanted}
+            if side == "BOTH":
                 if wanted == "LONG" and raw_amt < 0:
                     continue
                 if wanted == "SHORT" and raw_amt > 0:
                     continue
-                qty_abs = abs(raw_amt)
-            else:
+            qty_abs = abs(raw_amt)
+            if qty_abs <= 0:
                 continue
-            if qty_abs > 0 and avg_price > 0:
-                return {
-                    "status": "found",
-                    "symbol": p.get("symbol", bx),
-                    "positionSide": wanted,
-                    "positionAmt": qty_abs,
-                    "avgPrice": avg_price,
-                    "entryPrice": float(p.get("entryPrice", 0) or avg_price),
-                }
+            if avg_price <= 0:
+                return {"status": "error", "error": f"open full-position row for {bx} has no valid entry price", "symbol": bx, "positionSide": wanted}
+            try:
+                entry_price = float(p.get("entryPrice") or avg_price)
+            except (TypeError, ValueError):
+                entry_price = 0.0
+            if not math.isfinite(entry_price) or entry_price <= 0:
+                entry_price = avg_price
+            return {
+                "status": "found",
+                "symbol": p.get("symbol", bx),
+                "positionSide": wanted,
+                "positionAmt": qty_abs,
+                "avgPrice": avg_price,
+                "entryPrice": entry_price,
+            }
         return {"status": "not_found", "symbol": bx, "positionSide": wanted}
 
     def _authoritative_position_read() -> dict:

@@ -703,18 +703,98 @@ def _set_leverage(bx_symbol: str, leverage: int, direction: str = "LONG") -> boo
     return False
 
 
-def _normalize_orders_list(resp: dict) -> list[dict]:
+def _response_code_is_success(resp: Any) -> bool:
+    if not isinstance(resp, dict):
+        return False
+    try:
+        return int(resp.get("code", -1)) == 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _rows_from_payload(value: Any, *, context: str) -> list[dict]:
+    """Normalize an explicitly recognized row container without fail-open defaults."""
+    if isinstance(value, list):
+        if any(not isinstance(row, dict) for row in value):
+            raise RuntimeError(f"[BINGX] {context} contains a non-object row")
+        return value
+    if isinstance(value, dict) and value:
+        return [value]
+    raise RuntimeError(f"[BINGX] {context} has an unrecognized response shape")
+
+
+def _normalize_orders_list(resp: Any) -> list[dict]:
+    """Normalize order rows; an unknown envelope is an error, never an empty book.
+
+    Callers use an empty list as authoritative evidence that no orders exist. Keep
+    that meaning only for known API shapes such as ``data: []`` or
+    ``data: {"orders": []}``.
+    """
+    if not isinstance(resp, dict) or "data" not in resp:
+        raise RuntimeError("[BINGX] orders response is not an object with a data field")
     data = resp.get("data")
     if isinstance(data, list):
-        return data
+        return _rows_from_payload(data, context="orders data")
     if isinstance(data, dict):
-        for key in ("orders", "positions", "order", "position"):
-            val = data.get(key)
-            if isinstance(val, list):
-                return val
-            if isinstance(val, dict):
-                return [val]
-    return []
+        for key in ("orders", "order"):
+            if key in data:
+                return _rows_from_payload(data[key], context=f"orders data.{key}")
+        # A few order lookup responses return the order object directly.
+        if "symbol" in data and any(key in data for key in ("orderId", "clientOrderId", "type")):
+            return [data]
+    raise RuntimeError("[BINGX] orders response returned an unrecognized response shape; refusing to assume no orders exist")
+
+
+def _normalize_positions_list(resp: Any) -> list[dict]:
+    """Normalize known position-response envelopes and validate every returned row.
+
+    Unknown envelopes, rows without a symbol/amount, and non-finite amounts are
+    not evidence of a flat account. Treat them as unavailable state so entry,
+    emergency-close verification, and reconciliation fail closed.
+    """
+    if not isinstance(resp, dict) or "data" not in resp:
+        raise RuntimeError("[BINGX] positions response is not an object with a data field")
+    data = resp.get("data")
+    rows: list[dict]
+    if isinstance(data, list):
+        rows = _rows_from_payload(data, context="positions data")
+    elif isinstance(data, dict):
+        rows = []
+        recognized = False
+        for key in ("positions", "position"):
+            if key in data:
+                rows = _rows_from_payload(data[key], context=f"positions data.{key}")
+                recognized = True
+                break
+        if not recognized and "symbol" in data and "positionAmt" in data:
+            rows = [data]
+            recognized = True
+        if not recognized:
+            raise RuntimeError("[BINGX] get_positions returned an unrecognized response shape; refusing to assume the account is flat")
+    else:
+        raise RuntimeError("[BINGX] get_positions returned an unrecognized response shape; refusing to assume the account is flat")
+
+    for index, row in enumerate(rows):
+        symbol = str(row.get("symbol", "")).strip()
+        if not symbol:
+            raise RuntimeError(f"[BINGX] position row {index} is missing symbol; account flatness cannot be verified")
+        if "positionAmt" not in row or row.get("positionAmt") in (None, ""):
+            raise RuntimeError(f"[BINGX] position row {index} for {symbol} is missing positionAmt")
+        try:
+            amount = float(row.get("positionAmt"))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"[BINGX] position row {index} for {symbol} has invalid positionAmt={row.get('positionAmt')!r}") from exc
+        if not math.isfinite(amount):
+            raise RuntimeError(f"[BINGX] position row {index} for {symbol} has non-finite positionAmt")
+        if abs(amount) > 0:
+            raw_price = row.get("avgPrice") or row.get("entryPrice")
+            try:
+                avg_price = float(raw_price)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(f"[BINGX] open position row {index} for {symbol} has invalid entry price={raw_price!r}") from exc
+            if not math.isfinite(avg_price) or avg_price <= 0:
+                raise RuntimeError(f"[BINGX] open position row {index} for {symbol} has no valid positive entry price")
+    return rows
 
 
 def get_positions(*, timeout_sec: float | None = None, retryable: bool = True) -> list[dict]:
@@ -726,21 +806,11 @@ def get_positions(*, timeout_sec: float | None = None, retryable: bool = True) -
         timeout_sec=timeout_sec,
         retryable=retryable,
     )
-    if resp.get("code") != 0:
-        raise RuntimeError(f"[BINGX] get_positions failed: code={resp.get('code')} msg={resp.get('msg')}")
-    data = resp.get("data")
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        for key in ("positions", "position"):
-            value = data.get(key)
-            if isinstance(value, list):
-                return value
-            if isinstance(value, dict):
-                return [value]
-        if "positionAmt" in data and "symbol" in data:
-            return [data]
-    raise RuntimeError("[BINGX] get_positions returned an unrecognized response shape; refusing to assume the account is flat")
+    if not _response_code_is_success(resp):
+        code = resp.get("code") if isinstance(resp, dict) else "invalid_response"
+        message = resp.get("msg") if isinstance(resp, dict) else repr(resp)
+        raise RuntimeError(f"[BINGX] get_positions failed: code={code} msg={message}")
+    return _normalize_positions_list(resp)
 
 
 def get_all_open_orders(*, timeout_sec: float | None = None, retryable: bool = True) -> list[dict]:
@@ -1094,31 +1164,37 @@ def close_position_market(symbol: str, direction: str, qty: float, *, reduce_onl
 def has_open_position(symbol: str, direction: str) -> bool:
     bx = to_bx_symbol(symbol)
     if not bx:
-        return False
-
-    want = "LONG" if direction.upper() == "LONG" else "SHORT"
+        raise RuntimeError("cannot verify position: contract symbol is unavailable")
+    want = str(direction).upper()
+    if want not in {"LONG", "SHORT"}:
+        raise ValueError(f"invalid direction={direction!r}")
+    target_symbol = str(bx).strip().upper().replace("-", "").replace("_", "")
     positions = get_positions()
 
     for p in positions:
-        if str(p.get("symbol", "")).upper() != bx:
+        row_symbol = str(p.get("symbol", "")).strip().upper().replace("-", "").replace("_", "")
+        if not row_symbol:
+            raise RuntimeError("position row is missing symbol; cannot verify requested position")
+        if row_symbol != target_symbol:
             continue
         position_side = str(p.get("positionSide", "")).upper()
-        if position_side in {"LONG", "SHORT"}:
-            explicit_side = position_side
-        elif position_side == "BOTH":
-            explicit_side = ""  # one-way direction comes from the signed amount
-        else:
-            explicit_side = str(p.get("side", "")).upper()
+        if position_side not in {"", "LONG", "SHORT", "BOTH"}:
+            raise RuntimeError(f"position row for {row_symbol} has unrecognized positionSide={position_side!r}")
+        raw_amt = p.get("positionAmt")
+        if raw_amt in (None, ""):
+            raise RuntimeError(f"position row for {row_symbol} is missing positionAmt")
         try:
-            amt = float(p.get("positionAmt", 0) or 0)
-        except Exception:
-            amt = 0.0
+            amt = float(raw_amt)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"position row for {row_symbol} has invalid positionAmt={raw_amt!r}") from exc
+        if not math.isfinite(amt):
+            raise RuntimeError(f"position row for {row_symbol} has non-finite positionAmt")
         if amt == 0:
             continue
         # In hedge mode the explicit LONG/SHORT side is authoritative; signed
-        # amount is used to infer direction only for one-way BOTH positions.
-        if explicit_side in {"LONG", "SHORT"}:
-            if explicit_side == want:
+        # amount is used to infer direction only for one-way BOTH/legacy rows.
+        if position_side in {"LONG", "SHORT"}:
+            if position_side == want:
                 return True
             continue
         if position_side == "BOTH" or not position_side:
@@ -1573,42 +1649,85 @@ def get_position_directional(symbol: str, direction: str) -> dict:
     direction = str(direction).upper()
     if not bx_symbol:
         return {"status": "error", "error": "contract_not_found", "symbol": bx_symbol}
+    if direction not in {"LONG", "SHORT"}:
+        return {"status": "error", "error": f"invalid direction={direction!r}", "symbol": bx_symbol}
 
-    resp = _request("GET", POSITION_PATH, {"symbol": bx_symbol})
-    if resp.get("code") != 0:
-        return {"status": "error", "error": f"get_position failed: {resp.get('msg')}", "symbol": bx_symbol}
+    try:
+        resp = _request("GET", POSITION_PATH, {"symbol": bx_symbol})
+    except Exception as exc:
+        return {"status": "error", "error": f"get_position request failed: {type(exc).__name__}: {exc}", "symbol": bx_symbol}
+    if not _response_code_is_success(resp):
+        code = resp.get("code") if isinstance(resp, dict) else "invalid_response"
+        message = resp.get("msg") if isinstance(resp, dict) else repr(resp)
+        return {"status": "error", "error": f"get_position failed: code={code} msg={message}", "symbol": bx_symbol}
 
-    for p in _normalize_orders_list(resp):
+    try:
+        rows = _normalize_positions_list(resp)
+    except Exception as exc:
+        return {"status": "error", "error": f"get_position response unavailable: {exc}", "symbol": bx_symbol, "positionSide": direction}
+
+    target_symbol = str(bx_symbol).strip().upper().replace("-", "").replace("_", "")
+    for p in rows:
+        row_symbol = str(p.get("symbol", "")).strip().upper().replace("-", "").replace("_", "")
+        if row_symbol != target_symbol:
+            continue
         position_side = str(p.get("positionSide", "")).upper()
-        if position_side not in (direction, "BOTH"):
-            continue
-
+        if position_side not in {"LONG", "SHORT", "BOTH"}:
+            return {
+                "status": "error",
+                "error": f"position row for {bx_symbol} has unrecognized positionSide={position_side!r}",
+                "symbol": bx_symbol,
+                "positionSide": direction,
+            }
+        raw_amt = p.get("positionAmt")
         try:
-            qty = abs(float(p.get("positionAmt", 0) or 0))
-            avg_price = float(p.get("avgPrice", 0) or p.get("entryPrice", 0) or 0)
-        except (TypeError, ValueError):
-            continue
-
-        if qty <= 0 or avg_price <= 0:
-            continue
-
+            raw_amount = float(raw_amt)
+            avg_price = float(p.get("avgPrice") or p.get("entryPrice") or 0)
+        except (TypeError, ValueError) as exc:
+            return {
+                "status": "error",
+                "error": f"malformed position values for {bx_symbol}: {exc}",
+                "symbol": bx_symbol,
+                "positionSide": direction,
+            }
+        if not math.isfinite(raw_amount) or not math.isfinite(avg_price):
+            return {
+                "status": "error",
+                "error": f"non-finite position values for {bx_symbol}",
+                "symbol": bx_symbol,
+                "positionSide": direction,
+            }
         if position_side == "BOTH":
-            try:
-                raw_amt = float(p.get("positionAmt", 0) or 0)
-            except (TypeError, ValueError):
+            if direction == "LONG" and raw_amount < 0:
                 continue
-            if direction == "LONG" and raw_amt < 0:
+            if direction == "SHORT" and raw_amount > 0:
                 continue
-            if direction == "SHORT" and raw_amt > 0:
-                continue
+        elif position_side != direction:
+            continue
 
+        qty = abs(raw_amount)
+        if qty <= 0:
+            continue
+        if avg_price <= 0:
+            return {
+                "status": "error",
+                "error": f"open position for {bx_symbol} has no valid positive avgPrice/entryPrice",
+                "symbol": bx_symbol,
+                "positionSide": direction,
+            }
+        try:
+            entry_price = float(p.get("entryPrice") or avg_price)
+        except (TypeError, ValueError):
+            entry_price = 0.0
+        if not math.isfinite(entry_price) or entry_price <= 0:
+            entry_price = avg_price
         return {
             "status": "found",
             "symbol": p.get("symbol", bx_symbol),
             "positionSide": direction,
             "avgPrice": avg_price,
             "positionAmt": qty,
-            "entryPrice": float(p.get("entryPrice", 0) or avg_price),
+            "entryPrice": entry_price,
         }
 
     return {"status": "not_found", "symbol": bx_symbol, "positionSide": direction}
@@ -1658,24 +1777,45 @@ def get_open_protection_directional(
         timeout_sec=timeout_sec,
         retryable=retryable,
     )
-    if resp.get("code") != 0:
-        return {"status": "error", "error": f"openOrders failed: {resp.get('msg')}", "tp_orders": [], "sl_orders": []}
+    if not _response_code_is_success(resp):
+        code = resp.get("code") if isinstance(resp, dict) else "invalid_response"
+        message = resp.get("msg") if isinstance(resp, dict) else repr(resp)
+        return {"status": "error", "error": f"openOrders failed: code={code} msg={message}", "tp_orders": [], "sl_orders": []}
+
+    try:
+        orders = _normalize_orders_list(resp)
+    except Exception as exc:
+        return {"status": "error", "error": f"openOrders response unavailable: {exc}", "tp_orders": [], "sl_orders": []}
 
     tp_orders = []
     sl_orders = []
+    target_symbol = str(bx_symbol).strip().upper().replace("-", "").replace("_", "")
 
-    for order in _normalize_orders_list(resp):
+    for index, order in enumerate(orders):
+        raw_symbol = str(order.get("symbol", "")).strip()
+        if not raw_symbol:
+            return {"status": "error", "error": f"openOrders row {index} is missing symbol; protection state is unknown", "tp_orders": [], "sl_orders": []}
+        row_symbol = raw_symbol.upper().replace("-", "").replace("_", "")
+        if row_symbol != target_symbol:
+            continue
         # Include both plausible directional labels so reconciliation can see and
-        # clean stale engine-owned orders. Every adoption/verification path below
-        # still requires the exact account-mode positionSide.
+        # clean stale engine-owned orders. Unknown labels cannot prove that the
+        # response contains no protection for this position.
         position_side = str(order.get("positionSide", "")).upper()
+        if position_side not in {"LONG", "SHORT", "BOTH"}:
+            return {"status": "error", "error": f"openOrders row {index} for {bx_symbol} has unknown positionSide={position_side!r}", "tp_orders": [], "sl_orders": []}
+        order_type = str(order.get("type", "")).upper()
+        if not order_type:
+            return {"status": "error", "error": f"openOrders row {index} for {bx_symbol} is missing order type; protection state is unknown", "tp_orders": [], "sl_orders": []}
         if position_side not in {direction, "BOTH"}:
             continue
-
-        order_type = str(order.get("type", "")).upper()
         if order_type in {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"}:
+            if not str(order.get("orderId", "")).strip():
+                return {"status": "error", "error": f"protective TP row {index} for {bx_symbol} is missing orderId", "tp_orders": [], "sl_orders": []}
             tp_orders.append(order)
         elif order_type in {"STOP", "STOP_MARKET"}:
+            if not str(order.get("orderId", "")).strip():
+                return {"status": "error", "error": f"protective SL row {index} for {bx_symbol} is missing orderId", "tp_orders": [], "sl_orders": []}
             sl_orders.append(order)
 
     return {"status": "ok", "symbol": bx_symbol, "positionSide": direction, "tp_orders": tp_orders, "sl_orders": sl_orders}
@@ -2916,7 +3056,7 @@ def fetch_research_account_snapshot() -> dict[str, Any]:
     try:
         positions = _request("GET", POSITION_PATH, {}, signed=True, timeout_sec=min(5.0, float(os.environ.get("RESEARCH_ACCOUNT_TIMEOUT_SEC", "5"))), retryable=False)
         if isinstance(positions, dict) and int(positions.get("code", -1)) == 0:
-            rows = _normalize_orders_list(positions)
+            rows = _normalize_positions_list(positions)
             position_rows = []
             total_notional = 0.0
             total_unrealized = 0.0
