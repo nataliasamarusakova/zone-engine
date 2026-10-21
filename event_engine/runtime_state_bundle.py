@@ -18,7 +18,13 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .state_validation import validate_active_trade_record
+# This module is imported as part of ``event_engine`` by tests and the engine,
+# but GitHub Actions also invokes it directly as ``python event_engine/runtime_state_bundle.py``.
+# A relative import has no package context in that CLI mode, so support both entry points.
+if __package__:
+    from .state_validation import validate_active_trade_record
+else:  # pragma: no cover - exercised by the subprocess CLI regression test
+    from state_validation import validate_active_trade_record
 
 BUNDLE_FORMAT = "zone-engine-runtime-state"
 BUNDLE_SCHEMA_VERSION = 2

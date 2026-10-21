@@ -389,6 +389,12 @@ def _request(
         api_key, secret_key = get_credentials()
         if signed and (not api_key or not secret_key):
             return {"code": -1, "msg": "missing BingX credentials"}
+        # Enforce isolation at the lowest signed-I/O boundary, not only in
+        # higher-level helpers such as get_fill_orders(). CI/test shells can
+        # accidentally inherit valid API credentials; no signed request should
+        # reach requests.Session while the explicit isolation flag is active.
+        if signed and os.environ.get("ZONE_ENGINE_TESTS_ISOLATED", "").strip() == "1":
+            return {"code": -1, "msg": "signed BingX requests disabled in isolated test mode"}
 
         last_error: Exception | None = None
         for base_url in _base_urls():
@@ -1014,12 +1020,31 @@ def get_fill_orders(
     return normalized_rows
 
 
-def cancel_order(symbol: str, order_id: str | int) -> dict:
+def cancel_order(
+    symbol: str,
+    order_id: str | int | None = None,
+    *,
+    client_order_id: str | None = None,
+) -> dict:
+    """Cancel one order by its exchange ID or durable client order ID.
+
+    BingX supports either identifier. The clientOrderId path is essential when
+    a MARKET POST was acknowledged ambiguously and the exchange orderId could
+    not be recovered yet; a failed GET must not prevent a best-effort cancel.
+    """
     bx = to_bx_symbol(symbol)
     if not bx:
         return {"status": "error", "error": "contract_not_found"}
-
-    return _request("DELETE", ORDER_PATH, {"symbol": bx, "orderId": str(order_id)}, signed=True)
+    has_order_id = order_id not in (None, "")
+    has_client_id = client_order_id not in (None, "")
+    if has_order_id == has_client_id:
+        return {"status": "error", "error": "provide exactly one of order_id or client_order_id"}
+    params = {"symbol": bx}
+    if has_order_id:
+        params["orderId"] = str(order_id)
+    else:
+        params["clientOrderId"] = str(client_order_id)
+    return _request("DELETE", ORDER_PATH, params, signed=True)
 
 
 
