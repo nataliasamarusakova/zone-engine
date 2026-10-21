@@ -1,4 +1,4 @@
-"""Regression tests for four confirmed audit findings in ZoneEngine 5.5.2."""
+"""Regression tests for confirmed ZoneEngine runtime and accounting audit findings."""
 from __future__ import annotations
 
 import threading

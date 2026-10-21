@@ -75,7 +75,7 @@ def test_pending_observation_scan_merges_live_journal_rows_not_in_pending_metada
         json.dumps({"processed_observation_ids": [], "pending_observations_v1": {"OLD": {
             "observation_id": "OLD", "symbol": "AAA-USDT", "direction": "LONG",
             "observation_ts": (now - timedelta(days=2)).isoformat(), "reference_price": 10,
-            "event_type": "SIGNAL_CREATED", "provider": "binance", "source": "test",
+            "event_type": "SIGNAL_CREATED", "provider": "binance", "source": "test", "scan_id": "SCAN_OLD",
         }}}), encoding="utf-8"
     )
     (tmp_path / "zone_observations.jsonl").write_text(

@@ -5094,12 +5094,13 @@ def test_protection_creation_does_not_mark_open_order_as_execution_fill(monkeypa
     from event_engine import bingx
     monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)
     monkeypatch.setattr(bingx, "get_contract", lambda symbol: {"quantityPrecision": 3, "pricePrecision": 4, "tradeMinQuantity": 0.001})
+    expected_sl_client_id = bingx.build_sl_client_order_id("EVT_TEST")
     protection_states = iter([
         {"status": "ok", "sl_orders": [], "tp_orders": [
             {"orderId": "OLD_TP", "clientOrderId": "EVT_OLD", "origQty": "0.5", "stopPrice": "110"},
         ]},
         {"status": "ok", "sl_orders": [
-            {"orderId": "SL_NEW", "clientOrderId": "EVT_TEST_SL", "origQty": "1.0", "stopPrice": "90.0", "type": "STOP_MARKET", "side":"SELL", "positionSide":"LONG"},
+            {"orderId": "SL_NEW", "clientOrderId": expected_sl_client_id, "origQty": "1.0", "stopPrice": "90.0", "type": "STOP_MARKET", "side":"SELL", "positionSide":"LONG"},
         ], "tp_orders": []},
     ])
     monkeypatch.setattr(bingx, "get_open_protection_directional", lambda *args, **kwargs: next(protection_states))
@@ -5115,6 +5116,8 @@ def test_protection_creation_does_not_mark_open_order_as_execution_fill(monkeypa
         return {"status": "verified", "order": {
             "orderId": "ORDER_" + str(order_kind), "clientOrderId": client_order_id, "type": order_kind,
             "stopPrice": str(expected_price), "origQty": str(expected_qty),
+            "side": "SELL" if direction == "LONG" else "BUY",
+            "positionSide": "LONG" if direction == "LONG" else "SHORT",
         }}
     monkeypatch.setattr(bingx, "_verify_open_order", fake_verify_open_order)
     result = bingx.ensure_directional_protection("AAA-USDT", "LONG", 100.0, 1.0, 10.0, [{"leg": "tp1", "pnl_pct": 3.0, "close_fraction": 0.5}, {"leg": "tp2", "pnl_pct": 6.0, "close_fraction": 0.5}], trade_id="EVT_TEST")
@@ -5395,16 +5398,18 @@ def test_be_exit_classification_uses_order_identity():
 
 def test_initial_protection_never_market_closes_crossed_tp(monkeypatch):
     from event_engine import bingx
+    expected_sl_client_id = bingx.build_sl_client_order_id("EVT_CROSSED_TP")
     states = iter([
         {"status": "ok", "sl_orders": [], "tp_orders": []},
-        {"status": "ok", "sl_orders": [{"orderId":"SL1","clientOrderId":"EVT_TEST_SL","type":"STOP_MARKET","stopPrice":"90.0","origQty":"1.0","side":"SELL","positionSide":"LONG"}], "tp_orders": []},
+        {"status": "ok", "sl_orders": [{"orderId":"SL1","clientOrderId":expected_sl_client_id,"type":"STOP_MARKET","stopPrice":"90.0","origQty":"1.0","side":"SELL","positionSide":"LONG"}], "tp_orders": []},
+        {"status": "ok", "sl_orders": [{"orderId":"SL1","clientOrderId":expected_sl_client_id,"type":"STOP_MARKET","stopPrice":"90.0","origQty":"1.0","side":"SELL","positionSide":"LONG"}], "tp_orders": []},
     ])
     monkeypatch.setattr(bingx, "get_open_protection_directional", lambda *a, **k: next(states))
     monkeypatch.setattr(bingx, "get_contract", lambda *a, **k: {"symbol": "AAA-USDT", "status": 1, "apiStateOpen": "true", "pricePrecision": 4, "quantityPrecision": 2, "tradeMinQuantity": 0.01})
     monkeypatch.setattr(bingx, "contract_exists", lambda *a, **k: True)
     monkeypatch.setattr(bingx, "get_position_mode", lambda *a, **k: "HEDGE")
     monkeypatch.setattr(bingx, "_current_close_price", lambda symbol: 106.0)
-    monkeypatch.setattr(bingx, "_request", lambda *a, **k: {"code": 0, "data": {"order": {"orderId": "SL1", "clientOrderId": "EVT_TEST_SL", "type": "STOP_MARKET", "stopPrice": "90.0", "origQty": "1.0", "side":"SELL", "positionSide":"LONG"}}})
+    monkeypatch.setattr(bingx, "_request", lambda *a, **k: {"code": 0, "data": {"order": {"orderId": "SL1", "clientOrderId": expected_sl_client_id, "type": "STOP_MARKET", "stopPrice": "90.0", "origQty": "1.0", "side":"SELL", "positionSide":"LONG"}}})
     out = bingx.ensure_directional_protection("AAA-USDT", "LONG", 100.0, 1.0, 10.0, [{"leg":"tp1","pnl_pct":3.0,"close_fraction":0.5},{"leg":"tp2","pnl_pct":6.0,"close_fraction":0.5}], trade_id="EVT_CROSSED_TP")
     assert out["status"] == "PROTECTION_FAILED"
     assert out["failure_class"] == "TP_TARGET_CROSSED_BEFORE_PROTECTION"
@@ -5666,34 +5671,39 @@ def test_directional_protection_keeps_old_engine_sl_until_new_sl_is_verified(mon
 
     events = []
     old_sl = {"orderId": "OLD_SL", "clientOrderId": "EVT_OLD_SL", "type": "STOP_MARKET", "stopPrice": "90.00", "origQty": "1.00", "positionSide": "LONG", "side": "SELL"}
-    new_sl = {"orderId": "NEW_SL", "clientOrderId": "EVT_NEW_SL", "type": "STOP_MARKET", "stopPrice": "90.00", "origQty": "1.00", "positionSide": "LONG", "side": "SELL"}
-    states = iter([
-        {"status": "ok", "sl_orders": [old_sl], "tp_orders": []},
-        {"status": "ok", "sl_orders": [old_sl, new_sl], "tp_orders": []},
-        {"status": "ok", "sl_orders": [new_sl], "tp_orders": []},
-    ])
-    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)
+    posted = {}
+    snapshots_after_post = 0
     def read_open_orders(*args, **kwargs):
-        state = next(states)
-        events.append(("open_orders", tuple(str(row.get("orderId", "")) for row in state.get("sl_orders", []))))
-        return state
+        nonlocal snapshots_after_post
+        client_id = posted.get("clientOrderId")
+        events.append(("open_orders", client_id))
+        if client_id is None:
+            return {"status": "ok", "sl_orders": [old_sl], "tp_orders": []}
+        snapshots_after_post += 1
+        new_sl = {"orderId": "NEW_SL", "clientOrderId": client_id, "type": "STOP_MARKET", "stopPrice": "90.00", "origQty": "1.00", "positionSide": "LONG", "side": "SELL"}
+        # First reads must show both orders; cancellation verification then sees
+        # the old order remain, requests cancellation, and confirms its absence.
+        if snapshots_after_post <= 3:
+            return {"status": "ok", "sl_orders": [old_sl, new_sl], "tp_orders": []}
+        return {"status": "ok", "sl_orders": [new_sl], "tp_orders": []}
+
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)
     monkeypatch.setattr(bingx, "get_open_protection_directional", read_open_orders)
     monkeypatch.setattr(bingx, "get_position_mode", lambda **k: "HEDGE")
     monkeypatch.setattr(bingx, "get_contract", lambda symbol: {"symbol": symbol, "quantityPrecision": 2, "pricePrecision": 2, "tradeMinQuantity": 0.01})
     monkeypatch.setattr(bingx, "_current_close_price", lambda symbol: 100.0)
-    monkeypatch.setattr(bingx, "_request", lambda method, path, params=None, **kwargs: events.append(("post", params)) or {"code": 0, "data": {"order": {"orderId": "NEW_SL", "clientOrderId": params["clientOrderId"], "type": params["type"], "stopPrice": params["stopPrice"], "origQty": params["quantity"], "positionSide": params["positionSide"], "side": params["side"]}}})
+    def fake_request(method, path, params=None, **kwargs):
+        posted.update(params or {})
+        events.append(("post", params))
+        return {"code": 0, "data": {"order": {"orderId": "NEW_SL", "clientOrderId": params["clientOrderId"], "type": params["type"], "stopPrice": params["stopPrice"], "origQty": params["quantity"], "positionSide": params["positionSide"], "side": params["side"]}}}
+    monkeypatch.setattr(bingx, "_request", fake_request)
     monkeypatch.setattr(bingx, "cancel_order", lambda symbol, oid: events.append(("cancel", oid)) or {"code": 0})
     result = bingx.ensure_directional_protection("AAA-USDT", "LONG", 100.0, 1.0, 10.0, [], trade_id="EVT_NEW")
     assert result["status"] == "PROTECTED"
     post_index = next(index for index, event in enumerate(events) if event[0] == "post")
     cancel_events = [index for index, event in enumerate(events) if event == ("cancel", "OLD_SL")]
-    if cancel_events:
-        assert post_index < cancel_events[0]
-        assert [event for event in events if event[0] == "cancel"] == [("cancel", "OLD_SL")]
-    else:
-        # A fresh openOrders snapshot may already prove the old SL disappeared
-        # after replacement verification. In that case no redundant DELETE is sent.
-        assert any(kind == "open_orders" and order_ids == ("NEW_SL",) for kind, order_ids in events[post_index + 1:])
+    assert cancel_events and post_index < cancel_events[0]
+    assert [event for event in events if event[0] == "cancel"] == [("cancel", "OLD_SL")]
 
 
 def test_fetch_research_account_snapshot_parses_single_fill_object(monkeypatch):
@@ -6105,18 +6115,22 @@ def test_manual_sl_is_not_adopted_as_engine_protection(monkeypatch):
     from event_engine import bingx
 
     manual = {"orderId":"MANUAL-1", "clientOrderId":"user-stop", "type":"STOP_MARKET", "stopPrice":"90", "origQty":"1", "side":"SELL", "positionSide":"LONG"}
-    engine = {"orderId":"ENGINE-SL", "clientOrderId":"EVT_TEST_SL", "type":"STOP_MARKET", "stopPrice":"90", "origQty":"1", "side":"SELL", "positionSide":"LONG"}
-    snapshots = iter([
-        {"status":"ok", "sl_orders":[manual], "tp_orders":[]},
-        {"status":"ok", "sl_orders":[manual, engine], "tp_orders":[]},
-    ])
+    posted = {}
+    def read_orders(*args, **kwargs):
+        if not posted:
+            return {"status":"ok", "sl_orders":[manual], "tp_orders":[]}
+        engine = {"orderId":"ENGINE-SL", "clientOrderId":posted["clientOrderId"], "type":"STOP_MARKET", "stopPrice":"90", "origQty":"1", "side":"SELL", "positionSide":"LONG"}
+        return {"status":"ok", "sl_orders":[manual, engine], "tp_orders":[]}
     deleted = []
     monkeypatch.setattr(bingx, "to_bx_symbol", lambda s: s)
     monkeypatch.setattr(bingx, "get_contract", lambda s: {"symbol":"AAA-USDT", "quantityPrecision":3, "pricePrecision":2, "tradeMinQuantity":0.001})
     monkeypatch.setattr(bingx, "get_position_mode", lambda **k: "HEDGE")
-    monkeypatch.setattr(bingx, "get_open_protection_directional", lambda *a, **k: next(snapshots))
+    monkeypatch.setattr(bingx, "get_open_protection_directional", read_orders)
     monkeypatch.setattr(bingx, "_current_close_price", lambda s: 100.0)
-    monkeypatch.setattr(bingx, "_request", lambda method, path, params=None, **k: {"code":0, "data":{"order":{"orderId":"ENGINE-SL", "clientOrderId":params.get("clientOrderId")}}})
+    def fake_request(method, path, params=None, **kwargs):
+        posted.update(params or {})
+        return {"code":0, "data":{"order":{"orderId":"ENGINE-SL", "clientOrderId":params.get("clientOrderId"), "type":"STOP_MARKET", "stopPrice":"90", "origQty":"1", "side":"SELL", "positionSide":"LONG"}}}
+    monkeypatch.setattr(bingx, "_request", fake_request)
     monkeypatch.setattr(bingx, "cancel_order", lambda *a, **k: deleted.append(a) or {"code":0})
 
     result = bingx.ensure_directional_protection("AAA-USDT", "LONG", 100.0, 1.0, 10.0, [], trade_id="EVT_TEST")

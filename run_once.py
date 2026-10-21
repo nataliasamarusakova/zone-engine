@@ -49,7 +49,7 @@ from event_engine.version import ENGINE_VERSION
 from event_engine.state_validation import validate_active_trade_record
 from event_engine.fundamental_assets import FUNDAMENTAL_ASSET_SYMBOLS
 from event_engine.telegram import format_signal, send as send_tg
-from event_engine.tracker import ActiveTradeStateCorrupt, register_active_trade, update_active_trades, update_active_trade_protection, merge_reconciled_tp_orders, has_active_trade_conflict, backfill_active_trade_provenance, record_verified_emergency_close
+from event_engine.tracker import ActiveTradeStateCorrupt, register_active_trade, update_active_trades, update_active_trade_protection, update_active_trade_entry_reconciliation, merge_reconciled_tp_orders, has_active_trade_conflict, backfill_active_trade_provenance, record_verified_emergency_close
 from event_engine import research, telemetry, shadow, request_metrics
 from event_engine.trend_filter import evaluate_trend_filter
 
@@ -624,6 +624,7 @@ def _load_terminal_event_ids() -> set[str]:
         "opened_emergency_close_unverified",
         "opened_registration_failed_close_unverified",
         "entry_state_unverified",
+        "entry_state_unverified_protected",
         "entry_not_filled",
     }
     for line in TRADES_PATH.read_text(encoding="utf-8").splitlines():
@@ -813,7 +814,7 @@ def _load_successful_trade_ids() -> set[str]:
             continue
         result = row.get("result", {}) if isinstance(row.get("result"), dict) else {}
         status = str(result.get("status", row.get("status", ""))).lower()
-        if status in {"opened_protected", "opened", "already_executed", "existing_position"} and row.get("event_id"):
+        if status in {"opened_protected", "entry_state_unverified_protected", "opened", "already_executed", "existing_position"} and row.get("event_id"):
             out.add(str(row["event_id"]))
     return out
 
@@ -2114,6 +2115,61 @@ def reconcile_all_open_positions() -> bool:
         return False
 
     active = _load_active_trades_file()
+
+    # If a previous entry could not be proven terminal, keep trying to cancel and
+    # reconcile it on later engine cycles. A one-time best-effort cancellation is
+    # not enough: a late fill after registration could otherwise outgrow fixed-size
+    # SL/TP orders. While unresolved, the normal protection repair below still runs
+    # against a fresh position snapshot, and new entries remain blocked.
+    unsettled_entry_ids = [
+        str(event_id) for event_id, trade in active.items()
+        if isinstance(trade, dict) and not trade.get("closed")
+        and _trade_has_unverified_entry_remainder(trade)
+    ]
+    if unsettled_entry_ids:
+        reconciliation_changed = False
+        for event_id in unsettled_entry_ids:
+            trade = active.get(event_id, {})
+            symbol = str(trade.get("symbol", ""))
+            entry_order = trade.get("entry_order") if isinstance(trade.get("entry_order"), dict) else {}
+            try:
+                settlement = _settle_entry_order_before_protection(
+                    symbol, entry_order,
+                    timeout_sec=max(0.5, float(os.environ.get("ENTRY_ORDER_RECONCILE_TIMEOUT_SEC", "0.75"))),
+                )
+            except Exception as exc:
+                settlement = {"status": "unverified", "error": f"{type(exc).__name__}: {exc}"}
+            if not update_active_trade_entry_reconciliation(event_id, settlement):
+                unresolved = True
+                log.critical(
+                    "[RECON_ENTRY_REMAINDER_STATE] event=%s symbol=%s could not persist settlement evidence; entries blocked",
+                    event_id, symbol,
+                )
+            elif settlement.get("status") != "settled":
+                unresolved = True
+                log.critical(
+                    "[RECON_ENTRY_REMAINDER_PENDING] event=%s symbol=%s status=%s error=%s; retaining ownership and retrying cancellation",
+                    event_id, symbol, settlement.get("status"), settlement.get("error"),
+                )
+            else:
+                log.warning(
+                    "[RECON_ENTRY_REMAINDER_SETTLED] event=%s symbol=%s status=%s; position snapshot will be refreshed",
+                    event_id, symbol, settlement.get("order_status"),
+                )
+            reconciliation_changed = True
+        if reconciliation_changed:
+            # Cancellation may race a partial fill. Never size protection from the
+            # position list captured before the cancellation/settlement attempts.
+            try:
+                positions = get_positions(
+                    timeout_sec=float(os.environ.get("RECONCILIATION_HTTP_TIMEOUT_SEC", "5")),
+                    retryable=False,
+                )
+                active = _load_active_trades_file()
+            except Exception as exc:
+                log.critical("[RECON_ENTRY_REMAINDER_POSITION_REFRESH] failed after entry settlement checks: %s", exc)
+                return False
+
     for p in positions:
         if time.time() - started >= RECONCILIATION_MAX_SECONDS:
             break
@@ -3140,6 +3196,18 @@ def _is_stale_entry_rejection(execution: dict[str, Any]) -> bool:
     )
 
 
+PROTECTED_EXECUTION_STATUSES = frozenset({"opened_protected", "entry_state_unverified_protected"})
+
+
+def _is_protected_execution_status(execution: dict[str, Any]) -> bool:
+    """True when a live position was registered with verified protection.
+
+    The entry remainder may still be unresolved; that is a protected, owned live
+    position requiring reconciliation, not a failed signal eligible for replay.
+    """
+    return str(execution.get("status", "")).strip().lower() in PROTECTED_EXECUTION_STATUSES
+
+
 def _is_terminal_execution_failure(execution: dict[str, Any]) -> bool:
     status = str(execution.get("status", "")).lower()
     error = str(execution.get("error", "")).lower()
@@ -3382,6 +3450,29 @@ def _settle_entry_order_before_protection(
         "order_state": last_state,
         "error": last_error or "entry order failed to reach an authoritative terminal status",
     }
+
+
+def _trade_has_unverified_entry_remainder(trade: dict[str, Any]) -> bool:
+    """Read the durable marker that an entry MARKET remainder was not settled."""
+    if not isinstance(trade, dict):
+        return False
+    setup = trade.get("setup") if isinstance(trade.get("setup"), dict) else {}
+    entry_order = trade.get("entry_order") if isinstance(trade.get("entry_order"), dict) else {}
+    reconciliation_candidates = (
+        trade.get("entry_order_reconciliation"),
+        setup.get("entry_order_reconciliation"),
+        entry_order.get("entry_reconciliation"),
+    )
+    reconciliation = next((candidate for candidate in reconciliation_candidates
+                           if isinstance(candidate, dict) and candidate.get("status")), {})
+    status = str(reconciliation.get("status", "")).lower()
+    flagged = bool(
+        trade.get("entry_remainder_unverified")
+        or setup.get("entry_remainder_unverified")
+        or status == "unverified"
+    )
+    return flagged and status != "settled"
+
 
 def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     symbol = str(signal["symbol"])
@@ -5546,7 +5637,7 @@ def main() -> None:
                 signal["symbol"], signal["type"], execution_status, execution.get("reason", "invalid_setup"), execution.get("error"), execution.get("qty"), execution.get("min_qty"),
                 float(execution.get("required_margin_usdt", 0.0) or 0.0), float(execution.get("configured_margin_usdt", MARGIN_USDT) or MARGIN_USDT),
             )
-        elif execution_status != "opened_protected":
+        elif not _is_protected_execution_status(execution):
             log.error("[EXEC_FAILED] %s %s | status=%s | error=%s | order=%s", signal["symbol"], signal["type"], execution_status, execution.get("error"), execution.get("order"))
             if execution_status not in {"DISABLED", "BLOCKED_MISSING_CREDENTIALS", "BLOCKED_PRIVATE_PREFLIGHT"}:
                 terminal_failure = _is_terminal_execution_failure(execution)
@@ -5558,6 +5649,19 @@ def main() -> None:
                 terminal_failure = False
         else:
             terminal_failure = False
+            if execution_status == "entry_state_unverified_protected":
+                # Protecting/registering the currently observed quantity is the
+                # safest immediate action, but an unresolved entry remainder can
+                # still change exposure. Do not admit unrelated signals later in
+                # this same scan before final reconciliation retries cancellation
+                # and repairs protection from a fresh exchange position snapshot.
+                private_ready = False
+                terminal_event_ids.add(event_id)
+                log.critical(
+                    "[EXEC_PROTECTED_ENTRY_UNVERIFIED] %s %s event=%s is protected and registered, "
+                    "but entry order remains unsettled; retaining the event claim and blocking further entries until reconciliation",
+                    signal["symbol"], signal["type"], event_id,
+                )
         _record_entry_decision(
             scan_id,
             signal,
@@ -5566,9 +5670,9 @@ def main() -> None:
             selection_rank=rank,
             attempt_id=attempt_id,
             execution_status=execution_status,
-            terminal=(True if execution_status == "opened_protected" else bool(_is_terminal_execution_failure(execution))),
+            terminal=(True if _is_protected_execution_status(execution) else bool(_is_terminal_execution_failure(execution))),
         )
-        if execution_status == "opened_protected":
+        if _is_protected_execution_status(execution):
             bx_position_symbol = str(((execution.get("position") or {}).get("symbol") or signal.get("symbol"))).upper()
             open_keys.add((bx_position_symbol, str(signal.get("type")).upper()))
             _finalize_event_claim(event_id, attempt_id, terminal=True, status=execution_status)
