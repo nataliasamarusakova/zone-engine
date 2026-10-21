@@ -5633,7 +5633,11 @@ def test_directional_protection_keeps_old_engine_sl_until_new_sl_is_verified(mon
         {"status": "ok", "sl_orders": [new_sl], "tp_orders": []},
     ])
     monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)
-    monkeypatch.setattr(bingx, "get_open_protection_directional", lambda *a, **k: events.append(("open_orders", None)) or next(states))
+    def read_open_orders(*args, **kwargs):
+        state = next(states)
+        events.append(("open_orders", tuple(str(row.get("orderId", "")) for row in state.get("sl_orders", []))))
+        return state
+    monkeypatch.setattr(bingx, "get_open_protection_directional", read_open_orders)
     monkeypatch.setattr(bingx, "get_position_mode", lambda **k: "HEDGE")
     monkeypatch.setattr(bingx, "get_contract", lambda symbol: {"symbol": symbol, "quantityPrecision": 2, "pricePrecision": 2, "tradeMinQuantity": 0.01})
     monkeypatch.setattr(bingx, "_current_close_price", lambda symbol: 100.0)
@@ -5641,8 +5645,15 @@ def test_directional_protection_keeps_old_engine_sl_until_new_sl_is_verified(mon
     monkeypatch.setattr(bingx, "cancel_order", lambda symbol, oid: events.append(("cancel", oid)) or {"code": 0})
     result = bingx.ensure_directional_protection("AAA-USDT", "LONG", 100.0, 1.0, 10.0, [], trade_id="EVT_NEW")
     assert result["status"] == "PROTECTED"
-    assert events.index(("post", next(value for kind, value in events if kind == "post"))) < events.index(("cancel", "OLD_SL"))
-    assert [event for event in events if event[0] == "cancel"] == [("cancel", "OLD_SL")]
+    post_index = next(index for index, event in enumerate(events) if event[0] == "post")
+    cancel_events = [index for index, event in enumerate(events) if event == ("cancel", "OLD_SL")]
+    if cancel_events:
+        assert post_index < cancel_events[0]
+        assert [event for event in events if event[0] == "cancel"] == [("cancel", "OLD_SL")]
+    else:
+        # A fresh openOrders snapshot may already prove the old SL disappeared
+        # after replacement verification. In that case no redundant DELETE is sent.
+        assert any(kind == "open_orders" and order_ids == ("NEW_SL",) for kind, order_ids in events[post_index + 1:])
 
 
 def test_fetch_research_account_snapshot_parses_single_fill_object(monkeypatch):
