@@ -22,8 +22,8 @@ jobs:
       BINGX_ENV: vst
       BINGX_BASE_URL: https://open-api-vst.bingx.com
       BINGX_MARGIN_USDT: "1"
-      BINGX_LEVERAGE: "3"
-      BINGX_MAX_LEVERAGE: "3"
+      BINGX_LEVERAGE: "10"
+      BINGX_MAX_LEVERAGE: "10"
       EXECUTION_ENABLED: "true"
       MAX_SCAN_SYMBOLS: "0"
       WATCHLIST_ONLY: "false"
@@ -462,7 +462,7 @@ jobs:
           fi
           echo "Quality gate passed."
 
-      - name: Restore cumulative retention archive from previous successful runs
+      - name: Restore fingerprint-matched cumulative retention archive
         id: restore_retention_archive
         env:
           GH_TOKEN: ${{ github.token }}
@@ -522,25 +522,70 @@ jobs:
             exit 0
           fi
 
-          artifact_candidates="$(jq -r '
-            [ .[].artifacts[]
-              | select(.name == "zone-engine-retention-archive")
-              | select(.expired == false)
-              | select(.workflow_run.id != null)
-              | select(.workflow_run.head_branch == "main")
-              | {created_at: .created_at, run_id: .workflow_run.id}
-            ]
-            | group_by(.run_id)
-            | map(max_by(.created_at))
-            | sort_by(.created_at)
-            | reverse
-            | .[]
-            | [.created_at, (.run_id | tostring)]
-            | @tsv
-          ' <<< "$artifact_json")"
+          # The runtime-state marker records the run that durably uploaded the
+          # exact archive fingerprint. Prefer that run over "latest successful":
+          # the archive upload/marker steps can succeed before a later workflow step
+          # fails, and the runtime-state artifact may correctly preserve that newer
+          # marker. Selecting an older successful archive would create a permanent
+          # fingerprint mismatch.
+          expected_archive_run_id=""
+          if [ -f data/retention_archive_state.json ]; then
+            expected_archive_run_id="$(jq -r '(.last_uploaded_by_run_id // "") | tostring' data/retention_archive_state.json)"
+            [ "$expected_archive_run_id" = "null" ] && expected_archive_run_id=""
+            if [ -n "$expected_archive_run_id" ] && [[ ! "$expected_archive_run_id" =~ ^[0-9]+$ ]]; then
+              echo "::warning::Retention archive marker has an invalid last_uploaded_by_run_id; compaction is paused for safety. Position management will continue."
+              echo "status=invalid_marker_run_id" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          if [ -n "$expected_archive_run_id" ]; then
+            artifact_candidates="$(jq -r --arg expected_run_id "$expected_archive_run_id" '
+              [ .[].artifacts[]
+                | select(.name == "zone-engine-retention-archive")
+                | select(.expired == false)
+                | select(.workflow_run.id != null)
+                | select((.workflow_run.id | tostring) == $expected_run_id)
+                | select(.workflow_run.head_branch == "main")
+                | {created_at: .created_at, run_id: .workflow_run.id}
+              ]
+              | group_by(.run_id)
+              | map(max_by(.created_at))
+              | sort_by(.created_at)
+              | reverse
+              | .[]
+              | [.created_at, (.run_id | tostring)]
+              | @tsv
+            ' <<< "$artifact_json")"
+            if [ -z "$artifact_candidates" ]; then
+              echo "::warning::The retention marker points to archive run $expected_archive_run_id, but its unexpired artifact is unavailable; compaction is paused. Position management will continue."
+              echo "status=marker_archive_unavailable" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            # Legacy marker-less state has no run ID to link the pair. Search
+            # recent candidates, but verify each candidate's contents against any
+            # available fingerprint before accepting it.
+            artifact_candidates="$(jq -r '
+              [ .[].artifacts[]
+                | select(.name == "zone-engine-retention-archive")
+                | select(.expired == false)
+                | select(.workflow_run.id != null)
+                | select(.workflow_run.head_branch == "main")
+                | {created_at: .created_at, run_id: .workflow_run.id}
+              ]
+              | group_by(.run_id)
+              | map(max_by(.created_at))
+              | sort_by(.created_at)
+              | reverse
+              | .[]
+              | [.created_at, (.run_id | tostring)]
+              | @tsv
+            ' <<< "$artifact_json")"
+          fi
 
           if [ -z "$artifact_candidates" ]; then
-            echo "::warning::Named archive artifacts exist, but no unexpired main-branch artifact has a run ID; retention compaction is paused."
+            echo "::warning::Named archive artifacts exist, but no unexpired main-branch artifact is eligible; retention compaction is paused."
             echo "status=no_suitable_archive" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -555,16 +600,34 @@ jobs:
               run_api_errors=$((run_api_errors + 1))
               continue
             fi
-            if jq -e --argjson expected_workflow_id "$workflow_id" '
+            if ! jq -e --argjson expected_workflow_id "$workflow_id" '
               .workflow_id == $expected_workflow_id
               and .head_branch == "main"
               and .event == "repository_dispatch"
               and .status == "completed"
-              and .conclusion == "success"
             ' >/dev/null <<< "$run_json"; then
+              continue
+            fi
+
+            run_conclusion="$(jq -r '.conclusion // ""' <<< "$run_json")"
+            trusted_archive_steps="false"
+            if [ "$run_conclusion" != "success" ]; then
+              jobs_json=""
+              if jobs_json="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/jobs?per_page=100" 2>/dev/null)" \
+                && jq -e '
+                  [.[].jobs[]?.steps[]?] as $steps
+                  | ($steps | any(.name == "Upload cumulative retention archive for next clean runner" and .conclusion == "success"))
+                  and ($steps | any(.name == "Mark retention archive upload durable" and .conclusion == "success"))
+                ' >/dev/null <<< "$jobs_json"; then
+                trusted_archive_steps="true"
+              fi
+            fi
+            if [ "$run_conclusion" = "success" ] || [ "$trusted_archive_steps" = "true" ]; then
               printf -v candidate_line '%s\t%s\n' "$created_at" "$run_id"
               artifact_runs+="$candidate_line"
               eligible_count=$((eligible_count + 1))
+              # If a marker names one exact upload run, the filtered list can only
+              # contain that run; otherwise test several recent legacy candidates.
               [ "$eligible_count" -ge 3 ] && break
             fi
           done <<< "$artifact_candidates"
@@ -574,7 +637,7 @@ jobs:
               echo "::warning::GitHub run-details API failed for archive candidates; retention restore/compaction is paused for safety."
               echo "status=run_details_api_error" >> "$GITHUB_OUTPUT"
             else
-              echo "::warning::Named artifacts exist, but none belongs to a successful event-engine.yml repository_dispatch run on main; retention compaction is paused."
+              echo "::warning::No archive candidate belongs to a verified event-engine run; retention compaction is paused."
               echo "status=no_suitable_archive" >> "$GITHUB_OUTPUT"
             fi
             exit 0
@@ -584,9 +647,18 @@ jobs:
             [ -n "$run_id" ] || continue
             if gh run download "$run_id" --name zone-engine-retention-archive --repo "$GITHUB_REPOSITORY" --dir "$tmp_dir"; then
               if find "$tmp_dir" -type f -print -quit | grep -q .; then
-                found_archive=true
-                echo "Retention archive found in successful event-engine.yml run $run_id created at $created_at."
-                break
+                # Verify before replacing the destination. This also lets legacy
+                # marker-less restoration skip a stale archive candidate when a
+                # fingerprint is available.
+                if GITHUB_OUTPUT=/dev/null python -m event_engine.retention_archive \
+                  --verify-restored \
+                  --archive-dir "$tmp_dir" \
+                  --state-file data/retention_archive_state.json; then
+                  found_archive=true
+                  echo "Retention archive fingerprint verified for run $run_id created at $created_at."
+                  break
+                fi
+                echo "::warning::Archive candidate from run $run_id did not match the restored marker; trying the next eligible candidate."
               fi
             fi
             rm -rf "$tmp_dir"/* "$tmp_dir"/.[!.]* "$tmp_dir"/..?* 2>/dev/null || true
@@ -594,13 +666,13 @@ jobs:
 
           if [ "$found_archive" = true ]; then
             cp -a "$tmp_dir"/. data/retention_archive/
-            echo "Restored cumulative retention archive from a previous successful workflow run."
+            echo "Restored the fingerprint-matched cumulative retention archive."
             find data/retention_archive -type f | wc -l
             echo "status=restored" >> "$GITHUB_OUTPUT"
             echo "recovery_safe=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::The three newest eligible retention archives could not be downloaded; compaction/upload is paused to avoid losing older pruned rows. Position management will continue."
-            echo "status=download_failed" >> "$GITHUB_OUTPUT"
+            echo "::warning::No downloaded archive matched the persisted marker; compaction/upload is paused to avoid losing older pruned rows. Position management will continue."
+            echo "status=download_failed_or_fingerprint_mismatch" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Verify restored retention archive fingerprint
