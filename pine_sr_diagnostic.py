@@ -36,14 +36,25 @@ def _get(url: str, params: dict[str, Any], timeout: float = 15.0) -> Any:
 
 
 def fetch_1h(symbol: str, limit: int = 1000) -> list[Candle]:
+    requested_closed = max(300, min(int(limit), 1000))
+    now_ms = int(time.time() * 1000)
+    # End the request at the last fully closed 1H candle, rather than querying
+    # the developing current candle and then discarding it after a limit-sized
+    # response has already been truncated. This keeps 300/1000 closed bars usable.
+    hour_ms = 3_600_000
+    last_closed_hour_end_ms = (now_ms // hour_ms) * hour_ms - 1
     payload = _get(
         KLINES_URL,
-        {"symbol": normalize_symbol(symbol), "interval": "1h", "limit": max(300, min(int(limit), 1000))},
+        {
+            "symbol": normalize_symbol(symbol),
+            "interval": "1h",
+            "limit": requested_closed,
+            "endTime": last_closed_hour_end_ms,
+        },
     )
     if not isinstance(payload, list):
         raise ValueError("Binance klines response is not a list")
 
-    now_ms = int(time.time() * 1000)
     candles: list[Candle] = []
     for row in payload:
         if not isinstance(row, list) or len(row) < 6:

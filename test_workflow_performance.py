@@ -5,9 +5,9 @@ from event_engine import bingx
 
 def test_existing_verified_protection_uses_one_open_orders_snapshot(monkeypatch):
     """Already protected positions should not do a redundant second openOrders call."""
-    sl = {"orderId": "SL1", "clientOrderId": "EVT_TEST_SL", "type": "STOP_MARKET", "stopPrice": "90.0", "origQty": "1.0", "side":"SELL", "positionSide":"LONG"}
-    tp1 = {"orderId": "TP1", "clientOrderId": "EVT_TEST_TP1", "type": "TAKE_PROFIT_MARKET", "stopPrice": "103.0", "origQty": "0.5", "side":"SELL", "positionSide":"LONG"}
-    tp2 = {"orderId": "TP2", "clientOrderId": "EVT_TEST_TP2", "type": "TAKE_PROFIT_MARKET", "stopPrice": "106.0", "origQty": "0.5", "side":"SELL", "positionSide":"LONG"}
+    sl = {"orderId": "SL1", "clientOrderId": bingx.build_sl_client_order_id("EVT_TEST"), "type": "STOP_MARKET", "stopPrice": "90.0", "origQty": "1.0", "side":"SELL", "positionSide":"LONG"}
+    tp1 = {"orderId": "TP1", "clientOrderId": bingx.build_tp_client_order_id("tp1", "EVT_TEST"), "type": "TAKE_PROFIT_MARKET", "stopPrice": "103.0", "origQty": "0.5", "side":"SELL", "positionSide":"LONG"}
+    tp2 = {"orderId": "TP2", "clientOrderId": bingx.build_tp_client_order_id("tp2", "EVT_TEST"), "type": "TAKE_PROFIT_MARKET", "stopPrice": "106.0", "origQty": "0.5", "side":"SELL", "positionSide":"LONG"}
     calls = []
 
     monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)

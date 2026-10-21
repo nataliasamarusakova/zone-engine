@@ -46,6 +46,7 @@ from event_engine.bingx import (
 )
 from event_engine.signals import STRATEGY_VERSION, SWING_LEN, MIN_BARS as SIGNALS_MIN_BARS, TP1_PCT, TP2_PCT, generate_zone_signals, score_zone_signal, _nearest_opposing_level, _signal_forensics
 from event_engine.version import ENGINE_VERSION
+from event_engine.state_validation import validate_active_trade_record
 from event_engine.fundamental_assets import FUNDAMENTAL_ASSET_SYMBOLS
 from event_engine.telegram import format_signal, send as send_tg
 from event_engine.tracker import ActiveTradeStateCorrupt, register_active_trade, update_active_trades, update_active_trade_protection, merge_reconciled_tp_orders, has_active_trade_conflict, backfill_active_trade_provenance, record_verified_emergency_close
@@ -881,7 +882,14 @@ def _load_zone_visit_state() -> dict[str, Any]:
     except Exception as exc:
         log.warning("[ZONE_STATE] load failed; starting empty state: %s", exc)
         return {"version": ZONE_VISIT_STATE_VERSION, "trigger_mode": ZONE_TRIGGER_MODE, "symbols": {}}
-    if not isinstance(raw, dict) or int(raw.get("version", -1)) != ZONE_VISIT_STATE_VERSION or not isinstance(raw.get("symbols"), dict):
+    raw_version = raw.get("version") if isinstance(raw, dict) else None
+    if (
+        not isinstance(raw, dict)
+        or isinstance(raw_version, bool)
+        or not isinstance(raw_version, int)
+        or raw_version != ZONE_VISIT_STATE_VERSION
+        or not isinstance(raw.get("symbols"), dict)
+    ):
         log.warning("[ZONE_STATE] invalid/newer schema; starting empty state")
         return {"version": ZONE_VISIT_STATE_VERSION, "trigger_mode": ZONE_TRIGGER_MODE, "symbols": {}}
     stored_mode = str(raw.get("trigger_mode", "")).strip().lower()
@@ -2431,8 +2439,10 @@ def _load_active_trades_file(*, fresh_runtime_start: bool = False) -> dict[str, 
     symbol_direction_owners: dict[tuple[str, str], str] = {}
     order_owners: dict[str, str] = {}
     for raw_event_id, trade in raw.items():
-        if not isinstance(trade, dict):
-            fail(f"event_id={raw_event_id!r} is not an object")
+        try:
+            validate_active_trade_record(raw_event_id, trade)
+        except ValueError as exc:
+            fail(str(exc))
         if trade.get("closed"):
             continue
         event_id = str(trade.get("event_id") or raw_event_id)
@@ -3213,6 +3223,160 @@ def _five_m_trigger_age_minutes(signal: dict[str, Any], now_ts: Any = None) -> t
         return None, "invalid_5m_trigger_time"
 
 
+
+def _settle_entry_order_before_protection(
+    symbol: str, order: dict[str, Any], *, timeout_sec: float | None = None,
+) -> dict[str, Any]:
+    """Ensure an accepted market entry cannot continue growing unnoticed.
+
+    A visible position is not proof that its originating MARKET order is terminal:
+    it may be a partial fill while the remainder remains executable. Query the
+    exchange order, cancel a still-active remainder, and require a terminal state
+    before sizing protection. When the exchange cannot be queried/cancelled, return
+    an explicit unverified result so callers can preserve/reconcile the live exposure
+    rather than silently claiming the entry is final.
+    """
+    if not isinstance(order, dict):
+        return {"status": "unverified", "error": "entry order result is not an object"}
+    initial_status = str(order.get("order_status") or "").strip().upper()
+    order_id = str(order.get("order_id") or order.get("orderId") or "").strip()
+    client_order_id = str(order.get("client_order_id") or order.get("clientOrderId") or "").strip()
+    if initial_status == "FILLED":
+        # A terminal label must not override a contradictory quantity payload.
+        # When the response includes the requested/original quantity, require its
+        # executed quantity to reconcile before trusting this short path.
+        try:
+            expected_qty = float(order.get("orig_qty") or order.get("origQty") or order.get("qty") or 0.0)
+            executed_qty = float(order.get("executed_qty") or order.get("executedQty") or 0.0)
+        except (TypeError, ValueError):
+            expected_qty, executed_qty = 0.0, 0.0
+        qty_tolerance = max(1e-10, abs(expected_qty) * 1e-6)
+        if expected_qty > 0 and executed_qty > 0 and abs(executed_qty - expected_qty) <= qty_tolerance:
+            return {
+                "status": "settled", "order_status": "FILLED",
+                "executed_qty": executed_qty,
+                "position_refresh_required": False,
+                "source": "market_order_response",
+            }
+        if not client_order_id:
+            return {
+                "status": "unverified", "order_status": "FILLED",
+                "executed_qty": executed_qty,
+                "position_refresh_required": True,
+                "error": "FILLED entry response lacks matching executed/original quantity evidence and durable clientOrderId",
+            }
+    if not client_order_id:
+        # The live execution path durably writes a clientOrderId before POST. If
+        # it is absent here, we cannot prove this order belongs to the current
+        # event; do not query/cancel an arbitrary historical order by numeric ID.
+        return {"status": "unverified", "error": "entry order has no durable clientOrderId identity"}
+
+    try:
+        timeout = max(0.5, float(timeout_sec if timeout_sec is not None else os.environ.get("ENTRY_ORDER_SETTLE_TIMEOUT_SEC", "3.0")))
+    except (TypeError, ValueError):
+        timeout = 3.0
+    deadline = time.monotonic() + timeout
+    cancel_attempted = False
+    last_error: str | None = None
+    last_state: dict[str, Any] | None = None
+    active_statuses = {"NEW", "PENDING", "PARTIALLY_FILLED"}
+    terminal_statuses = {"FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}
+    polls = 0
+
+    while polls < 12 and time.monotonic() <= deadline:
+        polls += 1
+        try:
+            state = get_order(
+                symbol,
+                order_id=order_id if order_id else None,
+                client_order_id=None if order_id else client_order_id,
+            )
+        except Exception as exc:
+            state = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+        if isinstance(state, dict) and state.get("status") == "ok":
+            last_state = state
+            order_id = str(state.get("order_id") or order_id)
+            current_status = str(state.get("order_status") or "").strip().upper()
+            try:
+                executed_qty = abs(float(state.get("executed_qty") or 0.0))
+            except (TypeError, ValueError):
+                executed_qty = 0.0
+            if current_status in terminal_statuses:
+                if current_status == "FILLED":
+                    raw_expected = state.get("orig_qty")
+                    try:
+                        exchange_expected_qty = float(raw_expected) if raw_expected not in (None, "") else 0.0
+                    except (TypeError, ValueError):
+                        exchange_expected_qty = 0.0
+                    quantity_known = state.get("executed_qty_known", True) is not False
+                    quantity_tolerance = max(1e-10, abs(exchange_expected_qty) * 1e-6)
+                    if exchange_expected_qty <= 0 or not quantity_known or executed_qty <= 0 or abs(executed_qty - exchange_expected_qty) > quantity_tolerance:
+                        last_error = (
+                            "exchange reports FILLED without consistent executedQty/origQty evidence: "
+                            f"executedQty={executed_qty} origQty={exchange_expected_qty} "
+                            f"executedQtyKnown={quantity_known}"
+                        )
+                        # Retry one fresh status read in case the exchange snapshot
+                        # was internally inconsistent; never size protection as final
+                        # from the contradictory response itself.
+                        if polls < 2 and time.monotonic() < deadline:
+                            time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+                            continue
+                        return {
+                            "status": "unverified", "order_status": current_status,
+                            "executed_qty": executed_qty, "position_refresh_required": True,
+                            "cancel_attempted": cancel_attempted, "order_state": state,
+                            "error": last_error,
+                        }
+                return {
+                    "status": "settled",
+                    "order_status": current_status,
+                    "executed_qty": executed_qty,
+                    "position_refresh_required": bool(
+                        initial_status in active_statuses or cancel_attempted or current_status != "FILLED"
+                    ),
+                    "source": "exchange_order_query",
+                    "cancel_attempted": cancel_attempted,
+                    "order_state": state,
+                }
+            if current_status in active_statuses:
+                if not cancel_attempted:
+                    if not order_id:
+                        last_error = "active entry order has no orderId to cancel"
+                    else:
+                        try:
+                            cancel_order(symbol, order_id)
+                            last_error = "entry remainder cancellation requested; awaiting terminal order state"
+                        except Exception as exc:
+                            last_error = f"entry cancellation request failed: {type(exc).__name__}: {exc}"
+                        cancel_attempted = True
+                else:
+                    last_error = f"entry order remains active after cancellation: {current_status}"
+            else:
+                last_error = f"unrecognized entry order status={current_status or 'EMPTY'}"
+        else:
+            last_error = str((state or {}).get("error") or "entry order query returned no authoritative state")
+            if order_id and not cancel_attempted:
+                # A failed GET does not prove the order is absent. Attempt cancel by
+                # its already-known server order ID, then keep polling GET for proof.
+                try:
+                    cancel_order(symbol, order_id)
+                except Exception as exc:
+                    last_error += f"; cancellation attempt: {type(exc).__name__}: {exc}"
+                cancel_attempted = True
+        if polls < 12 and time.monotonic() < deadline:
+            time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+
+    return {
+        "status": "unverified",
+        "order_status": str((last_state or {}).get("order_status") or initial_status or "UNKNOWN").upper(),
+        "executed_qty": (last_state or {}).get("executed_qty", order.get("executed_qty")),
+        "position_refresh_required": bool(cancel_attempted or initial_status in active_statuses),
+        "cancel_attempted": cancel_attempted,
+        "order_state": last_state,
+        "error": last_error or "entry order failed to reach an authoritative terminal status",
+    }
+
 def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     symbol = str(signal["symbol"])
     direction = str(signal["type"]).upper()
@@ -3539,7 +3703,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         symbol=symbol,
         direction=direction,
         leg="ENTRY",
-        status=("ACKNOWLEDGED" if order_status == "opened" else "REJECTED"),
+        status=("ACKNOWLEDGED" if order_status in {"opened", "entry_pending"} else "REJECTED"),
         order_type="MARKET",
         result_status=order.get("status") if isinstance(order, dict) else None,
         exchange_code=response.get("code"),
@@ -3596,7 +3760,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
             business_impact="MISSED_ENTRY",
         )
         return order
-    if order.get("status") != "opened":
+    if order.get("status") not in {"opened", "entry_pending"}:
         _append_execution_ledger(event_id, signal.get("attempt_id"), "ORDER_REJECTED", {"status": order.get("status"), "error": order.get("error")})
         error_code, error_message = telemetry.parse_exchange_error(order.get("error") or response, default_code=response.get("code"))
         telemetry.record_exchange_error(
@@ -3721,6 +3885,49 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
                 "error": f"entry state could not be authoritatively reconciled: {error_detail}",
             }
 
+    entry_settlement = _settle_entry_order_before_protection(symbol, order)
+    order["entry_reconciliation"] = dict(entry_settlement)
+    if entry_settlement.get("status") == "settled":
+        _append_execution_ledger(
+            event_id, signal.get("attempt_id"), "ENTRY_ORDER_SETTLED",
+            {"order_id": order.get("order_id"), "client_order_id": order.get("client_order_id"), **entry_settlement},
+        )
+        if entry_settlement.get("position_refresh_required"):
+            try:
+                refreshed_position = get_position_directional(symbol, direction)
+            except Exception as exc:
+                refreshed_position = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+            if refreshed_position.get("status") == "found":
+                position = refreshed_position
+            elif refreshed_position.get("status") == "not_found":
+                log.critical(
+                    "[EXEC_ENTRY_POSITION_DISAPPEARED] %s %s after entry-order settlement; refusing to register a phantom trade",
+                    symbol, direction,
+                )
+                return {
+                    "status": "entry_position_disappeared", "order": order,
+                    "order_state": entry_settlement.get("order_state"),
+                    "position": refreshed_position,
+                    "error": "position disappeared while the market order remainder was being settled",
+                }
+            else:
+                # Preserve the last known live position for best-effort protection,
+                # but surface that its quantity could not be refreshed after cancel.
+                order["entry_reconciliation"]["position_refresh_error"] = refreshed_position.get("error") or "position query did not return a known state"
+                log.critical(
+                    "[EXEC_ENTRY_POSITION_REFRESH_UNVERIFIED] %s %s; using last known position size for protective placement: %s",
+                    symbol, direction, order["entry_reconciliation"]["position_refresh_error"],
+                )
+    else:
+        _append_execution_ledger(
+            event_id, signal.get("attempt_id"), "ENTRY_ORDER_REMAINDER_UNVERIFIED",
+            {"order_id": order.get("order_id"), "client_order_id": order.get("client_order_id"), **entry_settlement},
+        )
+        log.critical(
+            "[EXEC_ENTRY_REMAINDER_UNVERIFIED] %s %s; placing protection for currently observed position, while blocking any claim that entry quantity is final: %s",
+            symbol, direction, entry_settlement.get("error"),
+        )
+
     fill_observed_ts = pd.Timestamp.now(tz="UTC")
     fill_observed_ts_ms = int(fill_observed_ts.timestamp() * 1000)
     signal["fill_observed_ts"] = fill_observed_ts.isoformat()
@@ -3832,6 +4039,8 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     ]
     setup["target_price"] = tp2_price
     setup["entry_order"] = order if isinstance(order, dict) else {}
+    setup["entry_order_reconciliation"] = dict(entry_settlement)
+    setup["entry_remainder_unverified"] = entry_settlement.get("status") != "settled"
     setup["fill_position"] = position if isinstance(position, dict) else {}
     setup["execution_snapshot"] = {
         "strategy_version": _effective_strategy_version(),
@@ -4050,8 +4259,12 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
             executed_signal=actual_signal,
         )
 
+    final_execution_status = (
+        "opened_protected" if entry_settlement.get("status") == "settled"
+        else "entry_state_unverified_protected"
+    )
     return {
-        "status": "opened_protected",
+        "status": final_execution_status,
         "order": order,
         "position": position,
         "protection": protection,

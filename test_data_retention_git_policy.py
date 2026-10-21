@@ -150,7 +150,10 @@ def test_size_guard_zone_observations_can_archive_old_non_nearest_rows_without_t
     path = data_dir / "zone_observations.jsonl"
     path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
     (data_dir / "active_trades.json").write_text(json.dumps({}), encoding="utf-8")
-    (data_dir / "research_outcome_state.json").write_text(json.dumps({"processed_observation_ids": []}), encoding="utf-8")
+    (data_dir / "research_outcome_state.json").write_text(
+        json.dumps({"processed_observation_ids": [f"OBS_OLD_{i}" for i in range(400)] + ["OBS_RECENT", "OBS_PROTECTED"]}),
+        encoding="utf-8",
+    )
     (data_dir / "trades.jsonl").write_text(json.dumps({"record_type": "TRADE_OPEN", "event_id": "E1", "scan_id": "SCAN_TRADE", "observation_id": "OBS_PROTECTED"}) + "\n", encoding="utf-8")
     monkeypatch.setattr(data_retention, "DATA_DIR", data_dir)
     monkeypatch.setattr(data_retention, "PROJECT_ROOT", tmp_path)
@@ -342,6 +345,8 @@ def test_clean_checkout_can_restore_runtime_state_from_verified_bundle(tmp_path)
             path.write_text("", encoding="utf-8")
         elif relative in {"data/active_trades.json", "data/event_execution_claims.json"}:
             path.write_text("{}\n", encoding="utf-8")
+        elif relative == "data/zone_visit_state.json":
+            path.write_text(json.dumps({"version": 1, "trigger_mode": "zone", "symbols": {}}) + "\n", encoding="utf-8")
         else:
             path.write_text(json.dumps({"path": relative}) + "\n", encoding="utf-8")
     (data / "active_trades.json").write_text(

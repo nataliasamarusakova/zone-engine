@@ -677,7 +677,7 @@ def test_bingx_min_qty_is_nonfatal_skip(monkeypatch):
         "multiplier": 1, "maxLeverage": 10,
     })
     monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
-    monkeypatch.setattr(bingx, "has_open_position", lambda symbol, direction: False)
+    monkeypatch.setattr(bingx, "has_position_conflict_for_open", lambda symbol, direction: False)
     monkeypatch.setattr(bingx, "get_position_mode", lambda **kwargs: "HEDGE")
     monkeypatch.setattr(bingx, "_current_close_price", lambda symbol: 93.368)
     monkeypatch.setattr(bingx, "get_execution_quote", lambda symbol, **kwargs: {
@@ -831,7 +831,7 @@ def test_open_market_resolves_existing_client_order_before_post(monkeypatch):
     monkeypatch.setattr(bingx, "get_contract", lambda symbol: {
         "quantityPrecision": 2, "tradeMinQuantity": 0.01, "multiplier": 1, "maxLeverage": 20,
     })
-    monkeypatch.setattr(bingx, "has_open_position", lambda *a, **k: False)
+    monkeypatch.setattr(bingx, "has_position_conflict_for_open", lambda *a, **k: False)
     monkeypatch.setattr(bingx, "get_execution_quote", lambda *a, **k: {"status": "ok", "bid": 99.9, "ask": 100.1, "mid": 100.0,
         "quote_observed_at_ms": int(time.time() * 1000), "quote_exchange_time_ms": int(time.time() * 1000)})
     monkeypatch.setattr(bingx, "_set_leverage", lambda *a, **k: True)
@@ -842,7 +842,8 @@ def test_open_market_resolves_existing_client_order_before_post(monkeypatch):
     })
     monkeypatch.setattr(bingx, "_request", lambda *a, **k: pytest.fail("MARKET POST must not happen when clientOrderId already exists"))
     out = bingx.open_market("TEST-USDT", "LONG", 100.0, "EVENT_X")
-    assert out["status"] == "opened"
+    assert out["status"] == "entry_pending"
+    assert out["order_status"] == "NEW"
     assert out["idempotency"] == "existing_client_order_resolved_before_post"
 
 
@@ -853,7 +854,7 @@ def test_open_market_transport_error_reconciles_client_order_without_repost(monk
     monkeypatch.setattr(bingx, "get_contract", lambda symbol: {
         "quantityPrecision": 2, "tradeMinQuantity": 0.01, "multiplier": 1, "maxLeverage": 20,
     })
-    monkeypatch.setattr(bingx, "has_open_position", lambda *a, **k: False)
+    monkeypatch.setattr(bingx, "has_position_conflict_for_open", lambda *a, **k: False)
     monkeypatch.setattr(bingx, "get_execution_quote", lambda *a, **k: {"status": "ok", "bid": 99.9, "ask": 100.1, "mid": 100.0,
         "quote_observed_at_ms": int(time.time() * 1000), "quote_exchange_time_ms": int(time.time() * 1000)})
     monkeypatch.setattr(bingx, "_set_leverage", lambda *a, **k: True)
@@ -889,7 +890,7 @@ def test_open_market_refuses_reuse_of_terminal_client_order(monkeypatch):
     monkeypatch.setattr(bingx, "get_contract", lambda symbol: {
         "quantityPrecision": 2, "tradeMinQuantity": 0.01, "multiplier": 1, "maxLeverage": 20,
     })
-    monkeypatch.setattr(bingx, "has_open_position", lambda *a, **k: False)
+    monkeypatch.setattr(bingx, "has_position_conflict_for_open", lambda *a, **k: False)
     monkeypatch.setattr(bingx, "get_execution_quote", lambda *a, **k: {"status": "ok", "bid": 99.9, "ask": 100.1, "mid": 100.0,
         "quote_observed_at_ms": int(time.time() * 1000), "quote_exchange_time_ms": int(time.time() * 1000)})
     monkeypatch.setattr(bingx, "_set_leverage", lambda *a, **k: True)
@@ -1914,7 +1915,7 @@ def test_open_market_blocks_two_tp_min_quantity_before_order(monkeypatch):
         "status": "ok", "symbol": symbol, "bid": 1000.0, "ask": 1000.0, "spread_pct": 0.0,
         "quote_observed_at_ms": int(time.time() * 1000), "quote_exchange_time_ms": int(time.time() * 1000),
     })
-    monkeypatch.setattr(bingx, "has_open_position", lambda *args, **kwargs: False)
+    monkeypatch.setattr(bingx, "has_position_conflict_for_open", lambda *args, **kwargs: False)
     monkeypatch.setattr(bingx, "position_side_param", lambda *args, **kwargs: "LONG")
     out = bingx.open_market("BNB-USDT", "LONG", 1000.0, "EVT_TEST")
     assert out["status"] == "skipped_tp_min_qty"
@@ -1933,7 +1934,7 @@ def test_open_market_zero_rounded_quantity_is_skipped_min_qty(monkeypatch):
         "multiplier": 1, "maxLeverage": 10,
     })
     monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
-    monkeypatch.setattr(bingx, "has_open_position", lambda *args, **kwargs: False)
+    monkeypatch.setattr(bingx, "has_position_conflict_for_open", lambda *args, **kwargs: False)
     monkeypatch.setattr(bingx, "position_side_param", lambda direction: "BOTH")
     monkeypatch.setattr(bingx, "get_order", lambda *args, **kwargs: {"status": "not_found"})
     monkeypatch.setattr(bingx, "get_execution_quote", lambda symbol, **kwargs: {
@@ -2200,7 +2201,11 @@ def test_execute_reconciles_position_after_fill_poll_timeout(monkeypatch):
     monkeypatch.setattr(run_once, "_validate_trade_geometry", lambda s, **kwargs: (True, "ok"))
     monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
     monkeypatch.setattr(run_once, "_build_setup", lambda s: {"zone": {"kind": "DEMAND"}, "tp_levels": []})
-    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: {"status": "opened", "symbol": "TEST-USDT", "order_id": "ENTRY1"})
+    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: {
+        "status": "opened", "symbol": "TEST-USDT", "order_id": "ENTRY1",
+        "client_order_id": "EVT_ZONETEST", "order_status": "FILLED",
+        "qty": 1.0, "executed_qty": 1.0,
+    })
     monkeypatch.setattr(run_once, "wait_for_position_fill_directional", lambda *a, **k: {"status": "timeout", "symbol": "TEST-USDT"})
     monkeypatch.setattr(run_once, "get_position_directional", lambda *a, **k: {"status": "found", "avgPrice": 100.5, "positionAmt": 1.0})
     monkeypatch.setattr(run_once, "_rebase_protection_after_fill", lambda s, avg: {
@@ -2781,9 +2786,9 @@ def test_tp_notification_reports_exchange_remaining_qty_after_fill(monkeypatch, 
     monkeypatch.setattr(tracker, "ACTIONS_PATH", tmp_path / "actions.jsonl")
     trade = {
         "event_id": "EVT_TP_REMAINING", "symbol": "AAA-USDT", "direction": "LONG", "name": "AAA",
-        "entry_price": 100.0, "initial_qty": 1.0, "remaining_qty": 0.5, "entry_ts": 1, "closed": False,
-        "tp_orders": [{"leg": "tp1", "order_id": "TP1"}], "sl_order": {}, "hit_legs": [], "tp_filled_qty": {},
-        "realized_pnl_qty": 0.0, "realized_pnl_weighted_sum": 0.0, "peak_pnl_pct": 0.0, "mae_pct": 0.0,
+        "entry_price": 100.0, "initial_qty": 1.0, "remaining_qty": 0.7, "entry_ts": 1, "closed": False,
+        "tp_orders": [{"leg": "tp1", "order_id": "TP1"}], "sl_order": {}, "hit_legs": [], "tp_filled_qty": {"tp1": 0.3},
+        "realized_pnl_qty": 0.3, "realized_pnl_weighted_sum": 0.6, "peak_pnl_pct": 0.0, "mae_pct": 0.0,
         "max_drawdown_pct": 0.0, "planned_risk_pct": 1.0, "planned_weighted_rr": 0.75,
         "effective_weighted_rr": 0.75, "setup": {}, "tp_levels": [], "effective_tp_levels": [],
     }
@@ -2800,7 +2805,8 @@ def test_tp_notification_reports_exchange_remaining_qty_after_fill(monkeypatch, 
     sent=[]
     monkeypatch.setattr(tracker, "send_tg", lambda text: sent.append(text) or True)
     tracker.update_active_trades()
-    assert sent and "0.50000000" in sent[0]
+    assert sent and "Закрыто: <code>0.50000000</code>" in sent[0]
+    assert "Закрыто: <code>0.20000000</code>" not in sent[0]
     assert "50.0%" in sent[0]
 
 def test_tracker_sends_and_records_close_notification(monkeypatch, tmp_path):
@@ -3929,7 +3935,7 @@ def test_open_market_uses_final_venue_quote_not_preflight_quote(monkeypatch):
     monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "TESTUSDT")
     monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
     monkeypatch.setattr(bingx, "get_contract", lambda symbol: {"quantityPrecision": 2, "tradeMinQuantity": 0.01, "multiplier": 1, "maxLeverage": 20})
-    monkeypatch.setattr(bingx, "has_open_position", lambda *a, **k: False)
+    monkeypatch.setattr(bingx, "has_position_conflict_for_open", lambda *a, **k: False)
     monkeypatch.setattr(bingx, "_set_leverage", lambda *a, **k: True)
     monkeypatch.setattr(bingx, "position_side_param", lambda *a, **k: "LONG")
     monkeypatch.setattr(bingx, "get_order", lambda *a, **k: {"status": "error", "error": "not found"})
@@ -3944,7 +3950,7 @@ def test_open_market_uses_final_venue_quote_not_preflight_quote(monkeypatch):
     posted = {}
     monkeypatch.setattr(bingx, "_request", lambda method, path, params, **kwargs: posted.update(params) or {"code":0,"data":{"order":{"orderId":"1","clientOrderId":params["clientOrderId"]}}})
     out = bingx.open_market("TEST-USDT", "LONG", 100.0, "EVENT_FINAL_QUOTE", execution_quote=preflight_quote)
-    assert out["status"] == "opened"
+    assert out["status"] == "entry_pending"
     assert calls["n"] == 1
     assert out["execution_quote"]["ask"] == 100.2
     assert isinstance(out.get("order_submit_at_ms"), int)
@@ -3958,7 +3964,7 @@ def test_open_market_records_authoritative_final_quote(monkeypatch):
     monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "TESTUSDT")
     monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
     monkeypatch.setattr(bingx, "get_contract", lambda symbol: {"quantityPrecision": 2, "tradeMinQuantity": 0.01, "multiplier": 1, "maxLeverage": 20})
-    monkeypatch.setattr(bingx, "has_open_position", lambda *a, **k: False)
+    monkeypatch.setattr(bingx, "has_position_conflict_for_open", lambda *a, **k: False)
     monkeypatch.setattr(bingx, "_set_leverage", lambda *a, **k: True)
     monkeypatch.setattr(bingx, "position_side_param", lambda *a, **k: "LONG")
     monkeypatch.setattr(bingx, "get_order", lambda *a, **k: {"status": "error", "error": "not found"})
@@ -3988,7 +3994,7 @@ def test_open_market_records_authoritative_final_quote(monkeypatch):
 
     out = bingx.open_market("TEST-USDT", "LONG", 100.0, "EVENT_AUTH_QUOTE", attempt_id="ATT_AUTH_QUOTE")
 
-    assert out["status"] == "opened"
+    assert out["status"] == "entry_pending"
     assert len(captured) == 1
     row = captured[0]
     assert row["event_id"] == "EVENT_AUTH_QUOTE"
@@ -4007,7 +4013,7 @@ def test_open_market_final_drift_blocks_post(monkeypatch):
     monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "TESTUSDT")
     monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
     monkeypatch.setattr(bingx, "get_contract", lambda symbol: {"quantityPrecision": 2, "tradeMinQuantity": 0.01, "multiplier": 1, "maxLeverage": 20})
-    monkeypatch.setattr(bingx, "has_open_position", lambda *a, **k: False)
+    monkeypatch.setattr(bingx, "has_position_conflict_for_open", lambda *a, **k: False)
     monkeypatch.setattr(bingx, "_set_leverage", lambda *a, **k: True)
     monkeypatch.setattr(bingx, "position_side_param", lambda *a, **k: "LONG")
     monkeypatch.setattr(bingx, "get_order", lambda *a, **k: {"status": "error", "error": "not found"})
@@ -4595,7 +4601,11 @@ def test_execute_new_position_persists_protection_timings_in_registered_snapshot
     monkeypatch.setattr(run_once, "_validate_trade_geometry", lambda s, **kwargs: (True, "ok"))
     monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {"status": "ok", "sl_orders": [], "tp_orders": []})
     monkeypatch.setattr(run_once, "_build_setup", lambda s: {"zone": {"kind": "DEMAND"}})
-    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: {"status": "opened", "symbol": "TEST-USDT", "order_id": "ENTRY1"})
+    monkeypatch.setattr(run_once, "open_market", lambda *a, **k: {
+        "status": "opened", "symbol": "TEST-USDT", "order_id": "ENTRY1",
+        "client_order_id": "EVT_ZONE_TEST_PROTECTION_TIMING", "order_status": "FILLED",
+        "qty": 1.0, "executed_qty": 1.0,
+    })
     monkeypatch.setattr(run_once, "wait_for_position_fill_directional", lambda *a, **k: {"status": "found", "avgPrice": 100.0, "positionAmt": 1.0})
     monkeypatch.setattr(run_once, "_rebase_protection_after_fill", lambda s, avg: {
         "sl": 90.0, "tp1": 103.0, "tp2": 106.0, "risk_abs": 10.0, "risk_pct": 10.0,
@@ -4752,7 +4762,7 @@ def test_registration_failure_after_protected_entry_rolls_back_and_verifies_clos
     monkeypatch.setattr(run_once, "_validate_exchange_price_distinctness", lambda *a, **k: (True, "ok"))
     monkeypatch.setattr(run_once, "open_market", lambda *a, **k: {
         "status": "opened", "symbol": "TEST-USDT", "order_id": "ENTRY1",
-        "client_order_id": "EVT_REG_ROLLBACK", "qty": 1.0,
+        "client_order_id": "EVT_REG_ROLLBACK", "order_status": "FILLED", "executed_qty": 1.0, "qty": 1.0,
         "execution_quote": signal and {"status": "ok", "bid": 100.0, "ask": 100.0},
     })
     monkeypatch.setattr(run_once, "wait_for_position_fill_directional", lambda *a, **k: {
@@ -5306,7 +5316,7 @@ def test_bingx_short_final_gate_uses_economic_adverse_drift(monkeypatch):
     monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "TESTUSDT")
     monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
     monkeypatch.setattr(bingx, "get_contract", lambda symbol: {"quantityPrecision": 2, "tradeMinQuantity": 0.01, "multiplier": 1, "maxLeverage": 20})
-    monkeypatch.setattr(bingx, "has_open_position", lambda *a, **k: False)
+    monkeypatch.setattr(bingx, "has_position_conflict_for_open", lambda *a, **k: False)
     monkeypatch.setattr(bingx, "_set_leverage", lambda *a, **k: True)
     monkeypatch.setattr(bingx, "position_side_param", lambda *a, **k: "SHORT")
     monkeypatch.setattr(bingx, "get_order", lambda *a, **k: {"status":"error", "error":"not found"})
@@ -5325,8 +5335,8 @@ def test_bingx_short_final_gate_uses_economic_adverse_drift(monkeypatch):
 def test_bingx_tp_geometry_accepts_exchange_price_precision_rounding(monkeypatch):
     from event_engine import bingx
     states = iter([
-        {"status":"ok","sl_orders":[{"orderId":"SL1","clientOrderId":"EVT_SL","type":"STOP_MARKET","stopPrice":"90.0","origQty":"1.0","side":"SELL","positionSide":"LONG"}],"tp_orders":[]},
-        {"status":"ok","sl_orders":[{"orderId":"SL1","clientOrderId":"EVT_SL","type":"STOP_MARKET","stopPrice":"90.0","origQty":"1.0","side":"SELL","positionSide":"LONG"}],"tp_orders":[
+        {"status":"ok","sl_orders":[{"orderId":"SL1","clientOrderId":bingx.build_sl_client_order_id("EVT_ROUND"),"type":"STOP_MARKET","stopPrice":"90.0","origQty":"1.0","side":"SELL","positionSide":"LONG"}],"tp_orders":[]},
+        {"status":"ok","sl_orders":[{"orderId":"SL1","clientOrderId":bingx.build_sl_client_order_id("EVT_ROUND"),"type":"STOP_MARKET","stopPrice":"90.0","origQty":"1.0","side":"SELL","positionSide":"LONG"}],"tp_orders":[
             {"orderId":"TP1","clientOrderId":"EVT_TP1","type":"TAKE_PROFIT_MARKET","stopPrice":"103.1267","origQty":"0.5","side":"SELL","positionSide":"LONG"},
             {"orderId":"TP2","clientOrderId":"EVT_TP2","type":"TAKE_PROFIT_MARKET","stopPrice":"106.1304","origQty":"0.5","side":"SELL","positionSide":"LONG"},
         ]},
@@ -5411,7 +5421,7 @@ def test_open_market_short_all_direction_signal_displacement_blocks_post(monkeyp
     monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "TESTUSDT")
     monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
     monkeypatch.setattr(bingx, "get_contract", lambda symbol: {"quantityPrecision": 2, "tradeMinQuantity": 0.01, "multiplier": 1, "maxLeverage": 20})
-    monkeypatch.setattr(bingx, "has_open_position", lambda *a, **k: False)
+    monkeypatch.setattr(bingx, "has_position_conflict_for_open", lambda *a, **k: False)
     monkeypatch.setattr(bingx, "_set_leverage", lambda *a, **k: True)
     monkeypatch.setattr(bingx, "position_side_param", lambda *a, **k: "SHORT")
     monkeypatch.setattr(bingx, "get_order", lambda *a, **k: {"status": "error", "error": "not found"})
@@ -5645,7 +5655,7 @@ def test_directional_protection_keeps_old_engine_sl_until_new_sl_is_verified(mon
     from event_engine import bingx
 
     events = []
-    old_sl = {"orderId": "OLD_SL", "clientOrderId": "EVT_OLD_SL", "type": "STOP_MARKET", "stopPrice": "105.00", "origQty": "0.5", "positionSide": "LONG", "side": "SELL"}
+    old_sl = {"orderId": "OLD_SL", "clientOrderId": "EVT_OLD_SL", "type": "STOP_MARKET", "stopPrice": "90.00", "origQty": "1.00", "positionSide": "LONG", "side": "SELL"}
     new_sl = {"orderId": "NEW_SL", "clientOrderId": "EVT_NEW_SL", "type": "STOP_MARKET", "stopPrice": "90.00", "origQty": "1.00", "positionSide": "LONG", "side": "SELL"}
     states = iter([
         {"status": "ok", "sl_orders": [old_sl], "tp_orders": []},
@@ -5872,7 +5882,7 @@ def test_open_market_blocks_market_post_if_order_identity_cannot_be_persisted(mo
     monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: "TESTUSDT")
     monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
     monkeypatch.setattr(bingx, "get_contract", lambda symbol: {"quantityPrecision": 2, "tradeMinQuantity": 0.01, "multiplier": 1, "maxLeverage": 20})
-    monkeypatch.setattr(bingx, "has_open_position", lambda *a, **k: False)
+    monkeypatch.setattr(bingx, "has_position_conflict_for_open", lambda *a, **k: False)
     monkeypatch.setattr(bingx, "_set_leverage", lambda *a, **k: True)
     monkeypatch.setattr(bingx, "position_side_param", lambda *a, **k: "LONG")
     monkeypatch.setattr(bingx, "get_order", lambda *a, **k: {"status": "error", "error": "not found"})
@@ -6059,6 +6069,7 @@ def test_tracker_be_retry_persists_verified_rollback_and_classifies_exit(tmp_pat
     monkeypatch.setattr(tracker, "_get_exit_from_sl", lambda *a, **k: (None, None))
     monkeypatch.setattr(tracker, "_get_filled_order", lambda *a, **k: None)
     monkeypatch.setattr(tracker, "cancel_order", lambda *a, **k: {"code": 0})
+    monkeypatch.setattr(tracker, "_cancel_engine_protection_orders_verified", lambda *a, **k: (True, None))
     monkeypatch.setattr(tracker, "_collect_trade_fill_accounting", lambda *a, **k: {
         "entry_fee_raw": None, "exit_fee_raw": None, "fee_raw_total": None, "fees_paid_abs": None,
         "exchange_realized_pnl_abs": None, "exit_vwap_confirmed": None, "exit_vwap_source": None,
@@ -6120,8 +6131,9 @@ def test_idempotent_existing_entry_does_not_trigger_fresh_quote_slippage_close(m
     monkeypatch.setattr(run_once, "get_execution_quote", lambda *a, **k: dict(quote))
     monkeypatch.setattr(run_once, "_build_setup", lambda s: {"zone":{"kind":"DEMAND"}})
     monkeypatch.setattr(run_once, "open_market", lambda *a, **k: {
-        "status":"opened", "symbol":"TEST-USDT", "order_id":"OLD-FILL", "idempotency":"existing_client_order_resolved_before_post",
-        "execution_quote":dict(quote),
+        "status":"opened", "symbol":"TEST-USDT", "order_id":"OLD-FILL",
+        "client_order_id":"EVT_IDEMPOTENT_SLIP", "order_status":"FILLED", "qty":1.0, "executed_qty":1.0,
+        "idempotency":"existing_client_order_resolved_before_post", "execution_quote":dict(quote),
     })
     monkeypatch.setattr(run_once, "wait_for_position_fill_directional", lambda *a, **k: {"status":"found", "avgPrice":102.5, "positionAmt":1.0})
     monkeypatch.setattr(run_once, "ensure_directional_protection", lambda *a, **k: {

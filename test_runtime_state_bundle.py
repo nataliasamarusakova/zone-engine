@@ -26,6 +26,8 @@ def _make_complete_state(root: Path) -> Path:
             path.write_text("empty scan\n", encoding="utf-8")
         elif path.name in {"active_trades.json", "event_execution_claims.json"}:
             path.write_text("{}\n", encoding="utf-8")
+        elif path.name == "zone_visit_state.json":
+            path.write_text(json.dumps({"version": 1, "trigger_mode": "zone", "symbols": {}}) + "\n", encoding="utf-8")
         else:
             path.write_text(json.dumps({"path": rel, "version": 1}) + "\n", encoding="utf-8")
     (data / "retention_archive").mkdir(parents=True, exist_ok=True)

@@ -117,7 +117,7 @@ def test_stale_five_minute_trigger_is_rejected_inside_market_submitter(monkeypat
         "multiplier": 1, "maxLeverage": 10,
     })
     monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
-    monkeypatch.setattr(bingx, "has_open_position", lambda *args, **kwargs: False)
+    monkeypatch.setattr(bingx, "has_position_conflict_for_open", lambda *args, **kwargs: False)
     monkeypatch.setattr(bingx, "position_side_param", lambda direction: direction)
     monkeypatch.setattr(bingx, "get_order", lambda *args, **kwargs: {"status": "not_found"})
     monkeypatch.setattr(bingx, "_set_leverage", lambda *args, **kwargs: True)
