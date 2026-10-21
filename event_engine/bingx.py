@@ -272,6 +272,15 @@ def get_credentials() -> tuple[str, str]:
 
 
 def credentials_available() -> bool:
+    """Return whether signed exchange calls are enabled in this process.
+
+    CI sets ``ZONE_ENGINE_TESTS_ISOLATED=1`` for pytest. Treat that flag as a
+    hard boundary even if job-level API credentials accidentally leak into the
+    test process: mocked fill/order evidence must never trigger live exchange
+    lookups or make accounting tests depend on account state.
+    """
+    if os.environ.get("ZONE_ENGINE_TESTS_ISOLATED", "").strip() == "1":
+        return False
     key, secret = get_credentials()
     return bool(key and secret)
 
