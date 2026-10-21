@@ -66,6 +66,107 @@ INCOME_PATH = "/openApi/swap/v2/user/income"
 FORCE_ORDERS_PATH = "/openApi/swap/v2/trade/forceOrders"
 ALL_FILL_ORDERS_PATH = "/openApi/swap/v2/trade/allFillOrders"
 
+# BingX has returned allFillOrders payloads both as a list and as an object
+# containing a fill row/row list. Keep normalization conservative: an explicit
+# empty list means no fills; an unknown object must never be silently treated as
+# an empty execution history.
+_FILL_ROWS_WRAPPER_KEYS = (
+    "rows", "list", "items", "data", "result", "records", "fills",
+    "fillOrders", "fill_orders", "fillOrderList", "fill_order_list",
+    "orders", "orderList", "order_list", "tradeList", "trade_list",
+    "listData", "dataList",
+)
+_FILL_ROW_ID_KEYS = ("tradeId", "tradeID", "trade_id", "orderId", "orderID", "order_id")
+_FILL_ROW_DETAIL_KEYS = (
+    "symbol", "side", "price", "tradePrice", "trade_price", "qty", "quantity",
+    "volume", "executedQty", "realizedPnl", "realisedPnl", "realized_pnl",
+    "fee", "commission", "time", "tradeTime", "trade_time",
+)
+
+def _normalize_fill_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Normalize the common swap/contract fill field aliases into one schema."""
+    item: dict[str, Any] = {}
+    for sources, dst in (
+        (("tradeId", "tradeID", "trade_id"), "trade_id"),
+        (("orderId", "orderID", "order_id"), "order_id"),
+        (("symbol",), "symbol"),
+        (("side",), "side"),
+        (("positionSide", "position_side"), "position_side"),
+    ):
+        for src in sources:
+            value = row.get(src)
+            if value not in (None, ""):
+                item[dst] = str(value)
+                break
+
+    for sources, dst in (
+        (("price", "tradePrice", "trade_price"), "price"),
+        (("qty", "quantity", "volume", "executedQty", "executed_qty"), "qty"),
+        (("realizedPnl", "realisedPnl", "realized_pnl", "realised_pnl", "profit"), "realized_pnl"),
+        (("fee", "commission", "commissionFee", "commission_fee"), "fee"),
+        (("time", "tradeTime", "trade_time", "timeMs", "timestamp"), "time_ms"),
+    ):
+        for src in sources:
+            value = row.get(src)
+            if value in (None, ""):
+                continue
+            try:
+                number = float(value)
+                if not math.isfinite(number):
+                    item[dst] = None
+                else:
+                    item[dst] = int(number) if dst == "time_ms" else number
+            except (TypeError, ValueError):
+                item[dst] = None
+            break
+    return item
+
+def _looks_like_fill_row(payload: dict[str, Any]) -> bool:
+    """Recognize a single fill record without confusing arbitrary wrappers for rows."""
+    has_identifier = any(payload.get(key) not in (None, "") for key in _FILL_ROW_ID_KEYS)
+    detail_count = sum(payload.get(key) not in (None, "") for key in _FILL_ROW_DETAIL_KEYS)
+    has_price_and_quantity = (
+        any(payload.get(key) not in (None, "") for key in ("price", "tradePrice", "trade_price"))
+        and any(payload.get(key) not in (None, "") for key in ("qty", "quantity", "volume", "executedQty"))
+    )
+    return has_identifier and (detail_count >= 2 or has_price_and_quantity)
+
+def _normalize_all_fill_orders_data(raw_data: Any, *, _depth: int = 0) -> list[dict[str, Any]] | None:
+    """Return fill rows, [] only for an explicit empty list, or None if unknown.
+
+    Only recurse through documented/common response wrapper names. An arbitrary
+    nested list is not enough evidence that it contains fills.
+    """
+    if isinstance(raw_data, list):
+        return list(raw_data) if all(isinstance(row, dict) for row in raw_data) else None
+    if not isinstance(raw_data, dict):
+        return None
+
+    for key in _FILL_ROWS_WRAPPER_KEYS:
+        candidate = raw_data.get(key)
+        if isinstance(candidate, list):
+            return list(candidate) if all(isinstance(row, dict) for row in candidate) else None
+
+    if _depth < 2:
+        for key in _FILL_ROWS_WRAPPER_KEYS:
+            candidate = raw_data.get(key)
+            if isinstance(candidate, dict):
+                normalized = _normalize_all_fill_orders_data(candidate, _depth=_depth + 1)
+                if normalized is not None:
+                    return normalized
+
+    if _looks_like_fill_row(raw_data):
+        return [raw_data]
+    return None
+
+def _fill_payload_shape(raw_data: Any) -> str:
+    if isinstance(raw_data, dict):
+        keys = sorted(str(key) for key in raw_data.keys())
+        shown = keys[:24]
+        suffix = ",..." if len(keys) > len(shown) else ""
+        return f"dict keys={shown}{suffix}"
+    return type(raw_data).__name__
+
 CACHE = {
     "ts": 0.0,
     "data": {},
@@ -808,47 +909,14 @@ def get_fill_orders(
     if response_code != 0:
         raise RuntimeError(f"allFillOrders failed: code={response_code} msg={resp.get('msg')}")
     raw = resp.get("data")
-    if isinstance(raw, dict):
-        for key in ("rows", "list", "items", "data"):
-            if isinstance(raw.get(key), list):
-                raw = raw[key]
-                break
-    if not isinstance(raw, list):
-        return []
+    rows = _normalize_all_fill_orders_data(raw)
+    if rows is None:
+        raise RuntimeError(
+            "allFillOrders returned unrecognized data shape: "
+            f"{_fill_payload_shape(raw)}"
+        )
 
-    out: list[dict] = []
-    for row in raw:
-        if not isinstance(row, dict):
-            continue
-        item: dict[str, Any] = {}
-        for src, dst in (
-            ("tradeId", "trade_id"),
-            ("orderId", "order_id"),
-            ("orderID", "order_id"),
-            ("symbol", "symbol"),
-            ("side", "side"),
-            ("positionSide", "position_side"),
-        ):
-            if row.get(src) not in (None, "") and dst not in item:
-                item[dst] = str(row.get(src))
-        for src, dst in (
-            ("price", "price"),
-            ("qty", "qty"),
-            ("realizedPnl", "realized_pnl"),
-            ("fee", "fee"),
-            ("time", "time_ms"),
-        ):
-            if row.get(src) in (None, ""):
-                continue
-            try:
-                val = float(row.get(src))
-                if dst == "time_ms":
-                    val = int(val)
-                item[dst] = val if math.isfinite(float(val)) else None
-            except (TypeError, ValueError):
-                item[dst] = None
-        out.append(item)
-    return out
+    return [_normalize_fill_row(row) for row in rows]
 
 
 def cancel_order(symbol: str, order_id: str | int) -> dict:
@@ -2473,27 +2541,15 @@ def fetch_research_account_snapshot() -> dict[str, Any]:
         )
         if isinstance(fills, dict) and int(fills.get("code", -1)) == 0:
             raw_data = fills.get("data")
-            raw_rows: list[dict] | None
-            if isinstance(raw_data, list):
-                raw_rows = raw_data
-            elif isinstance(raw_data, dict):
-                raw_rows = None
-                for wrapper_key in ("rows", "list", "items", "data"):
-                    if isinstance(raw_data.get(wrapper_key), list):
-                        raw_rows = raw_data[wrapper_key]
-                        break
-            else:
-                # A missing/null data payload is not authoritative evidence that
-                # the queried time window had zero fills. Only an explicit list
-                # (including []) or a recognized wrapper can establish emptiness.
-                raw_rows = None
+            raw_rows = _normalize_all_fill_orders_data(raw_data)
 
             if raw_rows is None:
                 # Unknown response shape is not equivalent to an empty trading
                 # window. Keep financial totals unknown so INCOME can be used as
-                # a fallback instead of emitting false zeros.
+                # a fallback instead of emitting false zeros. Include only payload
+                # keys (never values) to make a future schema mismatch diagnosable.
                 result["recent_fill_status"] = "UNRECOGNIZED_RESPONSE_SHAPE"
-                result["recent_fill_error"] = f"unrecognized allFillOrders data type/shape: {type(raw_data).__name__}"
+                result["recent_fill_error"] = f"unrecognized allFillOrders data shape: {_fill_payload_shape(raw_data)}"
                 result["recent_fill_count"] = None
                 result["recent_fill_financial_status"] = "UNAVAILABLE"
                 result["recent_fill_fee_status"] = "UNAVAILABLE"
@@ -2514,20 +2570,7 @@ def fetch_research_account_snapshot() -> dict[str, Any]:
             for row in raw_rows:
                 if not isinstance(row, dict):
                     continue
-                item: dict[str, Any] = {}
-                for src, dst in (("tradeId", "trade_id"), ("orderId", "order_id"), ("symbol", "symbol"), ("side", "side"), ("positionSide", "position_side")):
-                    if row.get(src) not in (None, ""):
-                        item[dst] = str(row.get(src))
-                for src, dst in (("price", "price"), ("qty", "qty"), ("realizedPnl", "realized_pnl"), ("fee", "fee"), ("time", "time_ms")):
-                    if row.get(src) in (None, ""):
-                        continue
-                    try:
-                        val = float(row.get(src))
-                        if dst == "time_ms":
-                            val = int(val)
-                        item[dst] = val if math.isfinite(float(val)) else None
-                    except (TypeError, ValueError):
-                        item[dst] = None
+                item = _normalize_fill_row(row)
                 if item.get("fee") is not None:
                     fee_values.append(float(item["fee"]))
                 if item.get("realized_pnl") is not None:
