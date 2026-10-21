@@ -140,6 +140,10 @@ def test_non_batch_cursor_failure_retry_does_not_duplicate_market_bars(tmp_path,
     bars_path = research.MARKET_BARS_1H_PATH
     assert len(bars_path.read_text(encoding="utf-8").splitlines()) == 1
     assert not research.RESEARCH_BAR_CURSORS_PATH.exists()
+    # The bar was durably appended even though the cursor commit failed, so the
+    # manifest must count it immediately rather than losing the count on retry.
+    manifest_after_failure = json.loads(research.RESEARCH_MANIFEST_PATH.read_text(encoding="utf-8"))
+    assert manifest_after_failure["market_bars_1h_written"] == 1
 
     assert research.persist_market_bars(
         "AAA-USDT", "1h", [bar], provider="binance", source="test", scan_id="S2"
@@ -147,6 +151,8 @@ def test_non_batch_cursor_failure_retry_does_not_duplicate_market_bars(tmp_path,
     assert len(bars_path.read_text(encoding="utf-8").splitlines()) == 1
     cursor = json.loads(research.RESEARCH_BAR_CURSORS_PATH.read_text(encoding="utf-8"))
     assert cursor["AAA-USDT|1h|binance"]["last_timestamp"] == ts.isoformat()
+    manifest_after_retry = json.loads(research.RESEARCH_MANIFEST_PATH.read_text(encoding="utf-8"))
+    assert manifest_after_retry["market_bars_1h_written"] == 1
 
 
 def test_get_all_orders_recursively_splits_saturated_time_window(monkeypatch):

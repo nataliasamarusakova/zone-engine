@@ -2444,7 +2444,7 @@ def test_tracker_uses_exchange_qty_as_remaining_qty(monkeypatch, tmp_path):
     assert saved["EVT_QTY_RECON"]["closed"] is False
 
 
-def test_be_existing_with_old_sl_cancel_failure_is_not_success(monkeypatch):
+def test_be_existing_with_old_sl_cancel_failure_is_cleanup_pending(monkeypatch):
     from event_engine import tracker, bingx
     monkeypatch.setattr(bingx, "position_side_param", lambda direction: direction)
     monkeypatch.setattr(tracker, "position_side_param", lambda direction: direction)
@@ -2457,8 +2457,11 @@ def test_be_existing_with_old_sl_cancel_failure_is_not_success(monkeypatch):
     })
     monkeypatch.setattr(tracker, "_cancel_old_sl_verified", lambda *a, **k: (False, "cancel timeout"))
     out = tracker._move_sl_to_break_even("AAA-USDT", "LONG", 100.0, 1.0, "OLD1", "T", old_sl_price=99.0)
-    assert out["status"] == "error"
-    assert "old SL cancel failed" in out["error"]
+    assert out["status"] == "created_cleanup_pending"
+    assert out["order_id"] == "BE1"
+    assert out["old_sl_cleanup_pending"] is True
+    assert out["old_sl_cleanup_pending_order_id"] == "OLD1"
+    assert "cleanup is pending" in out["error"]
 
 
 def test_be_restore_requires_exchange_verification(monkeypatch):
@@ -3090,8 +3093,8 @@ def test_be_verification_polls_after_eventual_consistency(monkeypatch):
     states = iter([
         {"status": "ok", "sl_orders": [{"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1", "clientOrderId":"EVT_OLD_SL", "side":"SELL", "positionSide":"LONG"}], "tp_orders": []},
         {"status": "ok", "sl_orders": [{"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1", "clientOrderId":"EVT_OLD_SL", "side":"SELL", "positionSide":"LONG"}], "tp_orders": []},
-        {"status": "ok", "sl_orders": [{"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1", "clientOrderId":"EVT_OLD_SL", "side":"SELL", "positionSide":"LONG"}, {"orderId": "BE1", "type": "STOP_MARKET", "stopPrice": "100", "origQty": "0.5", "positionSide": "LONG", "side": "SELL"}], "tp_orders": []},
-        {"status": "ok", "sl_orders": [{"orderId": "BE1", "type": "STOP_MARKET", "stopPrice": "100", "origQty": "0.5", "positionSide": "LONG", "side": "SELL"}], "tp_orders": []},
+        {"status": "ok", "sl_orders": [{"orderId": "OLD1", "type": "STOP_MARKET", "stopPrice": "99", "origQty": "1", "clientOrderId":"EVT_OLD_SL", "side":"SELL", "positionSide":"LONG"}, {"orderId": "BE1", "clientOrderId": "EVT_BE_T", "type": "STOP_MARKET", "stopPrice": "100", "origQty": "0.5", "positionSide": "LONG", "side": "SELL"}], "tp_orders": []},
+        {"status": "ok", "sl_orders": [{"orderId": "BE1", "clientOrderId": "EVT_BE_T", "type": "STOP_MARKET", "stopPrice": "100", "origQty": "0.5", "positionSide": "LONG", "side": "SELL"}], "tp_orders": []},
     ])
     monkeypatch.setattr(tracker, "get_open_protection_directional", lambda *a, **k: next(states))
     monkeypatch.setattr(tracker, "_request", lambda method, path, params: {"code": 0, "data": {"order": {"orderId": "BE1", "clientOrderId": params["clientOrderId"]}}})
@@ -4628,24 +4631,31 @@ def test_get_fill_orders_raises_on_exchange_error(monkeypatch):
         raise AssertionError("allFillOrders exchange errors must be distinguishable from no fills")
 
 
-def test_get_fill_orders_parses_single_fill_object_payload(monkeypatch):
+def test_get_fill_orders_parses_single_fill_object_payload_in_coin_units(monkeypatch):
     from event_engine import bingx
     monkeypatch.setattr(bingx, "to_bx_symbol", lambda s: s)
     monkeypatch.setattr(bingx, "credentials_available", lambda: True)
-    monkeypatch.setattr(bingx, "_request", lambda *a, **k: {
-        "code": 0,
-        "data": {
-            "tradeId": "T-1", "orderId": "O-1", "symbol": "AAA-USDT",
-            "side": "SELL", "tradePrice": "101.5", "volume": "2",
-            "realizedPnl": "1.25", "commission": "-0.02", "tradeTime": 1767225500000,
-        },
-    })
+    captured = {}
+    def fake_request(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return {
+            "code": 0,
+            "data": {
+                "tradeId": "T-1", "orderId": "O-1", "symbol": "AAA-USDT",
+                "side": "SELL", "tradePrice": "101.5", "volume": "2",
+                "realizedPnl": "1.25", "commission": "-0.02", "tradeTime": 1767225500000,
+            },
+        }
+    monkeypatch.setattr(bingx, "_request", fake_request)
     rows = bingx.get_fill_orders("AAA-USDT", 100, 200)
+    assert captured["args"][2]["tradingUnit"] == "COIN"
     assert len(rows) == 1
     assert rows[0]["trade_id"] == "T-1"
     assert rows[0]["order_id"] == "O-1"
     assert rows[0]["price"] == pytest.approx(101.5)
     assert rows[0]["qty"] == pytest.approx(2.0)
+    assert rows[0]["quantity_unit"] == "COIN"
     assert rows[0]["realized_pnl"] == pytest.approx(1.25)
     assert rows[0]["fee"] == pytest.approx(-0.02)
     assert rows[0]["time_ms"] == 1767225500000
