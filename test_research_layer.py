@@ -790,6 +790,8 @@ def test_fetch_research_account_snapshot_falls_back_to_realized_pnl_income(monke
     assert snap["recent_realized_pnl_total"] == pytest.approx(3.25)
     assert snap["recent_income_totals"]["REALIZED_PNL"] == pytest.approx(3.25)
     assert any("fills:code=109500" in e for e in snap["errors"])
+    assert "fills unavailable" in snap["recent_fill_error"]
+    assert any("fills unavailable" in e for e in snap["errors"])
 
 
 def test_record_scan_symbol_persists_account_context_once_and_links_observation(tmp_path: Path, monkeypatch):

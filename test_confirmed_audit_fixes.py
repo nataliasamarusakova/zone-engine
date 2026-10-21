@@ -203,3 +203,53 @@ def test_get_all_orders_fails_closed_if_saturated_window_cannot_be_split(monkeyp
     )
     with pytest.raises(RuntimeError, match="cannot be split safely"):
         bingx.get_all_orders("AAA-USDT", 100, 100, limit=2)
+
+
+def test_unrequested_market_context_is_not_mislabeled_as_persistence_failure(tmp_path, monkeypatch):
+    from event_engine import research
+
+    _isolate_research_paths(tmp_path, monkeypatch)
+    monkeypatch.setattr(research, "MARKET_CONTEXT_PATH", tmp_path / "market_context.jsonl")
+
+    index = pd.date_range("2026-01-01T00:00:00Z", periods=48, freq="1h")
+    df_1h = pd.DataFrame({
+        "timestamp": index,
+        "open": [100.0] * len(index),
+        "high": [101.0] * len(index),
+        "low": [99.0] * len(index),
+        "close": [100.0] * len(index),
+        "volume": [1000.0] * len(index),
+    })
+    bar = {
+        "timestamp": "2026-01-03T00:05:00Z",
+        "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 200.0,
+    }
+    zone = {
+        "zone_id": "Z_NO_CONTEXT", "top": 105.0, "btm": 95.0, "poi": 100.0,
+        "origin_ts_ms": int(df_1h["timestamp"].iloc[0].timestamp() * 1000), "age_bars": 10,
+    }
+    signal = {
+        "event_id": "E_NO_CONTEXT", "symbol": "TEST-USDT", "type": "LONG",
+        "trigger_bar_time": bar["timestamp"], "decision_boundary_ts": "2026-01-03T00:10:00Z",
+        "entry": 100.5, "sl": 90.45, "tp1": 103.515, "tp2": 106.53,
+        "zone": zone, "zone_visit": {"visit_id": "V_NO_CONTEXT", "touch_count_before_trigger": 0},
+        "entry_bar": bar, "previous_bar": {}, "target": {"obstacle_price": 120.0},
+        "trigger": {"zone_trigger_mode": "zone"},
+    }
+
+    result = research.record_scan_symbol(
+        scan_id="S_NO_CONTEXT", symbol="TEST-USDT", strategy_version="v1", code_commit_sha="abc",
+        provider="binance", source="binance_spot", bars_1h=df_1h.to_dict("records"), bars_5m=[bar],
+        df_1h=df_1h, demand=[zone], supply=[],
+        diagnostics={"touch_events": [], "rearm_events": [], "zones": {}},
+        symbol_state={}, signals=[signal], decision_ts="2026-01-03T00:10:00Z",
+        market_context=None, account_context=None,
+    )
+
+    assert result["observations"] == 1
+    observations = [json.loads(line) for line in (tmp_path / "zone_observations.jsonl").read_text().splitlines() if line.strip()]
+    assert len(observations) == 1
+    assert observations[0]["market_context_id"] is None
+    assert observations[0]["market_context_persisted"] is None
+    assert observations[0]["market_context_status"] == "NOT_COLLECTED"
+    assert not (tmp_path / "market_context.jsonl").exists()

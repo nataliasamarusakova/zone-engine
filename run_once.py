@@ -1497,27 +1497,38 @@ def _process_5m_zone_visits(
                 continue
             state = dict(zs)
             # Only the previous bar that was actually processed in this scan batch
-            # participates in the continuous-visit guard. The first processed bar
-            # often has one older fetched bar before it; that bar may already belong
-            # to the pre-run history and must not suppress the first actionable touch
-            # after a fresh/empty durable state. Prior-run touches are represented by
-            # the persisted zone state itself (LOCKED), so they do not need this guard.
+            # and was itself inside the trigger freshness window participates in the
+            # continuous-visit guard. A stale touch is explicitly released below;
+            # it must not suppress a following fresh touch merely because both bars
+            # overlap the zone. Prior-run touches are represented by the persisted
+            # zone state itself (LOCKED), so they do not need this guard.
             prev_was_processed_now = False
+            prev_bar_is_fresh = False
+            prev_ts = None
             if prev is not None:
                 prev_ts = _coerce_utc_timestamp(prev["timestamp"])
+                if prev_ts is not None:
+                    # Candle timestamps mark the open; a 5m trigger becomes
+                    # actionable at its close, matching the signal-age calculation.
+                    prev_close_ts = prev_ts + pd.Timedelta(minutes=5)
+                    prev_age_min = max(0.0, (now - prev_close_ts).total_seconds() / 60.0)
+                    prev_bar_is_fresh = prev_age_min <= MAX_5M_TRIGGER_AGE_MINUTES
                 if last_processed_raw:
                     try:
-                        prev_was_processed_now = prev_ts > last_processed
+                        prev_was_processed_now = prev_ts is not None and prev_ts > last_processed
                     except Exception:
                         prev_was_processed_now = True
                 else:
-                    prev_was_processed_now = bool(prev_ts >= processed_rows["timestamp"].min())
+                    prev_was_processed_now = bool(
+                        prev_ts is not None and prev_ts >= processed_rows["timestamp"].min()
+                    )
+            previous_bar_can_block_new_visit = prev_was_processed_now and prev_bar_is_fresh
             state["previous_midpoint_touch"] = bool(
-                prev_was_processed_now and prev is not None and
+                previous_bar_can_block_new_visit and prev is not None and
                 float(prev["low"]) <= midpoint <= float(prev["high"])
             )
             state["previous_zone_touch"] = bool(
-                prev_was_processed_now and prev is not None and
+                previous_bar_can_block_new_visit and prev is not None and
                 float(prev["low"]) <= float(zone["top"]) and float(prev["high"]) >= float(zone["btm"])
             )
             previous_touch = state["previous_midpoint_touch"] if ZONE_TRIGGER_MODE == "midpoint" else state["previous_zone_touch"]

@@ -6216,3 +6216,46 @@ def test_tp1_trigger_timestamp_prefers_fill_time_in_both_be_paths():
     }]}
     assert tracker._tp1_fill_timestamp_ms(trade, 999) == 400
     assert tracker._tp1_fill_timestamp_ms({"tp_fill_events": []}, 999) == 999
+
+
+def test_5m_stale_touch_does_not_suppress_next_fresh_touch(monkeypatch):
+    """A released stale touch must not trip the same-visit guard on a fresh bar."""
+    import pandas as pd
+    import run_once
+    from run_once import _process_5m_zone_visits
+
+    monkeypatch.setattr(run_once, "INITIAL_5M_TRIGGER_LOOKBACK_MINUTES", 60.0)
+    monkeypatch.setattr(run_once, "MAX_5M_TRIGGER_AGE_MINUTES", 15.0)
+    monkeypatch.setattr(run_once, "ZONE_TRIGGER_MODE", "zone")
+    monkeypatch.setattr(run_once, "MIN_STRUCTURE_ROOM_R", 0.0)
+    monkeypatch.setattr(run_once, "REQUIRE_STRUCTURE_OBSTACLE", False)
+    monkeypatch.setattr(run_once, "_nearest_opposing_level", lambda *args, **kwargs: None)
+
+    now_floor = pd.Timestamp.now(tz="UTC").floor("5min")
+    # First candle closes 15-20 minutes ago and is stale; the next closes
+    # 10-15 minutes ago and is fresh. Both touch the same zone continuously.
+    t0 = now_floor - pd.Timedelta(minutes=20)
+    zone = {"start": 0, "top": 110.0, "btm": 100.0, "poi": 105.0}
+    bars = [
+        {"timestamp": int((t0 + pd.Timedelta(minutes=5 * i)).timestamp() * 1000),
+         "open": 104, "high": 109, "low": 102, "close": 106, "volume": 10}
+        for i in range(2)
+    ]
+    df1h = pd.DataFrame([{
+        "timestamp": now_floor - pd.Timedelta(hours=12-i),
+        "open": 100, "high": 111, "low": 99, "close": 105,
+        "volume": 100, "atr50": 2.0,
+    } for i in range(12)])
+    diagnostics = {}
+    signals, state, _ = _process_5m_zone_visits(
+        "TEST-USDT", bars, [zone], [], df1h, None, set(), set(), diagnostics=diagnostics
+    )
+
+    assert diagnostics["zones"]["DEMAND:0:110.000000000000:100.000000000000"]["stale_touches"] == 1
+    assert len(signals) == 1
+    assert signals[0]["trigger_bar_time"] == pd.Timestamp(
+        bars[1]["timestamp"], unit="ms", tz="UTC"
+    ).isoformat()
+    zone_state = state["zones"]["DEMAND:0:110.000000000000:100.000000000000"]
+    assert zone_state["state"] == "LOCKED"
+    assert zone_state["trigger_event_id"] == signals[0]["event_id"]
