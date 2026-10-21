@@ -832,6 +832,52 @@ def _update_active_trade_protection_locked(
             preserved_tp_orders.append(old_tp)
     trade["tp_orders"] = preserved_tp_orders + new_tp_orders
     trade["sl_order"] = sl_result if isinstance(sl_result, dict) else {}
+
+    # The SL saved after reconciliation is the authoritative currently-verified
+    # stop. If the previously recorded BE order disappeared and a normal engine
+    # SL was rebuilt, do not leave be_activated=True: that would suppress the
+    # TP1->BE retry and misrepresent the protection actually on the exchange.
+    new_sl_order_id = str(trade["sl_order"].get("order_id") or trade["sl_order"].get("orderId") or "")
+    new_sl_client_id = str(
+        trade["sl_order"].get("client_order_id") or trade["sl_order"].get("clientOrderId") or ""
+    ).upper()
+    old_be_order_id = str(trade.get("be_order_id") or "")
+    recorded_be_client_id = str(trade.get("be_client_order_id") or "").upper()
+    same_recorded_be_identity = bool(
+        recorded_be_client_id
+        and new_sl_client_id.startswith("EVT_BE_")
+        and _client_order_id_matches_base(new_sl_client_id, recorded_be_client_id)
+    )
+    current_sl_is_recorded_be = bool(
+        new_sl_order_id
+        and new_sl_client_id.startswith("EVT_BE_")
+        and (new_sl_order_id == old_be_order_id or same_recorded_be_identity)
+        and trade.get("sl_order", {}).get("protection_order_verified", True) is not False
+    )
+    if current_sl_is_recorded_be:
+        # The exchange order ID may change while a verified BE is repaired under
+        # its recorded client ID. Keep the BE state, but refresh the concrete ID
+        # used by exit classification/accounting.
+        trade["be_order_id"] = new_sl_order_id
+        trade["be_client_order_id"] = new_sl_client_id
+    if trade.get("be_activated") and new_sl_order_id and not current_sl_is_recorded_be:
+        trade["be_previous_order_id"] = old_be_order_id or None
+        trade["be_previous_activation_ts"] = trade.get("be_activation_ts")
+        trade["be_activated"] = False
+        trade["be_order_id"] = None
+        trade["be_client_order_id"] = None
+        trade["be_activation_ts"] = None
+        tp1_was_hit = any(str(leg).lower() == "tp1" for leg in (trade.get("hit_legs") or []))
+        remaining_qty = max(0.0, _safe_float(trade.get("remaining_qty"), 0.0))
+        trade["be_required"] = bool(tp1_was_hit and remaining_qty > max(1e-12, _safe_float(trade.get("initial_qty"), 0.0) * 1e-9))
+        trade["be_last_error"] = (
+            "reconciliation replaced missing break-even stop with a non-BE stop; retry required"
+            if trade["be_required"] else None
+        )
+        log.warning(
+            "[TRACKER_BE_STATE_RECONCILED] event=%s symbol=%s previous_be_order=%s new_sl=%s be_required=%s",
+            owner_event_id, symbol, old_be_order_id or "unknown", new_sl_order_id, trade["be_required"],
+        )
     if effective_tp_levels is not None:
         trade["effective_tp_levels"] = effective_tp_levels
     if tp_mode:
@@ -1566,8 +1612,19 @@ def _emergency_close_after_be_failure(symbol: str, direction: str, qty: float, t
         "order_filled": order_filled,
     }
 
-def _is_valid_break_even_stop(order: dict, direction: str, entry_price: float, qty: float, price_precision: int) -> bool:
-    """Validate a BE stop's type, exact trigger price and live-position quantity."""
+def _is_break_even_stop_shape_valid(
+    order: dict,
+    direction: str,
+    entry_price: float,
+    qty: float,
+    price_precision: int,
+) -> bool:
+    """Check whether an exchange stop has BE geometry, independent of ownership.
+
+    This predicate is for conflict detection only. Passing it does not mean the
+    engine may adopt or cancel the order; identity and owner checks remain
+    mandatory in `_is_valid_break_even_stop` and in the reconciliation path.
+    """
     if not isinstance(order, dict):
         return False
     order_id = str(order.get("orderId") or order.get("order_id") or "")
@@ -1577,20 +1634,45 @@ def _is_valid_break_even_stop(order: dict, direction: str, entry_price: float, q
     tolerance = max(0.5 * (10 ** (-max(0, int(price_precision)))), entry_price * 1e-8)
     if abs(stop_price - entry_price) > tolerance:
         return False
-    # get_open_protection_directional filters positionSide to LONG/SHORT/BOTH;
-    # when the exchange includes the field, reject any contradictory value.
-    position_side = str(order.get("positionSide", "")).upper()
     try:
         expected_position_side = position_side_param(direction)
     except Exception:
         return False
-    if position_side != expected_position_side:
+    if str(order.get("positionSide", "")).upper() != expected_position_side:
         return False
-    side = str(order.get("side", "")).upper()
     expected_side = "SELL" if str(direction).upper() == "LONG" else "BUY"
-    if side != expected_side:
+    if str(order.get("side", "")).upper() != expected_side:
         return False
     return True
+
+
+def _is_valid_break_even_stop(
+    order: dict,
+    direction: str,
+    entry_price: float,
+    qty: float,
+    price_precision: int,
+    *,
+    expected_client_order_id: str | None = None,
+) -> bool:
+    """Validate a BE stop's engine ownership, identity, trigger and quantity.
+
+    A user-created stop at the entry price is not proof that the engine's BE
+    transition completed. Only an EVT_BE_* order belonging to this event may
+    be adopted as the engine's active BE protection.
+    """
+    if not isinstance(order, dict):
+        return False
+    client_order_id = str(order.get("clientOrderId") or order.get("client_order_id") or "").upper()
+    if not client_order_id.startswith("EVT_BE_"):
+        return False
+    if expected_client_order_id and not _client_order_id_matches_base(
+        client_order_id, expected_client_order_id
+    ):
+        return False
+    return _is_break_even_stop_shape_valid(
+        order, direction, entry_price, qty, price_precision
+    )
 
 
 def _cancel_conflicted_be_if_old_sl_verified(
@@ -1643,7 +1725,10 @@ def _cancel_conflicted_be_if_old_sl_verified(
         return {"verified": False, "status": "deferred", "error": "old SL not independently verified to cover the live residual"}
     if new_order is None:
         return {"verified": True, "status": "new_BE_already_absent", "error": None}
-    if not _is_valid_break_even_stop(new_order, direction, entry_price, qty, price_precision):
+    if not _is_valid_break_even_stop(
+        new_order, direction, entry_price, qty, price_precision,
+        expected_client_order_id=be_client_id,
+    ):
         return {"verified": False, "status": "deferred", "error": "matched client ID did not pass BE validation"}
 
     try:
@@ -1720,18 +1805,64 @@ def _move_sl_to_break_even(
             "stop_price": entry_price,
             "safety_action": "existing_protection_unchanged",
         }
+    # Detect BE-shaped engine stops already owned by another active event before
+    # attempting a new POST. They must not be adopted or cancelled, but ignoring
+    # them and posting another protection order can create overlapping stops and
+    # violates the existing ownership-conflict guard.
+    current_trades_for_conflict_check = None
+    current_owner_id = str(owner_event_id or trade_id or "")
+    for candidate in verified.get("sl_orders", []):
+        candidate_id = str(candidate.get("orderId") or candidate.get("order_id") or "")
+        candidate_cid = str(candidate.get("clientOrderId") or candidate.get("client_order_id") or "").upper()
+        if (
+            not candidate_id
+            or not candidate_cid.startswith("EVT_")
+            or _client_order_id_matches_base(candidate_cid, base_be_client_id)
+            or not _is_break_even_stop_shape_valid(candidate, direction, entry_price, qty, price_precision)
+        ):
+            continue
+        if current_trades_for_conflict_check is None:
+            current_trades_for_conflict_check = _load_active_trades_required()
+        foreign_owners = _order_ids_owned_by_other_trades(
+            current_trades_for_conflict_check, {candidate_id}, exclude_event_id=current_owner_id
+        )
+        if not foreign_owners:
+            continue
+        telemetry.record_state_conflict(
+            event_id=owner_event_id or trade_id, attempt_id=None, position_id=owner_event_id or trade_id,
+            order_id=candidate_id, symbol=symbol, direction=direction,
+            conflict_type="BE_ORDER_OWNERSHIP_CONFLICT",
+            message=f"BE-shaped protection order is owned by another active event: {foreign_owners}; existing SL is kept",
+            owner_event_ids=[current_owner_id] + sorted({eid for ids in foreign_owners.values() for eid in ids}),
+            conflicting_order_ids=[candidate_id], leg="BE_SL",
+        )
+        return {
+            "status": "error",
+            "error": "BE-shaped protection order belongs to another active event",
+            "order_id": candidate_id,
+            "client_order_id": candidate_cid,
+            "stop_price": entry_price,
+            "safety_action": "old_sl_kept",
+        }
+
     invalid_be_order_ids = [
         str(order.get("orderId", "")) for order in verified.get("sl_orders", [])
         if str(order.get("orderId", ""))
         and _client_order_id_matches_base(order.get("clientOrderId", ""), base_be_client_id)
-        and not _is_valid_break_even_stop(order, direction, entry_price, qty, price_precision)
+        and not _is_valid_break_even_stop(
+            order, direction, entry_price, qty, price_precision,
+            expected_client_order_id=base_be_client_id,
+        )
     ]
     if verified.get("status") == "ok":
         for order in verified.get("sl_orders", []):
             cid = str(order.get("clientOrderId", "")).upper()
             # A client ID is only an identity hint, not proof that this is a valid
             # BE stop. Price, order type, side/position-side and quantity must match.
-            if _is_valid_break_even_stop(order, direction, entry_price, qty, price_precision):
+            if _is_valid_break_even_stop(
+                order, direction, entry_price, qty, price_precision,
+                expected_client_order_id=base_be_client_id,
+            ):
                 existing_id = str(order.get("orderId", ""))
                 if existing_id:
                     current_trades = _load_active_trades_required()
@@ -1788,16 +1919,18 @@ def _move_sl_to_break_even(
                     old_cancelled, cancel_note = _cancel_old_sl_verified(symbol, direction, str(old_sl_id), owner_event_id=owner_event_id or trade_id)
                 if not old_cancelled:
                     log.warning(
-                        "[TRACKER] BE already in place for %s but old SL %s cancel failed: %s; "
-                        "BE is NOT considered active while multiple SL states may coexist.",
+                        "[TRACKER] BE already in place for %s; old SL %s cleanup remains pending: %s. "
+                        "The verified BE stays active while cleanup is retried.",
                         symbol, old_sl_id, cancel_note,
                     )
                     return {
-                        "status": "error",
-                        "error": f"BE exists but old SL cancel failed: {cancel_note}",
+                        "status": "created_cleanup_pending",
+                        "error": f"BE exists but old SL cleanup is pending: {cancel_note}",
                         "order_id": existing_id,
                         "client_order_id": cid or be_client_id,
                         "stop_price": entry_price,
+                        "old_sl_cleanup_pending": True,
+                        "old_sl_cleanup_pending_order_id": str(old_sl_id),
                     }
                 return {
                     "status": "created",
@@ -1951,7 +2084,10 @@ def _move_sl_to_break_even(
         if verified_after.get("status") == "ok":
             if any(
                 str(o.get("orderId", "")) == new_order_id
-                and _is_valid_break_even_stop(o, direction, entry_price, qty, price_precision)
+                and _is_valid_break_even_stop(
+                    o, direction, entry_price, qty, price_precision,
+                    expected_client_order_id=be_client_id,
+                )
                 and str(o.get("clientOrderId") or be_client_id).upper() == be_client_id.upper()
                 for o in verified_after.get("sl_orders", [])
             ):
@@ -2397,6 +2533,7 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
         "fill_query_mode": "AGGREGATE",
         "exact_order_queries_attempted": [],
         "exact_order_query_errors": {},
+        "order_execution_evidence_errors": {},
         "incomplete_order_fill_ids": [],
     }
     if not symbol or not order_roles:
@@ -2434,6 +2571,7 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
     aggregate_order_ids = {str(row.get("order_id", "")) for row in relevant_map.values()}
     exact_attempts: list[str] = []
     exact_errors: dict[str, str] = {}
+    order_execution_evidence_errors: dict[str, str] = {}
     incomplete_order_fill_ids: list[str] = []
     expected_qty_by_order: dict[str, float] = {}
     order_evidence_cache: dict[str, dict[str, Any]] = {}
@@ -2441,7 +2579,7 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
         rows_for_order = [row for row in relevant_map.values() if str(row.get("order_id", "")) == order_id]
         had_any_fill_rows = bool(rows_for_order)
         observed_qty = sum(abs(_safe_float(row.get("qty"), 0.0)) for row in rows_for_order)
-        needs_exact = order_id not in aggregate_order_ids
+        needs_exact = order_id not in aggregate_order_ids or order_id in order_execution_evidence_errors
         # Order status gives us the authoritative executedQty needed to detect a
         # truncated aggregate response. Cache it so missing-fill fallback below
         # doesn't issue a duplicate request for the same order.
@@ -2453,6 +2591,17 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
                 execution_evidence = {"status": "error", "error": f"{type(exc).__name__}:{exc}"}
             if isinstance(execution_evidence, dict):
                 order_evidence_cache[order_id] = execution_evidence
+                if execution_evidence.get("status") == "error":
+                    order_execution_evidence_errors[order_id] = str(
+                        execution_evidence.get("error") or "order execution evidence query failed"
+                    )
+                    # An aggregate row is not authoritative proof of order-level
+                    # completeness when the status query failed. Attempt the exact
+                    # order-specific fill query as an independent evidence path.
+                    needs_exact = True
+            elif execution_evidence is None:
+                order_execution_evidence_errors[order_id] = "order execution evidence unavailable"
+                needs_exact = True
         if isinstance(execution_evidence, dict) and execution_evidence.get("status") == "ok":
             expected_qty = _optional_float(execution_evidence.get("executed_qty"))
             if expected_qty is not None:
@@ -2558,6 +2707,14 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
 
     entry_execution_complete = _complete_exec(entry_exec)
     exit_execution_complete = _complete_exec(exit_exec)
+    # If order-status lookup failed, aggregate rows alone cannot establish that
+    # the fill history covers the order's full executedQty. Preserve observed
+    # rows for forensic review, but do not label that order's accounting complete.
+    if order_execution_evidence_errors:
+        if any(order_roles.get(order_id) == "ENTRY" for order_id in order_execution_evidence_errors):
+            entry_execution_complete = False
+        if any(order_roles.get(order_id) != "ENTRY" for order_id in order_execution_evidence_errors):
+            exit_execution_complete = False
     if incomplete_order_fill_ids:
         if any(order_roles.get(order_id) == "ENTRY" for order_id in incomplete_order_fill_ids):
             entry_execution_complete = False
@@ -2565,13 +2722,18 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
             exit_execution_complete = False
     entry_qty = sum(float(row["qty"]) for row in entry_exec if row.get("qty") is not None)
     exit_qty = sum(float(row["qty"]) for row in exit_exec if row.get("qty") is not None)
+    qty_tolerance = max(1e-12, abs(entry_qty) * 1e-8) if entry_qty > 0 else 1e-12
+    exit_qty_covers_entry = entry_qty > 0 and exit_qty >= entry_qty - qty_tolerance
     entry_vwap = (
         sum(float(row["qty"]) * float(row["price"]) for row in entry_exec) / entry_qty
         if entry_execution_complete and entry_qty > 0 else None
     )
 
     gross_realized_pnl_abs = None
-    if entry_vwap is not None and exit_execution_complete and direction in {"LONG", "SHORT"} and not incomplete_order_fill_ids:
+    if (
+        entry_vwap is not None and exit_execution_complete and direction in {"LONG", "SHORT"}
+        and not incomplete_order_fill_ids and not order_execution_evidence_errors and exit_qty_covers_entry
+    ):
         gross_realized_pnl_abs = 0.0
         for row in exit_exec:
             q = float(row["qty"])
@@ -2580,8 +2742,14 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
 
     # Financial totals remain fill-ledger-only. An order-level execution response
     # has no authoritative fee/realizedPnl fields and must not be treated as one.
-    fee_complete = bool(relevant) and _all_present_numeric(relevant, "fee") and not order_execution_evidence and not incomplete_order_fill_ids
-    realized_complete = bool(relevant) and _all_present_numeric(relevant, "realized_pnl") and not order_execution_evidence and not incomplete_order_fill_ids
+    fee_complete = (
+        bool(relevant) and _all_present_numeric(relevant, "fee") and not order_execution_evidence
+        and not incomplete_order_fill_ids and not order_execution_evidence_errors and exit_qty_covers_entry
+    )
+    realized_complete = (
+        bool(relevant) and _all_present_numeric(relevant, "realized_pnl") and not order_execution_evidence
+        and not incomplete_order_fill_ids and not order_execution_evidence_errors and exit_qty_covers_entry
+    )
     exchange_realized_pnl_abs = sum(float(_optional_float(f.get("realized_pnl"))) for f in relevant) if realized_complete else None
     entry_fee_raw = exit_fee_raw = fee_raw_total = fees_paid_abs = None
     if fee_complete:
@@ -2618,7 +2786,6 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
         last_exit_fill_ts_ms = None
         last_exit_execution_timestamp_source = "UNAVAILABLE"
 
-    qty_tolerance = max(1e-12, abs(entry_qty) * 1e-8) if entry_qty > 0 else 1e-12
     execution_source = "ALL_FILL_ORDERS"
     if order_execution_evidence and relevant:
         execution_source = "ALL_FILL_ORDERS+ORDER_STATUS"
@@ -2626,6 +2793,8 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
         execution_source = "ORDER_STATUS_EXECUTION_EVIDENCE"
     elif aggregate_error:
         execution_source = "ALL_FILL_ORDERS_ERROR"
+    if order_execution_evidence_errors:
+        execution_source += "+ORDER_STATUS_ERROR"
 
     exit_vwap_confirmed = (
         sum(float(row["qty"]) * float(row["price"]) for row in exit_exec) / exit_qty
@@ -2643,12 +2812,17 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
     else:
         exit_vwap_source = "UNAVAILABLE"
     execution_qty_status = (
-        "VERIFIED" if entry_execution_complete and exit_execution_complete and exit_qty >= entry_qty - qty_tolerance and not incomplete_order_fill_ids
+        "VERIFIED" if entry_execution_complete and exit_execution_complete and exit_qty_covers_entry
+        and not incomplete_order_fill_ids and not order_execution_evidence_errors
         else "PARTIAL_OR_UNVERIFIED"
     )
+    full_execution_accounting = (
+        entry_execution_complete and exit_execution_complete and exit_qty_covers_entry
+        and not incomplete_order_fill_ids and not order_execution_evidence_errors
+    )
     status = (
-        "VERIFIED" if entry_execution_complete and exit_execution_complete and not order_execution_evidence and not incomplete_order_fill_ids
-        else "VERIFIED_ORDER_EXECUTION" if entry_execution_complete and exit_execution_complete and not incomplete_order_fill_ids
+        "VERIFIED" if full_execution_accounting and not order_execution_evidence
+        else "VERIFIED_ORDER_EXECUTION" if full_execution_accounting
         else "PARTIAL_ACCOUNTING"
     )
     return {
@@ -2658,6 +2832,8 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
         "order_ids": sorted(order_roles),
         "entry_qty_confirmed": entry_qty if entry_execution_complete else None,
         "confirmed_exit_qty": exit_qty if exit_execution_complete else None,
+        "observed_entry_qty": entry_qty,
+        "observed_exit_qty": exit_qty,
         "confirmed_exit_qty_source": "FILL_HISTORY" if exit_fills and not order_execution_evidence else "ORDER_STATUS_EXECUTION_EVIDENCE" if order_execution_evidence else "UNAVAILABLE",
         "exit_vwap_confirmed": exit_vwap_confirmed,
         "exit_vwap_source": exit_vwap_source,
@@ -2687,6 +2863,7 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
         "aggregate_query_error": aggregate_error,
         "exact_order_queries_attempted": exact_attempts,
         "exact_order_query_errors": exact_errors,
+        "order_execution_evidence_errors": order_execution_evidence_errors,
         "incomplete_order_fill_ids": sorted(set(incomplete_order_fill_ids)),
     }
 
@@ -3266,6 +3443,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                     trade["be_trigger_price"] = trade.get("be_trigger_price") or _safe_float(retry.get("stop_price"), entry_price)
                     trade["be_activation_ts"] = trade.get("be_activation_ts") or now_ms
                     trade["be_order_id"] = retry.get("order_id")
+                    trade["be_client_order_id"] = retry.get("client_order_id")
                     pending_old_sl_id = retry.get("old_sl_cleanup_pending_order_id")
                     if pending_old_sl_id:
                         trade["sl_cleanup_pending"] = {
@@ -3553,6 +3731,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                                 trade["be_trigger_rule"] = "tp1_filled"
                                 trade["be_activation_ts"] = now_ms
                                 trade["be_order_id"] = new_sl.get("order_id")
+                                trade["be_client_order_id"] = new_sl.get("client_order_id")
                                 trade["be_trigger_price"] = _safe_float(new_sl.get("stop_price"), entry_price)
                                 telemetry.record_protection_event(
                                     event_id=event_id,

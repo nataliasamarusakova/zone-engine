@@ -960,7 +960,11 @@ def get_fill_orders(
     start_ms = max(0, int(start_time_ms))
     end_ms = max(start_ms, int(end_time_ms))
     params: dict[str, Any] = {
-        "tradingUnit": "CONT",
+        # Internal position/order quantities are expressed in COIN units. CONT
+        # returns contract-count quantities (e.g. 1,389 for a 138.9-coin AWE
+        # position when multiplier=0.1), which must not be mixed into position
+        # accounting or realized-PnL quantity reconciliation.
+        "tradingUnit": "COIN",
         "startTs": start_ms,
         "endTs": end_ms,
         "currency": "USDT",
@@ -991,7 +995,14 @@ def get_fill_orders(
             f"{_fill_payload_shape(raw)}"
         )
 
-    return [_normalize_fill_row(row) for row in rows]
+    normalized_rows = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        item = _normalize_fill_row(row)
+        item["quantity_unit"] = "COIN"
+        normalized_rows.append(item)
+    return normalized_rows
 
 
 def cancel_order(symbol: str, order_id: str | int) -> dict:
@@ -2871,7 +2882,7 @@ def fetch_research_account_snapshot() -> dict[str, Any]:
     try:
         fills = _request(
             "GET", ALL_FILL_ORDERS_PATH,
-            {"tradingUnit": "CONT", "startTs": activity_start_ms, "endTs": activity_end_ms, "currency": "USDT"},
+            {"tradingUnit": "COIN", "startTs": activity_start_ms, "endTs": activity_end_ms, "currency": "USDT"},
             signed=True, timeout_sec=min(5.0, float(os.environ.get("RESEARCH_ACCOUNT_TIMEOUT_SEC", "5"))), retryable=False,
         )
         if isinstance(fills, dict) and int(fills.get("code", -1)) == 0:
@@ -2906,6 +2917,7 @@ def fetch_research_account_snapshot() -> dict[str, Any]:
                 if not isinstance(row, dict):
                     continue
                 item = _normalize_fill_row(row)
+                item["quantity_unit"] = "COIN"
                 if item.get("fee") is not None:
                     fee_values.append(float(item["fee"]))
                 if item.get("realized_pnl") is not None:

@@ -876,11 +876,15 @@ def persist_market_bars(
             _update_cursor(key, {"last_timestamp": fresh[-1]["timestamp"], "last_bar_id": fresh[-1]["bar_id"], "updated_at": _now_iso(), "scan_id": scan_id})
             return len(fresh)
         written = _append_market_bars_idempotent_locked(path, fresh)
+        # Count newly durable rows immediately after append, before the cursor
+        # commit. If cursor persistence fails, the next idempotent retry may append
+        # zero rows; moving this counter after the cursor would permanently lose the
+        # audit count for rows already written to the journal.
+        if written:
+            _bump_manifest(f"market_bars_{tf}_written", written)
         # Even when all candidate bars were already present from a prior run whose
         # cursor write failed, the successful idempotent check lets us repair cursor.
         _update_cursor(key, {"last_timestamp": fresh[-1]["timestamp"], "last_bar_id": fresh[-1]["bar_id"], "updated_at": _now_iso(), "scan_id": scan_id})
-        if written:
-            _bump_manifest(f"market_bars_{tf}_written", written)
         return written
     except Exception as exc:
         target = MARKET_BARS_1H_PATH if tf == "1h" else MARKET_BARS_5M_PATH
