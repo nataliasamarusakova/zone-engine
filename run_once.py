@@ -3997,6 +3997,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     _append_execution_ledger(event_id, signal.get("attempt_id"), "PROTECTED_POSITION", {"fill_price": avg_price, "sl_price": sl_price, "tp1_price": tp1_price, "tp2_price": tp2_price, "risk_pct": actual_risk_pct, "planned_weighted_rr": setup["planned_weighted_rr"]})
 
     registration_reason = "active_trade_registration_failed"
+    registration_setup = _setup_with_protection_result(setup, protection)
     try:
         registered = register_active_trade(
             event_id=event_id,
@@ -4010,7 +4011,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
             event_type=f"{setup['zone'].get('kind', 'ZONE')}_{'MIDPOINT_TOUCH_5M' if ZONE_TRIGGER_MODE == 'midpoint' else 'ZONE_TOUCH_5M'}",
             timeframe="5m",
             score=float(signal.get("score", 0.0)),
-            setup={**setup, "protection_status": protection.get("status"), "protection_result": protection},
+            setup=registration_setup,
             requested_entry_price=entry_price,
             entry_ts_ms=fill_observed_ts_ms,
         )
@@ -4144,6 +4145,42 @@ def _prefer_longer_research_5m_history(
     existing = list(existing_bars or [])
     prefetched = list(prefetched_bars or [])
     return prefetched if len(prefetched) > len(existing) else existing
+
+
+def _setup_with_protection_result(
+    setup: dict[str, Any], protection: dict[str, Any]
+) -> dict[str, Any]:
+    """Prepare setup metadata for persistence on the active trade.
+
+    ``effective_tp_levels`` is determined by protection sizing and may differ
+    from the originally planned ``tp_levels``. The tracker consumes it from the
+    setup's top level, so do not leave it buried only inside protection_result.
+    """
+    enriched = dict(setup) if isinstance(setup, dict) else {}
+    enriched["protection_status"] = protection.get("status")
+    enriched["protection_result"] = protection
+    if isinstance(protection.get("effective_tp_levels"), list):
+        enriched["effective_tp_levels"] = protection["effective_tp_levels"]
+    return enriched
+
+
+def _research_bar_payload(
+    *,
+    research_enabled: bool,
+    has_research_boundary: bool,
+    persist_bars_for_forward: bool,
+    bars_1h: list[dict[str, Any]] | None,
+    bars_5m: list[dict[str, Any]] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Select raw bars needed by either a current observation or a maturing one.
+
+    A symbol can have no active zones and therefore no new boundary while still
+    having an older observation awaiting its forward outcome. Keep both source
+    timeframes in that case so the outcome worker does not lose its price path.
+    """
+    if not research_enabled or not (has_research_boundary or persist_bars_for_forward):
+        return [], []
+    return list(bars_1h or []), list(bars_5m or [])
 
 
 def _research_payload_needs_5m_history(payload: dict[str, Any]) -> bool:
@@ -4746,13 +4783,13 @@ def main() -> None:
                     "trigger_age_minutes_at_scan": max(0.0, (pd.Timestamp.now(tz="UTC") - trigger_ts).total_seconds() / 60.0),
                 })
 
-            # Research market snapshot is captured only for symbols that reached at least one
-            # observation boundary. It is best-effort and never gates production execution.
-            # Raw market bars are persisted only for boundary symbols so a 5-minute universe scan
-            # does not grow the journal with irrelevant 5m history.
+            # Research context is captured only for symbols with a new boundary,
+            # but raw bars are also retained for symbols with maturing observations.
+            # A pending observation still needs both timeframes even when its zone
+            # is no longer active and no new visit boundary is generated.
             research_context = None
-            research_bars_5m_raw = []
-            research_bars_1h_raw = []
+            research_bars_5m_raw: list[dict[str, Any]] = []
+            research_bars_1h_raw: list[dict[str, Any]] = []
             touch_events = five_min_diag.get("touch_events") or []
             rearm_events = five_min_diag.get("rearm_events") or []
             near_approach_limit = max(0.0, float(os.environ.get("RESEARCH_NEAREST_APPROACH_MAX_PCT", "1.0")))
@@ -4777,9 +4814,14 @@ def main() -> None:
             if has_nearest:
                 boundary_types.append("NEAREST_APPROACH")
             has_research_boundary = bool(boundary_types)
-            if research.RESEARCH_ENABLED and has_research_boundary:
-                research_bars_1h_raw = bars
-                research_bars_5m_raw = trigger_bars_raw
+            persist_bars_for_forward = str(symbol).upper() in research_pending_forward_symbols
+            research_bars_1h_raw, research_bars_5m_raw = _research_bar_payload(
+                research_enabled=research.RESEARCH_ENABLED,
+                has_research_boundary=has_research_boundary,
+                persist_bars_for_forward=persist_bars_for_forward,
+                bars_1h=bars,
+                bars_5m=trigger_bars_raw,
+            )
             collect_rich_context = RESEARCH_RICH_CONTEXT_ENABLED and not RESEARCH_DEFER_UNTIL_AFTER_EXECUTION and (bool(research_signals) or (rich_rejection_context and bool(touch_events or rearm_events)))
             if research.RESEARCH_ENABLED and has_research_boundary and collect_rich_context:
                 # Pull a larger 5m history only for research-boundary symbols. This gives
@@ -4860,7 +4902,7 @@ def main() -> None:
                         "signals": research_signals,
                         "decision_ts": research_decision_ts,
                         "market_context": None,
-                        "persist_bars_for_forward": (str(symbol).upper() in research_pending_forward_symbols),
+                        "persist_bars_for_forward": persist_bars_for_forward,
                     })
             elif research.RESEARCH_ENABLED:
                 research.record_scan_symbol(
@@ -4869,7 +4911,7 @@ def main() -> None:
                     bars_1h=research_bars_1h_raw, bars_5m=research_bars_5m_raw, df_1h=df, demand=demand, supply=supply,
                     diagnostics=five_min_diag, symbol_state=symbol_state, signals=research_signals,
                     decision_ts=research_decision_ts, market_context=research_context,
-                    persist_bars_for_forward=(str(symbol).upper() in research_pending_forward_symbols),
+                    persist_bars_for_forward=persist_bars_for_forward,
                     account_context=research_account_context, btc_df_5m=btc_research_df_5m, btc_df_1h=btc_research_df_1h,
                 )
 

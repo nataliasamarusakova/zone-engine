@@ -69,14 +69,14 @@ def test_batch_cursor_does_not_advance_when_bar_append_fails(tmp_path, monkeypat
     _isolate_paths(tmp_path, monkeypatch)
     now = pd.Timestamp.now(tz="UTC").floor("h") - pd.Timedelta(hours=2)
     bar = {**_bar(now), "close_time": int((now + pd.Timedelta(hours=1)).timestamp() * 1000)}
-    original_append = research._append_jsonl_locked
+    original_append = research._append_market_bars_idempotent_locked
 
     def fail_hourly(path, rows):
         if path == research.MARKET_BARS_1H_PATH:
             raise OSError("simulated disk write failure")
         return original_append(path, rows)
 
-    monkeypatch.setattr(research, "_append_jsonl_locked", fail_hourly)
+    monkeypatch.setattr(research, "_append_market_bars_idempotent_locked", fail_hourly)
     with research.batch_persistence():
         assert research.persist_market_bars("AAA-USDT", "1h", [bar], provider="binance", source="test", scan_id="S1") == 1
 
