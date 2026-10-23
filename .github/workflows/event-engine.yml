@@ -172,7 +172,12 @@ jobs:
                 and .event == "repository_dispatch"
                 and .status == "completed"
               ' >/dev/null <<< "$run_json"; then
-                echo "Ignoring runtime-state artifact id=$candidate_artifact_id because it is not from a completed event-engine run on main."
+                candidate_workflow_id="$(jq -r '.workflow_id // "unknown"' <<< "$run_json")"
+                candidate_branch="$(jq -r '.head_branch // "unknown"' <<< "$run_json")"
+                candidate_event="$(jq -r '.event // "unknown"' <<< "$run_json")"
+                candidate_status="$(jq -r '.status // "unknown"' <<< "$run_json")"
+                candidate_conclusion="$(jq -r '.conclusion // "unknown"' <<< "$run_json")"
+                echo "Ignoring runtime-state artifact id=$candidate_artifact_id: workflow_id=$candidate_workflow_id expected=$workflow_id branch=$candidate_branch event=$candidate_event status=$candidate_status conclusion=$candidate_conclusion. Required: this event-engine workflow, main, repository_dispatch, completed."
                 continue
               fi
               # A later workflow step (for example Git externalization) can fail
@@ -381,10 +386,15 @@ jobs:
           TESTS_REQUIRED: ${{ steps.test_policy.outputs.run_tests }}
           TESTS_OUTCOME: ${{ steps.tests.outcome }}
           SNAPSHOT_OUTCOME: ${{ steps.runtime_data_snapshot.outcome }}
+          RESTORE_OUTCOME: ${{ steps.restore_runtime_state.outcome }}
           RUNNER_TEMP: ${{ runner.temp }}
         shell: bash
         run: |
           set -euo pipefail
+          if [ "$RESTORE_OUTCOME" != "success" ]; then
+            echo "Skipping runtime-data isolation verification because runtime-state restoration failed before tests could run; the restore failure remains fatal and the commit gate stays closed."
+            exit 0
+          fi
           if [ "$TESTS_REQUIRED" = "true" ]; then
             if [ "$TESTS_OUTCOME" != "success" ]; then
               echo "ERROR: Full tests were required but did not complete successfully (outcome=$TESTS_OUTCOME)."
@@ -960,7 +970,10 @@ jobs:
 
       - name: Retain only the two newest runtime-state artifacts
         id: prune_runtime_state_artifacts
-        if: ${{ steps.verify_runtime_state_artifact.outcome == 'success' }}
+        # Do not delete fallbacks merely because the API lists the new artifact.
+        # Pruning is safe only after the current bundle was downloaded and its
+        # manifest/file checksums independently verified.
+        if: ${{ steps.verify_runtime_state_artifact.outcome == 'success' && steps.verify_uploaded_runtime_state_bundle.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
