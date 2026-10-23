@@ -5080,14 +5080,19 @@ def test_tp_full_close_exposes_confirmed_vwap_and_latest_exit_order(monkeypatch)
         ],
     }
     evidence = tracker._close_execution_evidence(trade, {"fills": [], "order_execution_evidence": []})
-    assert evidence["status"] == "CONFIRMED"
-    assert evidence["confirmed_exit_qty"] == pytest.approx(1.0)
-    assert evidence["exit_vwap_confirmed"] == pytest.approx(104.5)
+    # Local TP events establish the observed exit quantity/VWAP, but with no
+    # initial/entry quantity in this legacy-shaped record the whole-trade
+    # quantity cannot be independently reconciled or labelled confirmed.
+    assert evidence["status"] == "QTY_UNVERIFIABLE"
+    assert evidence["confirmed_exit_qty"] is None
+    assert evidence["observed_exit_qty"] == pytest.approx(1.0)
+    assert evidence["exit_vwap_confirmed"] is None
+    assert evidence["exit_vwap_observed"] == pytest.approx(104.5)
     assert evidence["latest"]["order_id"] == "TP2"
     assert evidence["latest_execution_ts_ms"] == 2000
     assert evidence["latest_execution_timestamp_source"] == "FILL_TIME"
-    assert evidence["authority"] == "TRACKER_LOCAL_EVENT"
-    assert evidence["exit_vwap_source"] == "TRACKER_RECORDED_TP_EVENT"
+    assert evidence["authority"] == "UNVERIFIED_EXPECTED_EXIT_QTY_UNKNOWN"
+    assert evidence["exit_vwap_source"] == "UNAVAILABLE_EXPECTED_EXIT_QTY"
 
 
 def test_protection_creation_does_not_mark_open_order_as_execution_fill(monkeypatch):

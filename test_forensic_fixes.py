@@ -304,7 +304,11 @@ def test_tracker_local_tp_fallback_is_not_double_counted_for_repeated_partial_ev
         ],
     }
     evidence = tracker._close_execution_evidence(trade, {"fills": [], "order_execution_evidence": []})
-    assert evidence["confirmed_exit_qty"] == pytest.approx(0.5)
+    assert evidence["status"] == "QTY_UNVERIFIABLE"
+    assert evidence["confirmed_exit_qty"] is None
+    assert evidence["observed_exit_qty"] == pytest.approx(0.5)
+    assert evidence["exit_vwap_confirmed"] is None
+    assert evidence["exit_vwap_observed"] == pytest.approx(103.2)
     assert len(evidence["rows"]) == 1
     assert evidence["rows"][0]["executed_qty"] == pytest.approx(0.5)
     assert evidence["rows"][0]["avg_price"] == pytest.approx(103.2)
