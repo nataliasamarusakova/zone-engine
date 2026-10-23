@@ -9,7 +9,17 @@ import requests
 
 def _chat_ids() -> list[str]:
     raw = os.environ.get("TG_CHAT_IDS") or os.environ.get("TG_CHAT_ID") or ""
-    return [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
+    # Secret values are frequently copied/merged during workflow maintenance.
+    # Preserve target order but never deliver the same notification twice to the
+    # same Telegram chat because its ID was accidentally listed more than once.
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in raw.replace(";", ",").split(","):
+        chat_id = value.strip()
+        if chat_id and chat_id not in seen:
+            seen.add(chat_id)
+            result.append(chat_id)
+    return result
 
 
 def send(text: str) -> bool:

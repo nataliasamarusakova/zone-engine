@@ -627,6 +627,23 @@ def _append_trade_close_once(record: dict) -> bool:
                     fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
 
 
+def _notify_trade_close_if_new(
+    *, journal_inserted: bool, event_id: str, symbol: str, message: str,
+) -> bool:
+    """Send TRADE_CLOSE only for the invocation that first journals the close.
+
+    The journal is durable and event-id idempotent. A later retry/reconciliation
+    that discovers the same close must not send the same user-facing message again.
+    """
+    if not journal_inserted:
+        log.info(
+            "[TRACKER_CLOSE_DUPLICATE_NOTIFICATION_SUPPRESSED] event=%s symbol=%s: TRADE_CLOSE journal already exists",
+            event_id, symbol,
+        )
+        return False
+    return _send_tracker_notification("TRADE_CLOSE", event_id, message, symbol=symbol)
+
+
 def _normalize_direction(direction: str) -> str:
     d = str(direction or "").upper()
     if d not in {"LONG", "SHORT"}:
@@ -2453,6 +2470,14 @@ def _get_order_execution_evidence(symbol: str, order_id: str | None, *, entry_ts
         info = {"status": "error", "error": "invalid order response"}
 
     status = str(info.get("order_status", "")).upper()
+    returned_order_id = str(info.get("order_id") or info.get("orderId") or "").strip()
+    if returned_order_id and returned_order_id != str(order_id).strip():
+        return {
+            "status": "error",
+            "error": f"order execution evidence ID mismatch: requested={order_id} response={returned_order_id}",
+            "requested_order_id": str(order_id),
+            "reported_order_id": returned_order_id,
+        }
     executed_qty = max(0.0, _safe_float(info.get("executed_qty"), 0.0))
     avg_price = max(0.0, _safe_float(info.get("avg_price"), 0.0))
     if info.get("status") == "ok" and executed_qty > 0 and avg_price > 0:
@@ -2779,7 +2804,8 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
     entry_qty = sum(float(row["qty"]) for row in entry_exec if row.get("qty") is not None)
     exit_qty = sum(float(row["qty"]) for row in exit_exec if row.get("qty") is not None)
     qty_tolerance = max(1e-12, abs(entry_qty) * 1e-8) if entry_qty > 0 else 1e-12
-    exit_qty_covers_entry = entry_qty > 0 and exit_qty >= entry_qty - qty_tolerance
+    exit_qty_reconciles_entry = entry_qty > 0 and abs(exit_qty - entry_qty) <= qty_tolerance
+    exit_qty_over_entry = entry_qty > 0 and exit_qty > entry_qty + qty_tolerance
     entry_vwap = (
         sum(float(row["qty"]) * float(row["price"]) for row in entry_exec) / entry_qty
         if entry_execution_complete and entry_qty > 0 else None
@@ -2788,7 +2814,7 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
     gross_realized_pnl_abs = None
     if (
         entry_vwap is not None and exit_execution_complete and direction in {"LONG", "SHORT"}
-        and not incomplete_order_fill_ids and not order_execution_evidence_errors and exit_qty_covers_entry
+        and not incomplete_order_fill_ids and not order_execution_evidence_errors and exit_qty_reconciles_entry
     ):
         gross_realized_pnl_abs = 0.0
         for row in exit_exec:
@@ -2800,11 +2826,11 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
     # has no authoritative fee/realizedPnl fields and must not be treated as one.
     fee_complete = (
         bool(relevant) and _all_present_numeric(relevant, "fee") and not order_execution_evidence
-        and not incomplete_order_fill_ids and not order_execution_evidence_errors and exit_qty_covers_entry
+        and not incomplete_order_fill_ids and not order_execution_evidence_errors and exit_qty_reconciles_entry
     )
     realized_complete = (
         bool(relevant) and _all_present_numeric(relevant, "realized_pnl") and not order_execution_evidence
-        and not incomplete_order_fill_ids and not order_execution_evidence_errors and exit_qty_covers_entry
+        and not incomplete_order_fill_ids and not order_execution_evidence_errors and exit_qty_reconciles_entry
     )
     exchange_realized_pnl_abs = sum(float(_optional_float(f.get("realized_pnl"))) for f in relevant) if realized_complete else None
     entry_fee_raw = exit_fee_raw = fee_raw_total = fees_paid_abs = None
@@ -2852,10 +2878,13 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
     if order_execution_evidence_errors:
         execution_source += "+ORDER_STATUS_ERROR"
 
-    exit_vwap_confirmed = (
+    exit_vwap_observed = (
         sum(float(row["qty"]) * float(row["price"]) for row in exit_exec) / exit_qty
         if exit_execution_complete and exit_qty > 0 and not incomplete_order_fill_ids else None
     )
+    # A VWAP based on more exit quantity than the entry is not a confirmed
+    # whole-trade VWAP. Preserve it separately for forensic diagnostics only.
+    exit_vwap_confirmed = None if exit_qty_over_entry else exit_vwap_observed
     exit_sources = {str(row.get("source") or "").upper() for row in exit_exec}
     if exit_vwap_confirmed is None:
         exit_vwap_source = "UNAVAILABLE"
@@ -2867,15 +2896,16 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
         exit_vwap_source = "CONFIRMED_ORDER_EXECUTION_EVIDENCE"
     else:
         exit_vwap_source = "UNAVAILABLE"
-    execution_qty_status = (
-        "VERIFIED" if entry_execution_complete and exit_execution_complete and exit_qty_covers_entry
+    evidence_complete = bool(
+        entry_execution_complete and exit_execution_complete
         and not incomplete_order_fill_ids and not order_execution_evidence_errors
+    )
+    execution_qty_status = (
+        "VERIFIED" if evidence_complete and exit_qty_reconciles_entry
+        else "MISMATCH" if evidence_complete and exit_qty_over_entry
         else "PARTIAL_OR_UNVERIFIED"
     )
-    full_execution_accounting = (
-        entry_execution_complete and exit_execution_complete and exit_qty_covers_entry
-        and not incomplete_order_fill_ids and not order_execution_evidence_errors
-    )
+    full_execution_accounting = evidence_complete and exit_qty_reconciles_entry
     status = (
         "VERIFIED" if full_execution_accounting and not order_execution_evidence
         else "VERIFIED_ORDER_EXECUTION" if full_execution_accounting
@@ -2887,11 +2917,17 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
         "order_execution_evidence": order_execution_evidence,
         "order_ids": sorted(order_roles),
         "entry_qty_confirmed": entry_qty if entry_execution_complete else None,
-        "confirmed_exit_qty": exit_qty if exit_execution_complete else None,
+        "confirmed_exit_qty": exit_qty if exit_execution_complete and not exit_qty_over_entry else None,
         "observed_entry_qty": entry_qty,
         "observed_exit_qty": exit_qty,
-        "confirmed_exit_qty_source": "FILL_HISTORY" if exit_fills and not order_execution_evidence else "ORDER_STATUS_EXECUTION_EVIDENCE" if order_execution_evidence else "UNAVAILABLE",
+        "confirmed_exit_qty_source": (
+            "UNAVAILABLE_QTY_MISMATCH" if exit_qty_over_entry
+            else "FILL_HISTORY" if exit_fills and not order_execution_evidence
+            else "ORDER_STATUS_EXECUTION_EVIDENCE" if order_execution_evidence
+            else "UNAVAILABLE"
+        ),
         "exit_vwap_confirmed": exit_vwap_confirmed,
+        "exit_vwap_observed": exit_vwap_observed,
         "exit_vwap_source": exit_vwap_source,
         "entry_vwap_confirmed": entry_vwap,
         "entry_fee_raw": entry_fee_raw,
@@ -2911,7 +2947,8 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
         "quantity_reconciliation": {
             "status": execution_qty_status,
             "initial_qty": entry_qty if entry_execution_complete else None,
-            "confirmed_exit_qty": exit_qty if exit_execution_complete else None,
+            "confirmed_exit_qty": exit_qty if exit_execution_complete and not exit_qty_over_entry else None,
+            "observed_exit_qty": exit_qty,
             "difference_qty": (exit_qty - entry_qty) if entry_execution_complete and exit_execution_complete else None,
             "tolerance": qty_tolerance,
         },
@@ -2922,6 +2959,39 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
         "order_execution_evidence_errors": order_execution_evidence_errors,
         "incomplete_order_fill_ids": sorted(set(incomplete_order_fill_ids)),
     }
+
+
+def _confirmed_whole_trade_exit_vwap(fill_accounting: dict[str, Any], expected_qty: float) -> float | None:
+    """Return an all-exits VWAP only when exit quantity exactly reconciles to entry.
+
+    This is the display/recording price for whole-trade PnL messages. A last-leg
+    price must not be paired with aggregate PnL when a TP filled earlier.
+    """
+    if not isinstance(fill_accounting, dict) or not math.isfinite(float(expected_qty)) or expected_qty <= 0:
+        return None
+    status = str(fill_accounting.get("status") or "").upper()
+    quantity = fill_accounting.get("quantity_reconciliation")
+    quantity = quantity if isinstance(quantity, dict) else {}
+    entry_qty = _optional_float(fill_accounting.get("entry_qty_confirmed"))
+    exit_qty = _optional_float(fill_accounting.get("confirmed_exit_qty"))
+    vwap = _optional_float(fill_accounting.get("exit_vwap_confirmed"))
+    gross = _optional_float(fill_accounting.get("gross_realized_pnl_abs"))
+    incomplete_ids = fill_accounting.get("incomplete_order_fill_ids")
+    errors = fill_accounting.get("order_execution_evidence_errors")
+    tolerance = max(1e-12, abs(expected_qty) * 1e-8)
+    if status not in {"VERIFIED", "VERIFIED_ORDER_EXECUTION"}:
+        return None
+    if str(quantity.get("status") or "").upper() != "VERIFIED":
+        return None
+    if entry_qty is None or exit_qty is None or vwap is None or vwap <= 0 or gross is None:
+        return None
+    if abs(entry_qty - expected_qty) > tolerance or abs(exit_qty - expected_qty) > tolerance:
+        return None
+    if isinstance(incomplete_ids, list) and incomplete_ids:
+        return None
+    if isinstance(errors, dict) and errors:
+        return None
+    return float(vwap)
 
 
 def _close_execution_evidence(trade: dict, fill_accounting: dict[str, Any]) -> dict[str, Any]:
@@ -2938,7 +3008,12 @@ def _close_execution_evidence(trade: dict, fill_accounting: dict[str, Any]) -> d
         if role == "ENTRY":
             return False
         if reason == "TAKE_PROFIT_FULL":
-            return role.startswith("TP")
+            # A whole-trade take-profit close can be normalized by the exchange
+            # fill parser as generic EXIT (for example, after the original TP
+            # order was removed from active state and recovered from fill history).
+            # This routine reconciles the total quantity/VWAP of the logical trade,
+            # not only TP-named rows; exclude ENTRY above, but retain every exit role.
+            return True
         if reason in {"STOP_LOSS", "BREAK_EVEN"}:
             # A final SL/BE close only exits the remaining quantity. Earlier TP
             # fills are part of the same logical trade's exit accounting and must
@@ -2974,16 +3049,23 @@ def _close_execution_evidence(trade: dict, fill_accounting: dict[str, Any]) -> d
             "evidence_source": "ALL_FILL_ORDERS",
             "trade_id": fill.get("trade_id"),
         })
+    fill_order_ids = {str(row.get("order_id") or "") for row in rows if row.get("order_id")}
+    status_order_ids: set[str] = set()
     for row in fill_accounting.get("order_execution_evidence", []) if isinstance(fill_accounting.get("order_execution_evidence"), list) else []:
         role = str(row.get("role") or "EXIT").upper()
         if not _include_leg(role):
+            continue
+        order_id = str(row.get("order_id") or "")
+        # Fill-history rows are more granular and authoritative than a cumulative
+        # order status for the same order. Never count both sources for one ID.
+        if order_id and (order_id in fill_order_ids or order_id in status_order_ids):
             continue
         qty = _optional_float(row.get("executed_qty"))
         px = _optional_float(row.get("avg_price"))
         if qty is None or px is None or qty <= 0 or px <= 0:
             continue
         rows.append({
-            "order_id": str(row.get("order_id") or ""),
+            "order_id": order_id,
             "leg": role,
             "status": str(row.get("order_status") or "FILLED").upper(),
             "executed_qty": float(qty),
@@ -2994,6 +3076,24 @@ def _close_execution_evidence(trade: dict, fill_accounting: dict[str, Any]) -> d
             "evidence_source": row.get("execution_evidence_source") or "ORDER_STATUS_EXECUTION_EVIDENCE",
             "trade_id": None,
         })
+        if order_id:
+            status_order_ids.add(order_id)
+
+    expected_exit_qty = _optional_float(trade.get("initial_qty"))
+    if expected_exit_qty is None or expected_exit_qty <= 0:
+        expected_exit_qty = _optional_float(fill_accounting.get("entry_qty_confirmed"))
+    qty_tolerance = max(1e-12, abs(expected_exit_qty) * 1e-8) if expected_exit_qty and expected_exit_qty > 0 else 1e-12
+    exchange_rows_qty = sum(float(row["executed_qty"]) for row in rows)
+    exchange_rows_cover_entry = bool(
+        expected_exit_qty and expected_exit_qty > 0
+        and exchange_rows_qty >= expected_exit_qty - qty_tolerance
+    )
+
+    # If exchange evidence already covers the expected closed quantity (or is
+    # already in conflict by exceeding it), do not append tracker-local TP events
+    # from a different order ID. Those events are a lower-authority fallback and
+    # cannot be added on top of a complete exchange total.
+    allow_tp_local_fallback = not exchange_rows_cover_entry
 
     # If the exchange fill/order query did not return a TP order, retain its
     # previously recorded tracker TP-fill event as lower-authority evidence.
@@ -3020,7 +3120,7 @@ def _close_execution_evidence(trade: dict, fill_accounting: dict[str, Any]) -> d
             tp_events_by_order[order_id] = event
 
     for order_id, event in tp_events_by_order.items():
-        if order_id in represented_order_ids:
+        if not allow_tp_local_fallback or order_id in represented_order_ids:
             continue
         qty = _optional_float(event.get("executed_qty_total")) or _optional_float(event.get("delta_qty"))
         px = _optional_float(event.get("avg_price"))
@@ -3055,6 +3155,9 @@ def _close_execution_evidence(trade: dict, fill_accounting: dict[str, Any]) -> d
 
     total_qty = sum(float(r["executed_qty"]) for r in rows)
     exit_vwap = sum(float(r["executed_qty"]) * float(r["avg_price"]) for r in rows) / total_qty if total_qty > 0 else None
+    expected_qty_known = expected_exit_qty is not None and expected_exit_qty > 0
+    exit_qty_matches_expected = bool(expected_qty_known and abs(total_qty - float(expected_exit_qty)) <= qty_tolerance)
+    exit_qty_exceeds_expected = bool(expected_qty_known and total_qty > float(expected_exit_qty) + qty_tolerance)
 
     def _ts(row: dict[str, Any]) -> int:
         value = row.get("fill_time_ms") or row.get("order_update_time_ms")
@@ -3075,13 +3178,31 @@ def _close_execution_evidence(trade: dict, fill_accounting: dict[str, Any]) -> d
     else:
         authority = "TRACKER_LOCAL_EVENT"
         exit_vwap_source = "TRACKER_RECORDED_TP_EVENT"
+    expected_qty_unverifiable = not expected_qty_known
+    evidence_conflict = expected_qty_unverifiable or not exit_qty_matches_expected
+    if expected_qty_unverifiable:
+        authority = "UNVERIFIED_EXPECTED_EXIT_QTY_UNKNOWN"
+        exit_vwap_source = "UNAVAILABLE_EXPECTED_EXIT_QTY"
+    elif evidence_conflict:
+        authority = "UNVERIFIED_CONFLICT" if exit_qty_exceeds_expected else "UNVERIFIED_INCOMPLETE"
+        exit_vwap_source = "UNAVAILABLE_QTY_MISMATCH" if exit_qty_exceeds_expected else "UNAVAILABLE_PARTIAL_EXIT_QTY"
     return {
-        "status": "CONFIRMED",
+        "status": (
+            "QTY_UNVERIFIABLE" if expected_qty_unverifiable
+            else "CONFIRMED" if exit_qty_matches_expected
+            else "QTY_MISMATCH" if exit_qty_exceeds_expected
+            else "PARTIAL"
+        ),
         "authority": authority,
         "rows": rows,
-        "confirmed_exit_qty": total_qty,
-        "exit_vwap_confirmed": exit_vwap,
+        "confirmed_exit_qty": total_qty if expected_qty_known and exit_qty_matches_expected else None,
+        "observed_exit_qty": total_qty,
+        "exit_vwap_confirmed": exit_vwap if not evidence_conflict else None,
+        "exit_vwap_observed": exit_vwap,
         "exit_vwap_source": exit_vwap_source,
+        "expected_exit_qty": float(expected_exit_qty) if expected_qty_known else None,
+        "quantity_difference": (total_qty - float(expected_exit_qty)) if expected_qty_known else None,
+        "quantity_tolerance": qty_tolerance,
         "latest": latest,
         "latest_execution_ts_ms": _ts(latest) or None,
         "latest_execution_timestamp_source": (
@@ -4244,13 +4365,22 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                 else (hist_source or "observation_price_estimate")
             )
             exit_price_semantics = "UNAVAILABLE"
-            if closed_by_tp and realized_qty > 0 and sl_exit_price is None:
+            last_exit_price_value = float(exit_price) if _safe_float(exit_price, 0.0) > 0 else None
+            confirmed_whole_trade_vwap = _confirmed_whole_trade_exit_vwap(fill_accounting, init_qty)
+            if confirmed_whole_trade_vwap is not None:
+                # TRADE_CLOSE summarizes the whole position, not only its final TP/BE
+                # leg. Pair whole-trade PnL with the confirmed all-exits VWAP and retain
+                # the final-leg price separately for forensic/reporting consumers.
+                exit_price = confirmed_whole_trade_vwap
+                trade["last_exit_price"] = last_exit_price_value
+                exit_price_semantics = "CONFIRMED_EXIT_VWAP"
+            elif closed_by_tp and realized_qty > 0 and sl_exit_price is None:
                 confirmed_vwap = close_execution_evidence.get("exit_vwap_confirmed")
                 if confirmed_vwap is not None and close_execution_evidence.get("confirmed_exit_qty") is not None:
                     exit_price = float(confirmed_vwap)
                     exit_price_semantics = (
                         "CONFIRMED_EXIT_VWAP"
-                        if str(close_execution_evidence.get("authority")) != "TRACKER_LOCAL_EVENT"
+                        if str(close_execution_evidence.get("authority")) not in {"TRACKER_LOCAL_EVENT", "UNVERIFIED_CONFLICT", "UNVERIFIED_INCOMPLETE"}
                         else "TRACKER_RECORDED_TP_EVENT_VWAP"
                     )
                 else:
@@ -4508,7 +4638,9 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                 "exit_reason": exit_reason,
                 "outcome_category": _exit_outcome_category(exit_reason),
                 "entry_price": entry_price,
+                "initial_qty": init_qty,
                 "exit_price": exit_price,
+                "last_exit_price": trade.get("last_exit_price", trade.get("exit_order_avg_price") or sl_exit_price),
                 "exit_price_semantics": exit_price_semantics,
                 "exit_vwap_confirmed": fill_accounting.get("exit_vwap_confirmed"),
                 "exit_vwap_source": fill_accounting.get("exit_vwap_source"),
@@ -4583,7 +4715,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
             # open in local state and the next cycle can retry without losing the
             # close event.  If another process already wrote the close, treating the
             # idempotent duplicate as success is safe.
-            _append_trade_close_once(close_record)
+            close_record_inserted = _append_trade_close_once(close_record)
             trade["closed"] = True
 
             duration_min = trade["duration_min"] if trade["duration_min"] is not None else trade["observed_duration_min"]
@@ -4601,26 +4733,33 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                     realized_rr_log, planned_rr, exit_price, exit_reason, duration_min,
                 )
 
-            _send_tracker_notification(
-                "TRADE_CLOSE",
-                event_id,
-                format_trade_closed_message(
-                    name=trade.get("name", symbol),
-                    symbol=symbol,
-                    direction=direction,
-                    entry_price=entry_price,
-                    exit_price=exit_price,
-                    pnl_pct=final_pnl,
-                    realized_rr=realized_rr,
-                    planned_rr=planned_rr,
-                    duration_min=duration_min,
-                    peak_pnl=_safe_float(trade.get("peak_pnl_pct")),
-                    max_drawdown=_safe_float(trade.get("max_drawdown_pct")),
-                    exit_reason=exit_reason,
-                    event_type=trade.get("event_type", "DIVERGENCE"),
-                    timeframe=trade.get("timeframe") or (trade.get("setup") or {}).get("event_timeframe") or "1h",
-                ),
+            notification_exit_price = exit_price
+            if close_fill_qty_verified and confirmed_exit_vwap is not None and confirmed_exit_vwap > 0:
+                # The PnL in this notification is whole-trade PnL. Pair it with
+                # the all-exits VWAP when the full entry quantity reconciles,
+                # rather than the last TP/BE leg price which can look inconsistent.
+                notification_exit_price = float(confirmed_exit_vwap)
+            close_message = format_trade_closed_message(
+                name=trade.get("name", symbol),
                 symbol=symbol,
+                direction=direction,
+                entry_price=entry_price,
+                exit_price=notification_exit_price,
+                pnl_pct=final_pnl,
+                realized_rr=realized_rr,
+                planned_rr=planned_rr,
+                duration_min=duration_min,
+                peak_pnl=_safe_float(trade.get("peak_pnl_pct")),
+                max_drawdown=_safe_float(trade.get("max_drawdown_pct")),
+                exit_reason=exit_reason,
+                event_type=trade.get("event_type", "DIVERGENCE"),
+                timeframe=trade.get("timeframe") or (trade.get("setup") or {}).get("event_timeframe") or "1h",
+            )
+            _notify_trade_close_if_new(
+                journal_inserted=close_record_inserted,
+                event_id=event_id,
+                symbol=symbol,
+                message=close_message,
             )
 
         except Exception as exc:

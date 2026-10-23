@@ -916,6 +916,40 @@ def get_order(
     if not isinstance(order, dict):
         return {"status": "error", "error": "order_payload_missing"}
 
+    requested_order_id = str(order_id).strip() if order_id not in (None, "") else ""
+    reported_order_id = str(order.get("orderID") or order.get("orderId") or "").strip()
+    if requested_order_id:
+        if not reported_order_id:
+            return {
+                "status": "error",
+                "error": f"order lookup for requested orderId={requested_order_id} returned no exchange orderId",
+                "code": resp.get("code"),
+            }
+        if reported_order_id != requested_order_id:
+            return {
+                "status": "error",
+                "error": f"orderId mismatch: requested={requested_order_id} response={reported_order_id}",
+                "code": resp.get("code"),
+                "requested_order_id": requested_order_id,
+                "reported_order_id": reported_order_id,
+            }
+    reported_symbol = str(order.get("symbol") or "").strip().upper().replace("-", "").replace("_", "")
+    requested_symbol = str(bx).strip().upper().replace("-", "").replace("_", "")
+    if reported_symbol and reported_symbol != requested_symbol:
+        return {
+            "status": "error",
+            "error": f"order symbol mismatch: requested={bx} response={order.get('symbol')}",
+            "code": resp.get("code"),
+        }
+    requested_client_id = str(client_order_id or "").strip()
+    reported_client_id = str(order.get("clientOrderId") or "").strip()
+    if requested_client_id and reported_client_id and reported_client_id != requested_client_id:
+        return {
+            "status": "error",
+            "error": f"clientOrderId mismatch: requested={requested_client_id} response={reported_client_id}",
+            "code": resp.get("code"),
+        }
+
     def _num(key: str, fallback: str | None = None) -> float:
         raw = order.get(key)
         if raw in (None, "") and fallback:
@@ -933,7 +967,7 @@ def get_order(
 
     return {
         "status": "ok",
-        "order_id": str(order.get("orderID") or order.get("orderId") or order_id or ""),
+        "order_id": reported_order_id,
         "order_status": str(order.get("status", "")).upper(),
         "symbol": str(order.get("symbol", bx)).upper(),
         "side": str(order.get("side", "")).upper(),
