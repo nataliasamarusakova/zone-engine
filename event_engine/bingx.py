@@ -943,7 +943,13 @@ def get_order(
         }
     requested_client_id = str(client_order_id or "").strip()
     reported_client_id = str(order.get("clientOrderId") or "").strip()
-    if requested_client_id and reported_client_id and reported_client_id != requested_client_id:
+    if requested_client_id and not reported_client_id:
+        return {
+            "status": "error",
+            "error": f"clientOrderId query for {requested_client_id} returned no exchange clientOrderId",
+            "code": resp.get("code"),
+        }
+    if requested_client_id and reported_client_id.casefold() != requested_client_id.casefold():
         return {
             "status": "error",
             "error": f"clientOrderId mismatch: requested={requested_client_id} response={reported_client_id}",
@@ -978,10 +984,104 @@ def get_order(
         "executed_qty": _num("executedQty", "cumQty"),
         "executed_qty_known": executed_qty_known,
         "orig_qty": _num("origQty", "quantity"),
-        "client_order_id": str(order.get("clientOrderId", client_order_id or "")),
+        "client_order_id": str(order.get("clientOrderId", "")),
+        "exchange_reported_client_order_id": str(order.get("clientOrderId", "")),
+        "exchange_reported_symbol": str(order.get("symbol", "")),
         "time_ms": int(_num("time")) if _num("time") > 0 else None,
         "update_time_ms": int(_num("updateTime")) if _num("updateTime") > 0 else None,
     }
+
+
+def get_order_by_identity(
+    symbol: str,
+    order_id: str | int | None = None,
+    *,
+    client_order_id: str | None = None,
+    order_lookup=None,
+) -> dict:
+    """Resolve a known order by system ID, falling back only to its exact client ID.
+
+    Some exchange responses can return a different orderId for an orderId query.
+    Never accept that response as the requested order. If a durable clientOrderId
+    is available, query by that identity and require the returned payload to include
+    the exact clientOrderId, a non-empty system ID, and the requested symbol.
+    This is an identity-recovery path, not a fuzzy search.
+    """
+    requested_id = str(order_id).strip() if order_id not in (None, "") else ""
+    requested_cid = str(client_order_id or "").strip()
+    lookup = order_lookup or get_order
+    # Do not trigger contract-cache/network discovery merely to verify an identity;
+    # callers already hold the canonical symbol from their active trade record.
+    bx = str(symbol or "").strip().upper().replace("-", "").replace("_", "")
+    if not bx:
+        return {"status": "error", "error": "contract_not_found"}
+
+    primary: dict[str, Any] | None = None
+    if requested_id:
+        try:
+            primary = lookup(symbol, requested_id)
+        except Exception as exc:
+            primary = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+        if isinstance(primary, dict) and primary.get("status") == "ok":
+            returned_id = str(primary.get("order_id") or "").strip()
+            returned_cid = str(primary.get("exchange_reported_client_order_id") or "").strip()
+            cid_conflicts = bool(requested_cid and returned_cid and returned_cid.casefold() != requested_cid.casefold())
+            if returned_id == requested_id and not cid_conflicts:
+                primary.pop("exchange_reported_client_order_id", None)
+                primary.pop("exchange_reported_symbol", None)
+                primary["identity_resolution"] = "ORDER_ID"
+                return primary
+    elif not requested_cid:
+        return {"status": "error", "error": "order_id_or_client_order_id_required"}
+
+    if not requested_cid:
+        return primary if isinstance(primary, dict) else {"status": "error", "error": "order lookup failed"}
+
+    try:
+        fallback = lookup(symbol, client_order_id=requested_cid)
+    except Exception as exc:
+        fallback = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+    if not isinstance(fallback, dict) or fallback.get("status") != "ok":
+        primary_error = str((primary or {}).get("error") or (primary or {}).get("status") or "not attempted")
+        fallback_error = str((fallback or {}).get("error") or (fallback or {}).get("status") or "invalid response")
+        return {
+            "status": "error",
+            "error": f"orderId lookup failed ({primary_error}); clientOrderId fallback failed ({fallback_error})",
+            "requested_order_id": requested_id or None,
+            "requested_client_order_id": requested_cid,
+        }
+
+    actual_cid = str(fallback.get("exchange_reported_client_order_id") or "").strip()
+    actual_symbol = str(fallback.get("exchange_reported_symbol") or "").strip().upper().replace("-", "").replace("_", "")
+    requested_symbol = str(bx).strip().upper().replace("-", "").replace("_", "")
+    actual_id = str(fallback.get("order_id") or "").strip()
+    if not actual_cid or actual_cid.casefold() != requested_cid.casefold():
+        return {
+            "status": "error",
+            "error": f"clientOrderId fallback identity mismatch: requested={requested_cid} response={actual_cid or '<missing>'}",
+            "requested_order_id": requested_id or None,
+            "reported_order_id": actual_id or None,
+        }
+    if not actual_symbol or actual_symbol != requested_symbol:
+        return {
+            "status": "error",
+            "error": f"clientOrderId fallback symbol mismatch: requested={bx} response={actual_symbol or '<missing>'}",
+            "requested_order_id": requested_id or None,
+            "reported_order_id": actual_id or None,
+        }
+    if not actual_id:
+        return {
+            "status": "error",
+            "error": f"clientOrderId fallback returned no system orderId for {requested_cid}",
+            "requested_order_id": requested_id or None,
+        }
+
+    fallback.pop("exchange_reported_client_order_id", None)
+    fallback.pop("exchange_reported_symbol", None)
+    fallback["identity_resolution"] = "CLIENT_ORDER_ID_FALLBACK"
+    fallback["requested_order_id"] = requested_id or None
+    fallback["requested_client_order_id"] = requested_cid
+    return fallback
 
 
 def get_fill_orders(

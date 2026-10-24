@@ -22,6 +22,7 @@ from event_engine.bingx import (
     get_position_directional,
     get_positions,
     get_order,
+    get_order_by_identity,
     credentials_available,
     get_all_orders,
     get_fill_orders,
@@ -120,12 +121,20 @@ def _record_tracker_elapsed(timings: dict[str, dict[str, float]], name: str, ela
 
 def _fetch_tp_evidence_timed(
     symbol: str, order_id: str, entry_ts: int, phase_name: str,
+    client_order_id: str | None = None,
 ) -> tuple[dict | None, float, Exception | None]:
     """Fetch one read-only TP status in a worker with isolated retry/session context."""
     started = time.perf_counter() if request_metrics.enabled() else None
     try:
         with request_metrics.phase(phase_name), request_metrics.symbol_context(symbol), thread_local_retry_session():
-            value = _get_order_execution_evidence(symbol, order_id, entry_ts=entry_ts)
+            if client_order_id:
+                value = _get_order_execution_evidence(
+                    symbol, order_id, entry_ts=entry_ts, client_order_id=client_order_id,
+                )
+            else:
+                # Preserve compatibility with callers/test doubles that implement
+                # the historical signature when no fallback identity is supplied.
+                value = _get_order_execution_evidence(symbol, order_id, entry_ts=entry_ts)
         elapsed = max(0.0, time.perf_counter() - started) if started is not None else 0.0
         return value, elapsed, None
     except Exception as exc:
@@ -2437,8 +2446,10 @@ def _update_mfe_mae(trade: dict, candles: list[dict]) -> None:
     trade["mae_pct"] = mae
     trade["max_drawdown_pct"] = drawdown
 
-def _get_filled_order(symbol: str, order_id: str | None) -> dict | None:
-    info = _get_order_execution_evidence(symbol, order_id)
+def _get_filled_order(
+    symbol: str, order_id: str | None, client_order_id: str | None = None,
+) -> dict | None:
+    info = _get_order_execution_evidence(symbol, order_id, client_order_id=client_order_id)
     if not info:
         return None
     if info.get("status") != "ok" or str(info.get("order_status", "")).upper() != "FILLED":
@@ -2448,7 +2459,13 @@ def _get_filled_order(symbol: str, order_id: str | None) -> dict | None:
     return info
 
 
-def _get_order_execution_evidence(symbol: str, order_id: str | None, *, entry_ts: int | None = None) -> dict | None:
+def _get_order_execution_evidence(
+    symbol: str,
+    order_id: str | None,
+    *,
+    entry_ts: int | None = None,
+    client_order_id: str | None = None,
+) -> dict | None:
     """Return order status enriched with actual fill-history evidence when needed.
 
     A FILLED status with executedQty=0 is not enough evidence of execution.  In that
@@ -2461,7 +2478,7 @@ def _get_order_execution_evidence(symbol: str, order_id: str | None, *, entry_ts
     if not order_id:
         return None
     try:
-        info = get_order(symbol, order_id)
+        info = get_order_by_identity(symbol, order_id, client_order_id=client_order_id, order_lookup=get_order) if client_order_id else get_order(symbol, order_id)
     except Exception as exc:
         log.warning("[TRACKER] order query error for %s/%s: %s", symbol, order_id, exc)
         info = {"status": "error", "error": str(exc)}
@@ -2471,7 +2488,8 @@ def _get_order_execution_evidence(symbol: str, order_id: str | None, *, entry_ts
 
     status = str(info.get("order_status", "")).upper()
     returned_order_id = str(info.get("order_id") or info.get("orderId") or "").strip()
-    if returned_order_id and returned_order_id != str(order_id).strip():
+    resolved_by_client_id = info.get("identity_resolution") == "CLIENT_ORDER_ID_FALLBACK"
+    if returned_order_id and returned_order_id != str(order_id).strip() and not resolved_by_client_id:
         return {
             "status": "error",
             "error": f"order execution evidence ID mismatch: requested={order_id} response={returned_order_id}",
@@ -2491,15 +2509,19 @@ def _get_order_execution_evidence(symbol: str, order_id: str | None, *, entry_ts
         return info
 
     now_ms = int(time.time() * 1000)
+    effective_order_id = returned_order_id or str(order_id).strip()
+    if resolved_by_client_id:
+        info["requested_order_id"] = str(order_id)
+        info["resolved_order_id"] = effective_order_id
     start_ms = max(0, int(entry_ts or info.get("time_ms") or now_ms) - 60_000)
     end_ms = max(start_ms, now_ms + 60_000)
     try:
-        fills = get_fill_orders(symbol, start_ms, end_ms, order_id=str(order_id), limit=1000)
+        fills = get_fill_orders(symbol, start_ms, end_ms, order_id=effective_order_id, limit=1000)
     except Exception as exc:
-        log.warning("[TRACKER] fill-history query error for %s/%s: %s", symbol, order_id, exc)
+        log.warning("[TRACKER] fill-history query error for %s/%s: %s", symbol, effective_order_id, exc)
         fills = []
 
-    fills = [f for f in fills if str(f.get("order_id", "")) == str(order_id)]
+    fills = [f for f in fills if str(f.get("order_id", "")) == effective_order_id]
     info["fill_history"] = fills
     qty_complete = _all_present_numeric(fills, "qty")
     price_complete = _all_present_numeric(fills, "price")
@@ -2556,17 +2578,39 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
     entry_ts = int(_safe_float(trade.get("entry_ts"), 0.0))
     order_roles: dict[str, str] = {}
 
+    order_client_ids: dict[str, str] = {}
     entry_order = trade.get("entry_order") if isinstance(trade.get("entry_order"), dict) else {}
     for key in ("order_id", "orderId", "orderID"):
         if entry_order.get(key):
-            order_roles[str(entry_order[key])] = "ENTRY"
+            order_id_value = str(entry_order[key])
+            order_roles[order_id_value] = "ENTRY"
+            if entry_order.get("client_order_id") or entry_order.get("clientOrderId"):
+                order_client_ids[order_id_value] = str(entry_order.get("client_order_id") or entry_order.get("clientOrderId"))
 
-    for tp in trade.get("tp_orders", []) if isinstance(trade.get("tp_orders"), list) else []:
+    setup = trade.get("setup") if isinstance(trade.get("setup"), dict) else {}
+    protection_result = setup.get("protection_result") if isinstance(setup.get("protection_result"), dict) else {}
+    active_tp_identity_rows = trade.get("tp_orders", []) if isinstance(trade.get("tp_orders"), list) else []
+    active_tp_cids_with_order_id = {
+        str(x.get("client_order_id") or x.get("clientOrderId") or "").strip().casefold()
+        for x in active_tp_identity_rows if isinstance(x, dict) and x.get("order_id")
+        and (x.get("client_order_id") or x.get("clientOrderId"))
+    }
+    original_tp_identity_rows = protection_result.get("tp_orders", []) if isinstance(protection_result.get("tp_orders"), list) else []
+    all_tp_identity_rows = list(active_tp_identity_rows)
+    all_tp_identity_rows.extend(
+        x for x in original_tp_identity_rows
+        if not isinstance(x, dict)
+        or not (str(x.get("client_order_id") or x.get("clientOrderId") or "").strip().casefold() in active_tp_cids_with_order_id)
+    )
+    for tp in all_tp_identity_rows:
         if not isinstance(tp, dict):
             continue
         for key in ("order_id", "orderId", "orderID"):
             if tp.get(key):
-                order_roles[str(tp[key])] = str(tp.get("leg") or "TP").upper()
+                order_id_value = str(tp[key])
+                order_roles.setdefault(order_id_value, str(tp.get("leg") or "TP").upper())
+                if tp.get("client_order_id") or tp.get("clientOrderId"):
+                    order_client_ids[order_id_value] = str(tp.get("client_order_id") or tp.get("clientOrderId"))
 
     # Filled TP orders may be removed from ``tp_orders`` once the tracker sees
     # them complete. Keep their IDs from the immutable TP-fill event ledger so the
@@ -2577,16 +2621,27 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
         order_id = str(tp_event.get("order_id") or tp_event.get("orderId") or "")
         if order_id:
             order_roles.setdefault(order_id, str(tp_event.get("leg") or "TP").upper())
+            if tp_event.get("client_order_id") or tp_event.get("clientOrderId"):
+                order_client_ids[order_id] = str(tp_event.get("client_order_id") or tp_event.get("clientOrderId"))
 
     sl_order = trade.get("sl_order") if isinstance(trade.get("sl_order"), dict) else {}
     for key in ("order_id", "orderId", "orderID"):
         if sl_order.get(key):
-            order_roles[str(sl_order[key])] = "SL"
+            order_id_value = str(sl_order[key])
+            order_roles[order_id_value] = "SL"
+            if sl_order.get("client_order_id") or sl_order.get("clientOrderId"):
+                order_client_ids[order_id_value] = str(sl_order.get("client_order_id") or sl_order.get("clientOrderId"))
 
     if trade.get("be_order_id"):
-        order_roles[str(trade["be_order_id"])] = "BE_SL"
+        be_id = str(trade["be_order_id"])
+        order_roles[be_id] = "BE_SL"
+        if trade.get("be_client_order_id"):
+            order_client_ids[be_id] = str(trade["be_client_order_id"])
     if trade.get("exit_order_id"):
-        order_roles[str(trade["exit_order_id"])] = order_roles.get(str(trade["exit_order_id"]), "EXIT")
+        exit_id = str(trade["exit_order_id"])
+        order_roles[exit_id] = order_roles.get(exit_id, "EXIT")
+        if trade.get("exit_client_order_id"):
+            order_client_ids[exit_id] = str(trade["exit_client_order_id"])
 
     # Emergency rollback MARKET orders are nested in durable evidence. Include
     # every known order ID so their actual fills can complete the whole-trade PnL.
@@ -2644,6 +2699,9 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
             continue
         row = dict(fill)
         row["role"] = order_roles.get(str(row.get("order_id", "")), "UNKNOWN")
+        client_id = order_client_ids.get(str(row.get("order_id", "")))
+        if client_id:
+            row["client_order_id"] = client_id
         relevant_map[_fill_key(row)] = row
 
     # The aggregate endpoint is not guaranteed to surface every order for a
@@ -2656,6 +2714,7 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
     incomplete_order_fill_ids: list[str] = []
     expected_qty_by_order: dict[str, float] = {}
     order_evidence_cache: dict[str, dict[str, Any]] = {}
+    resolved_order_ids: dict[str, str] = {}
     for order_id in sorted(order_roles):
         rows_for_order = [row for row in relevant_map.values() if str(row.get("order_id", "")) == order_id]
         had_any_fill_rows = bool(rows_for_order)
@@ -2667,11 +2726,14 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
         execution_evidence = None
         if credentials_available():
             try:
-                execution_evidence = _get_order_execution_evidence(symbol, order_id, entry_ts=entry_ts)
+                execution_evidence = _get_order_execution_evidence(symbol, order_id, entry_ts=entry_ts, client_order_id=order_client_ids.get(order_id))
             except Exception as exc:
                 execution_evidence = {"status": "error", "error": f"{type(exc).__name__}:{exc}"}
             if isinstance(execution_evidence, dict):
                 order_evidence_cache[order_id] = execution_evidence
+                resolved_id = str(execution_evidence.get("order_id") or "").strip()
+                if execution_evidence.get("status") == "ok" and resolved_id:
+                    resolved_order_ids[order_id] = resolved_id
                 if execution_evidence.get("status") == "error":
                     order_execution_evidence_errors[order_id] = str(
                         execution_evidence.get("error") or "order execution evidence query failed"
@@ -2691,25 +2753,28 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
                     needs_exact = True
         if not needs_exact:
             continue
-        exact_attempts.append(order_id)
+        evidence_id = str((execution_evidence or {}).get("order_id") or order_id)
+        exact_attempts.append(evidence_id)
         try:
-            exact_rows = get_fill_orders(symbol, start_ms, end_ms, order_id=order_id, limit=1000)
+            exact_rows = get_fill_orders(symbol, start_ms, end_ms, order_id=evidence_id, limit=1000)
         except Exception as exc:
             exact_rows = []
             exact_errors[order_id] = f"{type(exc).__name__}:{exc}"
         exact_rows_added = 0
         for fill in exact_rows if isinstance(exact_rows, list) else []:
-            if str(fill.get("order_id", "")) != order_id:
+            if str(fill.get("order_id", "")) != evidence_id:
                 continue
             row = dict(fill)
             row["role"] = order_roles.get(order_id, "UNKNOWN")
+            if order_client_ids.get(order_id):
+                row["client_order_id"] = order_client_ids[order_id]
             relevant_map[_fill_key(row)] = row
             exact_rows_added += 1
         expected_qty = expected_qty_by_order.get(order_id)
         if expected_qty is not None:
             observed_after_exact = sum(
                 abs(_safe_float(row.get("qty"), 0.0))
-                for row in relevant_map.values() if str(row.get("order_id", "")) == order_id
+                for row in relevant_map.values() if str(row.get("order_id", "")) == evidence_id
             )
             if (had_any_fill_rows or exact_rows_added > 0) and expected_qty > observed_after_exact + max(1e-10, expected_qty * 1e-6):
                 incomplete_order_fill_ids.append(order_id)
@@ -2722,7 +2787,10 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
     fill_order_ids = {str(row.get("order_id", "")) for row in relevant}
     order_execution_evidence: list[dict[str, Any]] = []
     for order_id in sorted(order_roles):
-        if order_id in fill_order_ids:
+        resolved_id = resolved_order_ids.get(order_id, order_id)
+        if order_id in fill_order_ids or resolved_id in fill_order_ids:
+            # The exchange fill ledger already covers this resolved system ID;
+            # never add its cumulative order status as a second execution.
             continue
         info = order_evidence_cache.get(order_id)
         if info is None and not credentials_available():
@@ -2740,6 +2808,7 @@ def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
             continue
         order_execution_evidence.append({
             "order_id": str(info.get("order_id") or order_id),
+            "client_order_id": str(order_client_ids.get(order_id) or info.get("client_order_id") or ""),
             "role": order_roles.get(order_id, "UNKNOWN"),
             "order_status": str(info.get("order_status") or "").upper(),
             "executed_qty": executed_qty,
@@ -3022,12 +3091,42 @@ def _close_execution_evidence(trade: dict, fill_accounting: dict[str, Any]) -> d
         return True
 
     rows: list[dict[str, Any]] = []
+    client_id_by_order: dict[str, str] = {}
+
+    def _register_order_identity(row: Any) -> None:
+        if not isinstance(row, dict):
+            return
+        oid = str(row.get("order_id") or row.get("orderId") or row.get("orderID") or "").strip()
+        cid = str(row.get("client_order_id") or row.get("clientOrderId") or "").strip()
+        if oid and cid:
+            client_id_by_order[oid] = cid
+
+    _register_order_identity(trade.get("entry_order"))
+    _register_order_identity(trade.get("sl_order"))
+    for order in trade.get("tp_orders", []) if isinstance(trade.get("tp_orders"), list) else []:
+        _register_order_identity(order)
+    setup = trade.get("setup") if isinstance(trade.get("setup"), dict) else {}
+    protection_result = setup.get("protection_result") if isinstance(setup.get("protection_result"), dict) else {}
+    for order in protection_result.get("tp_orders", []) if isinstance(protection_result.get("tp_orders"), list) else []:
+        _register_order_identity(order)
+    if trade.get("be_order_id") and trade.get("be_client_order_id"):
+        client_id_by_order[str(trade["be_order_id"])] = str(trade["be_client_order_id"])
+    if trade.get("exit_order_id") and trade.get("exit_client_order_id"):
+        client_id_by_order[str(trade["exit_order_id"])] = str(trade["exit_client_order_id"])
+
     tp_event_by_order: dict[str, dict[str, Any]] = {}
+    tp_event_by_client_id: dict[str, dict[str, Any]] = {}
     for event in trade.get("tp_fill_events", []) if isinstance(trade.get("tp_fill_events"), list) else []:
+        if not isinstance(event, dict):
+            continue
         oid = str(event.get("order_id") or "")
+        cid = str(event.get("client_order_id") or event.get("clientOrderId") or client_id_by_order.get(oid, "")).strip()
         if oid:
             tp_event_by_order[oid] = event
+        if cid:
+            tp_event_by_client_id[cid.casefold()] = event
 
+    represented_client_ids: set[str] = set()
     for fill in fill_accounting.get("fills", []) if isinstance(fill_accounting.get("fills"), list) else []:
         role = str(fill.get("role") or "EXIT").upper()
         if not _include_leg(role):
@@ -3036,9 +3135,14 @@ def _close_execution_evidence(trade: dict, fill_accounting: dict[str, Any]) -> d
         px = _optional_float(fill.get("price"))
         if qty is None or px is None or qty <= 0 or px <= 0:
             continue
-        event = tp_event_by_order.get(str(fill.get("order_id") or "")) or {}
+        fill_order_id = str(fill.get("order_id") or "")
+        fill_client_id = str(fill.get("client_order_id") or fill.get("clientOrderId") or client_id_by_order.get(fill_order_id, "")).strip()
+        event = tp_event_by_order.get(fill_order_id) or (tp_event_by_client_id.get(fill_client_id.casefold()) if fill_client_id else None) or {}
+        if fill_client_id:
+            represented_client_ids.add(fill_client_id.casefold())
         rows.append({
-            "order_id": str(fill.get("order_id") or ""),
+            "order_id": fill_order_id,
+            "client_order_id": fill_client_id or None,
             "leg": role,
             "status": "FILLED",
             "executed_qty": float(qty),
@@ -3056,9 +3160,13 @@ def _close_execution_evidence(trade: dict, fill_accounting: dict[str, Any]) -> d
         if not _include_leg(role):
             continue
         order_id = str(row.get("order_id") or "")
-        # Fill-history rows are more granular and authoritative than a cumulative
-        # order status for the same order. Never count both sources for one ID.
-        if order_id and (order_id in fill_order_ids or order_id in status_order_ids):
+        client_id = str(row.get("client_order_id") or row.get("clientOrderId") or client_id_by_order.get(order_id, "")).strip()
+        client_id_key = client_id.casefold()
+        # Fill-history rows are more granular and authoritative than cumulative
+        # status. De-duplicate by both system ID and stable clientOrderId because
+        # this exchange/runtime has returned different system IDs for the same
+        # exact client order in separate query paths.
+        if (order_id and (order_id in fill_order_ids or order_id in status_order_ids)) or (client_id_key and client_id_key in represented_client_ids):
             continue
         qty = _optional_float(row.get("executed_qty"))
         px = _optional_float(row.get("avg_price"))
@@ -3066,6 +3174,7 @@ def _close_execution_evidence(trade: dict, fill_accounting: dict[str, Any]) -> d
             continue
         rows.append({
             "order_id": order_id,
+            "client_order_id": client_id or None,
             "leg": role,
             "status": str(row.get("order_status") or "FILLED").upper(),
             "executed_qty": float(qty),
@@ -3078,6 +3187,8 @@ def _close_execution_evidence(trade: dict, fill_accounting: dict[str, Any]) -> d
         })
         if order_id:
             status_order_ids.add(order_id)
+        if client_id_key:
+            represented_client_ids.add(client_id_key)
 
     expected_exit_qty = _optional_float(trade.get("initial_qty"))
     if expected_exit_qty is None or expected_exit_qty <= 0:
@@ -3120,7 +3231,10 @@ def _close_execution_evidence(trade: dict, fill_accounting: dict[str, Any]) -> d
             tp_events_by_order[order_id] = event
 
     for order_id, event in tp_events_by_order.items():
-        if not allow_tp_local_fallback or order_id in represented_order_ids:
+        event_client_id = str(event.get("client_order_id") or event.get("clientOrderId") or client_id_by_order.get(order_id, "")).strip()
+        event_client_key = event_client_id.casefold()
+        if (not allow_tp_local_fallback or order_id in represented_order_ids
+                or (event_client_key and event_client_key in represented_client_ids)):
             continue
         qty = _optional_float(event.get("executed_qty_total")) or _optional_float(event.get("delta_qty"))
         px = _optional_float(event.get("avg_price"))
@@ -3130,6 +3244,7 @@ def _close_execution_evidence(trade: dict, fill_accounting: dict[str, Any]) -> d
             continue
         rows.append({
             "order_id": order_id,
+            "client_order_id": event_client_id or None,
             "leg": str(event.get("leg") or "TP").upper(),
             "status": str(event.get("order_status") or "FILLED").upper(),
             "executed_qty": float(qty),
@@ -3141,6 +3256,8 @@ def _close_execution_evidence(trade: dict, fill_accounting: dict[str, Any]) -> d
             "trade_id": (event.get("fill_trade_ids") or [None])[0],
         })
         represented_order_ids.add(order_id)
+        if event_client_key:
+            represented_client_ids.add(event_client_key)
 
     if not rows:
         return {
@@ -3229,8 +3346,10 @@ def _classify_confirmed_stop_exit_reason(trade: dict[str, Any], sl_order_id: str
     return "STOP_LOSS"
 
 
-def _get_exit_from_sl(symbol: str, sl_order_id: str | None) -> tuple[float | None, str | None]:
-    info = _get_filled_order(symbol, sl_order_id)
+def _get_exit_from_sl(
+    symbol: str, sl_order_id: str | None, client_order_id: str | None = None,
+) -> tuple[float | None, str | None]:
+    info = _get_filled_order(symbol, sl_order_id, client_order_id=client_order_id)
     if not info:
         return None, None
     exit_price = _safe_float(info.get("avg_price"), 0.0)
@@ -3256,7 +3375,8 @@ def _reconcile_historical_exit_order(
     """
     # First ask the currently-owned stop order directly.
     sl_id = sl_order.get("order_id") if isinstance(sl_order, dict) else None
-    sl_info = _get_filled_order(symbol, sl_id)
+    sl_client_id = sl_order.get("client_order_id") if isinstance(sl_order, dict) else None
+    sl_info = _get_filled_order(symbol, sl_id, client_order_id=sl_client_id)
     if sl_info:
         px = _safe_float(sl_info.get("avg_price"), 0.0)
         if px > 0:
@@ -3619,6 +3739,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                     str(first_tp.get("order_id")),
                     entry_ts,
                     request_metrics.current_phase(),
+                    str(first_tp.get("client_order_id") or "") or None,
                 )
 
             cur_price = entry_price
@@ -3702,10 +3823,20 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                         if query_error is not None:
                             raise query_error
                     else:
-                        order_info = _timed_tracker_call(
-                            tracker_timings, "tp_order_evidence", _get_order_execution_evidence,
-                            symbol, str(order_id), entry_ts=entry_ts,
-                        )
+                        tp_client_order_id = str(tp.get("client_order_id") or "").strip()
+                        if tp_client_order_id:
+                            order_info = _timed_tracker_call(
+                                tracker_timings, "tp_order_evidence", _get_order_execution_evidence,
+                                symbol, str(order_id), entry_ts=entry_ts,
+                                client_order_id=tp_client_order_id,
+                            )
+                        else:
+                            # Preserve compatibility with older call sites and
+                            # test doubles when no durable client identity exists.
+                            order_info = _timed_tracker_call(
+                                tracker_timings, "tp_order_evidence", _get_order_execution_evidence,
+                                symbol, str(order_id), entry_ts=entry_ts,
+                            )
                 except Exception as exc:
                     telemetry.record_exchange_error(
                         event_id=event_id,
@@ -3745,6 +3876,17 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                         leg=leg.upper(),
                     )
                     continue
+
+                if order_info.get("identity_resolution") == "CLIENT_ORDER_ID_FALLBACK":
+                    resolved_order_id = str(order_info.get("order_id") or "").strip()
+                    if resolved_order_id and resolved_order_id != str(order_id):
+                        tp["previous_exchange_order_id"] = str(order_id)
+                        tp["order_id"] = resolved_order_id
+                        order_id = resolved_order_id
+                        log.warning(
+                            "[TRACKER_TP_IDENTITY_RECOVERED] event=%s symbol=%s leg=%s old_order_id=%s resolved_order_id=%s clientOrderId=%s",
+                            event_id, symbol, leg, tp["previous_exchange_order_id"], resolved_order_id, tp.get("client_order_id"),
+                        )
 
                 order_status = str(order_info.get("order_status", "")).upper()
                 if order_status not in {"PARTIALLY_FILLED", "FILLED"}:
@@ -3830,6 +3972,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                     "ts": now_ms,
                     "leg": leg,
                     "order_id": order_id,
+                    "client_order_id": str(tp.get("client_order_id") or "") or None,
                     "order_status": order_status,
                     "executed_qty_total": executed_qty,
                     "delta_qty": delta_qty,
@@ -4328,10 +4471,15 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                     accounting_diff_qty = 0.0
                     trade["remaining_qty"] = 0.0
                     exit_price = confirmed_exit_vwap
-                    close_execution_evidence["authority"] = "EXCHANGE_CONFIRMED_COMPLETE_FILL_ACCOUNTING"
-                    close_execution_evidence["confirmed_exit_qty"] = float(confirmed_exit_fill_qty)
-                    close_execution_evidence["exit_vwap_confirmed"] = float(confirmed_exit_vwap)
-                    close_execution_evidence["exit_vwap_source"] = fill_accounting.get("exit_vwap_source")
+                    # Keep the detailed row-level evidence internally consistent.
+                    # If its rows still conflict, the separate canonical fill_accounting
+                    # is authoritative for whole-trade PnL, but do not rewrite a QTY_MISMATCH
+                    # close-evidence record into CONFIRMED while its rows still overcount.
+                    if str(close_execution_evidence.get("status") or "").upper() == "CONFIRMED":
+                        close_execution_evidence["authority"] = "EXCHANGE_CONFIRMED_COMPLETE_FILL_ACCOUNTING"
+                        close_execution_evidence["confirmed_exit_qty"] = float(confirmed_exit_fill_qty)
+                        close_execution_evidence["exit_vwap_confirmed"] = float(confirmed_exit_vwap)
+                        close_execution_evidence["exit_vwap_source"] = fill_accounting.get("exit_vwap_source")
             if not residual_exit_verified:
                 accounting_status = "UNVERIFIED_RESIDUAL_EXIT"
             elif close_fill_qty_verified and abs(accounting_diff_qty) <= qty_tolerance:
@@ -4416,7 +4564,10 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
             # so the next audit can measure actual stop degradation rather than
             # infer it from PnL.
             exit_order_info = (
-                _timed_tracker_call(tracker_timings, "exit_order_evidence", _get_filled_order, symbol, sl_order_id)
+                _timed_tracker_call(
+                    tracker_timings, "exit_order_evidence", _get_filled_order,
+                    symbol, sl_order_id, str(sl_order.get("client_order_id") or "") or None,
+                )
                 if sl_order_id else None
             )
             if exit_order_info:
