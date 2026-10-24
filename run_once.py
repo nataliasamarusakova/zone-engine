@@ -29,6 +29,7 @@ from event_engine.bingx import (
     get_contract,
     get_positions,
     get_order,
+    get_order_by_identity,
     get_position_mode,
     get_position_directional,
     get_open_protection_directional,
@@ -1878,6 +1879,16 @@ def _blocked_private_execution_result() -> dict[str, str]:
     }
 
 
+def _private_block_decision_reason(blocked: dict[str, Any]) -> str:
+    """Map the actual private execution block to an accurate telemetry reason."""
+    status = str(blocked.get("status", "")).strip().upper()
+    if status == "BLOCKED_MISSING_CREDENTIALS":
+        return "missing_private_credentials"
+    if status == "BLOCKED_PRIVATE_PREFLIGHT":
+        return "private_preflight_unresolved"
+    return "private_execution_blocked"
+
+
 def _private_layer_ready() -> bool:
     ready = credentials_available()
     if not ready:
@@ -2295,16 +2306,31 @@ def reconcile_all_open_positions() -> bool:
         original_tp_orders = original_protection.get("tp_orders", []) if isinstance(original_protection.get("tp_orders"), list) else []
         active_tp_orders = trade.get("tp_orders", []) if isinstance(trade.get("tp_orders"), list) else []
         active_ids = {str(x.get("order_id")) for x in active_tp_orders if isinstance(x, dict) and x.get("order_id")}
+        active_tp_client_ids = {
+            str(x.get("client_order_id") or x.get("clientOrderId") or "").strip().casefold()
+            for x in active_tp_orders if isinstance(x, dict) and x.get("order_id")
+            and (x.get("client_order_id") or x.get("clientOrderId"))
+        }
+        completed_tp_legs = {str(x).casefold() for x in (trade.get("completed_tp_legs") or [])}
         recovered_filled_orders = []
         for original_tp in original_tp_orders:
             if not isinstance(original_tp, dict):
                 continue
             original_id = str(original_tp.get("order_id") or "")
             leg = str(original_tp.get("leg") or "")
-            if not original_id or original_id in active_ids or leg in hit_legs:
+            original_client_id = str(original_tp.get("client_order_id") or original_tp.get("clientOrderId") or "").strip().casefold()
+            if (
+                not original_id or original_id in active_ids or leg.casefold() in hit_legs
+                or leg.casefold() in completed_tp_legs
+                or (original_client_id and original_client_id in active_tp_client_ids)
+            ):
                 continue
             try:
-                evidence = get_order(symbol, original_id)
+                evidence = get_order_by_identity(
+                    symbol, original_id,
+                    client_order_id=str(original_tp.get("client_order_id") or "") or None,
+                    order_lookup=get_order,
+                )
             except Exception as exc:
                 log.warning("[RECON_TP_IDENTITY] order lookup failed symbol=%s event=%s leg=%s id=%s error=%s", symbol, event_id, leg, original_id, exc)
                 continue
@@ -2313,6 +2339,10 @@ def reconcile_all_open_positions() -> bool:
                     and float(evidence.get("executed_qty") or 0.0) > 0):
                 recovered = dict(original_tp)
                 recovered["status"] = "FILLED"
+                if evidence.get("order_id"):
+                    recovered["previous_exchange_order_id"] = original_id
+                    recovered["order_id"] = str(evidence.get("order_id"))
+                recovered["client_order_id"] = str(original_tp.get("client_order_id") or evidence.get("client_order_id") or "")
                 recovered["executed_qty"] = float(evidence.get("executed_qty") or 0.0)
                 recovered["avg_price"] = float(evidence.get("avg_price") or 0.0)
                 recovered["exchange_update_time_ms"] = evidence.get("update_time_ms")
@@ -5530,7 +5560,11 @@ def main() -> None:
                 })
             except Exception as blocked_log_exc:
                 log.error("[TRADE_BLOCKED_JOURNAL_FAILED] event_id=%s error=%s", signal.get("event_id"), blocked_log_exc)
-            _record_entry_decision(scan_id, signal, "EXECUTION_RESULT", "missing_private_credentials", selection_rank=rank, execution_status=blocked.get("status"), terminal=True)
+            block_reason = _private_block_decision_reason(blocked)
+            _record_entry_decision(
+                scan_id, signal, "EXECUTION_RESULT", block_reason,
+                selection_rank=rank, execution_status=blocked.get("status"), terminal=True,
+            )
             _send_signal(signal, blocked)
             continue
         event_id = str(signal["event_id"])

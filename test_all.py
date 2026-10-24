@@ -2296,21 +2296,29 @@ def test_reconcile_recovers_original_filled_tp_and_defers_tp_recreation(monkeypa
             {"leg": "tp1", "pnl_pct": 3.0, "close_fraction": 0.5},
             {"leg": "tp2", "pnl_pct": 6.0, "close_fraction": 0.5},
         ], "protection_result": {"tp_orders": [
-            {"leg": "tp1", "order_id": "TP1_ORIGINAL", "qty": 898.0, "pnl_pct": 3.0},
-            {"leg": "tp2", "order_id": "TP2_ORIGINAL", "qty": 897.0, "pnl_pct": 6.0},
+            {"leg": "tp1", "order_id": "TP1_ORIGINAL", "client_order_id": "CID_TP1", "qty": 898.0, "pnl_pct": 3.0},
+            {"leg": "tp2", "order_id": "TP2_ORIGINAL", "client_order_id": "CID_TP2", "qty": 897.0, "pnl_pct": 6.0},
         ]}},
     }
     monkeypatch.setattr(run_once, "_load_active_trades_file", lambda: {"EVT_ACH": trade})
     monkeypatch.setattr(run_once, "get_positions", lambda **kwargs: [
         {"symbol": "ACH-USDT", "positionSide": "LONG", "positionAmt": "449", "avgPrice": "0.005537"}
     ])
-    monkeypatch.setattr(run_once, "get_order", lambda symbol, order_id: {
-        "status": "ok", "order_id": order_id,
-        "order_status": "FILLED" if order_id == "TP1_ORIGINAL" else "NEW",
-        "executed_qty": 898.0 if order_id == "TP1_ORIGINAL" else 0.0,
-        "avg_price": 0.005703 if order_id == "TP1_ORIGINAL" else 0.0,
-        "update_time_ms": 123,
-    })
+    def fake_get_order(symbol, order_id=None, *, client_order_id=None):
+        if order_id:
+            return {"status": "error", "error": f"orderId mismatch: requested={order_id} response=OTHER"}
+        leg1 = client_order_id == "CID_TP1"
+        return {
+            "status": "ok", "order_id": "TP1_ACTUAL" if leg1 else "TP2_ACTUAL",
+            "client_order_id": client_order_id,
+            "order_status": "FILLED" if leg1 else "NEW",
+            "executed_qty": 898.0 if leg1 else 0.0,
+            "avg_price": 0.005703 if leg1 else 0.0,
+            "update_time_ms": 123,
+            "exchange_reported_client_order_id": client_order_id,
+            "exchange_reported_symbol": "ACHUSDT",
+        }
+    monkeypatch.setattr(run_once, "get_order", fake_get_order)
     monkeypatch.setattr(run_once, "merge_reconciled_tp_orders", lambda event_id, orders: recovered.extend(orders) or True)
     monkeypatch.setattr(run_once, "ensure_directional_protection", lambda symbol, side, avg, qty, risk, levels, trade_id=None: (
         protection_calls.append({"qty": qty, "levels": levels}) or
@@ -2319,7 +2327,8 @@ def test_reconcile_recovers_original_filled_tp_and_defers_tp_recreation(monkeypa
     monkeypatch.setattr(run_once, "update_active_trade_protection", lambda *args, **kwargs: True)
     monkeypatch.setattr(run_once.telemetry, "record_position_reconciliation", lambda **kwargs: None)
     run_once.reconcile_all_open_positions()
-    assert [x["order_id"] for x in recovered] == ["TP1_ORIGINAL"]
+    assert [x["order_id"] for x in recovered] == ["TP1_ACTUAL"]
+    assert recovered[0]["client_order_id"] == "CID_TP1"
     assert protection_calls == [{"qty": 449.0, "levels": []}]
 
 
