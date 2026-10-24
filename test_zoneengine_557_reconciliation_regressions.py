@@ -225,3 +225,23 @@ def test_close_evidence_deduplicates_tp_event_and_order_status_by_client_order_i
     assert result["observed_exit_qty"] == pytest.approx(1.0)
     assert len(result["rows"]) == 2
     assert {row.get("client_order_id", "").casefold() for row in result["rows"]} == {"evt_tp1", "evt_be"}
+
+
+def test_directly_confirmed_break_even_stop_is_not_mislabeled_stop_loss(monkeypatch):
+    from event_engine import tracker
+
+    monkeypatch.setattr(tracker, "_get_filled_order", lambda *a, **k: {
+        "status": "ok", "order_status": "FILLED", "order_id": "BE123",
+        "client_order_id": "EVT_BE_EVENT", "executed_qty": 1.0,
+        "avg_price": 100.2,
+    })
+    out = tracker._reconcile_historical_exit_order(
+        "AAA-USDT", "LONG", 100, 1.0, [],
+        {"order_id": "BE123", "client_order_id": "EVT_BE_EVENT"},
+        trade={"be_activated": True, "be_order_id": "BE123", "be_client_order_id": "EVT_BE_EVENT"},
+    )
+
+    assert out[0] == pytest.approx(100.2)
+    assert out[1] == "BREAK_EVEN"
+    assert out[2] == "historical_sl_order"
+    assert out[3]["order_id"] == "BE123"

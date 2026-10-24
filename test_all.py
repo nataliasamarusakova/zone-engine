@@ -6340,3 +6340,65 @@ def test_5m_stale_touch_does_not_suppress_next_fresh_touch(monkeypatch):
     zone_state = state["zones"]["DEMAND:0:110.000000000000:100.000000000000"]
     assert zone_state["state"] == "LOCKED"
     assert zone_state["trigger_event_id"] == signals[0]["event_id"]
+
+
+@pytest.mark.parametrize("direct_stop_with_missing_second_lookup", [False, True], ids=["historical_order", "confirmed_stop_fallback"])
+def test_historical_be_close_keeps_be_order_as_canonical_and_computes_rr(monkeypatch, tmp_path, direct_stop_with_missing_second_lookup):
+    from event_engine import tracker
+    active = tmp_path / "active_trades.json"
+    trades_path = tmp_path / "trades.jsonl"
+    actions = tmp_path / "actions.jsonl"
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", active)
+    monkeypatch.setattr(tracker, "TRADES_PATH", trades_path)
+    monkeypatch.setattr(tracker, "ACTIONS_PATH", actions)
+    monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: {"status": "not_found"})
+    monkeypatch.setattr(tracker, "fetch_klines", lambda *a, **k: [])
+    monkeypatch.setattr(tracker, "get_order", lambda *a, **k: None)
+    if direct_stop_with_missing_second_lookup:
+        # The first stop check verifies the fill, but a second lookup used only
+        # for telemetry is unavailable. Serialization must still use the known
+        # stop fill price and must not retain unrelated TP metadata.
+        monkeypatch.setattr(tracker, "_get_exit_from_sl", lambda *a, **k: (100.2, "SL_FILLED"))
+        monkeypatch.setattr(tracker, "_get_filled_order", lambda *a, **k: None)
+    monkeypatch.setattr(tracker, "send_tg", lambda *a, **k: True)
+    monkeypatch.setattr(tracker, "_cancel_engine_protection_orders_verified", lambda *a, **k: (True, "verified"))
+    fills = [
+        {"order_id": "ENTRY1", "trade_id": "E1", "qty": 1.0, "price": 100.0, "fee": -0.01, "realized_pnl": 0.0, "time_ms": 900},
+        {"order_id": "TP1", "trade_id": "T1", "qty": 0.5, "price": 103.0, "fee": -0.01, "realized_pnl": 1.5, "time_ms": 1000},
+        # Deliberately no fill timestamp: order identity/history, not a stale TP timestamp,
+        # must determine the final BE order fields.
+        {"order_id": "BE123", "trade_id": "B1", "qty": 0.5, "price": 100.2, "fee": -0.01, "realized_pnl": 0.1},
+    ]
+    monkeypatch.setattr(tracker, "get_fill_orders", lambda *a, **k: fills)
+    monkeypatch.setattr(tracker, "get_all_orders", lambda *a, **k: [{
+        "orderId": "BE123", "clientOrderId": "EVT_BE_EVENT", "status": "FILLED",
+        "side": "SELL", "positionSide": "LONG", "type": "STOP_MARKET",
+        "executedQty": "0.5", "avgPrice": "100.2", "stopPrice": "100.0",
+        "time": 3000, "updateTime": 3000,
+    }])
+    trade = {
+        "event_id": "EVT_BE_CLOSE", "symbol": "AAA-USDT", "direction": "LONG", "name": "AAA",
+        "entry_price": 100.0, "initial_qty": 1.0, "remaining_qty": 0.5, "entry_ts": 800, "closed": False,
+        "entry_order": {"order_id": "ENTRY1", "client_order_id": "EVT_ENTRY"},
+        "tp_orders": [{"leg": "tp1", "order_id": "TP1", "client_order_id": "EVT_TP1"}],
+        "sl_order": {"order_id": "BE123", "client_order_id": "EVT_BE_EVENT", "type": "STOP_MARKET", "trigger_price": 100.0},
+        "be_activated": True, "be_order_id": "BE123", "be_client_order_id": "EVT_BE_EVENT",
+        "be_trigger_price": 100.0, "hit_legs": ["tp1"], "tp_filled_qty": {"tp1": 0.5},
+        "tp_fill_events": [{"leg": "tp1", "order_id": "TP1", "client_order_id": "EVT_TP1", "order_status": "FILLED", "delta_qty": 0.5, "executed_qty_total": 0.5, "avg_price": 103.0, "fill_time_ms": 1000, "order_update_time_ms": 1010, "trigger_price": 103.0}],
+        "realized_pnl_qty": 0.5, "realized_pnl_weighted_sum": 1.5,
+        "peak_pnl_pct": 3.0, "mae_pct": -0.5, "max_drawdown_pct": -0.5,
+        "planned_risk_pct": 10.0, "planned_weighted_rr": 0.45, "effective_weighted_rr": 0.45,
+        "setup": {}, "tp_levels": [], "effective_tp_levels": [],
+    }
+    active.write_text(json.dumps({trade["event_id"]: trade}), encoding="utf-8")
+
+    tracker.update_active_trades()
+    record = json.loads(trades_path.read_text(encoding="utf-8").strip())
+    assert record["exit_reason"] == "BREAK_EVEN"
+    assert record["exit_order_id"] == "BE123"
+    assert record["exit_order_avg_price"] == pytest.approx(100.2)
+    assert record["exit_order_trigger_price"] == pytest.approx(100.0)
+    assert record["exit_order_evidence"]["order_id"] == "BE123"
+    assert record["be_client_order_id"] == "EVT_BE_EVENT"
+    assert record["realized_rr"] == pytest.approx(0.16)
+    assert record["fill_accounting"]["status"] in {"VERIFIED", "VERIFIED_ORDER_EXECUTION"}
