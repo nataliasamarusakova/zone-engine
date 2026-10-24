@@ -3373,21 +3373,24 @@ def _reconcile_historical_exit_order(
     identity, HEDGE position side (when available), execution chronology, and a
     near-exact residual-quantity match. Ambiguous evidence fails closed.
     """
-    # First ask the currently-owned stop order directly.
+    # First ask the currently-owned stop order directly. Classify the confirmed
+    # execution from durable BE order identity; the currently-owned stop can be
+    # a break-even stop, not only the original stop-loss order.
+    trade_state = trade if isinstance(trade, dict) else {}
     sl_id = sl_order.get("order_id") if isinstance(sl_order, dict) else None
     sl_client_id = sl_order.get("client_order_id") if isinstance(sl_order, dict) else None
     sl_info = _get_filled_order(symbol, sl_id, client_order_id=sl_client_id)
     if sl_info:
         px = _safe_float(sl_info.get("avg_price"), 0.0)
         if px > 0:
-            return px, "STOP_LOSS", "historical_sl_order", sl_info
+            resolved_sl_id = str(sl_info.get("order_id") or sl_info.get("orderId") or sl_id or "") or None
+            return px, _classify_confirmed_stop_exit_reason(trade_state, resolved_sl_id, sl_info), "historical_sl_order", sl_info
 
     residual = max(0.0, float(remaining_qty))
     if residual <= 0:
         return None, None, None, None
 
     tp_ids = {str(x.get("order_id")) for x in tp_orders if x.get("order_id")}
-    trade_state = trade if isinstance(trade, dict) else {}
     tp_fill_events = trade_state.get("tp_fill_events")
     tp_fill_events = tp_fill_events if isinstance(tp_fill_events, list) else []
     tp_filled_qty = trade_state.get("tp_filled_qty")
@@ -4546,7 +4549,21 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
             else:
                 exit_price_semantics = "OBSERVED_PRICE_ESTIMATE"
             planned_risk_pct = _derive_planned_risk_pct(trade)
-            realized_rr = _calc_realized_rr(final_pnl, planned_risk_pct) if final_pnl is not None and realized_pnl_source in {"executed_tp_or_sl", "confirmed_fill_accounting"} else None
+            fill_accounting_verified_for_rr = bool(
+                residual_exit_verified
+                and fill_evidence_status in {"VERIFIED", "VERIFIED_ORDER_EXECUTION"}
+                and close_fill_qty_verified
+                and confirmed_entry_vwap is not None and confirmed_entry_vwap > 0
+                and confirmed_exit_vwap is not None and confirmed_exit_vwap > 0
+            )
+            realized_rr = (
+                _calc_realized_rr(final_pnl, planned_risk_pct)
+                if final_pnl is not None
+                and planned_risk_pct is not None and planned_risk_pct > 0
+                and residual_exit_verified
+                and (realized_pnl_source in {"executed_tp_or_sl", "confirmed_fill_accounting"} or fill_accounting_verified_for_rr)
+                else None
+            )
             final_weighted_rr = _calc_realized_rr(final_pnl, planned_risk_pct) if final_pnl is not None and planned_risk_pct and planned_risk_pct > 0 else None
             if final_pnl is not None:
                 projected_rr, realized_rr_component, remaining_rr_component = _weighted_rr_snapshot({**trade, "remaining_qty": 0.0, "realized_pnl_qty": init_qty, "realized_pnl_weighted_sum": final_pnl * init_qty, "hit_legs": hit_legs})
@@ -4597,11 +4614,12 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                                 direction, actual_exit_fill, be_trigger_px
                             )
 
-            # For TP closes, surface the latest confirmed TP leg as the canonical exit-order
-            # evidence while keeping all legs in tp_fill_events.  For historical closes,
-            # surface the normalized exchange order used to reconcile the residual.
-            if close_execution_evidence.get("latest"):
-                latest_exit = close_execution_evidence["latest"]
+            # Canonical last-order fields must describe the order that actually
+            # closed the residual position. A stale TP event can remain the latest
+            # timestamped row when the final BE/SL fill has no exchange timestamp;
+            # never let that TP row overwrite stronger stop/historical-order identity.
+            latest_exit = close_execution_evidence.get("latest")
+            if exit_reason == "TAKE_PROFIT_FULL" and latest_exit:
                 trade["exit_order_id"] = latest_exit.get("order_id") or trade.get("exit_order_id")
                 trade["exit_order_avg_price"] = _safe_float(latest_exit.get("avg_price"), 0.0) or None
                 trade["exit_order_trigger_price"] = _safe_float(latest_exit.get("trigger_price"), 0.0) or None
@@ -4609,19 +4627,102 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                     trade["exit_order_adverse_slippage_pct"] = _adverse_exit_slippage_pct(
                         direction, float(trade["exit_order_avg_price"]), float(trade["exit_order_trigger_price"])
                     )
-            elif historical_order is not None:
                 trade["exit_order_evidence"] = {
-                    "order_id": str(historical_order.get("orderId") or historical_order.get("orderID") or "") or None,
-                    "status": str(historical_order.get("status") or historical_order.get("orderStatus") or "FILLED").upper(),
+                    "order_id": latest_exit.get("order_id"),
+                    "status": latest_exit.get("status"),
+                    "leg": latest_exit.get("leg"),
+                    "executed_qty": latest_exit.get("executed_qty"),
+                    "avg_price": latest_exit.get("avg_price"),
+                    "trigger_price": latest_exit.get("trigger_price"),
+                    "fill_time_ms": latest_exit.get("fill_time_ms"),
+                    "order_update_time_ms": latest_exit.get("order_update_time_ms"),
+                    "source": latest_exit.get("evidence_source"),
+                    "fill_evidence_status": "CONFIRMED",
+                }
+            elif historical_order is not None:
+                historical_order_id = str(historical_order.get("orderId") or historical_order.get("orderID") or historical_order.get("order_id") or "") or None
+                historical_avg_price = _optional_float(historical_order.get("avgPrice") or historical_order.get("avg_price") or historical_order.get("_px"))
+                historical_trigger_price = _optional_float(historical_order.get("stopPrice") or historical_order.get("trigger_price") or historical_order.get("stop_price"))
+                trade["exit_order_id"] = historical_order_id or trade.get("exit_order_id")
+                trade["exit_order_avg_price"] = historical_avg_price if historical_avg_price and historical_avg_price > 0 else None
+                trade["exit_order_trigger_price"] = historical_trigger_price if historical_trigger_price and historical_trigger_price > 0 else None
+                if trade["exit_order_trigger_price"] is not None and trade["exit_order_avg_price"] is not None:
+                    trade["exit_order_adverse_slippage_pct"] = _adverse_exit_slippage_pct(
+                        direction, float(trade["exit_order_avg_price"]), float(trade["exit_order_trigger_price"])
+                    )
+                else:
+                    # Do not retain a trigger/slippage copied from an unrelated TP.
+                    trade["exit_order_adverse_slippage_pct"] = None
+                trade["exit_order_evidence"] = {
+                    "order_id": historical_order_id,
+                    "status": str(historical_order.get("status") or historical_order.get("orderStatus") or historical_order.get("order_status") or "FILLED").upper(),
                     "type": str(historical_order.get("type") or "").upper() or None,
                     "side": str(historical_order.get("side") or "").upper() or None,
-                    "position_side": str(historical_order.get("positionSide") or "").upper() or None,
-                    "executed_qty": _optional_float(historical_order.get("executedQty") or historical_order.get("cumQty") or historical_order.get("_qty")),
-                    "avg_price": _optional_float(historical_order.get("avgPrice") or historical_order.get("_px")),
-                    "trigger_price": _optional_float(historical_order.get("stopPrice")),
-                    "update_time_ms": _optional_float(historical_order.get("updateTime") or historical_order.get("time") or historical_order.get("createTime") or historical_order.get("_ts")),
-                    "source": "HISTORICAL_ALL_ORDERS",
+                    "position_side": str(historical_order.get("positionSide") or historical_order.get("position_side") or "").upper() or None,
+                    "executed_qty": _optional_float(historical_order.get("executedQty") or historical_order.get("cumQty") or historical_order.get("executed_qty") or historical_order.get("_qty")),
+                    "avg_price": historical_avg_price,
+                    "trigger_price": historical_trigger_price,
+                    "update_time_ms": _optional_float(historical_order.get("updateTime") or historical_order.get("update_time_ms") or historical_order.get("time") or historical_order.get("createTime") or historical_order.get("_ts")),
+                    "client_order_id": historical_order.get("clientOrderId") or historical_order.get("client_order_id"),
+                    "source": "HISTORICAL_SL_ORDER" if hist_source == "historical_sl_order" else "HISTORICAL_ALL_ORDERS",
                     "fill_evidence_status": "ORDER_EXECUTION_CONFIRMED",
+                }
+            elif sl_exit_price is not None:
+                # The stop lookup is the identified closing order. Preserve it as
+                # canonical even if close_execution_evidence.latest points to TP1.
+                stop_order_id = str((exit_order_info or {}).get("order_id") or (exit_order_info or {}).get("orderId") or sl_order_id or "") or None
+                trade["exit_order_id"] = stop_order_id or trade.get("exit_order_id")
+                stop_avg_price = _optional_float((exit_order_info or {}).get("avg_price"))
+                if stop_avg_price is None or stop_avg_price <= 0:
+                    # The earlier stop lookup already confirmed this fill price.
+                    # Do not retain a TP price if a second order lookup temporarily
+                    # fails or returns an incomplete row.
+                    stop_avg_price = _optional_float(sl_exit_price)
+                trade["exit_order_avg_price"] = stop_avg_price if stop_avg_price is not None and stop_avg_price > 0 else None
+                stop_trigger_price = None
+                for raw_trigger in (
+                    (exit_order_info or {}).get("trigger_price"),
+                    (exit_order_info or {}).get("stop_price"),
+                    sl_order.get("trigger_price"),
+                    sl_order.get("stop_price"),
+                ):
+                    candidate_trigger = _optional_float(raw_trigger)
+                    if candidate_trigger is not None and candidate_trigger > 0:
+                        stop_trigger_price = candidate_trigger
+                        break
+                trade["exit_order_trigger_price"] = stop_trigger_price
+                if trade["exit_order_trigger_price"] is not None and trade.get("exit_order_avg_price") is not None:
+                    trade["exit_order_adverse_slippage_pct"] = _adverse_exit_slippage_pct(
+                        direction, float(trade["exit_order_avg_price"]), float(trade["exit_order_trigger_price"])
+                    )
+                else:
+                    trade["exit_order_adverse_slippage_pct"] = None
+                trade["exit_order_evidence"] = {
+                    "order_id": stop_order_id,
+                    "status": str((exit_order_info or {}).get("order_status") or (exit_order_info or {}).get("status") or "FILLED").upper(),
+                    "type": str((exit_order_info or {}).get("type") or sl_order.get("type") or "").upper() or None,
+                    "side": str((exit_order_info or {}).get("side") or sl_order.get("side") or "").upper() or None,
+                    "position_side": str((exit_order_info or {}).get("position_side") or (exit_order_info or {}).get("positionSide") or sl_order.get("position_side") or sl_order.get("positionSide") or "").upper() or None,
+                    "executed_qty": _optional_float((exit_order_info or {}).get("executed_qty")),
+                    "avg_price": _optional_float((exit_order_info or {}).get("avg_price")) or sl_exit_price,
+                    "trigger_price": trade.get("exit_order_trigger_price"),
+                    "client_order_id": (exit_order_info or {}).get("client_order_id") or sl_order.get("client_order_id"),
+                    "source": (exit_order_info or {}).get("execution_evidence_source") or "CONFIRMED_STOP_ORDER",
+                    "fill_evidence_status": "ORDER_EXECUTION_CONFIRMED",
+                }
+            elif latest_exit and trade.get("exit_order_evidence") is None:
+                # Fallback only when no stronger final-order identity exists.
+                trade["exit_order_evidence"] = {
+                    "order_id": latest_exit.get("order_id"),
+                    "status": latest_exit.get("status"),
+                    "leg": latest_exit.get("leg"),
+                    "executed_qty": latest_exit.get("executed_qty"),
+                    "avg_price": latest_exit.get("avg_price"),
+                    "trigger_price": latest_exit.get("trigger_price"),
+                    "fill_time_ms": latest_exit.get("fill_time_ms"),
+                    "order_update_time_ms": latest_exit.get("order_update_time_ms"),
+                    "source": latest_exit.get("evidence_source"),
+                    "fill_evidence_status": "CONFIRMED",
                 }
 
             tp_actual_close_fractions: dict[str, float] = {}
@@ -4829,6 +4930,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                 "be_trigger_ts": trade.get("be_trigger_ts"),
                 "be_trigger_peak_r": trade.get("be_trigger_peak_r"),
                 "be_order_id": trade.get("be_order_id"),
+                "be_client_order_id": trade.get("be_client_order_id"),
                 "be_trigger_price": trade.get("be_trigger_price"),
                 "be_fill_price": trade.get("be_fill_price"),
                 "be_execution_slippage_pct": trade.get("be_execution_slippage_pct"),
