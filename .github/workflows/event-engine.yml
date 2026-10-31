@@ -162,7 +162,29 @@ jobs:
             while IFS=$'\t' read -r candidate_artifact_id candidate_run_id candidate_created_at; do
               [ -n "$candidate_run_id" ] || continue
               run_json=""
-              if ! run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${candidate_run_id}" 2>/dev/null)"; then
+              # Artifact metadata can become visible just before the associated
+              # workflow-run status reaches "completed". Re-read the run briefly
+              # instead of failing on a single in_progress/unknown snapshot. This
+              # is bounded; a genuinely active/failed run is still never trusted.
+              for status_attempt in 1 2 3 4; do
+                if current_run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${candidate_run_id}" 2>/dev/null)"; then
+                  run_json="$current_run_json"
+                  candidate_status="$(jq -r '.status // "unknown"' <<< "$run_json")"
+                  if [ "$candidate_status" = "completed" ]; then
+                    break
+                  fi
+                  if [ "$candidate_status" != "in_progress" ] && [ "$candidate_status" != "queued" ]; then
+                    break
+                  fi
+                  echo "Runtime-state artifact id=$candidate_artifact_id belongs to a $candidate_status run; rechecking run metadata (attempt $status_attempt/4)."
+                else
+                  echo "Could not refresh workflow status for artifact id=$candidate_artifact_id (attempt $status_attempt/4); retrying metadata lookup."
+                fi
+                if [ "$status_attempt" -lt 4 ]; then
+                  sleep "$status_attempt"
+                fi
+              done
+              if [ -z "$run_json" ]; then
                 echo "::error::Could not verify the workflow result for runtime-state artifact id=$candidate_artifact_id; refusing to guess or initialize empty state."
                 exit 1
               fi
@@ -453,9 +475,14 @@ jobs:
           TESTS_REQUIRED: ${{ steps.test_policy.outputs.run_tests }}
           TESTS_OUTCOME: ${{ steps.tests.outcome }}
           DATA_CHECK_OUTCOME: ${{ steps.verify_tests_data.outcome }}
+          RESTORE_OUTCOME: ${{ steps.restore_runtime_state.outcome }}
         shell: bash
         run: |
           set -euo pipefail
+          if [ "$RESTORE_OUTCOME" != "success" ]; then
+            echo "::error::Runtime-state restoration did not succeed (outcome=$RESTORE_OUTCOME); test policy was not evaluated, and persistent state must not be committed."
+            exit 1
+          fi
           if [ "$DATA_CHECK_OUTCOME" != "success" ]; then
             echo "::error::Runtime-data isolation verification failed (outcome=$DATA_CHECK_OUTCOME)."
             exit 1
