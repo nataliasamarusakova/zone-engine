@@ -3063,6 +3063,27 @@ def _confirmed_whole_trade_exit_vwap(fill_accounting: dict[str, Any], expected_q
     return float(vwap)
 
 
+def _confirmed_whole_trade_pnl_pct(fill_accounting: dict[str, Any], expected_qty: float) -> float | None:
+    """Return gross whole-trade PnL only when exchange fills reconcile end to end.
+
+    This is deliberately independent of tracker-local leg accounting: local TP
+    and residual snapshots can be stale or incomplete even when the exchange fill
+    ledger now proves the complete entry and exit quantities.
+    """
+    if _confirmed_whole_trade_exit_vwap(fill_accounting, expected_qty) is None:
+        return None
+    entry_qty = _optional_float(fill_accounting.get("entry_qty_confirmed"))
+    entry_vwap = _optional_float(fill_accounting.get("entry_vwap_confirmed"))
+    gross_pnl = _optional_float(fill_accounting.get("gross_realized_pnl_abs"))
+    if entry_qty is None or entry_qty <= 0 or entry_vwap is None or entry_vwap <= 0 or gross_pnl is None:
+        return None
+    tolerance = max(1e-12, abs(expected_qty) * 1e-8)
+    if abs(entry_qty - expected_qty) > tolerance:
+        return None
+    result = gross_pnl / (entry_vwap * entry_qty) * 100.0
+    return result if math.isfinite(result) else None
+
+
 def _close_execution_evidence(trade: dict, fill_accounting: dict[str, Any]) -> dict[str, Any]:
     """Return the strongest confirmed exit-leg evidence available for a close.
 
@@ -4439,50 +4460,35 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                 confirmed_exit_fill_qty is not None
                 and abs(float(confirmed_exit_fill_qty) - init_qty) <= qty_tolerance
             )
-            # A missing residual price at the position snapshot must not keep the
-            # whole trade permanently unverified when the close-time execution
-            # ledger now proves every entry and exit fill.  Upgrade only on exact
-            # quantity coverage, complete per-order evidence, and a confirmed
-            # entry VWAP + gross realized PnL; otherwise remain fail-closed.
-            confirmed_entry_qty = _optional_float(fill_accounting.get("entry_qty_confirmed"))
+            # Prefer whole-trade PnL reconstructed from exchange fills whenever
+            # both the complete entry quantity and complete exit quantity reconcile.
+            # This must override stale/local TP-leg sums too: a zero local residual
+            # does not prove that the locally accumulated weighted PnL is complete.
             confirmed_entry_vwap = _optional_float(fill_accounting.get("entry_vwap_confirmed"))
             confirmed_exit_vwap = _optional_float(fill_accounting.get("exit_vwap_confirmed"))
-            confirmed_gross_pnl_abs = _optional_float(fill_accounting.get("gross_realized_pnl_abs"))
-            incomplete_order_ids = fill_accounting.get("incomplete_order_fill_ids")
             fill_evidence_status = str(fill_accounting.get("status") or "").upper()
+            verified_full_trade_pnl_pct = _confirmed_whole_trade_pnl_pct(fill_accounting, init_qty)
             complete_fill_based_close = bool(
-                position_gone
-                and residual_qty_before_position_disappeared > 0
-                and not residual_exit_verified
+                (position_gone or closed_by_tp)
                 and fill_evidence_status in {"VERIFIED", "VERIFIED_ORDER_EXECUTION"}
-                and confirmed_entry_qty is not None
-                and abs(confirmed_entry_qty - init_qty) <= qty_tolerance
-                and confirmed_entry_vwap is not None and confirmed_entry_vwap > 0
-                and close_fill_qty_verified
-                and confirmed_exit_vwap is not None and confirmed_exit_vwap > 0
-                and confirmed_gross_pnl_abs is not None
-                and not (isinstance(incomplete_order_ids, list) and incomplete_order_ids)
+                and verified_full_trade_pnl_pct is not None
             )
             if complete_fill_based_close:
-                verified_full_trade_pnl_pct = (
-                    confirmed_gross_pnl_abs / (confirmed_entry_vwap * confirmed_entry_qty)
-                ) * 100.0
-                if math.isfinite(verified_full_trade_pnl_pct):
-                    residual_exit_verified = True
-                    realized_qty = init_qty
-                    realized_weighted = verified_full_trade_pnl_pct * init_qty
-                    accounting_diff_qty = 0.0
-                    trade["remaining_qty"] = 0.0
-                    exit_price = confirmed_exit_vwap
-                    # Keep the detailed row-level evidence internally consistent.
-                    # If its rows still conflict, the separate canonical fill_accounting
-                    # is authoritative for whole-trade PnL, but do not rewrite a QTY_MISMATCH
-                    # close-evidence record into CONFIRMED while its rows still overcount.
-                    if str(close_execution_evidence.get("status") or "").upper() == "CONFIRMED":
-                        close_execution_evidence["authority"] = "EXCHANGE_CONFIRMED_COMPLETE_FILL_ACCOUNTING"
-                        close_execution_evidence["confirmed_exit_qty"] = float(confirmed_exit_fill_qty)
-                        close_execution_evidence["exit_vwap_confirmed"] = float(confirmed_exit_vwap)
-                        close_execution_evidence["exit_vwap_source"] = fill_accounting.get("exit_vwap_source")
+                residual_exit_verified = True
+                realized_qty = init_qty
+                realized_weighted = verified_full_trade_pnl_pct * init_qty
+                accounting_diff_qty = 0.0
+                trade["remaining_qty"] = 0.0
+                exit_price = confirmed_exit_vwap
+                # Keep the detailed row-level evidence internally consistent.
+                # If its rows still conflict, the canonical fill_accounting remains
+                # authoritative for whole-trade PnL, but do not relabel a conflicting
+                # close-evidence record as CONFIRMED.
+                if str(close_execution_evidence.get("status") or "").upper() == "CONFIRMED":
+                    close_execution_evidence["authority"] = "EXCHANGE_CONFIRMED_COMPLETE_FILL_ACCOUNTING"
+                    close_execution_evidence["confirmed_exit_qty"] = float(confirmed_exit_fill_qty)
+                    close_execution_evidence["exit_vwap_confirmed"] = float(confirmed_exit_vwap)
+                    close_execution_evidence["exit_vwap_source"] = fill_accounting.get("exit_vwap_source")
             if not residual_exit_verified:
                 accounting_status = "UNVERIFIED_RESIDUAL_EXIT"
             elif close_fill_qty_verified and abs(accounting_diff_qty) <= qty_tolerance:

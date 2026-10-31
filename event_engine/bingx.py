@@ -185,6 +185,8 @@ _LAST_BOOK_TICKER_TS = 0.0
 _RESEARCH_RATE_LOCK_GUARD = threading.Lock()
 _RESEARCH_RATE_LOCKS: dict[str, threading.Lock] = {}
 _RESEARCH_RATE_LAST_TS: dict[str, float] = {}
+_OPEN_ORDERS_RATE_LOCK = threading.Lock()
+_LAST_OPEN_ORDERS_REQUEST_TS: float | None = None
 
 # Requests Session is not used concurrently across scan worker threads.
 # Public scan requests get one Session per worker thread, each with a small bounded
@@ -247,6 +249,36 @@ def _get_retry_session() -> requests.Session:
         session.mount("http://", adapter)
         _FAST_LOCAL.retry_session = session
     return session
+
+
+def _throttle_open_orders_request() -> None:
+    """Keep private openOrders reads below BingX's trigger-order request cap.
+
+    The same endpoint is used by entry verification, reconciliation and trade
+    tracking. A limiter at the signed-I/O boundary makes those call sites share
+    one process-wide budget, including calls made from worker threads.
+    """
+    if os.environ.get("ZONE_ENGINE_TESTS_ISOLATED", "").strip() == "1":
+        return
+    try:
+        # BingX documents a 5 requests/second UID limit for swap openOrders.
+        # Keep headroom for other clients sharing the API key and for scheduling
+        # jitter rather than running exactly at the published ceiling.
+        interval = float(os.environ.get("BINGX_OPEN_ORDERS_MIN_INTERVAL_SEC", "0.30"))
+    except (TypeError, ValueError):
+        interval = 0.30
+    if not math.isfinite(interval):
+        interval = 0.30
+    interval = max(0.25, min(interval, 5.0))
+
+    global _LAST_OPEN_ORDERS_REQUEST_TS
+    with _OPEN_ORDERS_RATE_LOCK:
+        now = time.monotonic()
+        if _LAST_OPEN_ORDERS_REQUEST_TS is not None:
+            wait = interval - (now - _LAST_OPEN_ORDERS_REQUEST_TS)
+            if wait > 0:
+                time.sleep(wait)
+        _LAST_OPEN_ORDERS_REQUEST_TS = time.monotonic()
 
 
 @contextmanager
@@ -440,6 +472,8 @@ def _request(
                             request_kwargs = {"method": method, "url": url, "headers": headers, "timeout": request_timeout}
                         else:
                             request_kwargs = {"method": method, "url": base_url + path, "params": wire_params, "headers": headers, "timeout": request_timeout}
+                        if method.upper() == "GET" and path == OPEN_ORDERS_PATH:
+                            _throttle_open_orders_request()
                         response = timed_request(
                             "bingx", path, method, session.request, **request_kwargs
                         )
@@ -2425,30 +2459,57 @@ def _allocate_tp_quantities(position_qty: float, precision: int, min_qty: float,
     return [float(q) for q in quantities]
 
 
-def _normalize_tp_levels(tp_levels: list) -> list[dict]:
-    if isinstance(tp_levels, list) and len(tp_levels) == 0:
+def _normalize_tp_levels(tp_levels: list | None) -> list[dict]:
+    """Validate the complete TP plan before normalizing its allocation weights.
+
+    Silently dropping one malformed leg changes the strategy: the remaining legs
+    would be renormalized to close the entire position. Treat the list atomically
+    so a partially corrupt persisted plan can never masquerade as a valid one.
+    """
+    if tp_levels is None:
         return []
-    normalized = []
-    for tp in (tp_levels or []):
-        leg = str(tp.get("leg", f"tp{len(normalized) + 1}"))
+    if not isinstance(tp_levels, list):
+        raise ValueError("TP configuration must be a list")
+    if not tp_levels:
+        return []
+
+    normalized: list[dict] = []
+    seen_legs: set[str] = set()
+    for index, tp in enumerate(tp_levels):
+        if not isinstance(tp, dict):
+            raise ValueError(f"TP leg {index} must be an object")
+        raw_leg = tp.get("leg")
+        if not isinstance(raw_leg, str):
+            raise ValueError(f"TP leg {index} must have a string leg identity")
+        leg = raw_leg.strip()
+        if not leg:
+            raise ValueError(f"TP leg {index} is missing its leg identity")
+        leg_key = leg.casefold()
+        if leg_key in seen_legs:
+            raise ValueError(f"duplicate TP leg identity: {leg}")
+        seen_legs.add(leg_key)
+
+        raw_pnl_pct = tp.get("pnl_pct")
+        raw_fraction = tp.get("close_fraction")
+        if isinstance(raw_pnl_pct, bool) or isinstance(raw_fraction, bool):
+            raise ValueError(f"TP leg {leg} has a non-numeric boolean value")
         try:
-            pnl_pct = float(tp.get("pnl_pct", 0))
-            fraction = float(tp.get("close_fraction", 0))
-        except (TypeError, ValueError):
-            continue
+            pnl_pct = float(raw_pnl_pct)
+            fraction = float(raw_fraction)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"TP leg {leg} has invalid pnl_pct or close_fraction") from exc
 
-        if not math.isfinite(pnl_pct) or not math.isfinite(fraction) or pnl_pct <= 0 or fraction <= 0:
-            continue
+        if not math.isfinite(pnl_pct) or pnl_pct <= 0:
+            raise ValueError(f"TP leg {leg} pnl_pct must be finite and positive")
+        if not math.isfinite(fraction) or fraction <= 0:
+            raise ValueError(f"TP leg {leg} close_fraction must be finite and positive")
         normalized.append({"leg": leg, "pnl_pct": pnl_pct, "close_fraction": fraction})
-
-    if not normalized:
-        return []
 
     total = sum(x["close_fraction"] for x in normalized)
     if not math.isfinite(total) or total <= 0:
-        return []
-    for x in normalized:
-        x["close_fraction"] /= total
+        raise ValueError("TP close_fraction total must be finite and positive")
+    for level in normalized:
+        level["close_fraction"] /= total
     return normalized
 
 
@@ -3669,6 +3730,19 @@ def ensure_directional_protection(
     if not math.isfinite(avg_price) or not math.isfinite(qty) or not math.isfinite(stop_loss_pct) or avg_price <= 0 or qty <= 0 or not (0 < stop_loss_pct <= 25):
         return {"status": "error", "error": "invalid protection parameters"}
 
+    try:
+        tp_levels_norm = _normalize_tp_levels(tp_levels)
+    except ValueError as exc:
+        return {
+            "status": "PROTECTION_FAILED",
+            "symbol": symbol,
+            "direction": direction,
+            "avg_price": avg_price,
+            "qty": qty,
+            "error": f"invalid TP configuration: {exc}",
+            "failure_class": "INVALID_TP_CONFIGURATION",
+        }
+
     bx_symbol = to_bx_symbol(symbol)
     contract = get_contract(symbol)
     if not bx_symbol or not contract:
@@ -3687,22 +3761,18 @@ def ensure_directional_protection(
 
     existing = get_open_protection_directional(symbol, direction)
     if existing.get("status") != "ok":
-        return {"status": "PROTECTION_FAILED", "error": existing.get("error", "openOrders unavailable")}
+        # An exchange read failure does not prove that protective orders are
+        # absent. Reconciliation must preserve the live position and retry once
+        # the endpoint is readable; a fresh entry still fails its post-fill
+        # protection gate and is rolled back by execute_new_position().
+        return {
+            "status": "PROTECTION_READ_UNAVAILABLE",
+            "failure_class": "EXCHANGE_READ_UNAVAILABLE",
+            "error": existing.get("error", "openOrders unavailable"),
+        }
 
     existing_tp = list(existing.get("tp_orders", []))
     existing_sl = list(existing.get("sl_orders", []))
-    tp_levels_norm = _normalize_tp_levels(tp_levels)
-    if tp_levels and not tp_levels_norm:
-        return {
-            "status": "PROTECTION_FAILED",
-            "symbol": symbol,
-            "bx_symbol": bx_symbol,
-            "direction": direction,
-            "avg_price": avg_price,
-            "qty": position_qty,
-            "error": "invalid_nonempty_tp_configuration",
-            "failure_class": "INVALID_TP_CONFIGURATION",
-        }
 
     valid_existing_sl = None
     engine_owned_invalid_sl_ids: list[str] = []
