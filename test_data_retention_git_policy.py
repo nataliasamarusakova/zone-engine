@@ -6,7 +6,9 @@ def test_persistent_runtime_data_is_artifact_backed_and_ephemeral_data_is_ignore
     lines = {line.strip() for line in Path(".gitignore").read_text(encoding="utf-8").splitlines()}
     assert "data/*" in lines
     assert "!data/.gitkeep" in lines
-    assert (Path("data") / ".gitkeep").is_file()
+    # Source checkouts may keep the placeholder, while distributable archives
+    # intentionally omit the runtime-data directory completely.
+    assert not Path("data").exists() or (Path("data") / ".gitkeep").is_file()
     assert "bootstrap/research_history_seed/" not in lines
     assert "data/scan_history.jsonl" in lines
     assert "data/scan_history.jsonl.*" in lines

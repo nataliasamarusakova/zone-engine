@@ -747,7 +747,8 @@ def test_execute_rejects_invalid_geometry_before_entry(monkeypatch):
     assert called["open"] is False
 
 
-def test_execute_emergency_closes_when_protection_fails(monkeypatch):
+@pytest.mark.parametrize("protection_status", ["PROTECTION_FAILED", "PROTECTION_READ_UNAVAILABLE"])
+def test_execute_emergency_closes_when_protection_fails(monkeypatch, protection_status):
     import run_once
     signal = {
         "event_id": "ZONE_TEST_PROTECT_FAIL",
@@ -772,7 +773,7 @@ def test_execute_emergency_closes_when_protection_fails(monkeypatch):
         "status": "found", "avgPrice": 100.0, "positionAmt": 1.0
     })
     monkeypatch.setattr(run_once, "ensure_directional_protection", lambda *a, **k: {
-        "status": "PROTECTION_FAILED", "error": "TP2 failed", "sl_result": {}, "tp_orders": []
+        "status": protection_status, "error": "protection not verified", "sl_result": {}, "tp_orders": []
     })
     position_states = iter([
         {"status": "found", "positionAmt": 1.0},
@@ -2404,6 +2405,86 @@ def test_reconcile_sl_only_persists_valid_stop_and_blocks_new_entries(monkeypatc
     assert any(args[2] == "RECON_PROTECTION_PARTIAL" for args, kwargs in ledger)
 
 
+def test_reconcile_open_orders_read_unavailable_preserves_position_and_blocks_entries(monkeypatch):
+    import run_once
+
+    trade = {
+        "event_id": "ZONE_READ_UNAVAILABLE", "symbol": "AAA-USDT", "direction": "LONG",
+        "closed": False, "remaining_qty": 1.0, "planned_risk_pct": 10.0,
+        "sl_order": {"order_id": "SL-KNOWN"},
+        "tp_orders": [
+            {"leg": "tp1", "order_id": "TP1-KNOWN"},
+            {"leg": "tp2", "order_id": "TP2-KNOWN"},
+        ],
+        "setup": {"tp_levels": [
+            {"leg": "tp1", "pnl_pct": 3.0, "close_fraction": 0.5},
+            {"leg": "tp2", "pnl_pct": 6.0, "close_fraction": 0.5},
+        ]},
+    }
+    conflicts = []
+    ledger = []
+    closes = []
+    monkeypatch.setattr(run_once, "_load_active_trades_file", lambda: {"ZONE_READ_UNAVAILABLE": trade})
+    monkeypatch.setattr(run_once, "get_positions", lambda **kwargs: [
+        {"symbol": "AAA-USDT", "positionSide": "LONG", "positionAmt": "1", "avgPrice": "100"},
+    ])
+    monkeypatch.setattr(run_once, "ensure_directional_protection", lambda *a, **k: {
+        "status": "PROTECTION_READ_UNAVAILABLE",
+        "failure_class": "EXCHANGE_READ_UNAVAILABLE",
+        "error": "openOrders failed: code=100410 msg=trigger frequency limit",
+    })
+
+    def unexpected_close(*args, **kwargs):
+        closes.append(args)
+        raise AssertionError("unknown protection state must not trigger MARKET close")
+
+    monkeypatch.setattr(run_once, "_emergency_close_and_verify", unexpected_close)
+    monkeypatch.setattr(run_once.telemetry, "record_position_reconciliation", lambda **kwargs: None)
+    monkeypatch.setattr(run_once.telemetry, "record_state_conflict", lambda **kwargs: conflicts.append(kwargs))
+    monkeypatch.setattr(run_once, "_append_execution_ledger", lambda *a, **k: ledger.append((a, k)))
+
+    assert run_once.reconcile_all_open_positions() is False
+    assert closes == []
+    assert any(item.get("conflict_type") == "PROTECTION_READ_UNAVAILABLE" for item in conflicts)
+    matching = [args for args, kwargs in ledger if args[2] == "RECON_PROTECTION_READ_UNAVAILABLE"]
+    assert len(matching) == 1
+    details = matching[0][3]
+    assert details["action"].startswith("preserve_position")
+    assert details["last_known_protection"]["sl_order_id"] == "SL-KNOWN"
+    assert details["last_known_protection"]["tp_order_ids"] == ["TP1-KNOWN", "TP2-KNOWN"]
+
+
+def test_reconcile_confirmed_protection_failure_still_uses_emergency_close(monkeypatch):
+    import run_once
+
+    trade = {
+        "event_id": "ZONE_CONFIRMED_PROTECTION_FAILURE", "symbol": "AAA-USDT", "direction": "LONG",
+        "closed": False, "remaining_qty": 1.0, "planned_risk_pct": 10.0,
+        "setup": {"tp_levels": []},
+    }
+    closes = []
+    ledgers = []
+    monkeypatch.setattr(run_once, "_load_active_trades_file", lambda: {"ZONE_CONFIRMED_PROTECTION_FAILURE": trade})
+    monkeypatch.setattr(run_once, "get_positions", lambda **kwargs: [
+        {"symbol": "AAA-USDT", "positionSide": "LONG", "positionAmt": "1", "avgPrice": "100"},
+    ])
+    monkeypatch.setattr(run_once, "ensure_directional_protection", lambda *a, **k: {
+        "status": "PROTECTION_FAILED", "error": "protection POST was rejected after readable order snapshot",
+    })
+    monkeypatch.setattr(run_once, "_emergency_close_and_verify", lambda *a, **k: (
+        closes.append(a) or {"status": "closed_verified", "attempts": []}
+    ))
+    monkeypatch.setattr(run_once, "record_verified_emergency_close", lambda *a, **k: None)
+    monkeypatch.setattr(run_once, "_cancel_engine_protection_before_emergency_close", lambda *a, **k: {"status": "ok"})
+    monkeypatch.setattr(run_once.telemetry, "record_position_reconciliation", lambda **kwargs: None)
+    monkeypatch.setattr(run_once.telemetry, "record_state_conflict", lambda **kwargs: None)
+    monkeypatch.setattr(run_once, "_append_execution_ledger", lambda *a, **k: ledgers.append((a, k)))
+
+    assert run_once.reconcile_all_open_positions() is False
+    assert len(closes) == 1
+    assert any(args[2] == "RECON_PROTECTION_FAILURE_EMERGENCY_CLOSE" for args, kwargs in ledgers)
+
+
 def test_reconcile_classifies_side_mismatch_and_orphan_local(monkeypatch):
     import run_once
     statuses = []
@@ -3184,6 +3265,9 @@ def test_workflow_persists_runtime_state_in_verified_artifact_not_git_snapshots(
     assert "check-legacy" not in workflow
     assert "EXECUTION_ENABLED: ${{ steps.restore_runtime_state.outputs.mode == 'artifact' && 'true' || 'false' }}" in workflow
     assert '.conclusion == "success"' in workflow
+    assert "for status_attempt in 1 2 3 4" in workflow
+    assert "RESTORE_OUTCOME: ${{ steps.restore_runtime_state.outcome }}" in workflow
+    assert "Runtime-state restoration did not succeed" in workflow
     assert "data/*" in gitignore
     assert "bootstrap/research_history_seed/" not in gitignore
     assert "git add data/" not in workflow
@@ -4889,6 +4973,74 @@ def test_trade_close_uses_exchange_execution_timestamp_and_canonical_absolute_ac
     assert record["net_realized_pnl_abs"] == pytest.approx(1.7)
     assert record["realized_pnl_abs"] == pytest.approx(1.7)
     assert record["realized_pnl_abs_status"] == "CONFIRMED"
+
+
+def test_trade_close_prefers_complete_exchange_fills_over_stale_local_weighted_pnl(monkeypatch, tmp_path):
+    from event_engine import tracker
+
+    active = tmp_path / "active_trades.json"
+    trades_path = tmp_path / "trades.jsonl"
+    actions = tmp_path / "actions.jsonl"
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", active)
+    monkeypatch.setattr(tracker, "TRADES_PATH", trades_path)
+    monkeypatch.setattr(tracker, "ACTIONS_PATH", actions)
+    monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: {"status": "not_found"})
+    monkeypatch.setattr(tracker, "fetch_klines", lambda *a, **k: [])
+    monkeypatch.setattr(tracker, "_get_filled_order", lambda *a, **k: None)
+    monkeypatch.setattr(tracker, "get_all_orders", lambda *a, **k: [])
+    monkeypatch.setattr(tracker, "send_tg", lambda *a, **k: True)
+    monkeypatch.setattr(tracker, "_collect_trade_fill_accounting", lambda *a, **k: {
+        "status": "VERIFIED",
+        "fills": [
+            {"order_id": "ENTRY1", "role": "ENTRY", "qty": 1.0, "price": 100.0, "time_ms": 100},
+            {"order_id": "EXIT1", "role": "EXIT", "qty": 1.0, "price": 103.0, "time_ms": 210},
+        ],
+        "order_execution_evidence": [],
+        "entry_qty_confirmed": 1.0,
+        "confirmed_exit_qty": 1.0,
+        "entry_vwap_confirmed": 100.0,
+        "exit_vwap_confirmed": 103.0,
+        "exit_vwap_source": "CONFIRMED_FILL_HISTORY",
+        "gross_realized_pnl_abs": 3.0,
+        "gross_realized_pnl_source": "CONFIRMED_EXECUTION_EVIDENCE",
+        "exchange_realized_pnl_abs": None,
+        "exchange_realized_pnl_source": "UNAVAILABLE_FILL_LEVEL_EVIDENCE",
+        "entry_fee_raw": -0.1,
+        "exit_fee_raw": -0.1,
+        "fee_raw_total": -0.2,
+        "fees_paid_abs": 0.2,
+        "fee_source": "ALL_FILL_ORDERS",
+        "net_realized_pnl_abs": 2.8,
+        "net_realized_pnl_source": "CONFIRMED_EXECUTION_EVIDENCE_PLUS_SIGNED_FEES",
+        "last_exit_fill_ts_ms": 210,
+        "incomplete_order_fill_ids": [],
+        "order_execution_evidence_errors": {},
+        "quantity_reconciliation": {
+            "status": "VERIFIED", "initial_qty": 1.0, "confirmed_exit_qty": 1.0,
+            "observed_exit_qty": 1.0, "difference_qty": 0.0, "tolerance": 1e-8,
+        },
+    })
+
+    trade = {
+        "event_id": "EVT_FILL_PNL_OVERRIDES_LOCAL", "symbol": "AAA-USDT", "direction": "LONG", "name": "AAA",
+        "entry_price": 100.0, "initial_qty": 1.0, "remaining_qty": 0.0, "entry_ts": 1, "closed": False,
+        "entry_order": {"order_id": "ENTRY1"}, "tp_orders": [], "sl_order": {},
+        "hit_legs": [], "tp_filled_qty": {}, "realized_pnl_qty": 1.0,
+        "realized_pnl_weighted_sum": 1.5,
+        "peak_pnl_pct": 2.0, "mae_pct": -1.0, "max_drawdown_pct": -1.0,
+        "planned_risk_pct": 10.0, "planned_weighted_rr": 0.45, "effective_weighted_rr": 0.45,
+        "setup": {}, "tp_levels": [], "effective_tp_levels": [],
+        "verified_emergency_close": {"status": "closed_verified", "reason": "EMERGENCY_CLOSE_AFTER_PROTECTION_FAILURE"},
+    }
+    active.write_text(json.dumps({trade["event_id"]: trade}), encoding="utf-8")
+
+    tracker.update_active_trades()
+    record = json.loads(trades_path.read_text(encoding="utf-8").strip())
+    assert record["exit_reason"] == "EMERGENCY_CLOSE_AFTER_PROTECTION_FAILURE"
+    assert record["realized_pnl_pct"] == pytest.approx(3.0)
+    assert record["realized_pnl_source"] == "confirmed_fill_accounting"
+    assert record["exit_price"] == pytest.approx(103.0)
+    assert record["gross_realized_pnl_abs"] == pytest.approx(3.0)
 
 
 def test_position_disappearance_without_exit_evidence_keeps_state_and_protection(monkeypatch, tmp_path):

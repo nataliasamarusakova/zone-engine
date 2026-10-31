@@ -118,6 +118,54 @@ def test_get_open_protection_directional_rejects_unclassifiable_order_row(monkey
     assert "missing order type" in result["error"]
 
 
+def test_open_orders_requests_are_rate_limited_across_callers(monkeypatch):
+    now = {"value": 100.0}
+    sleeps = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        now["value"] += seconds
+
+    monkeypatch.delenv("ZONE_ENGINE_TESTS_ISOLATED", raising=False)
+    monkeypatch.setenv("BINGX_OPEN_ORDERS_MIN_INTERVAL_SEC", "0.30")
+    monkeypatch.setattr(bingx.time, "monotonic", lambda: now["value"])
+    monkeypatch.setattr(bingx.time, "sleep", fake_sleep)
+    monkeypatch.setattr(bingx, "_LAST_OPEN_ORDERS_REQUEST_TS", None)
+
+    bingx._throttle_open_orders_request()
+    assert sleeps == []
+    bingx._throttle_open_orders_request()
+
+    assert sleeps == pytest.approx([0.30])
+    assert now["value"] == pytest.approx(100.30)
+
+
+@pytest.mark.parametrize("exchange_error", [
+    "openOrders failed: code=100410 msg=trigger frequency limit",
+    "openOrders failed: code=109500 msg=temporary network error",
+])
+def test_ensure_directional_protection_distinguishes_unavailable_read_from_missing_orders(monkeypatch, exchange_error):
+    monkeypatch.setattr(bingx, "to_bx_symbol", _identity_symbol)
+    monkeypatch.setattr(bingx, "get_contract", lambda symbol: {
+        "symbol": "BTC-USDT", "quantityPrecision": 3,
+        "pricePrecision": 2, "tradeMinQuantity": 0.001,
+    })
+    monkeypatch.setattr(bingx, "get_open_protection_directional", lambda *args, **kwargs: {
+        "status": "error",
+        "error": exchange_error,
+    })
+
+    result = bingx.ensure_directional_protection(
+        "BTC-USDT", "LONG", 100.0, 1.0, 10.0,
+        [{"leg": "tp1", "pnl_pct": 3.0, "close_fraction": 0.5}],
+        trade_id="EVT_READ_LIMITED",
+    )
+
+    assert result["status"] == "PROTECTION_READ_UNAVAILABLE"
+    assert result["failure_class"] == "EXCHANGE_READ_UNAVAILABLE"
+    assert result["error"] == exchange_error
+
+
 def test_has_open_position_does_not_convert_bad_quantity_to_flat(monkeypatch):
     monkeypatch.setattr(bingx, "to_bx_symbol", _identity_symbol)
     monkeypatch.setattr(

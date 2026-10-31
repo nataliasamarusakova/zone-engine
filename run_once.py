@@ -2397,7 +2397,50 @@ def reconcile_all_open_positions() -> bool:
                 # new entries until tracker books the recovered fill and restores TP.
                 result["status"] = "SL_ONLY"
                 result["error"] = "tp_recovery_pending: TP recreation deferred until recovered fill is booked"
-            if result.get("status") in {"PROTECTED", "SL_ONLY"}:
+            if result.get("status") == "PROTECTION_READ_UNAVAILABLE":
+                # An openOrders API failure is an unknown protection state, not
+                # evidence that the SL/TP orders disappeared. Emergency MARKET
+                # liquidation here converted transient BingX/network read errors
+                # into mass position closures. Preserve the live position and its
+                # last-known protection metadata, block new entries, and retry on
+                # the next reconciliation cycle.
+                unresolved = True
+                known_sl = trade.get("sl_order") if isinstance(trade.get("sl_order"), dict) else {}
+                known_tps = trade.get("tp_orders") if isinstance(trade.get("tp_orders"), list) else []
+                last_known_protection = {
+                    "sl_order_id": known_sl.get("order_id") or known_sl.get("orderId"),
+                    "tp_order_ids": [
+                        item.get("order_id") or item.get("orderId")
+                        for item in known_tps
+                        if isinstance(item, dict) and (item.get("order_id") or item.get("orderId"))
+                    ],
+                    "current_exchange_status": "unknown",
+                }
+                error = str(result.get("error") or "exchange openOrders read unavailable")
+                telemetry.record_state_conflict(
+                    event_id=str(event_id), attempt_id=trade.get("attempt_id"),
+                    position_id=trade.get("position_id") or str(event_id), order_id=None,
+                    symbol=symbol, direction=side,
+                    conflict_type="PROTECTION_READ_UNAVAILABLE",
+                    message=(
+                        "could not read exchange open protection orders; absence is not proven; "
+                        "preserving the current position and retrying reconciliation; "
+                        f"last error: {error}"
+                    ),
+                    owner_event_ids=[str(event_id)],
+                )
+                _append_execution_ledger(str(event_id), None, "RECON_PROTECTION_READ_UNAVAILABLE", {
+                    "status": "deferred", "symbol": symbol, "direction": side,
+                    "error": error,
+                    "action": "preserve_position_and_last_known_protection_retry_next_cycle_block_new_entries",
+                    "last_known_protection": last_known_protection,
+                })
+                log.error(
+                    "[RECON_PROTECTION_READ_UNAVAILABLE] %s %s event=%s error=%s; "
+                    "not closing position because exchange protection absence is unproven; entries blocked",
+                    symbol, side, event_id, error,
+                )
+            elif result.get("status") in {"PROTECTED", "SL_ONLY"}:
                 updated = update_active_trade_protection(
                     symbol, side, result.get("tp_orders", []), result.get("sl_result", {}),
                     result.get("effective_tp_levels", []), result.get("tp_mode"),
