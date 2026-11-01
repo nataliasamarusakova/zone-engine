@@ -1011,10 +1011,12 @@ def test_telegram_uses_zone_only_label_and_dynamic_rr_values():
         "target": {"tp1_pct": 3.0, "tp2_pct": 6.0},
         "confirmation": {},
     })
-    assert "Demand/Supply Zone First" in msg
+    assert "Demand/Supply Zone First" not in msg
     assert "Ajay R5.41 · ALMA" not in msg
     assert "(3% / 0.3R / 50%)" in msg
     assert "(6% / 0.6R / 50%)" in msg
+    assert "Candle body / ATR" not in msg
+    assert "<b>ZONE</b>" not in msg
 
 
 def test_telegram_formats_live_entry_with_compact_prices_and_zone_counts():
@@ -1029,10 +1031,10 @@ def test_telegram_formats_live_entry_with_compact_prices_and_zone_counts():
     })
     assert "ONDOUSDT" in msg
     assert "ONDO-USDT" not in msg
-    assert "Demand zones: <code>5</code>" in msg
-    assert "Supply zones: <code>1</code>" in msg
-    assert "0.35534" in msg
-    assert "0.35534041298549673" not in msg
+    assert "Demand zones:" not in msg
+    assert "Supply zones:" not in msg
+    assert "Bottom:" not in msg
+    assert "POI:" not in msg
     assert "(3% / 0.3R / 50%)" in msg
     assert "(6% / 0.6R / 50%)" in msg
     assert "Risk: <code>10%</code>" in msg
@@ -1043,6 +1045,7 @@ def test_entry_telegram_is_suppressed_for_failed_execution(monkeypatch):
     sent = []
     monkeypatch.setattr(run_once, "send_tg", lambda text: sent.append(text) or True)
     monkeypatch.setattr(run_once, "_append_jsonl", lambda *args, **kwargs: None)
+    monkeypatch.setattr(run_once, "fetch_funding_snapshot", lambda symbol: {"status": "ok", "funding_rate_pct": 0.01})
     signal = {
         "event_id": "EVT_TG_GUARD", "type": "SHORT", "symbol": "ONDO-USDT",
         "entry": 1.0, "sl": 1.1, "tp1": 0.97, "tp2": 0.94, "risk_pct": 10.0,
@@ -1053,6 +1056,21 @@ def test_entry_telegram_is_suppressed_for_failed_execution(monkeypatch):
     assert sent == []
     run_once._send_signal(signal, {"status": "opened_protected"})
     assert len(sent) == 1
+
+
+def test_entry_telegram_is_still_sent_when_optional_funding_lookup_raises(monkeypatch):
+    import run_once
+
+    sent = []
+    monkeypatch.setattr(run_once, "send_tg", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(run_once, "_append_jsonl", lambda *args, **kwargs: None)
+    monkeypatch.setattr(run_once, "fetch_funding_snapshot", lambda symbol: (_ for _ in ()).throw(RuntimeError("temporary API error")))
+    run_once._send_signal(
+        {"event_id": "EVT_TG_FUNDING_FAIL", "type": "LONG", "symbol": "BTC-USDT", "confirmation": {}},
+        {"status": "opened_protected", "order": {}, "protection": {"status": "PROTECTED"}},
+    )
+    assert len(sent) == 1
+    assert "Funding (last): <code>—</code>" in sent[0]
 
 
 def test_post_fill_risk_pct_remains_exactly_at_configured_limit():

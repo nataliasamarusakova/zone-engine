@@ -40,12 +40,13 @@ from event_engine.bingx import (
     POSITION_PATH,
     fetch_research_market_context,
     fetch_research_account_snapshot,
+    fetch_funding_snapshot,
     cancel_order,
     close_position_market,
     open_market,
     wait_for_position_fill_directional,
 )
-from event_engine.signals import STRATEGY_VERSION, SWING_LEN, MIN_BARS as SIGNALS_MIN_BARS, TP1_PCT, TP2_PCT, generate_zone_signals, score_zone_signal, _nearest_opposing_level, _signal_forensics
+from event_engine.signals import STRATEGY_VERSION, SWING_LEN, MIN_BARS as SIGNALS_MIN_BARS, TP1_PCT, TP2_PCT, generate_zone_signals, score_zone_signal, add_3h_zone_confluence, _nearest_opposing_level, _signal_forensics
 from event_engine.version import ENGINE_VERSION
 from event_engine.state_validation import validate_active_trade_record
 from event_engine.fundamental_assets import FUNDAMENTAL_ASSET_SYMBOLS
@@ -4506,9 +4507,22 @@ def _send_signal(signal: dict[str, Any], execution: dict[str, Any] | None = None
         display_signal = signal
         if isinstance(execution, dict) and isinstance(execution.get("executed_signal"), dict):
             display_signal = execution["executed_signal"]
-        text = format_signal(display_signal, setup=_build_setup(display_signal), execution=execution)
+        # Funding is informational and is fetched only after the exchange has
+        # confirmed both entry and mandatory protection. Its API failure must
+        # never affect the already-open position or notification delivery.
+        try:
+            funding = fetch_funding_snapshot(str(display_signal.get("symbol") or signal.get("symbol") or ""))
+        except Exception as funding_exc:
+            log.warning("[TG_FUNDING] optional funding lookup failed: %s", type(funding_exc).__name__)
+            funding = {"status": "unavailable", "reason": type(funding_exc).__name__}
+        execution["funding_snapshot"] = funding
+        text = format_signal(display_signal, execution=execution, funding=funding)
         ok = send_tg(text)
-        _append_jsonl(ACTIONS_PATH, {"ts": int(time.time() * 1000), "action": "SIGNAL", "event_id": signal["event_id"], "telegram_ok": ok})
+        _append_jsonl(ACTIONS_PATH, {
+            "ts": int(time.time() * 1000), "action": "SIGNAL",
+            "event_id": signal["event_id"], "telegram_ok": ok,
+            "funding_snapshot": funding,
+        })
     except Exception as exc:
         log.warning("[TG] signal send failed: %s", exc)
 
@@ -4617,14 +4631,34 @@ def _prefetch_missing_research_5m_bars(
     by object identity so two symbols with similar payloads can never share the
     wrong bars. Persistence and per-symbol application remain serial below.
     """
-    pending = [
+    cursor_snapshot = research._load_cursors()
+    candidates = [
         payload for payload in payload_batch
         if _research_payload_needs_5m_history(payload)
         and len(payload.get("bars_5m") or []) < max(1, int(limit))
     ]
+    pending: list[dict[str, Any]] = []
+    already_seeded = 0
+    for payload in candidates:
+        if research.market_bar_history_seeded(
+            str(payload.get("symbol") or ""), "5m", str(payload.get("provider") or "binance"),
+            cursor_snapshot=cursor_snapshot,
+        ):
+            already_seeded += 1
+        else:
+            pending.append(payload)
     if not pending:
+        if already_seeded:
+            log.info(
+                "[RESEARCH_5M_PREFETCH] candidates=%d already_seeded=%d fetch=0 limit=%d",
+                len(candidates), already_seeded, max(1, int(limit)),
+            )
         return {}
     workers = max(1, min(4, int(max_workers), len(pending)))
+    log.info(
+        "[RESEARCH_5M_PREFETCH] candidates=%d already_seeded=%d fetch=%d workers=%d limit=%d",
+        len(candidates), already_seeded, len(pending), workers, max(1, int(limit)),
+    )
     results: dict[int, list[dict]] = {}
     if workers == 1:
         for payload in pending:
@@ -5108,8 +5142,13 @@ def main() -> None:
                 trigger_text = None
 
             recent = zone_signals
+            mtf_zone_snapshot_cache: dict[str, dict[str, Any]] = {}
             for sig in recent:
                 sig["score"] = score_zone_signal(sig)
+                # Informational multi-timeframe confluence: use only complete 3h
+                # candles aggregated from the already-fetched 1h series. It does
+                # not add API traffic or change entry eligibility/score.
+                add_3h_zone_confluence(sig, df, snapshot_cache=mtf_zone_snapshot_cache)
                 sig["market_snapshot"] = {
                     "analysis_provider": provider,
                     "analysis_source": source_name,
@@ -5917,6 +5956,7 @@ def main() -> None:
                             account_context=_account_context_asof(payload.get("decision_ts")),
                             btc_df_5m=btc_df_5m, btc_df_1h=btc_df_1h,
                             persist_bars_for_forward=bool(payload.get("persist_bars_for_forward")),
+                            seed_5m_history=bool(prefetched_bars.get(id(payload))),
                         )
                         batch_observations += int(counts.get("observations", 0))
                         batch_bars1h += int(counts.get("bars_1h", 0))
