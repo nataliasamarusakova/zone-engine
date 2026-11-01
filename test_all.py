@@ -1070,7 +1070,7 @@ def test_entry_telegram_is_still_sent_when_optional_funding_lookup_raises(monkey
         {"status": "opened_protected", "order": {}, "protection": {"status": "PROTECTED"}},
     )
     assert len(sent) == 1
-    assert "Funding (last): <code>—</code>" in sent[0]
+    assert "Funding: <code>—</code>" in sent[0]
 
 
 def test_post_fill_risk_pct_remains_exactly_at_configured_limit():

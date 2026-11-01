@@ -24,7 +24,7 @@ def _hourly_bars(count: int, start: pd.Timestamp | None = None) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def test_telegram_compact_format_contains_only_requested_fields():
+def test_telegram_compact_format_uses_requested_layout_and_zone_proximity():
     from event_engine.telegram import format_signal
 
     msg = format_signal(
@@ -50,22 +50,83 @@ def test_telegram_compact_format_contains_only_requested_fields():
         },
         funding={"status": "ok", "funding_rate_pct": 0.01},
     )
-    assert "🔴 SHORT · GUSDT" in msg
-    assert "Score: <b>60.0</b>" in msg
-    assert "Zone: <b>SUPPLY</b>" in msg
-    assert "Entry reference: <code>0.004174</code>" in msg
-    assert "TP1: <code>0.00404878</code> (3% / 0.3R / 50%)" in msg
-    assert "TP2: <code>0.00392356</code> (6% / 0.6R / 50%)" in msg
-    assert "Volume / SMA20: <code>0.554</code>" in msg
-    assert "DEMAND 77,300 ↔ DEMAND 77,130 (0.22%)" in msg
-    assert "Funding (last): <code>+0.0100%</code>" in msg
-    assert "Status: <code>opened_protected</code>" in msg
-    assert "Order: <code>2116810510872612864</code>" in msg
-    assert "Protection: <code>PROTECTED</code>" in msg
+    expected = "\n".join([
+        '<a href="https://web.telegram.org/k/assets/img/emoji/1f534.png">🔴</a> SHORT · <code>GUSDT</code>',
+        "",
+        "Score: <code>60.0</code>",
+        "Zone: <code>SUPPLY</code>",
+        "Entry reference: <code>0.004174</code>",
+        "SL: <code>0.0045914</code>",
+        "TP1: <code>0.00404878 (3% / 0.3R / 50%)</code>",
+        "TP2: <code>0.00392356 (6% / 0.6R / 50%)</code>",
+        "Risk: <code>10%</code>",
+        "",
+        "CONFIRMATION",
+        "Volume / SMA20: <code>0.554</code>",
+        "Zone 1H: <code>DEMAND 77,300</code>",
+        "Zone 3H: <code>DEMAND 77,130</code>",
+        "Calculation: <code>NEAR · 0.22%</code>",
+        "Funding: <code>+0.0100%</code>",
+        "",
+        "EXECUTION",
+        "Status: <code>opened_protected</code>",
+        "Order: <code>2116810510872612864</code>",
+        "Protection: <code>PROTECTED</code>",
+        "Error: <code>—</code>",
+    ])
+    assert msg == expected
+    assert "1H / 3H zones:" not in msg
+    assert "Funding (last):" not in msg
+    assert "<b>" not in msg
+    assert "<code>0.004174</code>" in msg
+    assert "<code>NEAR · 0.22%</code>" in msg
+    assert "<code>2116810510872612864</code>" in msg
     assert "Signal:" not in msg
     assert "Demand zones:" not in msg
     assert "Candle body / ATR:" not in msg
     assert "Age:" not in msg
+
+
+def test_telegram_zone_proximity_reports_overlap_and_far_separately():
+    from event_engine.telegram import _fmt_mtf_zone_lines
+
+    base = {
+        "kind": "SUPPLY",
+        "one_hour": {"poi": 100.0},
+        "three_hour": {"poi": 100.2},
+        "poi_distance_pct": 0.2,
+    }
+    assert _fmt_mtf_zone_lines({**base, "status": "confluent", "overlap": True}) == [
+        "Zone 1H: SUPPLY 100",
+        "Zone 3H: SUPPLY 100.2",
+        "Calculation: OVERLAP · 0.2%",
+    ]
+    far = {**base, "status": "not_confluent", "overlap": False, "poi_distance_pct": 0.8}
+    assert _fmt_mtf_zone_lines(far)[2] == "Calculation: FAR · 0.8%"
+    tiny = {**base, "status": "confluent", "overlap": False, "poi_distance_pct": 0.000001}
+    assert _fmt_mtf_zone_lines(tiny)[2] == "Calculation: NEAR · 0.000001%"
+
+
+def test_telegram_zone_proximity_handles_unavailable_mtf_data():
+    from event_engine.telegram import _fmt_mtf_zone_lines
+
+    result = _fmt_mtf_zone_lines({
+        "status": "no_3h_zone",
+        "kind": "DEMAND",
+        "one_hour": {"poi": 77300.0},
+    })
+    assert result == [
+        "Zone 1H: DEMAND 77,300",
+        "Zone 3H: —",
+        "Calculation: —",
+    ]
+
+
+def test_telegram_long_header_uses_green_emoji_link():
+    from event_engine.telegram import format_signal
+
+    message = format_signal({"type": "LONG", "symbol": "BTC-USDT", "confirmation": {}})
+    assert message.startswith('<a href="https://web.telegram.org/k/assets/img/emoji/1f7e2.png">🟢</a> LONG · <code>BTCUSDT</code>')
 
 
 def test_telegram_price_formatting_preserves_exchange_precision_without_scientific_notation():
@@ -87,8 +148,8 @@ def test_telegram_price_formatting_preserves_exchange_precision_without_scientif
     })
     assert "Entry reference: <code>0.000123456789</code>" in message
     assert "SL: <code>0.000111111119</code>" in message
-    assert "TP1: <code>0.000127160493</code>" in message
-    assert "TP2: <code>0.000130864197</code>" in message
+    assert "TP1: <code>0.000127160493 (3% / 0.3R / 50%)</code>" in message
+    assert "TP2: <code>0.000130864197 (6% / 0.6R / 50%)</code>" in message
 
 
 def test_telegram_never_displays_stale_or_unavailable_funding_as_a_rate():
@@ -207,6 +268,31 @@ def test_3h_zone_confluence_uses_same_side_zones_and_is_informational(monkeypatc
     assert signal["zone"] == before["zone"]
 
 
+def test_3h_zone_confluence_uses_configured_three_percent_threshold(monkeypatch):
+    from event_engine import signals
+
+    start = pd.Timestamp("2026-10-01T00:00:00Z")
+    bars = _hourly_bars(240, start)
+    monkeypatch.setenv("MTF_ZONE_CONFLUENCE_MAX_DISTANCE_PCT", "3.0")
+    monkeypatch.setattr(
+        signals,
+        "_pine_zone_walk",
+        lambda df: ([], [{"top": 103.1, "btm": 102.9, "poi": 103.0, "start": 10}], [], [], []),
+    )
+    signal = {
+        "type": "LONG",
+        "decision_boundary_ts": (start + pd.Timedelta(hours=240)).isoformat(),
+        "zone": {"kind": "DEMAND", "top": 100.1, "btm": 99.9, "poi": 100.0},
+        "confirmation": {},
+    }
+
+    signals.add_3h_zone_confluence(signal, bars)
+    data = signal["confirmation"]["mtf_zone_confluence"]
+    assert data["poi_distance_pct"] == pytest.approx(3.0)
+    assert data["max_distance_pct"] == pytest.approx(3.0)
+    assert data["status"] == "confluent"
+
+
 def test_3h_zone_confluence_does_not_match_opposite_side(monkeypatch):
     from event_engine import signals
 
@@ -231,6 +317,7 @@ def _isolated_research_paths(research, tmp_path: Path, monkeypatch) -> None:
     for name in ["MARKET_BARS_5M_PATH", "RESEARCH_BAR_CURSORS_PATH", "RESEARCH_MANIFEST_PATH", "RESEARCH_ERRORS_PATH"]:
         monkeypatch.setattr(research, name, tmp_path / getattr(research, name).name)
     monkeypatch.setattr(research, "_PERSISTENCE_BATCH", None)
+    monkeypatch.setattr(research, "_MARKET_BAR_INDEX_CACHE", {})
 
 
 def test_research_history_seed_backfills_older_bars_behind_existing_cursor(tmp_path, monkeypatch):

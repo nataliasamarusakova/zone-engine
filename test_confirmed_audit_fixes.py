@@ -31,6 +31,7 @@ def _isolate_research_paths(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(research, "_OBSERVATION_SEEN_IDS", None)
     monkeypatch.setattr(research, "_OBSERVATION_SEEN_IDS_PATH", None)
     monkeypatch.setattr(research, "_PERSISTENCE_BATCH", None)
+    monkeypatch.setattr(research, "_MARKET_BAR_INDEX_CACHE", {})
 
 
 def test_pending_forward_without_new_boundary_keeps_both_timeframes():

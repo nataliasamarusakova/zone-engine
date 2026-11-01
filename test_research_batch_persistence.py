@@ -29,6 +29,59 @@ def _isolate_paths(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(research, "_OBSERVATION_SEEN_IDS", None)
     monkeypatch.setattr(research, "_OBSERVATION_SEEN_IDS_PATH", None)
     monkeypatch.setattr(research, "_PERSISTENCE_BATCH", None)
+    monkeypatch.setattr(research, "_MARKET_BAR_INDEX_CACHE", {})
+
+
+def test_market_bar_idempotency_index_reuses_scan_and_invalidates_after_external_append(tmp_path, monkeypatch):
+    research._MARKET_BAR_INDEX_CACHE.clear()
+    path = tmp_path / "market_bars_5m.jsonl"
+    original_reader = research._read_market_bar_identity_index
+    read_calls = []
+
+    def counted_reader(target):
+        read_calls.append(target)
+        return original_reader(target)
+
+    monkeypatch.setattr(research, "_read_market_bar_identity_index", counted_reader)
+    start = pd.Timestamp("2026-10-01T00:00:00Z")
+    rows = [_bar(start + pd.Timedelta(minutes=5 * index)) for index in range(4)]
+    rows = [
+        {**row, "symbol": "AAA-USDT", "timeframe": "5m", "provider": "binance"}
+        for row in rows
+    ]
+
+    assert research._append_market_bars_idempotent_locked(path, rows[:1]) == 1
+    # A second normal batch must reuse the in-memory identity index.
+    assert research._append_market_bars_idempotent_locked(path, rows[1:2]) == 1
+    assert research._append_market_bars_idempotent_locked(path, rows[:1]) == 0
+    assert len(read_calls) == 1
+
+    # Simulate a durable writer outside this process/cache. The file signature
+    # must invalidate it and preserve deduplication after the external append.
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(rows[2], ensure_ascii=False, separators=(",", ":")) + "\n")
+        fh.flush()
+
+    assert research._append_market_bars_idempotent_locked(path, rows[2:3]) == 0
+    assert len(read_calls) == 2
+
+    # Retention restoration/compaction may atomically replace the journal. A new
+    # inode with the same rows must trigger a rebuild rather than trust stale IDs.
+    replacement = tmp_path / "market_bars_5m.replacement.jsonl"
+    replacement.write_text(
+        "".join(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n" for row in rows[:3]),
+        encoding="utf-8",
+    )
+    replacement.replace(path)
+    assert research._append_market_bars_idempotent_locked(path, rows[2:3]) == 0
+    assert len(read_calls) == 3
+
+    assert research._append_market_bars_idempotent_locked(path, rows[3:]) == 1
+    assert len(read_calls) == 3
+
+    saved = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [row["timestamp"] for row in saved] == [row["timestamp"] for row in rows]
+    research._MARKET_BAR_INDEX_CACHE.clear()
 
 
 def test_batch_persistence_flushes_observations_bars_cursors_and_counters(tmp_path, monkeypatch):
