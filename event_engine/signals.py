@@ -267,6 +267,155 @@ def _aggregate_8h(df_1h: pd.DataFrame) -> pd.DataFrame:
     return tf
 
 
+def _aggregate_complete_3h_bars(df_1h: pd.DataFrame, decision_boundary: Any) -> pd.DataFrame:
+    """Aggregate only complete, contiguous UTC 3-hour bars available at a decision boundary."""
+    boundary = pd.to_datetime(decision_boundary, utc=True, errors="coerce")
+    if pd.isna(boundary):
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+    x = _normalize_1h(df_1h)
+    # Source timestamps are candle-open times. A 1h candle is usable only after
+    # its close, and future 1h candles must not leak into the 3h structure.
+    x = x.loc[x["timestamp"] + pd.Timedelta(hours=1) <= boundary].copy()
+    if x.empty:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+    x["bucket"] = x["timestamp"].dt.floor("3h")
+    rows: list[dict[str, Any]] = []
+    for bucket, group in x.groupby("bucket", sort=True, observed=True):
+        group = group.sort_values("timestamp")
+        expected = [bucket + pd.Timedelta(hours=offset) for offset in range(3)]
+        if group["timestamp"].tolist() != expected:
+            continue
+        rows.append({
+            "timestamp": bucket,
+            "open": float(group.iloc[0]["open"]),
+            "high": float(group["high"].max()),
+            "low": float(group["low"].min()),
+            "close": float(group.iloc[-1]["close"]),
+            "volume": float(group["volume"].sum()),
+        })
+    result = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    if len(result) > 1:
+        gaps = result["timestamp"].diff().ne(pd.Timedelta(hours=3))
+        gap_positions = np.flatnonzero(gaps.to_numpy())
+        # _pine_zone_walk interprets adjacent rows as adjacent candles. Keep only
+        # the latest contiguous suffix rather than compressing missing 3h bars
+        # into a fictitious continuous series.
+        if gap_positions.size:
+            result = result.iloc[int(gap_positions[-1]):].reset_index(drop=True)
+    return result
+
+
+def add_3h_zone_confluence(
+    signal: dict[str, Any],
+    df_1h: pd.DataFrame,
+    *,
+    max_distance_pct: float | None = None,
+    snapshot_cache: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Attach informational same-side 1h/3h zone confluence without changing entry eligibility.
+
+    ``snapshot_cache`` is deliberately caller-scoped (normally one symbol scan),
+    so multiple fresh signals at the same decision boundary share one 3h zone walk
+    without retaining DataFrames or market state across symbols/runs.
+    """
+    try:
+        tolerance = (
+            max(0.0, float(max_distance_pct))
+            if max_distance_pct is not None
+            else max(0.0, float(os.environ.get("MTF_ZONE_CONFLUENCE_MAX_DISTANCE_PCT", "0.50")))
+        )
+    except (TypeError, ValueError):
+        tolerance = 0.50
+
+    zone = signal.get("zone") if isinstance(signal.get("zone"), dict) else {}
+    confirmation = signal.setdefault("confirmation", {})
+    if not isinstance(confirmation, dict):
+        confirmation = {}
+        signal["confirmation"] = confirmation
+    kind = str(zone.get("kind") or ("DEMAND" if str(signal.get("type", "")).upper() == "LONG" else "SUPPLY")).upper()
+    try:
+        poi_1h = float(zone.get("poi"))
+        top_1h = float(zone.get("top"))
+        bottom_1h = float(zone.get("btm", zone.get("bottom")))
+    except (TypeError, ValueError):
+        confirmation["mtf_zone_confluence"] = {"status": "unavailable", "reason": "invalid_1h_zone"}
+        return signal
+    if kind not in {"DEMAND", "SUPPLY"} or not all(math.isfinite(v) and v > 0 for v in (poi_1h, top_1h, bottom_1h)) or top_1h < bottom_1h:
+        confirmation["mtf_zone_confluence"] = {"status": "unavailable", "reason": "invalid_1h_zone"}
+        return signal
+
+    boundary = signal.get("decision_boundary_ts") or signal.get("trigger_bar_close_time")
+    if not boundary:
+        confirmation["mtf_zone_confluence"] = {"status": "unavailable", "reason": "missing_decision_boundary"}
+        return signal
+
+    boundary_ts = pd.to_datetime(boundary, utc=True, errors="coerce")
+    cache_key = f"{id(df_1h)}|{boundary_ts.floor('3h') if not pd.isna(boundary_ts) else 'NaT'}"
+    snapshot = snapshot_cache.get(cache_key) if isinstance(snapshot_cache, dict) else None
+    if not isinstance(snapshot, dict):
+        try:
+            bars_3h = _aggregate_complete_3h_bars(df_1h, boundary)
+            if len(bars_3h) < MIN_BARS:
+                snapshot = {
+                    "status": "unavailable", "reason": "insufficient_complete_3h_history",
+                    "complete_3h_bars": len(bars_3h), "as_of": str(boundary),
+                }
+            else:
+                bars_3h["atr50"] = calc_atr(bars_3h, 50)
+                active_supply, active_demand, _, _, _ = _pine_zone_walk(bars_3h.reset_index(drop=True))
+                snapshot = {
+                    "status": "ok", "supply": active_supply, "demand": active_demand,
+                    "complete_3h_bars": len(bars_3h), "as_of": str(boundary),
+                }
+        except Exception as exc:
+            snapshot = {"status": "unavailable", "reason": type(exc).__name__, "as_of": str(boundary)}
+        if isinstance(snapshot_cache, dict):
+            snapshot_cache[cache_key] = snapshot
+
+    if snapshot.get("status") != "ok":
+        confirmation["mtf_zone_confluence"] = {
+            key: value for key, value in snapshot.items() if key not in {"supply", "demand"}
+        }
+        return signal
+
+    candidates = snapshot.get("demand" if kind == "DEMAND" else "supply") or []
+    if not candidates:
+        confirmation["mtf_zone_confluence"] = {
+            "status": "no_3h_zone", "kind": kind,
+            "one_hour": {"poi": poi_1h, "top": top_1h, "bottom": bottom_1h},
+            "complete_3h_bars": snapshot.get("complete_3h_bars"),
+            "as_of": str(boundary),
+        }
+        return signal
+
+    try:
+        nearest = min(candidates, key=lambda candidate: abs(float(candidate.get("poi", 0.0)) - poi_1h))
+        poi_3h = float(nearest["poi"])
+        top_3h = float(nearest["top"])
+        bottom_3h = float(nearest["btm"])
+        if not all(math.isfinite(v) and v > 0 for v in (poi_3h, top_3h, bottom_3h)) or top_3h < bottom_3h:
+            raise ValueError("invalid_3h_zone")
+        overlap = max(bottom_1h, bottom_3h) <= min(top_1h, top_3h)
+        poi_distance_pct = abs(poi_3h - poi_1h) / poi_1h * 100.0
+        status = "confluent" if overlap or poi_distance_pct <= tolerance else "not_confluent"
+        confirmation["mtf_zone_confluence"] = {
+            "status": status,
+            "kind": kind,
+            "one_hour": {"poi": poi_1h, "top": top_1h, "bottom": bottom_1h},
+            "three_hour": {"poi": poi_3h, "top": top_3h, "bottom": bottom_3h},
+            "overlap": bool(overlap),
+            "poi_distance_pct": poi_distance_pct,
+            "max_distance_pct": tolerance,
+            "complete_3h_bars": snapshot.get("complete_3h_bars"),
+            "as_of": str(boundary),
+        }
+    except Exception as exc:
+        confirmation["mtf_zone_confluence"] = {
+            "status": "unavailable", "reason": type(exc).__name__, "as_of": str(boundary),
+        }
+    return signal
+
+
 def _attach_exact_alternate_series(df: pd.DataFrame, mode: Literal["historical", "live"] = "live") -> pd.DataFrame:
     """Attach Ajay R5.41 ``request.security(..., 480, ..., lookahead_on)`` values.
 

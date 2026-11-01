@@ -2935,6 +2935,82 @@ def _research_symbol_row(data: Any, symbol: str) -> dict[str, Any] | None:
     return None
 
 
+def fetch_funding_snapshot(symbol: str, *, timeout_sec: float = 2.0) -> dict[str, Any]:
+    """Fetch the latest BingX premium-index funding rate for a Telegram trade notice.
+
+    This optional read is deliberately fail-open and is called only after an entry
+    has been opened with verified protection. ``lastFundingRate`` is a decimal
+    fraction, so the returned percentage is multiplied by 100 exactly once.
+    """
+    captured_at_ms = int(time.time() * 1000)
+    bx_symbol = to_bx_symbol(symbol)
+    if not bx_symbol:
+        return {"status": "unavailable", "reason": "contract_not_found", "symbol": str(symbol).upper(), "captured_at_ms": captured_at_ms}
+    try:
+        response = _research_public_get(
+            "premiumIndex", PREMIUM_INDEX_PATH, {"symbol": bx_symbol},
+            timeout_sec=max(0.5, float(timeout_sec)),
+        )
+        if not isinstance(response, dict) or int(response.get("code", -1)) != 0:
+            return {
+                "status": "unavailable", "reason": "premium_index_request_failed",
+                "exchange_code": response.get("code") if isinstance(response, dict) else None,
+                "captured_at_ms": captured_at_ms, "symbol": bx_symbol,
+            }
+        row = _research_symbol_row(response.get("data"), bx_symbol)
+        if not isinstance(row, dict):
+            return {"status": "unavailable", "reason": "premium_index_row_missing", "captured_at_ms": captured_at_ms, "symbol": bx_symbol}
+        raw_rate = row.get("lastFundingRate")
+        rate = float(raw_rate)
+        if not math.isfinite(rate):
+            raise ValueError("non_finite_funding_rate")
+        raw_exchange_ts = row.get("time")
+        try:
+            exchange_ts_ms = int(raw_exchange_ts) if raw_exchange_ts not in (None, "") else None
+        except (TypeError, ValueError, OverflowError):
+            exchange_ts_ms = None
+        if exchange_ts_ms is None:
+            # The documented endpoint includes the exchange timestamp. Without it
+            # we cannot prove freshness, so do not present the rate as current.
+            return {
+                "status": "unverified", "reason": "premium_index_timestamp_missing",
+                "captured_at_ms": captured_at_ms, "symbol": bx_symbol,
+            }
+        age_ms = captured_at_ms - exchange_ts_ms
+        try:
+            max_age_ms = max(30_000, int(float(os.environ.get("TELEGRAM_FUNDING_MAX_AGE_SEC", "300")) * 1000))
+        except (TypeError, ValueError, OverflowError):
+            max_age_ms = 300_000
+        if age_ms < -30_000 or age_ms > max_age_ms:
+            return {
+                "status": "stale", "reason": "premium_index_timestamp_out_of_range",
+                "exchange_ts_ms": exchange_ts_ms, "age_ms": age_ms,
+                "captured_at_ms": captured_at_ms, "symbol": bx_symbol,
+            }
+        next_funding = row.get("nextFundingTime")
+        try:
+            next_funding_ms = int(next_funding) if next_funding not in (None, "") else None
+        except (TypeError, ValueError, OverflowError):
+            next_funding_ms = None
+        return {
+            "status": "ok",
+            "symbol": bx_symbol,
+            "funding_rate": rate,
+            "funding_rate_pct": rate * 100.0,
+            "funding_rate_unit": "PERCENT",
+            "exchange_ts_ms": exchange_ts_ms,
+            "timestamp_source": "exchange" if exchange_ts_ms is not None else "local_fetch",
+            "age_ms": age_ms,
+            "next_funding_time_ms": next_funding_ms,
+            "captured_at_ms": captured_at_ms,
+        }
+    except Exception as exc:
+        return {
+            "status": "unavailable", "reason": type(exc).__name__,
+            "captured_at_ms": captured_at_ms, "symbol": bx_symbol,
+        }
+
+
 def _research_depth_metrics(data: Any, *, mid_price: float | None = None) -> dict[str, Any]:
     if not isinstance(data, dict):
         return {"status": "error", "error": "depth_data_invalid"}

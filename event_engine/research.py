@@ -751,6 +751,19 @@ def _cursor_key(symbol: str, timeframe: str, provider: str) -> str:
     return f"{str(symbol).upper()}|{str(timeframe).lower()}|{str(provider).lower()}"
 
 
+def market_bar_history_seeded(
+    symbol: str,
+    timeframe: str = "5m",
+    provider: str = "binance",
+    *,
+    cursor_snapshot: dict[str, Any] | None = None,
+) -> bool:
+    """Whether the one-time historical backfill is durably recorded for a bar stream."""
+    cursors = cursor_snapshot if isinstance(cursor_snapshot, dict) else _load_cursors()
+    cursor = cursors.get(_cursor_key(symbol, timeframe, provider))
+    return isinstance(cursor, dict) and cursor.get("history_seeded") is True
+
+
 def _load_cursors() -> dict[str, Any]:
     if _PERSISTENCE_BATCH is not None:
         cache = _PERSISTENCE_BATCH.get("cursor_cache")
@@ -803,6 +816,7 @@ def persist_market_bars(
     source: str,
     scan_id: str,
     code_commit_sha: str | None = None,
+    seed_history: bool = False,
 ) -> int:
     if not RESEARCH_ENABLED:
         return 0
@@ -861,19 +875,46 @@ def persist_market_bars(
         normalized = list(unique_by_timestamp.values())
         key = _cursor_key(symbol, tf, provider)
         cursors = _load_cursors()
-        previous = str((cursors.get(key) or {}).get("last_timestamp", ""))
-        if previous:
+        previous_cursor = cursors.get(key) if isinstance(cursors.get(key), dict) else {}
+        previous = str(previous_cursor.get("last_timestamp", ""))
+        if seed_history and tf == "5m":
+            # A scan cursor may already point at the newest 5m candle even though
+            # the older part of a requested 300-bar history was never archived.
+            # Seed the complete bounded response once; append is idempotent and
+            # cursor advancement remains monotonic.
+            fresh = normalized
+        elif previous:
             fresh = [r for r in normalized if str(r["timestamp"]) > previous]
         else:
             bootstrap = INITIAL_1H_BARS if tf == "1h" else INITIAL_5M_BARS
             fresh = normalized[-bootstrap:]
-        if not fresh:
+        if not fresh and not (seed_history and tf == "5m"):
             return 0
         path = MARKET_BARS_1H_PATH if tf == "1h" else MARKET_BARS_5M_PATH
+        latest_row = normalized[-1]
+        if previous and previous >= str(latest_row["timestamp"]):
+            last_timestamp = previous
+            last_bar_id = str(previous_cursor.get("last_bar_id") or latest_row["bar_id"])
+        else:
+            last_timestamp = str(latest_row["timestamp"])
+            last_bar_id = str(latest_row["bar_id"])
+        cursor_value = {
+            **previous_cursor,
+            "last_timestamp": last_timestamp,
+            "last_bar_id": last_bar_id,
+            "updated_at": _now_iso(),
+            "scan_id": scan_id,
+        }
+        if seed_history and tf == "5m":
+            cursor_value.update({
+                "history_seeded": True,
+                "history_seeded_count": len(normalized),
+                "history_seeded_at": _now_iso(),
+            })
         if _PERSISTENCE_BATCH is not None:
             # Actual append and cursor advancement happen together at batch flush.
             _PERSISTENCE_BATCH["market_bars"][tf].extend(fresh)
-            _update_cursor(key, {"last_timestamp": fresh[-1]["timestamp"], "last_bar_id": fresh[-1]["bar_id"], "updated_at": _now_iso(), "scan_id": scan_id})
+            _update_cursor(key, cursor_value)
             return len(fresh)
         written = _append_market_bars_idempotent_locked(path, fresh)
         # Count newly durable rows immediately after append, before the cursor
@@ -884,7 +925,7 @@ def persist_market_bars(
             _bump_manifest(f"market_bars_{tf}_written", written)
         # Even when all candidate bars were already present from a prior run whose
         # cursor write failed, the successful idempotent check lets us repair cursor.
-        _update_cursor(key, {"last_timestamp": fresh[-1]["timestamp"], "last_bar_id": fresh[-1]["bar_id"], "updated_at": _now_iso(), "scan_id": scan_id})
+        _update_cursor(key, cursor_value)
         return written
     except Exception as exc:
         target = MARKET_BARS_1H_PATH if tf == "1h" else MARKET_BARS_5M_PATH
@@ -1909,6 +1950,7 @@ def record_scan_symbol(
     btc_df_5m: pd.DataFrame | None = None,
     btc_df_1h: pd.DataFrame | None = None,
     persist_bars_for_forward: bool = False,
+    seed_5m_history: bool = False,
 ) -> dict[str, int]:
     """Persist one symbol's shadow observations and market bars.
 
@@ -2149,6 +2191,7 @@ def record_scan_symbol(
         )
         if closed_5m:
             counts["bars_5m"] = persist_market_bars(
-                symbol, "5m", closed_5m, provider=provider, source=source, scan_id=scan_id, code_commit_sha=code_commit_sha
+                symbol, "5m", closed_5m, provider=provider, source=source, scan_id=scan_id,
+                code_commit_sha=code_commit_sha, seed_history=seed_5m_history,
             )
     return counts
