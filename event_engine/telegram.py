@@ -54,6 +54,16 @@ def _esc(value: Any) -> str:
     return html.escape("—" if value is None or value == "" else str(value), quote=False)
 
 
+def _code(value: Any) -> str:
+    """Render a Telegram inline-code entity whose contents are safe to copy."""
+    return f"<code>{_esc(value)}</code>"
+
+
+def _code_escaped(value: str) -> str:
+    """Wrap text already HTML-escaped by a formatter in a code entity."""
+    return f"<code>{value}</code>"
+
+
 def _decimal_price_text(value: Any) -> tuple[Decimal | None, str | None]:
     """Return a finite decimal and its exact plain-string representation.
 
@@ -111,29 +121,62 @@ def _fmt_price_grouped(value: Any) -> str:
     return _esc(text)
 
 
-def _fmt_confluence(value: Any) -> str:
-    if not isinstance(value, dict) or value.get("status") not in {"confluent", "not_confluent"}:
-        return "—"
-    kind = str(value.get("kind") or "").upper()
-    one_hour = value.get("one_hour") if isinstance(value.get("one_hour"), dict) else {}
-    three_hour = value.get("three_hour") if isinstance(value.get("three_hour"), dict) else {}
-    poi_1h = one_hour.get("poi")
-    poi_3h = three_hour.get("poi")
-    if poi_1h is None or poi_3h is None:
-        return "—"
+def _fmt_distance_pct(value: Any) -> str:
     try:
-        distance = float(value.get("poi_distance_pct"))
+        distance = float(value)
     except (TypeError, ValueError):
         return "—"
-    if not (distance == distance) or distance in (float("inf"), float("-inf")):
+    if not (distance == distance) or distance in (float("inf"), float("-inf")) or distance < 0:
         return "—"
-    distance_label = "overlap" if value.get("overlap") else f"{distance:.2f}%"
-    if value.get("status") == "not_confluent":
-        distance_label += ", far"
-    return (
-        f"{_esc(kind)} {_fmt_price_grouped(poi_1h)} ↔ "
-        f"{_esc(kind)} {_fmt_price_grouped(poi_3h)} ({_esc(distance_label)})"
-    )
+    # Keep ordinary distances compact while avoiding a misleading 0.00% for
+    # small but non-zero separations between two valid zones.
+    if distance >= 0.01:
+        digits = 2
+    elif distance >= 0.0001:
+        digits = 4
+    else:
+        digits = 8
+    return f"{distance:.{digits}f}".rstrip("0").rstrip(".") + "%"
+
+
+def _fmt_mtf_zone_lines(value: Any) -> list[str]:
+    """Render the 1h/3h zone snapshot as separate prices plus a clear relation."""
+    one_hour = value.get("one_hour") if isinstance(value, dict) and isinstance(value.get("one_hour"), dict) else {}
+    three_hour = value.get("three_hour") if isinstance(value, dict) and isinstance(value.get("three_hour"), dict) else {}
+    kind = str(value.get("kind") or "").upper() if isinstance(value, dict) else ""
+    if kind not in {"DEMAND", "SUPPLY"}:
+        kind = "—"
+
+    def zone_text(zone: dict[str, Any]) -> str:
+        number, text = _decimal_price_text(zone.get("poi"))
+        if number is None or number <= 0 or text is None or kind == "—":
+            return "—"
+        return f"{kind} {_fmt_price_grouped(text)}"
+
+    one_hour_text = zone_text(one_hour)
+    three_hour_text = zone_text(three_hour)
+    lines = [
+        f"Zone 1H: {one_hour_text}",
+        f"Zone 3H: {three_hour_text}",
+        "Calculation: —",
+    ]
+
+    if not isinstance(value, dict) or value.get("status") not in {"confluent", "not_confluent"}:
+        return lines
+    if one_hour_text == "—" or three_hour_text == "—":
+        return lines
+
+    distance_text = _fmt_distance_pct(value.get("poi_distance_pct"))
+    if distance_text == "—":
+        return lines
+    if value.get("overlap") is True:
+        relation = "OVERLAP"
+    elif value.get("status") == "confluent":
+        relation = "NEAR"
+    else:
+        relation = "FAR"
+    lines[2] = f"Calculation: {relation} · {distance_text}"
+    return lines
 
 
 def _fmt_funding(funding: dict[str, Any] | None) -> str:
@@ -159,7 +202,12 @@ def format_signal(
     """Render the compact production entry notice; no research/debug fields leak into chat."""
     direction = str(event.get("type") or event.get("direction") or "").upper()
     symbol = str(event.get("symbol", "")).replace("-", "").upper()
-    icon = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
+    icon = "🟢" if direction == "LONG" else "🔴"
+    icon_url = (
+        "https://web.telegram.org/k/assets/img/emoji/1f7e2.png"
+        if direction == "LONG"
+        else "https://web.telegram.org/k/assets/img/emoji/1f534.png"
+    )
     execution = execution or {}
     zone = event.get("zone", {}) if isinstance(event.get("zone"), dict) else {}
     confirmation = event.get("confirmation", {}) if isinstance(event.get("confirmation"), dict) else {}
@@ -185,31 +233,48 @@ def format_signal(
     volume_ratio = confirmation.get("volume_ratio")
     mtf = confirmation.get("mtf_zone_confluence")
 
+    mtf_lines = []
+    for mtf_line in _fmt_mtf_zone_lines(mtf):
+        label, separator, value = mtf_line.partition(": ")
+        mtf_lines.append(
+            f"{label}: {_code_escaped(value)}" if separator else _esc(mtf_line)
+        )
+
+    tp1_value = (
+        f"{_fmt_price(event.get('tp1'))} ({tp1_pct_text}% / "
+        f"{_fmt_num(event.get('tp1_rr'), 2)}R / {tp1_fraction_text}%)"
+    )
+    tp2_value = (
+        f"{_fmt_price(event.get('tp2'))} ({tp2_pct_text}% / "
+        f"{_fmt_num(event.get('tp2_rr'), 2)}R / {tp2_fraction_text}%)"
+    )
+    volume_value = _fmt_num(volume_ratio, 3) if volume_ratio not in (None, "") else "—"
+
     lines = [
-        f"<b>{icon} · {_esc(symbol)}</b>",
+        f'<a href="{icon_url}">{icon}</a> {"LONG" if direction == "LONG" else "SHORT"} · {_code(symbol)}',
         "",
-        f"Score: <b>{_esc(score_text)}</b>",
-        f"Zone: <b>{_esc(zone_kind)}</b>",
-        f"Entry reference: <code>{_fmt_price(event.get('entry'))}</code>",
-        f"SL: <code>{_fmt_price(event.get('sl'))}</code>",
-        f"TP1: <code>{_fmt_price(event.get('tp1'))}</code> ({tp1_pct_text}% / {_fmt_num(event.get('tp1_rr'), 2)}R / {tp1_fraction_text}%)",
-        f"TP2: <code>{_fmt_price(event.get('tp2'))}</code> ({tp2_pct_text}% / {_fmt_num(event.get('tp2_rr'), 2)}R / {tp2_fraction_text}%)",
-        f"Risk: <code>{_fmt_num(event.get('risk_pct'), 1)}%</code>",
+        f"Score: {_code(score_text)}",
+        f"Zone: {_code(zone_kind)}",
+        f"Entry reference: {_code_escaped(_fmt_price(event.get('entry')))}",
+        f"SL: {_code_escaped(_fmt_price(event.get('sl')))}",
+        f"TP1: {_code_escaped(tp1_value)}",
+        f"TP2: {_code_escaped(tp2_value)}",
+        f"Risk: {_code_escaped(_fmt_num(event.get('risk_pct'), 1) + '%')}",
         "",
-        "<b>CONFIRMATION</b>",
-        f"Volume / SMA20: <code>{_fmt_num(volume_ratio, 3) if volume_ratio not in (None, '') else '—'}</code>",
-        f"1H / 3H zones: <code>{_fmt_confluence(mtf)}</code>",
-        f"Funding (last): <code>{_esc(_fmt_funding(funding))}</code>",
+        "CONFIRMATION",
+        f"Volume / SMA20: {_code_escaped(volume_value)}",
+        *mtf_lines,
+        f"Funding: {_code(_fmt_funding(funding))}",
     ]
     if execution:
         order = execution.get("order") if isinstance(execution.get("order"), dict) else {}
         protection = execution.get("protection") if isinstance(execution.get("protection"), dict) else {}
         lines += [
             "",
-            "<b>EXECUTION</b>",
-            f"Status: <code>{_esc(execution.get('status'))}</code>",
-            f"Order: <code>{_esc(order.get('order_id') or order.get('client_order_id'))}</code>",
-            f"Protection: <code>{_esc(protection.get('status'))}</code>",
-            f"Error: <code>{_esc(execution.get('error') or order.get('error'))}</code>",
+            "EXECUTION",
+            f"Status: {_code(execution.get('status'))}",
+            f"Order: {_code(order.get('order_id') or order.get('client_order_id'))}",
+            f"Protection: {_code(protection.get('status'))}",
+            f"Error: {_code(execution.get('error') or order.get('error'))}",
         ]
     return "\n".join(lines)

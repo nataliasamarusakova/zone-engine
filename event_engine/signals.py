@@ -322,10 +322,10 @@ def add_3h_zone_confluence(
         tolerance = (
             max(0.0, float(max_distance_pct))
             if max_distance_pct is not None
-            else max(0.0, float(os.environ.get("MTF_ZONE_CONFLUENCE_MAX_DISTANCE_PCT", "0.50")))
+            else max(0.0, float(os.environ.get("MTF_ZONE_CONFLUENCE_MAX_DISTANCE_PCT", "3.0")))
         )
     except (TypeError, ValueError):
-        tolerance = 0.50
+        tolerance = 3.0
 
     zone = signal.get("zone") if isinstance(signal.get("zone"), dict) else {}
     confirmation = signal.setdefault("confirmation", {})

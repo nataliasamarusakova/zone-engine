@@ -58,6 +58,12 @@ _OBSERVATION_SEEN_LOCK = threading.RLock()
 _COUNTERFACTUAL_SEEN_IDS: set[str] | None = None
 _COUNTERFACTUAL_SEEN_LOCK = threading.RLock()
 
+# Market-bar journals can contain hundreds of thousands of JSONL rows. Research
+# flushes append in several batches; rebuild the deduplication index only when
+# the backing file changes. The OS file lock remains the cross-process authority.
+_MARKET_BAR_INDEX_CACHE: dict[str, dict[str, Any]] = {}
+_MARKET_BAR_INDEX_LOCK = threading.RLock()
+
 # Enabled only around the single-threaded post-execution research flush. This
 # batches fsync-heavy research writes without changing the live signal/order path.
 _PERSISTENCE_BATCH: dict[str, Any] | None = None
@@ -210,6 +216,46 @@ def _market_bar_identity(row: dict[str, Any]) -> tuple[str, str, str, str]:
     )
 
 
+def _market_bar_file_signature(path: Path) -> tuple[int, int, int, int, int] | None:
+    """Return a signature that changes on append, rewrite, or atomic replacement."""
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    return (
+        int(stat.st_dev),
+        int(stat.st_ino),
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+        int(stat.st_ctime_ns),
+    )
+
+
+def _read_market_bar_identity_index(path: Path) -> dict[tuple[str, str, str], set[str]]:
+    """Build a compact identity index while preserving legacy malformed-line handling."""
+    identities: dict[tuple[str, str, str], set[str]] = {}
+    if not path.exists():
+        return identities
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                saved = json.loads(text)
+            except json.JSONDecodeError:
+                # A previously interrupted final JSONL write must not be
+                # mistaken for a known bar. The valid rows around it remain
+                # available for de-duplication; malformed rows are handled by
+                # the normal research-journal validation tooling.
+                continue
+            if not isinstance(saved, dict):
+                continue
+            symbol, timeframe, provider, timestamp = _market_bar_identity(saved)
+            identities.setdefault((symbol, timeframe, provider), set()).add(timestamp)
+    return identities
+
+
 def _append_market_bars_idempotent_locked(path: Path, records: Iterable[dict[str, Any]]) -> int:
     """Append only market bars not already present in the JSONL journal.
 
@@ -217,6 +263,11 @@ def _append_market_bars_idempotent_locked(path: Path, records: Iterable[dict[str
     the next scan retries the same bars. Deduplicating under the journal's file lock
     makes that retry safe and still lets the caller advance the cursor after it has
     verified that every requested bar is already on disk or was appended now.
+
+    A process-local index avoids reparsing the entire growing JSONL file on every
+    post-execution research batch. Its stat signature detects writes from other
+    processes, retention compaction, and atomic replacements. The file lock remains
+    authoritative across processes; the in-memory cache is only an optimization.
 
     Returns the number of newly appended rows; returns zero if all rows were already
     persisted. Raises on read/write errors so callers do not commit a cursor blindly.
@@ -226,40 +277,69 @@ def _append_market_bars_idempotent_locked(path: Path, records: Iterable[dict[str
         return 0
 
     with _FileLock(path):
-        existing: set[tuple[str, str, str, str]] = set()
-        if path.exists():
-            with path.open("r", encoding="utf-8") as fh:
-                for line in fh:
-                    text = line.strip()
-                    if not text:
-                        continue
-                    try:
-                        saved = json.loads(text)
-                    except json.JSONDecodeError:
-                        # A previously interrupted final JSONL write must not be
-                        # mistaken for a known bar. The valid rows around it remain
-                        # available for de-duplication; malformed rows are handled by
-                        # the normal research-journal validation tooling.
-                        continue
-                    if isinstance(saved, dict):
-                        existing.add(_market_bar_identity(saved))
-
-        fresh: list[dict[str, Any]] = []
-        for row in rows:
-            identity = _market_bar_identity(row)
-            if identity in existing:
-                continue
-            fresh.append(row)
-            existing.add(identity)
-
-        if not fresh:
-            return 0
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh:
-            for row in fresh:
-                fh.write(json.dumps(row, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
+        cache_key = str(path.resolve())
+        with _MARKET_BAR_INDEX_LOCK:
+            signature = _market_bar_file_signature(path)
+            cached = _MARKET_BAR_INDEX_CACHE.get(cache_key)
+            if cached is None or cached.get("signature") != signature:
+                identities = _read_market_bar_identity_index(path)
+                signature_after_read = _market_bar_file_signature(path)
+                if signature_after_read != signature:
+                    # An external non-cooperating writer changed the file while
+                    # it was being indexed. Re-read once against the new snapshot;
+                    # if it changes again, fail closed rather than risk duplicates.
+                    identities = _read_market_bar_identity_index(path)
+                    signature_after_read = _market_bar_file_signature(path)
+                    signature_stability_check = _market_bar_file_signature(path)
+                    if signature_after_read != signature_stability_check:
+                        raise OSError(f"market-bar journal changed while indexing: {path}")
+                    signature_after_read = signature_stability_check
+                cached = {"signature": signature_after_read, "identities": identities}
+                _MARKET_BAR_INDEX_CACHE[cache_key] = cached
+
+            identities = cached["identities"]
+            fresh: list[dict[str, Any]] = []
+            pending: set[tuple[str, str, str, str]] = set()
+            for row in rows:
+                identity = _market_bar_identity(row)
+                stream_key = identity[:3]
+                timestamp = identity[3]
+                if timestamp in identities.get(stream_key, set()) or identity in pending:
+                    continue
+                fresh.append(row)
+                pending.add(identity)
+
+            if not fresh:
+                return 0
+            serialized_rows = [
+                json.dumps(row, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n"
+                for row in fresh
+            ]
+            previous_signature = _market_bar_file_signature(path)
+            expected_size = (previous_signature[2] if previous_signature is not None else 0) + sum(
+                len(line.encode("utf-8")) for line in serialized_rows
+            )
+            with path.open("a", encoding="utf-8") as fh:
+                fh.writelines(serialized_rows)
+                fh.flush()
+                os.fsync(fh.fileno())
+
+            # Publish the new identities only after the durable append succeeds.
+            # If an external writer replaced/appended to the journal outside our
+            # file lock, invalidate instead of blessing an incomplete cache.
+            final_signature = _market_bar_file_signature(path)
+            same_file = (
+                previous_signature is None
+                or final_signature is not None
+                and final_signature[:2] == previous_signature[:2]
+            )
+            if final_signature is None or final_signature[2] != expected_size or not same_file:
+                _MARKET_BAR_INDEX_CACHE.pop(cache_key, None)
+            else:
+                for symbol, timeframe, provider, timestamp in pending:
+                    identities.setdefault((symbol, timeframe, provider), set()).add(timestamp)
+                cached["signature"] = final_signature
     return len(fresh)
 
 
