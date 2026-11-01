@@ -8,6 +8,9 @@ permissions:
   contents: write
   actions: write
 
+# One serialized writer protects shared runtime-state artifacts and the single
+# exchange account. Keep the default single pending slot: stale queued scans are
+# replaced by the newest dispatch instead of accumulating behind a long run.
 concurrency:
   group: zone-engine
   cancel-in-progress: false
@@ -67,7 +70,9 @@ jobs:
       TREND_FILTER_REQUIRE_PERSISTENCE: "false"
       ENTRY_CONTEXT_TELEMETRY_ENABLED: "false"
       ENTRY_CONTEXT_DEPTH_LEVELS: "20"
-      REQUEST_TIMING_METRICS: "false"
+      REQUEST_TIMING_METRICS: "true"
+      TELEGRAM_FUNDING_MAX_AGE_SEC: "300"
+      MTF_ZONE_CONFLUENCE_MAX_DISTANCE_PCT: "0.50"
       ENTRY_CONTEXT_TRADES_LIMIT: "100"
       ENTRY_CONTEXT_HTTP_TIMEOUT_SEC: "2.0"
       # Research must never add the four-endpoint microstructure sweep to the
