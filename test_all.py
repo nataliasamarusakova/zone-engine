@@ -1716,6 +1716,18 @@ def test_5m_zone_diagnostics_formatter_never_raises_with_percent_literals(monkey
     assert all("ZONE_CLOSEST" not in r.message for r in caplog.records)
 
 
+def test_5m_zone_diagnostic_reports_open_and_close_age_separately():
+    import pandas as pd
+    import run_once
+
+    bar_open = pd.Timestamp("2026-11-02T10:45:00Z")
+    now = pd.Timestamp("2026-11-02T10:53:54Z")
+    open_age, close_age = run_once._five_minute_bar_age_minutes(bar_open, now=now)
+
+    assert open_age == pytest.approx(8.9)
+    assert close_age == pytest.approx(3.9)
+
+
 def test_active_zone_logs_compact_no_touch_reason(monkeypatch, caplog):
     import logging
     import pandas as pd
@@ -1734,6 +1746,7 @@ def test_active_zone_logs_compact_no_touch_reason(monkeypatch, caplog):
         )
     messages = [r.message for r in caplog.records]
     assert any("[ZONE_STATUS] ZILUSDT" in m and "5m=NO_5M_TOUCH" in m for m in messages)
+    assert any("bar_open_age=" in m and "bar_close_age=" in m for m in messages)
     assert not any("[ZONE_DIAG]" in m or "[ZONE_STATE]" in m for m in messages)
 
 

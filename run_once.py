@@ -1753,6 +1753,31 @@ def _active_log_zone(latest_price: float, demand: list[dict], supply: list[dict]
     return kind, zone
 
 
+def _five_minute_bar_age_minutes(
+    bar_open_time: Any,
+    *,
+    now: pd.Timestamp | None = None,
+) -> tuple[float | None, float | None]:
+    """Return 5m candle-open and candle-close ages for unambiguous diagnostics."""
+    try:
+        opened = pd.Timestamp(bar_open_time)
+        if opened.tzinfo is None:
+            opened = opened.tz_localize("UTC")
+        else:
+            opened = opened.tz_convert("UTC")
+        current = now if now is not None else pd.Timestamp.now(tz="UTC")
+        current = pd.Timestamp(current)
+        if current.tzinfo is None:
+            current = current.tz_localize("UTC")
+        else:
+            current = current.tz_convert("UTC")
+        open_age = max(0.0, (current - opened).total_seconds() / 60.0)
+        close_age = max(0.0, (current - (opened + pd.Timedelta(minutes=5))).total_seconds() / 60.0)
+        return open_age, close_age
+    except (TypeError, ValueError, OverflowError):
+        return None, None
+
+
 def _log_5m_zone_diagnostics(
     symbol: str,
     latest_price: float,
@@ -1787,18 +1812,17 @@ def _log_5m_zone_diagnostics(
         zone_label = "none"
     latest_5m = diagnostics.get("latest_closed_5m_ts") or "None"
     processed = int(diagnostics.get("processed_bars", 0))
-    age = "None"
+    age_label = "bar_open_age=None bar_close_age=None"
     if latest_5m != "None":
-        try:
-            age = f"{max(0.0, (pd.Timestamp.now(tz='UTC') - pd.Timestamp(latest_5m)).total_seconds() / 60.0):.1f}m"
-        except Exception:
-            pass
+        open_age, close_age = _five_minute_bar_age_minutes(latest_5m)
+        if open_age is not None and close_age is not None:
+            age_label = f"bar_open_age={open_age:.1f}m bar_close_age={close_age:.1f}m"
     suffix = f" | reason={reason}" if reason else ""
     if pending_signal_count:
         suffix += f" | pending={pending_signal_count}"
     log.info(
-        "[ZONE_STATUS] %s | 1h_close=%.12g | active=%s | 5m=%s | processed=%d latest_5m=%s age=%s | zone=%s%s",
-        display, latest_price, bool(active), status, processed, latest_5m, age, zone_label, suffix,
+        "[ZONE_STATUS] %s | 1h_close=%.12g | active=%s | 5m=%s | processed=%d latest_5m=%s %s | zone=%s%s",
+        display, latest_price, bool(active), status, processed, latest_5m, age_label, zone_label, suffix,
     )
 
 
