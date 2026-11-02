@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import math
 import logging
 import os
@@ -12,6 +13,7 @@ import inspect
 import re
 import shutil
 import threading
+from bisect import bisect_right
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -60,6 +62,12 @@ log = logging.getLogger("zone_engine")
 
 _PROJECT_SYMBOL_RE = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z0-9]+)-USDT\b", re.IGNORECASE)
 _DIAGNOSTIC_FILE_HANDLER_NAME = "zone_engine_diagnostic_file"
+
+# The account-context journal is append-only during a run and can grow large.
+# Deferred research asks for an as-of snapshot once per scanned symbol; indexing
+# it once avoids reopening and JSON-decoding the complete journal for every row.
+_ACCOUNT_CONTEXT_INDEX_LOCK = threading.RLock()
+_ACCOUNT_CONTEXT_INDEX_CACHE: dict[str, Any] | None = None
 
 class _CompactSymbolFilter(logging.Filter):
     """Keep human-readable logs compact by rendering BTC-USDT as BTCUSDT.
@@ -4684,40 +4692,144 @@ def _prefetch_missing_research_5m_bars(
     return results
 
 
-def _account_context_asof(decision_ts: Any) -> dict[str, Any] | None:
-    """Return the latest persisted account snapshot no later than a decision boundary."""
-    target = research._parse_timestamp(decision_ts)
-    path = research.ACCOUNT_CONTEXT_PATH
-    if target is None or not path.exists():
-        return None
-    best_row = None
-    best_ts = None
+def _account_context_file_signature(path: Path) -> tuple[int, int, int, int, int] | None:
+    """Detect append, rewrite and atomic replacement of the context journal."""
     try:
-        with path.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                text = line.strip()
-                if not text:
-                    continue
-                try:
-                    row = json.loads(text)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(row, dict):
-                    continue
-                stamp = research._parse_timestamp(row.get("captured_at_ms") or row.get("captured_at") or row.get("recorded_at"))
-                if stamp is None or stamp > target:
-                    continue
-                if best_ts is None or stamp > best_ts:
-                    best_row, best_ts = row, stamp
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    return (
+        int(stat.st_dev), int(stat.st_ino), int(stat.st_size),
+        int(stat.st_mtime_ns), int(stat.st_ctime_ns),
+    )
+
+
+def _build_account_context_index(path: Path) -> tuple[tuple[int, int, int, int, int] | None, tuple[int, ...], tuple[dict[str, Any], ...]]:
+    """Read one stable journal snapshot; first record wins when timestamps tie."""
+    # Writers use the same per-file lock. A second signature check also protects
+    # against retention/restore code that replaces the file atomically.
+    for attempt in range(2):
+        with research._FileLock(path):
+            before = _account_context_file_signature(path)
+            if before is None:
+                return (None, (), ())
+            first_by_timestamp: dict[int, dict[str, Any]] = {}
+            with path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    text = line.strip()
+                    if not text:
+                        continue
+                    try:
+                        row = json.loads(text)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(row, dict):
+                        continue
+                    stamp = research._parse_timestamp(
+                        row.get("captured_at_ms") or row.get("captured_at") or row.get("recorded_at")
+                    )
+                    if stamp is None:
+                        continue
+                    # The previous linear search updated only for strictly newer
+                    # timestamps, so the first row at an equal timestamp wins.
+                    first_by_timestamp.setdefault(int(stamp.value), row)
+            after = _account_context_file_signature(path)
+        if before == after:
+            ordered = sorted(first_by_timestamp.items(), key=lambda item: item[0])
+            return before, tuple(item[0] for item in ordered), tuple(item[1] for item in ordered)
+        if attempt == 1:
+            raise OSError(f"account-context journal changed while indexing: {path}")
+    raise OSError(f"could not obtain stable account-context journal snapshot: {path}")
+
+
+def _account_context_asof(decision_ts: Any) -> dict[str, Any] | None:
+    """Return the latest persisted account snapshot no later than a decision boundary.
+
+    The old implementation rescanned the full account_context.jsonl file for
+    every symbol in the deferred research pass. Keep the exact as-of semantics,
+    but build a timestamp index once and invalidate it when the file changes.
+    """
+    global _ACCOUNT_CONTEXT_INDEX_CACHE
+    started_perf = time.perf_counter()
+    target = research._parse_timestamp(decision_ts)
+    if target is None:
+        request_metrics.record_operation(
+            "research_account_context_asof", "invalid_decision_timestamp",
+            time.perf_counter() - started_perf, outcome="unavailable",
+        )
+        return None
+
+    path = research.ACCOUNT_CONTEXT_PATH
+    path_key = str(path.resolve())
+    cache_hit = False
+    try:
+        with _ACCOUNT_CONTEXT_INDEX_LOCK:
+            signature = _account_context_file_signature(path)
+            if signature is None:
+                _ACCOUNT_CONTEXT_INDEX_CACHE = {
+                    "path": path_key, "signature": None, "timestamps": (), "rows": (),
+                }
+                request_metrics.record_operation(
+                    "research_account_context_asof", "missing_journal",
+                    time.perf_counter() - started_perf, outcome="unavailable",
+                )
+                return None
+
+            cached = _ACCOUNT_CONTEXT_INDEX_CACHE
+            if (
+                cached is not None
+                and cached.get("path") == path_key
+                and cached.get("signature") == signature
+            ):
+                cache_hit = True
+                timestamps = cached["timestamps"]
+                rows = cached["rows"]
+            else:
+                build_started = time.perf_counter()
+                built_signature, timestamps, rows = _build_account_context_index(path)
+                if built_signature is None:
+                    _ACCOUNT_CONTEXT_INDEX_CACHE = {
+                        "path": path_key, "signature": None, "timestamps": (), "rows": (),
+                    }
+                    return None
+                _ACCOUNT_CONTEXT_INDEX_CACHE = {
+                    "path": path_key, "signature": built_signature,
+                    "timestamps": timestamps, "rows": rows,
+                }
+                log.info(
+                    "[RESEARCH_ACCOUNT_ASOF_INDEX] rows=%d bytes=%d build_seconds=%.3f",
+                    len(timestamps), built_signature[2], time.perf_counter() - build_started,
+                )
     except OSError as exc:
         log.warning("[RESEARCH_ACCOUNT_ASOF] could not read prior account snapshots: %s", exc)
+        request_metrics.record_operation(
+            "research_account_context_asof", "index_read_failed",
+            time.perf_counter() - started_perf, outcome="error",
+        )
+        # Match the pre-index implementation: an existing but unreadable
+        # journal is an error, not an absent snapshot. Do not silently persist
+        # deferred research rows with incomplete account context.
+        raise
+
+    index = bisect_right(timestamps, int(target.value)) - 1
+    if index < 0:
+        request_metrics.record_operation(
+            "research_account_context_asof", "no_prior_snapshot",
+            time.perf_counter() - started_perf, outcome="unavailable",
+        )
         return None
-    if best_row is None:
-        return None
-    result = dict(best_row)
+
+    best_ts = pd.Timestamp(timestamps[index], unit="ns", tz="UTC")
+    result = copy.deepcopy(rows[index])
     result["persisted"] = True
     result["account_context_asof"] = True
-    result["account_context_age_ms_at_decision"] = max(0.0, (target - best_ts).total_seconds() * 1000.0)
+    result["account_context_age_ms_at_decision"] = max(
+        0.0, (target - best_ts).total_seconds() * 1000.0
+    )
+    request_metrics.record_operation(
+        "research_account_context_asof", "cache_hit" if cache_hit else "index_build",
+        time.perf_counter() - started_perf, outcome="ok",
+    )
     return result
 
 
@@ -5945,6 +6057,8 @@ def main() -> None:
             with research.batch_persistence() as persistence_result:
                 for payload in payload_batch:
                     bars_5m = _prefer_longer_research_5m_history(payload.get("bars_5m"), prefetched_bars.get(id(payload)))
+                    research_symbol_started = time.perf_counter()
+                    research_symbol_outcome = "raised"
                     try:
                         counts = research.record_scan_symbol(
                             scan_id=scan_id, symbol=payload["symbol"], strategy_version=payload["strategy_version"],
@@ -5961,8 +6075,15 @@ def main() -> None:
                         batch_observations += int(counts.get("observations", 0))
                         batch_bars1h += int(counts.get("bars_1h", 0))
                         batch_bars5m += int(counts.get("bars_5m", 0))
+                        research_symbol_outcome = "returned"
                     except Exception as exc:
                         log.warning("[RESEARCH_DEFERRED_FLUSH] %s | persistence failed: %s", payload["symbol"], exc)
+                    finally:
+                        request_metrics.record_operation(
+                            "research_record_scan_symbol", str(payload.get("symbol", "unknown")),
+                            time.perf_counter() - research_symbol_started,
+                            outcome=research_symbol_outcome,
+                        )
             queued_observation_count += batch_observations
             queued_bar1h_count += batch_bars1h
             queued_bar5m_count += batch_bars5m

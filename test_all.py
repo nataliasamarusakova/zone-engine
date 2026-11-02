@@ -5815,6 +5815,81 @@ def test_account_context_asof_excludes_future_post_execution_snapshot(tmp_path, 
     assert context["account_context_age_ms_at_decision"] >= 0
 
 
+def test_account_context_asof_reuses_index_and_invalidates_on_append_or_replace(tmp_path, monkeypatch):
+    import json
+    import os
+    from pathlib import Path
+    import pandas as pd
+    import run_once
+    from event_engine import research
+
+    path = tmp_path / "account_context.jsonl"
+    base = pd.Timestamp("2026-01-01T00:00:00Z")
+
+    def account_row(account_id, stamp):
+        return {
+            "account_context_id": account_id,
+            "captured_at": stamp.isoformat(),
+            "captured_at_ms": int(stamp.timestamp() * 1000),
+        }
+
+    first = account_row("AC_FIRST_AT_TIE", base + pd.Timedelta(minutes=1))
+    duplicate = account_row("AC_SECOND_AT_TIE", base + pd.Timedelta(minutes=1))
+    future = account_row("AC_FUTURE", base + pd.Timedelta(minutes=10))
+    path.write_text("\n".join(json.dumps(row) for row in (first, duplicate, future)) + "\n", encoding="utf-8")
+    monkeypatch.setattr(research, "ACCOUNT_CONTEXT_PATH", path)
+
+    original_open = Path.open
+    journal_open_count = 0
+
+    def counted_open(self, *args, **kwargs):
+        nonlocal journal_open_count
+        if self == path:
+            journal_open_count += 1
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counted_open)
+    decision = base + pd.Timedelta(minutes=5)
+
+    # Equal timestamps preserve the previous linear-scan behavior: first row wins.
+    assert run_once._account_context_asof(decision.isoformat())["account_context_id"] == "AC_FIRST_AT_TIE"
+    for _ in range(20):
+        assert run_once._account_context_asof(decision.isoformat())["account_context_id"] == "AC_FIRST_AT_TIE"
+    assert journal_open_count == 1
+
+    appended = account_row("AC_APPENDED", base + pd.Timedelta(minutes=4))
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(appended) + "\n")
+    assert run_once._account_context_asof(decision.isoformat())["account_context_id"] == "AC_APPENDED"
+    assert journal_open_count == 2
+
+    replacement = tmp_path / "replacement.jsonl"
+    replaced = account_row("AC_REPLACED", base + pd.Timedelta(minutes=3, seconds=30))
+    with open(replacement, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(replaced) + "\n")
+    os.replace(replacement, path)
+    assert run_once._account_context_asof(decision.isoformat())["account_context_id"] == "AC_REPLACED"
+    assert journal_open_count == 3
+
+
+def test_account_context_asof_does_not_silently_drop_unreadable_journal(tmp_path, monkeypatch):
+    import json
+    import pandas as pd
+    import pytest
+    import run_once
+    from event_engine import research
+
+    path = tmp_path / "account_context.jsonl"
+    stamp = pd.Timestamp("2026-01-01T00:00:00Z")
+    path.write_text(json.dumps({"captured_at": stamp.isoformat(), "account_context_id": "AC_1"}) + "\n", encoding="utf-8")
+    monkeypatch.setattr(research, "ACCOUNT_CONTEXT_PATH", path)
+    monkeypatch.setattr(run_once, "_build_account_context_index", lambda _path: (_ for _ in ()).throw(OSError("simulated read failure")))
+    run_once._ACCOUNT_CONTEXT_INDEX_CACHE = None
+
+    with pytest.raises(OSError, match="simulated read failure"):
+        run_once._account_context_asof(stamp.isoformat())
+
+
 def test_record_verified_emergency_close_persists_active_owner_evidence(tmp_path, monkeypatch):
     import json
     from event_engine import tracker
