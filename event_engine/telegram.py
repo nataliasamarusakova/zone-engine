@@ -185,14 +185,17 @@ def _fmt_mtf_zone_lines(value: Any) -> list[str]:
 
 
 def _fmt_funding(funding: dict[str, Any] | None) -> str:
-    if not isinstance(funding, dict) or funding.get("status") != "ok":
-        return "—"
+    if not isinstance(funding, dict):
+        return "UNAVAILABLE"
+    if funding.get("status") != "ok":
+        status = str(funding.get("status") or "unavailable").strip().upper()
+        return status if status in {"STALE", "UNVERIFIED", "UNAVAILABLE"} else "UNAVAILABLE"
     try:
         percent = float(funding.get("funding_rate_pct"))
     except (TypeError, ValueError):
-        return "—"
+        return "UNAVAILABLE"
     if not (percent == percent) or percent in (float("inf"), float("-inf")):
-        return "—"
+        return "UNAVAILABLE"
     return f"{percent:+.4f}%"
 
 
@@ -219,8 +222,10 @@ def format_signal(
     target = event.get("target", {}) if isinstance(event.get("target"), dict) else {}
     tp1_pct_text = _fmt_num(target.get("tp1_pct"), 1) if target.get("tp1_pct") is not None else "—"
     tp2_pct_text = _fmt_num(target.get("tp2_pct"), 1) if target.get("tp2_pct") is not None else "—"
+    tp3_pct_text = _fmt_num(target.get("tp3_pct"), 1) if target.get("tp3_pct") is not None else "—"
     tp1_fraction = target.get("tp1_close_fraction", 0.5)
-    tp2_fraction = target.get("tp2_close_fraction", 0.5)
+    tp2_fraction = target.get("tp2_close_fraction", 0.25)
+    tp3_fraction = target.get("tp3_close_fraction", 0.25)
     try:
         tp1_fraction_text = _fmt_num(float(tp1_fraction) * 100.0, 1)
     except (TypeError, ValueError):
@@ -228,7 +233,11 @@ def format_signal(
     try:
         tp2_fraction_text = _fmt_num(float(tp2_fraction) * 100.0, 1)
     except (TypeError, ValueError):
-        tp2_fraction_text = "50"
+        tp2_fraction_text = "25"
+    try:
+        tp3_fraction_text = _fmt_num(float(tp3_fraction) * 100.0, 1)
+    except (TypeError, ValueError):
+        tp3_fraction_text = "25"
     score_value = score if score is not None else event.get("score")
     try:
         score_text = f"{float(score_value):.1f}" if score_value not in (None, "") else "—"
@@ -253,6 +262,10 @@ def format_signal(
         f"{_fmt_price(event.get('tp2'))} ({tp2_pct_text}% / "
         f"{_fmt_num(event.get('tp2_rr'), 2)}R / {tp2_fraction_text}%)"
     )
+    tp3_value = (
+        f"{_fmt_price(event.get('tp3'))} ({tp3_pct_text}% / "
+        f"{_fmt_num(event.get('tp3_rr'), 2)}R / {tp3_fraction_text}%)"
+    ) if event.get("tp3") is not None else None
     volume_value = _fmt_num(volume_ratio, 3) if volume_ratio not in (None, "") else "—"
 
     lines = [
@@ -264,6 +277,7 @@ def format_signal(
         f"SL: {_code_escaped(_fmt_price(event.get('sl')))}",
         f"TP1: {_code_escaped(tp1_value)}",
         f"TP2: {_code_escaped(tp2_value)}",
+        *([f"TP3: {_code_escaped(tp3_value)}"] if tp3_value is not None else []),
         f"Risk: {_code_escaped(_fmt_num(event.get('risk_pct'), 1) + '%')}",
         "",
         "CONFIRMATION",
@@ -274,12 +288,18 @@ def format_signal(
     if execution:
         order = execution.get("order") if isinstance(execution.get("order"), dict) else {}
         protection = execution.get("protection") if isinstance(execution.get("protection"), dict) else {}
+        status_value = str(execution.get("status") or "unknown").strip()
+        error_value = execution.get("error") or order.get("error") or protection.get("error")
+        if error_value not in (None, ""):
+            # Keep the notification to one status line. Never render a separate
+            # Error field; escape the detail through _code below.
+            error_text = " ".join(str(error_value).split())[:240]
+            status_value = f"{status_value} · {error_text}"
         lines += [
             "",
             "EXECUTION",
-            f"Status: {_code(execution.get('status'))}",
+            f"Status: {_code(status_value)}",
             f"Order: {_code(order.get('order_id') or order.get('client_order_id'))}",
             f"Protection: {_code(protection.get('status'))}",
-            f"Error: {_code(execution.get('error') or order.get('error'))}",
         ]
     return "\n".join(lines)

@@ -37,6 +37,8 @@ BASE_URL = os.environ.get("BINGX_BASE_URL", "https://open-api-vst.bingx.com").rs
 MARGIN_USDT = float(os.environ.get("BINGX_MARGIN_USDT", "1"))
 LEVERAGE = int(os.environ.get("BINGX_LEVERAGE", "10"))
 MAX_LEVERAGE = int(os.environ.get("BINGX_MAX_LEVERAGE", "10"))
+# Keep the pre-market position-size gate aligned with the active production TP plan.
+NEW_ENTRY_TP_CLOSE_FRACTIONS = (0.50, 0.25, 0.25)
 MAX_ENTRY_SIGNAL_DISPLACEMENT_PCT = max(0.0, float(os.environ.get("MAX_ENTRY_SIGNAL_DISPLACEMENT_PCT", "1.00")))
 
 SYMBOL_MAP = {}
@@ -1817,9 +1819,36 @@ def open_market(
     if min_qty > 0 and qty < min_qty:
         required_margin = (min_qty * sizing_price * mult) / max(leverage, 1)
         return {"status": "skipped_min_qty", "error": f"qty={qty} < min_qty={min_qty} at configured leverage={leverage}", "reason": "exchange_min_quantity", "symbol": bx, "qty": qty, "min_qty": min_qty, "required_margin_usdt": required_margin, "configured_margin_usdt": MARGIN_USDT, "leverage": leverage, "sizing_price": sizing_price, "execution_quote": final_quote}
-    if min_qty > 0 and qty < (2.0 * min_qty):
-        required_margin = (2.0 * min_qty * sizing_price * mult) / max(leverage, 1)
-        return {"status": "skipped_tp_min_qty", "error": f"qty={qty} cannot support 2 TP legs with min_qty={min_qty}", "reason": "tp_two_leg_min_quantity", "symbol": bx, "qty": qty, "min_qty": min_qty, "required_margin_usdt": required_margin, "configured_margin_usdt": MARGIN_USDT, "leverage": leverage, "sizing_price": sizing_price, "execution_quote": final_quote}
+    # Every new live entry now creates three independent reduce-only TP orders.
+    # Each order must support at least one exchange quantity step even when the
+    # contract omits tradeMinQuantity; discovering this only after MARKET fill
+    # would force an avoidable emergency close.
+    min_tp_leg_qty = _minimum_executable_qty(min_qty, prec)
+    # New entries use TP allocation 50/25/25. The smallest 25% legs determine
+    # the minimum total position; a mere 3*minQty check would distort the
+    # requested allocation by promoting undersized legs to minQty.
+    required_tp_qty = _minimum_position_qty_for_tp_plan(min_qty, prec, NEW_ENTRY_TP_CLOSE_FRACTIONS)
+    if Decimal(str(qty)) < required_tp_qty:
+        required_margin = (float(required_tp_qty) * sizing_price * mult) / max(leverage, 1)
+        return {
+            "status": "skipped_tp_min_qty",
+            "error": (
+                f"qty={qty} cannot support 3 TP legs; minimum per leg={float(min_tp_leg_qty)} "
+                f"at quantityPrecision={prec} and min_qty={min_qty}"
+            ),
+            "reason": "tp_three_leg_min_quantity",
+            "symbol": bx,
+            "qty": qty,
+            "min_qty": min_qty,
+            "min_tp_leg_qty": float(min_tp_leg_qty),
+            "required_tp_qty": float(required_tp_qty),
+            "required_tp_leg_count": 3,
+            "required_margin_usdt": required_margin,
+            "configured_margin_usdt": MARGIN_USDT,
+            "leverage": leverage,
+            "sizing_price": sizing_price,
+            "execution_quote": final_quote,
+        }
 
     # Only change leverage after the final executable quote has passed all admission
     # checks. The final micro-freshness check below covers the small REST delay from
@@ -2230,7 +2259,7 @@ def get_open_protection_directional(
 def prepare_protection_capacity(symbol: str, direction: str) -> dict:
     """Ensure a flat symbol is not carrying stale engine protection.
 
-    A new trade needs one SL plus two TP legs. Opening the market position first
+    A new trade needs one SL plus three TP legs. Opening the market position first
     and only then discovering stale TP/SL orders can trigger the exchange order
     limit and force an emergency exit. When no position exists, engine-owned
     protective orders are stale by definition and can be safely cancelled.
@@ -2381,6 +2410,34 @@ def _round_qty(qty: float, precision: int) -> float:
     if precision < 0:
         return float(qty)
     return float(Decimal(str(qty)).quantize(Decimal(1).scaleb(-precision), rounding=ROUND_DOWN))
+
+
+def _minimum_executable_qty(min_qty: float, precision: int) -> Decimal:
+    """Return minQty rounded UP to an amount accepted by quantityPrecision."""
+    step = Decimal(1).scaleb(-precision) if precision >= 0 else Decimal("1")
+    raw_min = max(Decimal(str(min_qty or 0.0)), Decimal("0"))
+    units = (raw_min / step).to_integral_value(rounding=ROUND_CEILING)
+    return max(Decimal("1"), units) * step
+
+
+def _minimum_position_qty_for_tp_plan(min_qty: float, precision: int, fractions: list[float]) -> Decimal:
+    """Minimum total position that can preserve every TP leg's exchange minimum."""
+    if not fractions:
+        return Decimal("0")
+    parsed = [Decimal(str(value)) for value in fractions]
+    if any(not value.is_finite() or value <= 0 for value in parsed):
+        raise ValueError("TP fractions must be finite and positive")
+    total = sum(parsed)
+    if not total.is_finite() or total <= 0:
+        raise ValueError("TP fractions must have a positive finite total")
+    normalized = [value / total for value in parsed]
+    step = Decimal(1).scaleb(-precision) if precision >= 0 else Decimal("1")
+    min_leg = _minimum_executable_qty(min_qty, precision)
+    required_by_leg = [
+        ((min_leg / fraction) / step).to_integral_value(rounding=ROUND_CEILING) * step
+        for fraction in normalized
+    ]
+    return max(required_by_leg)
 
 
 def _format_qty(qty: float, precision: int) -> str:
@@ -2555,21 +2612,27 @@ def _allocate_tp_quantities(position_qty: float, precision: int, min_qty: float,
 
     step = Decimal(1).scaleb(-precision) if precision >= 0 else Decimal("1")
     pos = Decimal(str(position_qty))
-    min_q = Decimal(str(max(min_qty, 0.0)))
-    min_leg = max(step, min_q)
+    min_leg = _minimum_executable_qty(min_qty, precision)
     k = len(fractions)
-
-    if pos < min_leg * k:
-        raise ValueError(f"position_qty={position_qty} cannot support {k} TP legs with min_leg={min_leg}")
 
     total_fraction = sum(Decimal(str(f)) for f in fractions)
     normalized = [Decimal(str(f)) / total_fraction for f in fractions]
-    raw_targets = [pos * f for f in normalized]
+    required_position = _minimum_position_qty_for_tp_plan(min_qty, precision, fractions)
+    if pos < required_position:
+        raise ValueError(
+            f"position_qty={position_qty} cannot support TP fractions={fractions}; "
+            f"minimum total quantity={required_position} for minimum leg={min_leg}"
+        )
 
+    raw_targets = [pos * f for f in normalized]
     quantities = []
     for raw in raw_targets:
         q_step = (raw / step).to_integral_value(rounding=ROUND_FLOOR) * step
-        quantities.append(max(q_step, min_leg))
+        if q_step < min_leg:
+            raise ValueError(
+                f"TP allocation rounded below exchange minimum: qty={q_step}, min_leg={min_leg}"
+            )
+        quantities.append(q_step)
 
     while sum(quantities) > pos:
         best_reduce = max(range(k), key=lambda i: (quantities[i] - min_leg, quantities[i] - raw_targets[i]))
@@ -3060,85 +3123,218 @@ def _research_symbol_row(data: Any, symbol: str) -> dict[str, Any] | None:
         for row in data:
             if isinstance(row, dict) and str(row.get("symbol", "")).upper() == bx:
                 return row
-        if len(data) == 1 and isinstance(data[0], dict):
+        # A single symbol-filtered object may omit its symbol field, but an
+        # explicitly different symbol must never be accepted as a match.
+        if len(data) == 1 and isinstance(data[0], dict) and not str(data[0].get("symbol", "")).strip():
             return data[0]
     return None
 
 
-def fetch_funding_snapshot(symbol: str, *, timeout_sec: float = 2.0) -> dict[str, Any]:
-    """Fetch the latest BingX premium-index funding rate for a Telegram trade notice.
+def _research_latest_funding_row(data: Any, symbol: str) -> dict[str, Any] | None:
+    """Select the newest matching funding row without trusting array order."""
+    bx = str(symbol).upper()
+    if isinstance(data, dict):
+        row_symbol = str(data.get("symbol", "")).upper()
+        return data if row_symbol in {"", bx} else None
+    if not isinstance(data, list):
+        return None
+    matching = [
+        row for row in data
+        if isinstance(row, dict) and str(row.get("symbol", "")).upper() == bx
+    ]
+    if not matching and len(data) == 1 and isinstance(data[0], dict) and not str(data[0].get("symbol", "")).strip():
+        return data[0]
+    if not matching:
+        return None
+    def funding_timestamp(row: dict[str, Any]) -> int:
+        try:
+            return int(row.get("fundingTime") or 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+    if len(matching) == 1:
+        return matching[0]
+    if not any(funding_timestamp(row) > 0 for row in matching):
+        return None
+    return max(matching, key=funding_timestamp)
 
-    This optional read is deliberately fail-open and is called only after an entry
-    has been opened with verified protection. ``lastFundingRate`` is a decimal
-    fraction, so the returned percentage is multiplied by 100 exactly once.
+
+def _funding_rate_fallback_snapshot(symbol: str, *, captured_at_ms: int, timeout_sec: float) -> dict[str, Any]:
+    """Read BingX's current funding-rate endpoint when premiumIndex lacks a verifiable time.
+
+    ``fundingTime`` is an exchange funding-period timestamp, not a quote-capture
+    timestamp. Keep it separate from the local ``captured_at_ms`` so callers do
+    not mistake the period marker for proof of when the response was observed.
+    """
+    try:
+        response = _research_public_get(
+            "fundingRate", FUNDING_RATE_PATH, {"symbol": symbol, "limit": 1},
+            timeout_sec=max(0.5, float(timeout_sec)),
+        )
+        if not isinstance(response, dict) or int(response.get("code", -1)) != 0:
+            return {
+                "status": "unavailable", "reason": "funding_rate_request_failed",
+                "exchange_code": response.get("code") if isinstance(response, dict) else None,
+                "captured_at_ms": captured_at_ms, "symbol": symbol,
+            }
+        row = _research_latest_funding_row(response.get("data"), symbol)
+        if not isinstance(row, dict):
+            return {"status": "unverified", "reason": "funding_rate_row_missing", "captured_at_ms": captured_at_ms, "symbol": symbol}
+        raw_rate = row.get("fundingRate")
+        if raw_rate in (None, ""):
+            return {
+                "status": "unverified", "reason": "funding_rate_value_missing",
+                "captured_at_ms": captured_at_ms, "symbol": symbol,
+            }
+        try:
+            rate = float(raw_rate)
+        except (TypeError, ValueError, OverflowError):
+            return {
+                "status": "unverified", "reason": "funding_rate_value_invalid",
+                "captured_at_ms": captured_at_ms, "symbol": symbol,
+            }
+        if not math.isfinite(rate):
+            return {
+                "status": "unverified", "reason": "funding_rate_value_invalid",
+                "captured_at_ms": captured_at_ms, "symbol": symbol,
+            }
+        funding_time_raw = row.get("fundingTime")
+        next_time_raw = row.get("nextFundingTime")
+        try:
+            funding_time_ms = int(funding_time_raw) if funding_time_raw not in (None, "") else None
+            next_funding_time_ms = int(next_time_raw) if next_time_raw not in (None, "") else None
+        except (TypeError, ValueError, OverflowError):
+            funding_time_ms = None
+            next_funding_time_ms = None
+        if not funding_time_ms or not next_funding_time_ms or next_funding_time_ms <= funding_time_ms:
+            return {
+                "status": "unverified", "reason": "funding_period_timestamps_invalid",
+                "captured_at_ms": captured_at_ms, "symbol": symbol,
+            }
+        # A historical funding period is not a current rate snapshot. Allow a
+        # small clock tolerance around the settlement boundary, but reject a
+        # next settlement that has clearly already passed.
+        if next_funding_time_ms < captured_at_ms - 30_000:
+            return {
+                "status": "stale", "reason": "funding_period_expired",
+                "funding_time_ms": funding_time_ms,
+                "next_funding_time_ms": next_funding_time_ms,
+                "captured_at_ms": captured_at_ms, "symbol": symbol,
+            }
+        if funding_time_ms > captured_at_ms + 30_000:
+            return {
+                "status": "unverified", "reason": "funding_period_from_future",
+                "funding_time_ms": funding_time_ms,
+                "next_funding_time_ms": next_funding_time_ms,
+                "captured_at_ms": captured_at_ms, "symbol": symbol,
+            }
+        return {
+            "status": "ok", "symbol": symbol,
+            "funding_rate": rate, "funding_rate_pct": rate * 100.0,
+            "funding_rate_unit": "PERCENT", "funding_source": "fundingRate",
+            "funding_time_ms": funding_time_ms,
+            "next_funding_time_ms": next_funding_time_ms,
+            "timestamp_source": "funding_period",
+            "captured_at_ms": captured_at_ms,
+        }
+    except Exception as exc:
+        return {
+            "status": "unavailable", "reason": type(exc).__name__,
+            "captured_at_ms": captured_at_ms, "symbol": symbol,
+        }
+
+
+def fetch_funding_snapshot(symbol: str, *, timeout_sec: float = 2.0) -> dict[str, Any]:
+    """Fetch a verifiable current BingX funding rate for the trade notification.
+
+    Prefer premiumIndex because its ``time`` is the exchange response timestamp.
+    If it is missing, stale, or unavailable, query the documented fundingRate
+    endpoint. Its ``fundingTime`` is retained as a period timestamp, never
+    relabelled as a quote-observation timestamp. This optional read runs only
+    after an entry has been opened with verified protection.
     """
     captured_at_ms = int(time.time() * 1000)
     bx_symbol = to_bx_symbol(symbol)
     if not bx_symbol:
         return {"status": "unavailable", "reason": "contract_not_found", "symbol": str(symbol).upper(), "captured_at_ms": captured_at_ms}
+
+    primary_result: dict[str, Any] = {
+        "status": "unavailable", "reason": "premium_index_request_failed",
+        "captured_at_ms": captured_at_ms, "symbol": bx_symbol,
+    }
     try:
         response = _research_public_get(
             "premiumIndex", PREMIUM_INDEX_PATH, {"symbol": bx_symbol},
             timeout_sec=max(0.5, float(timeout_sec)),
         )
         if not isinstance(response, dict) or int(response.get("code", -1)) != 0:
-            return {
-                "status": "unavailable", "reason": "premium_index_request_failed",
-                "exchange_code": response.get("code") if isinstance(response, dict) else None,
-                "captured_at_ms": captured_at_ms, "symbol": bx_symbol,
-            }
-        row = _research_symbol_row(response.get("data"), bx_symbol)
-        if not isinstance(row, dict):
-            return {"status": "unavailable", "reason": "premium_index_row_missing", "captured_at_ms": captured_at_ms, "symbol": bx_symbol}
-        raw_rate = row.get("lastFundingRate")
-        rate = float(raw_rate)
-        if not math.isfinite(rate):
-            raise ValueError("non_finite_funding_rate")
-        raw_exchange_ts = row.get("time")
-        try:
-            exchange_ts_ms = int(raw_exchange_ts) if raw_exchange_ts not in (None, "") else None
-        except (TypeError, ValueError, OverflowError):
-            exchange_ts_ms = None
-        if exchange_ts_ms is None:
-            # The documented endpoint includes the exchange timestamp. Without it
-            # we cannot prove freshness, so do not present the rate as current.
-            return {
-                "status": "unverified", "reason": "premium_index_timestamp_missing",
-                "captured_at_ms": captured_at_ms, "symbol": bx_symbol,
-            }
-        age_ms = captured_at_ms - exchange_ts_ms
-        try:
-            max_age_ms = max(30_000, int(float(os.environ.get("TELEGRAM_FUNDING_MAX_AGE_SEC", "300")) * 1000))
-        except (TypeError, ValueError, OverflowError):
-            max_age_ms = 300_000
-        if age_ms < -30_000 or age_ms > max_age_ms:
-            return {
-                "status": "stale", "reason": "premium_index_timestamp_out_of_range",
-                "exchange_ts_ms": exchange_ts_ms, "age_ms": age_ms,
-                "captured_at_ms": captured_at_ms, "symbol": bx_symbol,
-            }
-        next_funding = row.get("nextFundingTime")
-        try:
-            next_funding_ms = int(next_funding) if next_funding not in (None, "") else None
-        except (TypeError, ValueError, OverflowError):
-            next_funding_ms = None
-        return {
-            "status": "ok",
-            "symbol": bx_symbol,
-            "funding_rate": rate,
-            "funding_rate_pct": rate * 100.0,
-            "funding_rate_unit": "PERCENT",
-            "exchange_ts_ms": exchange_ts_ms,
-            "timestamp_source": "exchange" if exchange_ts_ms is not None else "local_fetch",
-            "age_ms": age_ms,
-            "next_funding_time_ms": next_funding_ms,
-            "captured_at_ms": captured_at_ms,
-        }
+            primary_result["exchange_code"] = response.get("code") if isinstance(response, dict) else None
+        else:
+            row = _research_symbol_row(response.get("data"), bx_symbol)
+            if not isinstance(row, dict):
+                primary_result["reason"] = "premium_index_row_missing"
+            else:
+                rate = float(row.get("lastFundingRate"))
+                if not math.isfinite(rate):
+                    raise ValueError("non_finite_funding_rate")
+                raw_exchange_ts = row.get("time")
+                try:
+                    exchange_ts_ms = int(raw_exchange_ts) if raw_exchange_ts not in (None, "") else None
+                except (TypeError, ValueError, OverflowError):
+                    exchange_ts_ms = None
+                if exchange_ts_ms is None:
+                    primary_result.update({"status": "unverified", "reason": "premium_index_timestamp_missing"})
+                else:
+                    age_ms = captured_at_ms - exchange_ts_ms
+                    try:
+                        max_age_ms = max(30_000, int(float(os.environ.get("TELEGRAM_FUNDING_MAX_AGE_SEC", "300")) * 1000))
+                    except (TypeError, ValueError, OverflowError):
+                        max_age_ms = 300_000
+                    if age_ms < -30_000 or age_ms > max_age_ms:
+                        primary_result.update({
+                            "status": "stale", "reason": "premium_index_timestamp_out_of_range",
+                            "exchange_ts_ms": exchange_ts_ms, "age_ms": age_ms,
+                        })
+                    else:
+                        next_funding = row.get("nextFundingTime")
+                        try:
+                            next_funding_ms = int(next_funding) if next_funding not in (None, "") else None
+                        except (TypeError, ValueError, OverflowError):
+                            next_funding_ms = None
+                        return {
+                            "status": "ok", "symbol": bx_symbol,
+                            "funding_rate": rate, "funding_rate_pct": rate * 100.0,
+                            "funding_rate_unit": "PERCENT", "funding_source": "premiumIndex",
+                            "exchange_ts_ms": exchange_ts_ms, "timestamp_source": "exchange",
+                            "age_ms": age_ms, "next_funding_time_ms": next_funding_ms,
+                            "captured_at_ms": captured_at_ms,
+                        }
     except Exception as exc:
-        return {
-            "status": "unavailable", "reason": type(exc).__name__,
-            "captured_at_ms": captured_at_ms, "symbol": bx_symbol,
-        }
+        primary_result.update({"status": "unavailable", "reason": type(exc).__name__})
+
+    fallback = _funding_rate_fallback_snapshot(
+        bx_symbol, captured_at_ms=captured_at_ms, timeout_sec=timeout_sec,
+    )
+    if fallback.get("status") == "ok":
+        fallback["primary_fallback_reason"] = primary_result.get("reason")
+        return fallback
+    # Preserve a verified primary stale/unverified diagnosis when the fallback
+    # endpoint did not supply enough fields to override it. Store the fallback
+    # failure separately rather than obscuring the original exchange response.
+    if primary_result.get("status") == "stale":
+        primary_result["fallback_status"] = fallback.get("status")
+        primary_result["fallback_reason"] = fallback.get("reason")
+        return primary_result
+    if fallback.get("status") == "stale":
+        fallback["primary_status"] = primary_result.get("status")
+        fallback["primary_reason"] = primary_result.get("reason")
+        return fallback
+    if primary_result.get("status") == "unverified":
+        primary_result["fallback_status"] = fallback.get("status")
+        primary_result["fallback_reason"] = fallback.get("reason")
+        return primary_result
+    fallback.setdefault("primary_status", primary_result.get("status"))
+    fallback.setdefault("primary_reason", primary_result.get("reason"))
+    return fallback
 
 
 def _research_depth_metrics(data: Any, *, mid_price: float | None = None) -> dict[str, Any]:

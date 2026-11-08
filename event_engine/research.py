@@ -1385,9 +1385,34 @@ def _derive_time_series_features(*, direction: str, df_5m: pd.DataFrame | None, 
         out["session_vwap_available_bars"] = int(len(day))
         out["session_cvd_available_bars"] = int(len(day))
         if dts is not None:
-            expected_day_bars = max(0, int((dts - day_start).total_seconds() // 300))
+            # Count candles whose *close_time* is at or before the decision
+            # boundary. Decisions commonly use exchange close timestamps
+            # such as 15:49:59.999 for the 15:45 candle. Flooring elapsed
+            # minutes alone undercounts that final completed candle by one,
+            # which can both mislabel a complete session PARTIAL and miss a
+            # genuinely missing last candle.
+            bar_delta = pd.Timedelta(minutes=5)
+            if not day.empty and "close_time" in day.columns:
+                close_offsets = day["close_time"] - day["timestamp"]
+                close_offsets = close_offsets.dropna()
+            else:
+                close_offsets = pd.Series(dtype="timedelta64[ns]")
+            close_offset_consistent = True
+            if not close_offsets.empty:
+                expected_close_offset = close_offsets.median()
+                close_offset_consistent = bool(close_offsets.eq(expected_close_offset).all())
+            else:
+                # _closed_market_frame uses open + timeframe when the source
+                # does not provide an exchange close_time.
+                expected_close_offset = bar_delta
+            last_expected_open_delta = dts - day_start - expected_close_offset
+            expected_day_bars = (
+                max(0, int(last_expected_open_delta // bar_delta) + 1)
+                if last_expected_open_delta >= pd.Timedelta(0) else 0
+            )
         else:
             expected_day_bars = int(len(day))
+            close_offset_consistent = True
         out["session_vwap_expected_bars"] = expected_day_bars
         out["session_cvd_expected_bars"] = expected_day_bars
         expected_timestamps = (
@@ -1397,6 +1422,7 @@ def _derive_time_series_features(*, direction: str, df_5m: pd.DataFrame | None, 
         actual_timestamps = pd.DatetimeIndex(day["timestamp"].tolist()) if not day.empty else pd.DatetimeIndex([])
         has_full_day_coverage = (
             expected_day_bars > 0
+            and close_offset_consistent
             and len(actual_timestamps) == expected_day_bars
             and actual_timestamps.equals(expected_timestamps)
         )
@@ -2261,6 +2287,8 @@ def _observation_from_signal(
         "signal_score": signal.get("score"),
         "tp1_rr": signal.get("tp1_rr"),
         "tp2_rr": signal.get("tp2_rr"),
+        "tp3_rr": signal.get("tp3_rr"),
+        "tp3": signal.get("tp3"),
         "signal_drift_pct": signal.get("signal_drift_pct"),
         "market_spread_pct": (signal.get("market_snapshot") or {}).get("market_spread_pct"),
         "venue_price_deviation_pct": (signal.get("market_snapshot") or {}).get("venue_price_deviation_pct"),
@@ -2513,6 +2541,45 @@ def record_scan_symbol(
         counts["market_context"] = 1 if market_context_persisted else 0
         context_payload["persisted"] = market_context_persisted
         market_context = context_payload
+
+    # Most symbols in a live run are carried only to append the next 5m candles
+    # required by already-pending 24h forward outcomes. They have no new signal,
+    # touch, rearm, or qualifying nearest-approach observation. Avoid building a
+    # pandas frame and traversing all observation builders for these bar-only
+    # rows; persist the same validated closed bars and advance cursors through the
+    # existing durable/idempotent writer. This is research-only and cannot alter
+    # signal generation, execution, or the observation population.
+    diag = diagnostics if isinstance(diagnostics, dict) else {}
+    has_signal_observation = bool(signals)
+    has_touch_observation = any(
+        isinstance(event, dict) and str(event.get("reason", "")) != "signal_created"
+        for event in (diag.get("touch_events") or [])
+    )
+    has_rearm_observation = bool(diag.get("rearm_events") or [])
+    has_nearest_approach_observation = False
+    if not (has_signal_observation or has_touch_observation or has_rearm_observation):
+        for zone_diag in (diag.get("zones") or {}).values():
+            if not isinstance(zone_diag, dict) or not isinstance(zone_diag.get("closest_midpoint_bar"), dict):
+                continue
+            try:
+                distance = float(zone_diag.get("closest_midpoint_distance_pct"))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(distance) and 0.0 < distance <= NEAREST_APPROACH_MAX_PCT:
+                has_nearest_approach_observation = True
+                break
+
+    if not (has_signal_observation or has_touch_observation or has_rearm_observation or has_nearest_approach_observation):
+        if persist_bars_for_forward:
+            counts["bars_1h"] = persist_market_bars(
+                symbol, "1h", bars_1h, provider=provider, source=source, scan_id=scan_id, code_commit_sha=code_commit_sha
+            )
+            counts["bars_5m"] = persist_market_bars(
+                symbol, "5m", bars_5m, provider=provider, source=source, scan_id=scan_id,
+                code_commit_sha=code_commit_sha, seed_history=seed_5m_history,
+            )
+        return counts
+
     closed_5m: list[dict[str, Any]] = []
     if bars_5m:
         try:

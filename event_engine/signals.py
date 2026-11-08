@@ -24,11 +24,13 @@ INT_RES = 8
 SWING_LEN = 10
 ZONE_HISTORY = 20
 BOX_WIDTH = 2.5
-STRATEGY_VERSION = "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp3-tp6-be-on-tp1"
+STRATEGY_VERSION = "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp3-tp6-tp9-be-on-tp1"
 TP1_PCT = 3.0
 TP2_PCT = 6.0
+TP3_PCT = 9.0
 TP1_FRACTION = 0.50
-TP2_FRACTION = 0.50
+TP2_FRACTION = 0.25
+TP3_FRACTION = 0.25
 
 MIN_BARS = 70
 # Production entry filters selected from the last completed audit. Keep them
@@ -931,27 +933,33 @@ def _targets_from_nearest_obstacle(
     """Build fixed percentage targets from entry; obstacle is diagnostic only.
 
     Production strategy contract:
-      LONG  -> TP1 +3%, TP2 +6%, SL is handled separately.
-      SHORT -> TP1 -3%, TP2 -6%.
+      LONG  -> TP1 +3%, TP2 +6%, TP3 +9%; SL is handled separately.
+      SHORT -> TP1 -3%, TP2 -6%, TP3 -9%.
     """
     risk = abs(entry - stop)
     if risk <= 0 or entry <= 0:
         return None
     tp1_distance = entry * TP1_PCT / 100.0
     tp2_distance = entry * TP2_PCT / 100.0
+    tp3_distance = entry * TP3_PCT / 100.0
     if direction == "LONG":
         tp1 = entry + tp1_distance
         tp2 = entry + tp2_distance
+        tp3 = entry + tp3_distance
     else:
         tp1 = entry - tp1_distance
         tp2 = entry - tp2_distance
+        tp3 = entry - tp3_distance
     tp1_rr = tp1_distance / risk
     tp2_rr = tp2_distance / risk
+    tp3_rr = tp3_distance / risk
     return {
         "tp1": tp1,
         "tp2": tp2,
+        "tp3": tp3,
         "tp1_rr": tp1_rr,
         "tp2_rr": tp2_rr,
+        "tp3_rr": tp3_rr,
         "target_source": "fixed_entry_percentage",
         "obstacle_price": float(obstacle["price"]) if obstacle and obstacle.get("price") is not None else None,
         "obstacle_source": obstacle.get("source") if obstacle else None,
@@ -1088,8 +1096,10 @@ def generate_zone_signals(
             continue
         tp1 = float(targets["tp1"])
         tp2 = float(targets["tp2"])
+        tp3 = float(targets["tp3"])
         tp1_rr = float(targets["tp1_rr"])
         tp2_rr = float(targets["tp2_rr"])
+        tp3_rr = float(targets["tp3_rr"])
         avg_vol = _safe_num(vol_sma20_values[i], 0.0)
         vol_ratio = (_safe_num(volumes[i]) / avg_vol) if avg_vol > 0 else None
         event_ts = int(timestamps[i].timestamp() * 1000)
@@ -1129,11 +1139,13 @@ def generate_zone_signals(
                 "sl": round(stop, 8),
                 "tp1": round(tp1, 8),
                 "tp2": round(tp2, 8),
+                "tp3": round(tp3, 8),
                 "risk_pct": round(risk_pct, 4),
                 "risk_abs": round(risk, 8),
                 "atr": round(float(atr), 8),
                 "tp1_rr": round(tp1_rr, 4),
                 "tp2_rr": round(tp2_rr, 4),
+                "tp3_rr": round(tp3_rr, 4),
                 "strategy": "Demand/Supply Zone First",
                 "strategy_version": STRATEGY_VERSION,
                 "entry_bar": entry_bar,
@@ -1157,8 +1169,10 @@ def generate_zone_signals(
                     "obstacle_price": targets["obstacle_price"],
                     "tp1_pct": TP1_PCT,
                     "tp2_pct": TP2_PCT,
+                    "tp3_pct": TP3_PCT,
                     "tp1_close_fraction": TP1_FRACTION,
                     "tp2_close_fraction": TP2_FRACTION,
+                    "tp3_close_fraction": TP3_FRACTION,
                     "be_rule": "after_tp1_filled",
                 },
                 "risk_model": {

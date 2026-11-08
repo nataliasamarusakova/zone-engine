@@ -1358,6 +1358,7 @@ def format_trade_closed_message(
     lines = [
         f"{emoji} <b>{_display_symbol(symbol)} — сделка закрыта</b>",
         "",
+        f"Направление: <b>{'LONG' if str(direction).upper() == 'LONG' else 'SHORT'}</b>",
         f"Вход <code>{entry_price:.8g}</code> → Выход <code>{exit_price:.8g}</code>   <b>{pnl_text}</b>",
         f"Realized R:R: <b>{realized_rr_text}</b> · Planned Weighted R:R: <b>{planned_rr_text}</b>",
         f"Держали <b>{duration_min:.1f} мин</b> · пик <b>+{peak_pnl:.2f}%</b> · просадка <b>{max_drawdown:.2f}%</b>",
@@ -2572,21 +2573,77 @@ def _weighted_rr_snapshot(trade: dict) -> tuple[float | None, float | None, floa
     remaining_qty = max(_safe_float(trade.get("remaining_qty"), 0.0), 0.0)
     remaining_rr_component = 0.0
     if remaining_qty > 0 and tp_levels:
-        remaining = [x for x in tp_levels if isinstance(x, dict) and str(x.get("leg", "")) not in consumed_legs and _safe_float(x.get("pnl_pct"), 0.0) > 0]
+        remaining = [
+            x for x in tp_levels
+            if isinstance(x, dict)
+            and str(x.get("leg", "")).casefold() not in {item.casefold() for item in consumed_legs}
+            and _safe_float(x.get("pnl_pct"), 0.0) > 0
+        ]
         if remaining:
-            raw_weights = [
-                max(0.0, _safe_float(x.get("qty"), 0.0))
-                if _safe_float(x.get("qty"), 0.0) > 0
-                else max(0.0, _safe_float(x.get("close_fraction"), 0.0))
-                for x in remaining
-            ]
-            weight_sum = sum(raw_weights)
-            if weight_sum <= 0:
-                raw_weights = [1.0] * len(remaining)
-                weight_sum = float(len(remaining))
-            for level, raw_weight in zip(remaining, raw_weights):
+            tolerance = max(1e-9, init_qty * 1e-6, remaining_qty * 1e-6)
+            filled_by_leg = {
+                str(leg).casefold(): max(0.0, _safe_float(qty, 0.0))
+                for leg, qty in (trade.get("tp_filled_qty") or {}).items()
+            }
+            level_qtys = [max(0.0, _safe_float(level.get("qty"), 0.0)) for level in remaining]
+            has_exchange_qty = all(qty > 0 for qty in level_qtys)
+            has_booked_tp_fills = any(qty > tolerance for qty in filled_by_leg.values())
+
+            if has_exchange_qty:
+                effective_qty_sum = sum(level_qtys)
+                if abs(effective_qty_sum - remaining_qty) <= tolerance:
+                    # A protection rebuild has already persisted residual
+                    # per-leg quantities. Do not subtract the cumulative fill
+                    # ledger a second time.
+                    remaining_qtys = level_qtys
+                elif has_booked_tp_fills:
+                    # Before a protection rebuild, effective_tp_levels still
+                    # contain the original exchange-confirmed allocations.
+                    # Subtract each leg's cumulative fills only from that leg.
+                    remaining_qtys = [
+                        max(0.0, qty - filled_by_leg.get(str(level.get("leg", "")).casefold(), 0.0))
+                        for level, qty in zip(remaining, level_qtys)
+                    ]
+                    if abs(sum(remaining_qtys) - remaining_qty) > tolerance:
+                        # State does not prove whether these are original or
+                        # residual allocations. Return unknown rather than
+                        # manufacture a projected RR from normalized weights.
+                        return None, realized_rr_component, None
+                else:
+                    # No TP fill is recorded. Preserve the historical behavior
+                    # for externally reduced/manual positions by scaling the
+                    # still-planned target weights to the authoritative residual.
+                    weight_sum = effective_qty_sum
+                    remaining_qtys = [remaining_qty * qty / weight_sum for qty in level_qtys] if weight_sum > 0 else []
+            else:
+                # Legacy records may only contain close fractions. With known
+                # fills, reconstruct from immutable original tp_levels; with no
+                # fills, retain the prior proportional fallback.
+                if has_booked_tp_fills:
+                    planned_by_leg = {
+                        str(level.get("leg", "")).casefold(): max(0.0, _safe_float(level.get("close_fraction"), 0.0))
+                        for level in planned_tp_levels if isinstance(level, dict)
+                    }
+                    original_qtys = [
+                        init_qty * planned_by_leg.get(str(level.get("leg", "")).casefold(), 0.0)
+                        for level in remaining
+                    ]
+                    remaining_qtys = [
+                        max(0.0, qty - filled_by_leg.get(str(level.get("leg", "")).casefold(), 0.0))
+                        for level, qty in zip(remaining, original_qtys)
+                    ]
+                    if abs(sum(remaining_qtys) - remaining_qty) > tolerance:
+                        return None, realized_rr_component, None
+                else:
+                    raw_weights = [max(0.0, _safe_float(x.get("close_fraction"), 0.0)) for x in remaining]
+                    weight_sum = sum(raw_weights)
+                    if weight_sum <= 0:
+                        raw_weights = [1.0] * len(remaining)
+                        weight_sum = float(len(remaining))
+                    remaining_qtys = [remaining_qty * weight / weight_sum for weight in raw_weights]
+
+            for level, qty in zip(remaining, remaining_qtys):
                 pnl_pct = _safe_float(level.get("pnl_pct"), 0.0)
-                qty = remaining_qty * raw_weight / weight_sum
                 remaining_rr_component += (qty / init_qty) * (pnl_pct / risk_pct)
     effective = realized_rr_component + remaining_rr_component
     remaining_rr = None

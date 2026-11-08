@@ -20,9 +20,12 @@ DELAYED_BE_BARS = (1, 2)
 MFE_PROTECTION_ACTIVATION_PCT = 2.0
 MFE_PROTECTION_LOCK_LEVELS_PCT = (-1.0, 0.0, 0.5)
 PRODUCTION_TP1_FRACTION = 0.50
+PRODUCTION_TP2_FRACTION = 0.25
+PRODUCTION_TP3_FRACTION = 0.25
 PRODUCTION_STOP_PCT = 10.0
 PRODUCTION_TP1_PCT = 3.0
 PRODUCTION_TP2_PCT = 6.0
+PRODUCTION_TP3_PCT = 9.0
 STRUCTURAL_SL_ATR_MULT = 0.5
 STRUCTURAL_SL_MIN_PCT = 1.0
 STRUCTURAL_SL_MAX_PCT = 6.0
@@ -277,8 +280,66 @@ def build_entry_snapshot(
     # the actual canonical decision boundary so an hourly candle that closes
     # between trigger open and trigger close is included when it was knowable.
     x5 = _closed_5m(df_5m, entry_ts)
-    x1 = _closed_1h(df_1h, decision_ts_parsed)
+    # The signal's entry_bar is the canonical candle that actually created the
+    # production event. Some call paths pass a history frame that does not yet
+    # contain the just-selected event candle. Reconcile the event candle into
+    # the frame
+    # even when a same-timestamp row exists: the event's OHLCV is authoritative,
+    # while non-null exchange diagnostics from either source are retained.
+    raw_entry_bar = signal.get("entry_bar")
+    if isinstance(raw_entry_bar, dict):
+        canonical_ts = _parse_ts(raw_entry_bar.get("timestamp"))
+        canonical_values = {
+            key: _finite(raw_entry_bar.get(key))
+            for key in ("open", "high", "low", "close", "volume")
+        }
+        if canonical_ts is not None and canonical_ts == entry_ts and all(
+            value is not None for value in canonical_values.values()
+        ):
+            open_price = canonical_values["open"]
+            high_price = canonical_values["high"]
+            low_price = canonical_values["low"]
+            close_price = canonical_values["close"]
+            volume = canonical_values["volume"]
+            if (
+                min(open_price, high_price, low_price, close_price) > 0
+                and volume >= 0
+                and high_price >= max(open_price, close_price, low_price)
+                and low_price <= min(open_price, close_price, high_price)
+            ):
+                existing_rows = x5.loc[x5["timestamp"] == entry_ts] if not x5.empty else pd.DataFrame()
+                canonical_row = existing_rows.iloc[-1].to_dict() if not existing_rows.empty else {}
+                canonical_row.update(canonical_values)
+                canonical_row.update({
+                    "timestamp": entry_ts,
+                    "close_time": entry_ts + pd.Timedelta(minutes=5),
+                })
+                flow_valid_raw = raw_entry_bar.get("taker_flow_valid")
+                flow_valid = None if flow_valid_raw is None else bool(flow_valid_raw)
+                if flow_valid is False:
+                    # The event bar's explicit invalid-flow flag overrides a
+                    # stale diagnostic value that may exist in the history row.
+                    canonical_row.pop("bar_delta_usdt", None)
+                for field in ("quote_volume", "taker_buy_base", "taker_buy_quote", "bar_delta_usdt"):
+                    value = _finite(raw_entry_bar.get(field))
+                    if value is not None and not (field == "bar_delta_usdt" and flow_valid is False):
+                        canonical_row[field] = value
+                if flow_valid is not None:
+                    canonical_row["taker_flow_valid"] = flow_valid
+                trade_count = raw_entry_bar.get("trade_count")
+                if trade_count is not None:
+                    try:
+                        canonical_row["trade_count"] = int(trade_count)
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+                if not x5.empty:
+                    x5 = x5.loc[x5["timestamp"] != entry_ts].copy()
+                x5 = _closed_5m(
+                    pd.concat([x5, pd.DataFrame([canonical_row])], ignore_index=True),
+                    entry_ts,
+                )
     trigger_rows = x5.loc[x5["timestamp"] == entry_ts] if not x5.empty else pd.DataFrame()
+    x1 = _closed_1h(df_1h, decision_ts_parsed)
     trigger_bar = trigger_rows.iloc[-1] if not trigger_rows.empty else None
     prior5 = x5.loc[x5["timestamp"] < entry_ts] if not x5.empty else pd.DataFrame()
     prev5 = prior5.tail(20)
@@ -414,6 +475,7 @@ def build_entry_snapshot(
     production_sl = _finite(signal.get("sl"))
     production_tp1 = _finite(signal.get("tp1"))
     production_tp2 = _finite(signal.get("tp2"))
+    production_tp3 = _finite(signal.get("tp3"))
     if production_sl is None:
         production_risk_abs = entry * PRODUCTION_STOP_PCT / 100.0
         production_sl = entry - production_risk_abs if direction == "LONG" else entry + production_risk_abs
@@ -423,7 +485,6 @@ def build_entry_snapshot(
     if production_tp2 is None:
         production_tp2_distance = entry * PRODUCTION_TP2_PCT / 100.0
         production_tp2 = entry + production_tp2_distance if direction == "LONG" else entry - production_tp2_distance
-
     return {
         "schema_version": SHADOW_SCHEMA_VERSION,
         "experiment_version": SHADOW_EXPERIMENT_VERSION,
@@ -537,12 +598,15 @@ def build_entry_snapshot(
                 ),
             },
             "CF_PRODUCTION_MANAGEMENT": {
-                "version": 1,
+                "version": 3 if production_tp3 is not None else 2,
                 "stop": production_sl,
                 "tp1": production_tp1,
                 "tp2": production_tp2,
+                "tp3": production_tp3,
                 "tp1_fraction": PRODUCTION_TP1_FRACTION,
-                "management_baseline": "current_production_SL_TP1_TP2_BE_after_TP1",
+                "tp2_fraction": PRODUCTION_TP2_FRACTION if production_tp3 is not None else 0.50,
+                "tp3_fraction": PRODUCTION_TP3_FRACTION if production_tp3 is not None else None,
+                "management_baseline": "current_production_SL_TP1_50_TP2_25_TP3_25_BE_after_TP1" if production_tp3 is not None else "legacy_production_SL_TP1_TP2_50_50_BE_after_TP1",
             },
             "CF_COST_MODEL": {
                 "version": 1,
@@ -562,7 +626,10 @@ def build_entry_snapshot(
                 "production_sl": production_sl,
                 "production_tp1": production_tp1,
                 "production_tp2": production_tp2,
+                "production_tp3": production_tp3,
                 "tp1_fraction": PRODUCTION_TP1_FRACTION,
+                "tp2_fraction": PRODUCTION_TP2_FRACTION if production_tp3 is not None else 0.50,
+                "tp3_fraction": PRODUCTION_TP3_FRACTION if production_tp3 is not None else None,
                 "standalone_management_only": True,
                 "production_gate_applied": False,
             },
@@ -573,7 +640,10 @@ def build_entry_snapshot(
                 "production_sl": production_sl,
                 "production_tp1": production_tp1,
                 "production_tp2": production_tp2,
+                "production_tp3": production_tp3,
                 "tp1_fraction": PRODUCTION_TP1_FRACTION,
+                "tp2_fraction": PRODUCTION_TP2_FRACTION if production_tp3 is not None else 0.50,
+                "tp3_fraction": PRODUCTION_TP3_FRACTION if production_tp3 is not None else None,
                 "standalone_management_only": True,
                 "production_gate_applied": False,
             },
@@ -595,6 +665,8 @@ def build_entry_snapshot(
                 "stop_semantics": "new_stop_first_active_on_next_completed_bar",
                 "same_bar_policy": "ambiguous_when_mfe_coexists_with_stop_or_tp1",
                 "tp1_fraction": PRODUCTION_TP1_FRACTION,
+                "tp2_fraction": PRODUCTION_TP2_FRACTION if production_tp3 is not None else 0.50,
+                "tp3_fraction": PRODUCTION_TP3_FRACTION if production_tp3 is not None else None,
                 "standalone_management_only": True,
                 "production_gate_applied": False,
             },
@@ -648,6 +720,14 @@ def _weighted_partial_exit_pnl(
     tp1_pnl = _pct_return(direction, entry, tp1_price)
     residual_pnl = _pct_return(direction, entry, residual_price)
     return float(tp1_pnl * tp1_fraction + residual_pnl * (1.0 - tp1_fraction))
+
+
+def _weighted_tp_pnl(direction: str, entry: float, realized_levels: list[tuple[float, float]], remaining_fraction: float = 0.0, residual_price: float | None = None) -> float:
+    """Weighted whole-position PnL from confirmed target legs and an optional residual exit."""
+    total = sum(_pct_return(direction, entry, price) * fraction for price, fraction in realized_levels)
+    if remaining_fraction > 0 and residual_price is not None:
+        total += _pct_return(direction, entry, residual_price) * remaining_fraction
+    return float(total)
 
 
 _SHADOW_ATR_BEFORE_CLOSE = "_shadow_atr_before_close"
@@ -722,209 +802,164 @@ def _simulate_management_only(
     production_stop: float | None,
     production_tp1: float | None,
     production_tp2: float | None,
+    production_tp3: float | None = None,
     mode: str,
     parameter: float | int,
 ) -> dict[str, Any]:
-    """Simulate only post-entry management changes against current production entry/SL/TP.
+    """Simulate management variants using the persisted production TP plan.
 
-    Before TP1, production SL and TP1 are unchanged. After TP1, 50% is realized at TP1;
-    only the residual 50% is managed by delayed-BE or ATR trailing. This isolates management
-    effects from structural-SL/1.5R experiments and returns weighted trade-level PnL.
+    DELAYED_BE keeps every planned TP leg active. TRAIL_ATR is an alternative
+    management experiment: TP1 remains a 50% partial exit and the residual is
+    managed by the ATR trail rather than fixed TP2/TP3 exits. Historical
+    snapshots without TP3 retain the old 50/50 allocation.
     """
-    if future.empty or production_stop is None or production_tp1 is None or production_tp2 is None:
+    if future is None or future.empty or production_stop is None or production_tp1 is None or production_tp2 is None:
         return {"status": "INSUFFICIENT_PATH", "pnl_pct": None, "exit": None, "standalone_management_only": True}
 
-    tp1_hit_idx: int | None = None
-    tp1_fill_ts: str | None = None
-    tp1_pnl_pct = _pct_return(direction, entry, production_tp1)
+    direction = str(direction).upper()
+    mode = str(mode).upper()
+    if direction not in {"LONG", "SHORT"} or mode not in {"DELAYED_BE", "TRAIL_ATR"}:
+        return {"status": "INVALID_INPUT", "pnl_pct": None, "exit": None, "standalone_management_only": True}
 
+    legacy_two_tp = production_tp3 is None
+    production_rows = [
+        (float(production_tp1), 0.50, "tp1"),
+        (float(production_tp2), 0.50 if legacy_two_tp else 0.25, "tp2"),
+    ]
+    if not legacy_two_tp:
+        production_rows.append((float(production_tp3), 0.25, "tp3"))
+    prices = [row[0] for row in production_rows]
+    fractions = [row[1] for row in production_rows]
+    if abs(sum(fractions) - 1.0) > 1e-9:
+        return {"status": "INVALID_TARGET_ALLOCATION", "pnl_pct": None, "exit": None, "standalone_management_only": True}
+    if (direction == "LONG" and not all(a < b for a, b in zip(prices, prices[1:]))) or (direction == "SHORT" and not all(a > b for a, b in zip(prices, prices[1:]))):
+        return {"status": "INVALID_TARGET_LADDER", "pnl_pct": None, "exit": None, "standalone_management_only": True}
+
+    all_bars = all_bars.copy().reset_index(drop=True)
     future = future.reset_index(drop=True)
-    # calculate_counterfactual_outcomes normalizes/sorts the full bar frame once
-    # and adds a strictly prior-close ATR series when the close times are ordered.
-    # Re-copying/re-normalizing all bars for each of five management variants was
-    # redundant. Keep the original fallback for direct/legacy inputs without it.
+    realized_levels: list[tuple[float, float]] = []
+    realized_legs: list[str] = []
+    realized_fraction = 0.0
+    tp1_fill_idx: int | None = None
+    tp1_fill_ts: str | None = None
+    current_stop = float(production_stop)
     has_precomputed_atr = _SHADOW_ATR_BEFORE_CLOSE in future.columns
     if not has_precomputed_atr:
-        all_bars = all_bars.copy().reset_index(drop=True)
         all_bars["timestamp"] = _timestamp_series_to_utc(all_bars["timestamp"])
         all_bars["close_time"] = _timestamp_series_to_utc(all_bars["close_time"])
         for col in ("open", "high", "low", "close"):
             all_bars[col] = pd.to_numeric(all_bars[col], errors="coerce")
+    future_atr = future[_SHADOW_ATR_BEFORE_CLOSE].to_numpy(dtype=float, copy=False) if has_precomputed_atr else None
 
-    for idx, (high_value, low_value, close_time) in enumerate(
-        future[["high", "low", "close_time"]].itertuples(index=False, name=None)
-    ):
-        high = float(high_value)
-        low = float(low_value)
-        stop_hit = _directional_hit(direction, high, low, float(production_stop), False)
-        tp1_hit = _directional_hit(direction, high, low, float(production_tp1), True)
-        tp2_hit = _directional_hit(direction, high, low, float(production_tp2), True)
-        if stop_hit and (tp1_hit or tp2_hit):
-            return {
-                "status": "AMBIGUOUS_PRE_TP1_BAR",
-                "exit": "AMBIGUOUS",
-                "exit_price": None,
-                "exit_ts": _parse_ts(close_time).isoformat() if _parse_ts(close_time) is not None else None,
-                "pnl_pct": None,
-                "standalone_management_only": True,
-            }
-        if stop_hit:
-            stop_pnl = _pct_return(direction, entry, float(production_stop))
-            return {
-                "status": "STOP_BEFORE_TP1",
-                "exit": "PRODUCTION_SL",
-                "exit_price": float(production_stop),
-                "tp1_pnl_pct": None,
-                "residual_exit_pnl_pct": stop_pnl,
-                "pnl_pct": stop_pnl,
-                "bars_to_exit": idx + 1,
-                "standalone_management_only": True,
-            }
-        if tp2_hit:
-            weighted = _weighted_partial_exit_pnl(direction, entry, production_tp1, production_tp2)
-            return {
-                "status": "TP1_AND_TP2_REACHED_SAME_BAR",
-                "exit": "PRODUCTION_TP2",
-                "exit_price": float(production_tp2),
-                "tp1_pnl_pct": tp1_pnl_pct,
-                "residual_exit_pnl_pct": _pct_return(direction, entry, production_tp2),
-                "pnl_pct": weighted,
-                "bars_to_exit": idx + 1,
-                "standalone_management_only": True,
-            }
-        if tp1_hit:
-            tp1_hit_idx = int(idx)
-            tp1_fill_ts = _parse_ts(close_time).isoformat() if _parse_ts(close_time) is not None else None
-            break
+    for idx, row in future.iterrows():
+        high = _finite(row.get("high"))
+        low = _finite(row.get("low"))
+        close_time = _parse_ts(row.get("close_time"))
+        if high is None or low is None or close_time is None:
+            return {"status": "INVALID_FUTURE_BAR", "exit": None, "pnl_pct": None, "standalone_management_only": True}
 
-    if tp1_hit_idx is None:
-        return {
-            "status": "PATH_NOT_REACHED_TP1",
-            "exit": None,
-            "exit_price": None,
-            "pnl_pct": None,
-            "standalone_management_only": True,
-        }
-
-    activation_idx = tp1_hit_idx + int(parameter) + 1 if mode == "DELAYED_BE" else tp1_hit_idx + 1
-    current_stop = float(production_stop)
-    highest = None
-    lowest = None
-
-    future_high = future["high"].to_numpy(dtype=float, copy=False)
-    future_low = future["low"].to_numpy(dtype=float, copy=False)
-    future_close = future["close"].to_numpy(dtype=float, copy=False)
-    future_close_times = future["close_time"].tolist()
-    future_atr = (
-        future[_SHADOW_ATR_BEFORE_CLOSE].to_numpy(dtype=float, copy=False)
-        if has_precomputed_atr else None
-    )
-    for idx in range(tp1_hit_idx + 1, len(future)):
-        high = float(future_high[idx])
-        low = float(future_low[idx])
-        close = float(future_close[idx])
-
-        if mode == "DELAYED_BE" and idx >= activation_idx:
-            current_stop = float(entry)
-        elif mode == "DELAYED_BE":
-            current_stop = float(production_stop)
-
-        current_close_ts = _parse_ts(future_close_times[idx])
-        if mode == "TRAIL_ATR":
-            # No intrabar look-ahead: use ATR computed only from candles whose
-            # close_time is strictly before this candle. The precomputed series
-            # follows the same boundary and 15-row warm-up as the legacy path.
-            if has_precomputed_atr:
-                atr = _finite(future_atr[idx])
-            else:
-                hist = all_bars.loc[all_bars["close_time"] < current_close_ts]
-                current_open_ts = current_close_ts - pd.Timedelta(minutes=5) if current_close_ts is not None else None
-                history_ts = _timestamp_series_to_utc(hist["timestamp"].tail(15)) if len(hist) >= 15 else pd.Series(dtype="datetime64[ns, UTC]")
-                cadence_ok = (
-                    current_open_ts is not None
-                    and len(history_ts) == 15
-                    and not history_ts.isna().any()
-                    and history_ts.diff().dropna().eq(pd.Timedelta(minutes=5)).all()
-                    and history_ts.iloc[-1] + pd.Timedelta(minutes=5) == current_open_ts
-                )
-                if cadence_ok:
-                    prev = hist["close"].shift(1)
-                    tr = pd.concat([
-                        hist["high"] - hist["low"],
-                        (hist["high"] - prev).abs(),
-                        (hist["low"] - prev).abs(),
-                    ], axis=1).max(axis=1)
-                    atr_vals = tr.dropna().tail(14)
-                    atr = _finite(atr_vals.mean()) if len(atr_vals) == 14 else None
+        # Recalculate the stop before checking this candle. Every input below
+        # comes strictly from previously closed bars, so the current candle's
+        # high/low cannot move a stop and then trigger that stop retroactively.
+        if tp1_fill_idx is not None and idx > tp1_fill_idx:
+            if mode == "DELAYED_BE":
+                activation_idx = tp1_fill_idx + int(parameter) + 1
+                if idx >= activation_idx:
+                    current_stop = float(entry)
+            else:  # TRAIL_ATR
+                if has_precomputed_atr:
+                    atr = _finite(future_atr[idx])
                 else:
-                    atr = None
-            if atr is not None:
-                if direction == "LONG":
-                    highest = max(float(highest), float(production_tp1)) if highest is not None else float(production_tp1)
-                    current_stop = max(current_stop, highest - atr * float(parameter))
-                else:
-                    lowest = min(float(lowest), float(production_tp1)) if lowest is not None else float(production_tp1)
-                    current_stop = min(current_stop, lowest + atr * float(parameter))
+                    current_close_ts = close_time
+                    hist = all_bars.loc[all_bars["close_time"] < current_close_ts]
+                    current_open_ts = current_close_ts - pd.Timedelta(minutes=5)
+                    history_ts = _timestamp_series_to_utc(hist["timestamp"].tail(15)) if len(hist) >= 15 else pd.Series(dtype="datetime64[ns, UTC]")
+                    cadence_ok = len(history_ts) == 15 and not history_ts.isna().any() and history_ts.diff().dropna().eq(pd.Timedelta(minutes=5)).all() and history_ts.iloc[-1] + pd.Timedelta(minutes=5) == current_open_ts
+                    if cadence_ok:
+                        previous_close = hist["close"].shift(1)
+                        true_range = pd.concat([hist["high"] - hist["low"], (hist["high"] - previous_close).abs(), (hist["low"] - previous_close).abs()], axis=1).max(axis=1)
+                        atr_values = true_range.dropna().tail(14)
+                        atr = _finite(atr_values.mean()) if len(atr_values) == 14 else None
+                    else:
+                        atr = None
+                if atr is not None:
+                    # Preserve the experiment's historical convention: the TP1
+                    # price anchors the first trail; later closed bars extend it.
+                    prior_future = future.iloc[tp1_fill_idx + 1:idx]
+                    if direction == "LONG":
+                        prior_extreme = max([float(production_tp1)] + [float(x) for x in prior_future["high"].dropna().tolist()])
+                        current_stop = max(current_stop, prior_extreme - atr * float(parameter))
+                    else:
+                        prior_extreme = min([float(production_tp1)] + [float(x) for x in prior_future["low"].dropna().tolist()])
+                        current_stop = min(current_stop, prior_extreme + atr * float(parameter))
 
+        # In the ATR alternative TP1 is retained but the remaining quantity is
+        # trailing-managed. DELAYED_BE continues to honor TP2 and TP3.
+        if mode == "TRAIL_ATR" and tp1_fill_idx is not None:
+            target_hits = [False] * len(production_rows)
+        else:
+            target_hits = [
+                leg not in realized_legs and _directional_hit(direction, high, low, price, True)
+                for price, _, leg in production_rows
+            ]
         stop_hit = _directional_hit(direction, high, low, current_stop, False)
-        target_hit = mode == "DELAYED_BE" and _directional_hit(direction, high, low, production_tp2, True)
-        if stop_hit and target_hit:
+        remaining_fraction = max(0.0, 1.0 - realized_fraction)
+
+        if stop_hit and any(target_hits):
             return {
-                "status": "AMBIGUOUS_POST_TP1_BAR",
-                "exit": "AMBIGUOUS",
-                "exit_price": None,
-                "tp1_pnl_pct": tp1_pnl_pct,
-                "residual_exit_pnl_pct": None,
-                "pnl_pct": None,
-                "tp1_fill_ts": tp1_fill_ts,
-                "standalone_management_only": True,
-            }
-        if target_hit:
-            weighted = _weighted_partial_exit_pnl(direction, entry, production_tp1, production_tp2)
-            return {
-                "status": "TP2_AFTER_TP1",
-                "exit": "PRODUCTION_TP2",
-                "exit_price": float(production_tp2),
-                "tp1_pnl_pct": tp1_pnl_pct,
-                "residual_exit_pnl_pct": _pct_return(direction, entry, production_tp2),
-                "pnl_pct": weighted,
-                "tp1_fill_ts": tp1_fill_ts,
-                "exit_ts": current_close_ts.isoformat(),
-                "bars_to_exit": idx + 1,
+                "status": "AMBIGUOUS_STOP_AND_TARGET_SAME_BAR", "exit": "AMBIGUOUS", "exit_price": None,
+                "exit_ts": close_time.isoformat(), "pnl_pct": None,
+                "realized_target_legs": list(realized_legs),
+                "realized_target_fraction": realized_fraction, "residual_fraction": remaining_fraction,
                 "standalone_management_only": True,
             }
         if stop_hit:
-            weighted = _weighted_partial_exit_pnl(direction, entry, production_tp1, current_stop)
+            pnl = _weighted_tp_pnl(direction, entry, realized_levels, remaining_fraction, current_stop)
+            residual_pnl = _pct_return(direction, entry, current_stop) if remaining_fraction > 0 else 0.0
+            tp1_pnl = _pct_return(direction, entry, float(production_tp1)) if "tp1" in realized_legs else None
+            status = "STOP_BEFORE_TP1" if realized_fraction <= 1e-9 else "EXIT_AFTER_PARTIAL_TPS"
+            exit_name = "PRODUCTION_SL" if not realized_legs else ("BE_AFTER_TP1" if abs(current_stop - entry) <= max(1e-12, abs(entry) * 1e-12) else mode)
             return {
-                "status": "EXIT_AFTER_TP1",
-                "exit": mode,
-                "exit_price": float(current_stop),
-                "tp1_pnl_pct": tp1_pnl_pct,
-                "residual_exit_pnl_pct": _pct_return(direction, entry, current_stop),
-                "pnl_pct": weighted,
-                "tp1_fill_ts": tp1_fill_ts,
-                "exit_ts": current_close_ts.isoformat(),
-                "bars_to_exit": idx + 1,
-                "standalone_management_only": True,
+                "status": status, "exit": exit_name, "exit_price": float(current_stop), "tp1_fill_ts": tp1_fill_ts,
+                "tp1_pnl_pct": tp1_pnl, "residual_exit_pnl_pct": residual_pnl,
+                "realized_target_legs": list(realized_legs), "realized_target_fraction": realized_fraction,
+                "residual_fraction": remaining_fraction, "pnl_pct": pnl,
+                "bars_to_exit": idx + 1, "exit_ts": close_time.isoformat(), "standalone_management_only": True,
             }
 
-        # Only a completed bar may move a trailing extreme used by the next bar.
-        if mode == "TRAIL_ATR":
-            if direction == "LONG":
-                highest = high if highest is None else max(float(highest), high)
-            else:
-                lowest = low if lowest is None else min(float(lowest), low)
+        hit_indexes = [i for i, hit in enumerate(target_hits) if hit]
+        if hit_indexes:
+            highest_hit = max(hit_indexes)
+            for target_index, (price, fraction, leg) in enumerate(production_rows):
+                if target_index <= highest_hit and leg not in realized_legs:
+                    realized_levels.append((price, fraction))
+                    realized_legs.append(leg)
+                    realized_fraction += fraction
+                    if leg == "tp1" and tp1_fill_idx is None:
+                        tp1_fill_idx = idx
+                        tp1_fill_ts = close_time.isoformat()
+            if realized_fraction >= 1.0 - 1e-9:
+                last_leg = production_rows[-1][2].upper()
+                return {
+                    "status": "ALL_TP_LEGS_REACHED" if not legacy_two_tp else "TP1_AND_TP2_REACHED",
+                    "exit": f"PRODUCTION_{last_leg}", "exit_price": production_rows[-1][0],
+                    "tp1_fill_ts": tp1_fill_ts, "realized_target_legs": list(realized_legs),
+                    "realized_target_fraction": realized_fraction, "residual_fraction": 0.0,
+                    "pnl_pct": _weighted_tp_pnl(direction, entry, realized_levels),
+                    "bars_to_exit": idx + 1, "exit_ts": close_time.isoformat(), "standalone_management_only": True,
+                }
+            continue
 
+    if tp1_fill_idx is None:
+        return {"status": "PATH_NOT_REACHED_TP1", "exit": None, "exit_price": None, "pnl_pct": None, "standalone_management_only": True}
     return {
-        "status": "PATH_NOT_EXITED",
-        "exit": None,
-        "exit_price": None,
-        "tp1_pnl_pct": tp1_pnl_pct,
-        "residual_exit_pnl_pct": None,
-        "pnl_pct": None,
-        "tp1_fill_ts": tp1_fill_ts,
+        "status": "PATH_NOT_EXITED", "exit": None, "exit_price": None,
+        "tp1_fill_ts": tp1_fill_ts, "tp1_pnl_pct": _pct_return(direction, entry, float(production_tp1)),
+        "realized_target_legs": list(realized_legs), "realized_target_fraction": realized_fraction,
+        "residual_fraction": max(0.0, 1.0 - realized_fraction), "pnl_pct": None,
         "standalone_management_only": True,
     }
+
 
 def _simulate_mfe_protection(
     future: pd.DataFrame,
@@ -936,15 +971,22 @@ def _simulate_mfe_protection(
     production_tp2: float,
     activation_mfe_pct: float,
     locked_profit_pct: float,
+    production_tp3: float | None = None,
 ) -> dict[str, Any]:
-    """Simulate a +MFE stop lock without intrabar look-ahead.
+    """Simulate an MFE stop lock with production TP allocation and no look-ahead.
 
-    A completed candle that reaches the MFE threshold only activates the new
-    stop for the *next* candle. If that same candle also touches the old stop
-    or TP1, OHLC data cannot prove event order and the result is marked
-    ambiguous. After TP1, the residual half uses the tighter of the MFE lock
-    and the existing production BE-at-entry rule. This is research-only.
+    TP1/TP2-only historical snapshots retain their old 50/50 model; new
+    observations with TP3 use the production 50/25/25 plan.
     """
+    legacy_two_tp = production_tp3 is None
+    target_rows = [
+        (float(production_tp1), 0.50, "tp1"),
+        (float(production_tp2), 0.50 if legacy_two_tp else 0.25, "tp2"),
+    ]
+    if not legacy_two_tp:
+        target_rows.append((float(production_tp3), 0.25, "tp3"))
+    prices = [x[0] for x in target_rows]
+    fractions = [x[1] for x in target_rows]
     base = {
         "standalone_management_only": True,
         "production_gate_applied": False,
@@ -959,30 +1001,28 @@ def _simulate_mfe_protection(
     }
     if future is None or future.empty or entry <= 0:
         return {**base, "status": "INSUFFICIENT_PATH", "exit": None}
-
     direction = str(direction).upper()
     if direction not in {"LONG", "SHORT"}:
         return {**base, "status": "INVALID_DIRECTION", "exit": None}
+    if abs(sum(fractions) - 1.0) > 1e-9:
+        return {**base, "status": "INVALID_TARGET_ALLOCATION", "exit": None}
+    if (direction == "LONG" and not all(a < b for a, b in zip(prices, prices[1:]))) or (direction == "SHORT" and not all(a > b for a, b in zip(prices, prices[1:]))):
+        return {**base, "status": "INVALID_TARGET_LADDER", "exit": None}
 
-    mfe_trigger = (
-        entry * (1.0 + float(activation_mfe_pct) / 100.0)
-        if direction == "LONG"
-        else entry * (1.0 - float(activation_mfe_pct) / 100.0)
-    )
-    lock_stop = (
-        entry * (1.0 + float(locked_profit_pct) / 100.0)
-        if direction == "LONG"
-        else entry * (1.0 - float(locked_profit_pct) / 100.0)
-    )
+    mfe_trigger = entry * (1.0 + activation_mfe_pct / 100.0) if direction == "LONG" else entry * (1.0 - activation_mfe_pct / 100.0)
+    lock_stop = entry * (1.0 + locked_profit_pct / 100.0) if direction == "LONG" else entry * (1.0 - locked_profit_pct / 100.0)
     activated = False
-    tp1_realized = False
     activation_ts = None
     tp1_fill_ts = None
+    realized_levels: list[tuple[float, float]] = []
+    realized_legs: list[str] = []
+    realized_fraction = 0.0
     current_stop = float(production_stop)
     future = future.reset_index(drop=True)
 
-    def finish(status: str, exit_name: str | None, price: float | None, idx: int, ts: Any, *, tp1_pnl: float | None = None) -> dict[str, Any]:
+    def finish(status: str, exit_name: str | None, price: float | None, idx: int, ts: Any) -> dict[str, Any]:
         out = dict(base)
+        residual = max(0.0, 1.0 - realized_fraction)
         out.update({
             "status": status,
             "exit": exit_name,
@@ -991,16 +1031,15 @@ def _simulate_mfe_protection(
             "bars_to_exit": int(idx) + 1,
             "mfe_activation_ts": activation_ts.isoformat() if activation_ts is not None else None,
             "tp1_fill_ts": tp1_fill_ts.isoformat() if tp1_fill_ts is not None else None,
+            "realized_target_legs": list(realized_legs),
+            "realized_target_fraction": realized_fraction,
+            "residual_fraction": residual,
         })
         if price is not None:
-            if tp1_realized:
+            out["pnl_pct"] = _weighted_tp_pnl(direction, entry, realized_levels, residual, float(price))
+            if "tp1" in realized_legs:
                 out["tp1_pnl_pct"] = _pct_return(direction, entry, float(production_tp1))
-                out["residual_exit_pnl_pct"] = _pct_return(direction, entry, float(price))
-                out["pnl_pct"] = _weighted_partial_exit_pnl(direction, entry, float(production_tp1), float(price))
-            else:
-                out["pnl_pct"] = _pct_return(direction, entry, float(price))
-        else:
-            out["pnl_pct"] = None
+                out["residual_exit_pnl_pct"] = _pct_return(direction, entry, float(price)) if residual > 0 else 0.0
         return out
 
     for idx, row in future.iterrows():
@@ -1010,77 +1049,63 @@ def _simulate_mfe_protection(
         if high is None or low is None or close_time is None:
             return finish("INVALID_FUTURE_BAR", None, None, idx, close_time)
 
-        if tp1_realized:
-            stop_hit = _directional_hit(direction, high, low, current_stop, False)
-            tp2_hit = _directional_hit(direction, high, low, float(production_tp2), True)
-            if stop_hit and tp2_hit:
-                return finish("AMBIGUOUS_POST_TP1_BAR", "AMBIGUOUS", None, idx, close_time)
-            if stop_hit:
-                return finish("EXIT_AFTER_TP1_AND_MFE", "MFE_PROTECTION_OR_BE", current_stop, idx, close_time)
-            if tp2_hit:
-                return finish("TP2_AFTER_TP1_AND_MFE", "PRODUCTION_TP2", production_tp2, idx, close_time)
-            continue
+        target_hits = [
+            leg not in realized_legs and _directional_hit(direction, high, low, price, True)
+            for price, _, leg in target_rows
+        ]
+        stop_hit = _directional_hit(direction, high, low, current_stop, False)
+        mfe_hit = not activated and not realized_legs and _directional_hit(direction, high, low, mfe_trigger, True)
 
-        if activated:
-            locked_stop_hit = _directional_hit(direction, high, low, current_stop, False)
-            tp1_hit = _directional_hit(direction, high, low, float(production_tp1), True)
-            tp2_hit = _directional_hit(direction, high, low, float(production_tp2), True)
-            if locked_stop_hit and (tp1_hit or tp2_hit):
-                return finish("AMBIGUOUS_MFE_STOP_AND_TARGET_SAME_BAR", "AMBIGUOUS", None, idx, close_time)
-            if locked_stop_hit:
-                return finish("STOP_AFTER_MFE_PROTECTION", "MFE_PROTECTION", current_stop, idx, close_time)
-            if tp2_hit:
-                tp1_realized = True
-                tp1_fill_ts = close_time
-                return finish("TP1_AND_TP2_AFTER_MFE_SAME_BAR", "PRODUCTION_TP2", production_tp2, idx, close_time)
-            if tp1_hit:
-                tp1_realized = True
-                tp1_fill_ts = close_time
-                current_stop = max(lock_stop, float(entry)) if direction == "LONG" else min(lock_stop, float(entry))
-            continue
-
-        production_stop_hit = _directional_hit(direction, high, low, current_stop, False)
-        tp1_hit = _directional_hit(direction, high, low, float(production_tp1), True)
-        tp2_hit = _directional_hit(direction, high, low, float(production_tp2), True)
-        mfe_hit = _directional_hit(direction, high, low, mfe_trigger, True)
-
-        if production_stop_hit and mfe_hit:
+        if stop_hit and mfe_hit and not any(target_hits):
             return finish("AMBIGUOUS_MFE_AND_PRODUCTION_STOP_SAME_BAR", "AMBIGUOUS", None, idx, close_time)
-        if production_stop_hit and (tp1_hit or tp2_hit):
-            return finish("AMBIGUOUS_PRE_TP1_BAR", "AMBIGUOUS", None, idx, close_time)
-        if production_stop_hit:
-            return finish("STOP_BEFORE_MFE", "PRODUCTION_SL", production_stop, idx, close_time)
-        if tp2_hit:
-            if mfe_hit:
-                return finish("AMBIGUOUS_MFE_AND_TP_SAME_BAR", "AMBIGUOUS", None, idx, close_time)
-            # Both production targets lie inside this bar; preserve the engine's
-            # existing conservative weighted partial-exit accounting convention.
-            tp1_realized = True
-            tp1_fill_ts = close_time
-            current_stop = float(entry)
-            return finish("TP1_AND_TP2_SAME_BAR", "PRODUCTION_TP2", production_tp2, idx, close_time)
-        if tp1_hit:
-            if mfe_hit:
-                return finish("AMBIGUOUS_MFE_AND_TP1_SAME_BAR", "AMBIGUOUS", None, idx, close_time)
-            tp1_realized = True
-            tp1_fill_ts = close_time
-            current_stop = float(entry)
-            continue
+        if stop_hit and any(target_hits):
+            return finish("AMBIGUOUS_MFE_STOP_AND_TARGET_SAME_BAR", "AMBIGUOUS", None, idx, close_time)
+        if stop_hit:
+            if activated and not realized_legs:
+                return finish("STOP_AFTER_MFE_PROTECTION", "MFE_PROTECTION", current_stop, idx, close_time)
+            if realized_legs:
+                status = "EXIT_AFTER_TP1_AND_MFE" if activated or abs(current_stop - entry) <= max(1e-12, abs(entry) * 1e-12) else "EXIT_AFTER_PARTIAL_TPS"
+                return finish(status, "MFE_PROTECTION_OR_BE" if activated or abs(current_stop - entry) <= max(1e-12, abs(entry) * 1e-12) else "PRODUCTION_STOP", current_stop, idx, close_time)
+            return finish("STOP_BEFORE_TP1", "PRODUCTION_SL", current_stop, idx, close_time)
+        if mfe_hit and any(target_hits):
+            return finish("AMBIGUOUS_MFE_AND_TARGET_SAME_BAR", "AMBIGUOUS", None, idx, close_time)
         if mfe_hit:
             activated = True
             activation_ts = close_time
             current_stop = lock_stop
-            # Deliberately do not evaluate the newly-created stop against this
-            # candle's low/high; it is only effective from the next bar.
+            # New stop becomes effective only on the following closed candle.
             continue
 
-    status = "PATH_NOT_EXITED" if activated else ("TP1_FILLED_PATH_NOT_EXITED" if tp1_realized else "MFE_NOT_REACHED")
+        hit_indexes = [i for i, hit in enumerate(target_hits) if hit]
+        if hit_indexes:
+            highest_hit = max(hit_indexes)
+            for index, (price, fraction, leg) in enumerate(target_rows):
+                if index <= highest_hit and leg not in realized_legs:
+                    realized_levels.append((price, fraction))
+                    realized_legs.append(leg)
+                    realized_fraction += fraction
+                    if leg == "tp1" and tp1_fill_ts is None:
+                        tp1_fill_ts = close_time
+            if realized_fraction >= 1.0 - 1e-9:
+                last_leg = target_rows[-1][2].upper()
+                return finish("ALL_TP_LEGS_REACHED" if not legacy_two_tp else "TP1_AND_TP2_REACHED", f"PRODUCTION_{last_leg}", prices[-1], idx, close_time)
+            if "tp1" in realized_legs:
+                # Existing BE rule activates only after TP1 is confirmed; it
+                # applies from the next bar in this closed-bar simulation.
+                be_stop = float(entry)
+                current_stop = max(current_stop, be_stop) if direction == "LONG" else min(current_stop, be_stop)
+            continue
+
+    status = "PATH_NOT_EXITED" if activated else ("TP1_FILLED_PATH_NOT_EXITED" if "tp1" in realized_legs else "MFE_NOT_REACHED")
     out = dict(base)
     out.update({
         "status": status,
         "exit": None,
         "mfe_activation_ts": activation_ts.isoformat() if activation_ts is not None else None,
         "tp1_fill_ts": tp1_fill_ts.isoformat() if tp1_fill_ts is not None else None,
+        "realized_target_legs": list(realized_legs),
+        "realized_target_fraction": realized_fraction,
+        "residual_fraction": max(0.0, 1.0 - realized_fraction),
         "pnl_pct": None,
     })
     return out
@@ -1176,16 +1201,19 @@ def calculate_counterfactual_outcomes(
     production_stop = _finite((production or {}).get("stop")) if isinstance(production, dict) else None
     production_tp1 = _finite((production or {}).get("tp1")) if isinstance(production, dict) else None
     production_tp2 = _finite((production or {}).get("tp2")) if isinstance(production, dict) else None
+    production_tp3 = _finite((production or {}).get("tp3")) if isinstance(production, dict) else None
     if production_stop is not None and production_tp1 is not None and production_tp2 is not None:
         for bars_delay in DELAYED_BE_BARS:
             out["experiments"][f"CF_DELAYED_BE_CURRENT_{bars_delay}BAR"] = _simulate_management_only(
                 x, future, direction=direction, entry=entry, production_stop=production_stop,
-                production_tp1=production_tp1, production_tp2=production_tp2, mode="DELAYED_BE", parameter=bars_delay,
+                production_tp1=production_tp1, production_tp2=production_tp2, production_tp3=production_tp3,
+                mode="DELAYED_BE", parameter=bars_delay,
             )
         for atr_mult in TRAIL_ATR_MULTIPLIERS:
             out["experiments"][f"CF_TRAIL_CURRENT_{str(atr_mult).replace('.', '_')}ATR"] = _simulate_management_only(
                 x, future, direction=direction, entry=entry, production_stop=production_stop,
-                production_tp1=production_tp1, production_tp2=production_tp2, mode="TRAIL_ATR", parameter=atr_mult,
+                production_tp1=production_tp1, production_tp2=production_tp2, production_tp3=production_tp3,
+                mode="TRAIL_ATR", parameter=atr_mult,
             )
         for locked_profit_pct in MFE_PROTECTION_LOCK_LEVELS_PCT:
             token = (
@@ -1196,7 +1224,7 @@ def calculate_counterfactual_outcomes(
             )
             out["experiments"][f"CF_MFE_PLUS_2_LOCK_{token}"] = _simulate_mfe_protection(
                 future, direction=direction, entry=entry, production_stop=production_stop,
-                production_tp1=production_tp1, production_tp2=production_tp2,
+                production_tp1=production_tp1, production_tp2=production_tp2, production_tp3=production_tp3,
                 activation_mfe_pct=MFE_PROTECTION_ACTIVATION_PCT,
                 locked_profit_pct=locked_profit_pct,
             )
