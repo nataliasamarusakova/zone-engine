@@ -807,18 +807,19 @@ def test_record_scan_symbol_persists_account_context_once_and_links_observation(
     zone = {"zone_id": "Z_AC", "top": 105.0, "btm": 95.0, "poi": 100.0, "origin_ts_ms": int(df["timestamp"].iloc[0].timestamp() * 1000), "age_bars": 10}
     signal = {
         "event_id": "E_AC", "symbol": "TEST-USDT", "type": "LONG", "trigger_bar_time": ts.isoformat(),
+        "decision_boundary_ts": "2026-01-03T00:10:00Z",
         "entry": 104.0, "sl": 93.6, "tp1": 107.12, "tp2": 110.24, "tp1_rr": 0.3, "tp2_rr": 0.6, "score": 80.0,
         "zone": zone, "zone_visit": {"visit_id": "V_AC", "touch_count_before_trigger": 0}, "entry_bar": bar,
         "previous_bar": {}, "target": {"obstacle_price": 120.0}, "trigger": {"zone_trigger_mode": "zone"},
     }
-    account = {"account_context_id": "AC_TEST", "captured_at_ms": int(ts.timestamp() * 1000), "equity": 120.0, "available_margin": 100.0}
+    account = {"account_context_id": "AC_TEST", "captured_at": "2026-01-03T00:05:00Z", "captured_at_ms": int(ts.timestamp() * 1000), "equity": 120.0, "available_margin": 100.0}
     diagnostics = {"touch_events": [], "rearm_events": [], "zones": {}}
 
     out = research.record_scan_symbol(
         scan_id="SCAN_AC", symbol="TEST-USDT", strategy_version="v1", code_commit_sha="abc",
         provider="binance", source="binance_spot", bars_1h=df.to_dict("records"), bars_5m=[bar], df_1h=df,
         demand=[zone], supply=[], diagnostics=diagnostics, symbol_state={}, signals=[signal],
-        decision_ts="2026-01-03T00:10:00Z", account_context=account,
+        decision_ts="2026-01-03T00:15:45Z", account_context=account,
     )
     assert out["observations"] == 1
     account_rows = [json.loads(x) for x in (tmp_path / "account_context.jsonl").read_text().splitlines()]
@@ -828,6 +829,8 @@ def test_record_scan_symbol_persists_account_context_once_and_links_observation(
     obs_rows = [json.loads(x) for x in (tmp_path / "zone_observations.jsonl").read_text().splitlines()]
     assert obs_rows[0]["account_context_id"] == "AC_TEST"
     assert obs_rows[0]["account_context_persisted"] is True
+    assert obs_rows[0]["decision_boundary_ts"] == "2026-01-03T00:10:00Z"
+    assert obs_rows[0]["account_context_age_ms_at_decision"] == pytest.approx(300_000.0)
 
     # A scan symbol call receiving an already-persisted context must not append it again.
     account_persisted = dict(account, persisted=True)
@@ -1844,3 +1847,43 @@ def test_pre_entry_utc_session_vwap_uses_only_closed_bars_at_decision_boundary()
     assert features["session_vwap_kind"] == "UTC_DAY_TP_VWAP"
     assert features["session_vwap_approx"] == pytest.approx(expected)
     assert features["btc_return_1h_pct"] is None
+
+
+def test_record_scan_symbol_does_not_attach_account_context_captured_after_event_boundary(tmp_path: Path, monkeypatch):
+    for name in [
+        "ZONE_OBSERVATIONS_PATH", "MARKET_BARS_1H_PATH", "MARKET_BARS_5M_PATH",
+        "RESEARCH_BAR_CURSORS_PATH", "RESEARCH_MANIFEST_PATH", "RESEARCH_ERRORS_PATH",
+        "ACCOUNT_CONTEXT_PATH",
+    ]:
+        monkeypatch.setattr(research, name, tmp_path / getattr(research, name).name)
+    df = _df_1h()
+    ts = pd.Timestamp("2026-01-03T00:05:00Z")
+    bar = {"timestamp": ts, "open": 101.0, "high": 105.0, "low": 99.0, "close": 104.0, "volume": 2000.0}
+    zone = {"zone_id": "Z_LATE_AC", "top": 105.0, "btm": 95.0, "poi": 100.0,
+            "origin_ts_ms": int(df["timestamp"].iloc[0].timestamp() * 1000), "age_bars": 10}
+    signal = {
+        "event_id": "E_LATE_AC", "symbol": "TEST-USDT", "type": "LONG",
+        "trigger_bar_time": ts.isoformat(), "decision_boundary_ts": "2026-01-03T00:10:00Z",
+        "entry": 104.0, "sl": 93.6, "tp1": 107.12, "tp2": 110.24,
+        "zone": zone, "zone_visit": {"visit_id": "V_LATE_AC", "touch_count_before_trigger": 0},
+        "entry_bar": bar,
+    }
+    late_capture = pd.Timestamp("2026-01-03T00:11:00Z")
+    account = {
+        "account_context_id": "AC_TOO_LATE", "captured_at": late_capture.isoformat(),
+        "captured_at_ms": int(late_capture.timestamp() * 1000), "equity": 120.0,
+        "available_margin": 100.0,
+    }
+    research.record_scan_symbol(
+        scan_id="SCAN_LATE_AC", symbol="TEST-USDT", strategy_version="v1", code_commit_sha="abc",
+        provider="binance", source="binance_spot", bars_1h=df.to_dict("records"), bars_5m=[bar], df_1h=df,
+        demand=[zone], supply=[], diagnostics={"touch_events": [], "rearm_events": [], "zones": {}},
+        symbol_state={}, signals=[signal], decision_ts="2026-01-03T00:15:45Z", account_context=account,
+    )
+    rows = [json.loads(line) for line in (tmp_path / "zone_observations.jsonl").read_text().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["account_context_id"] is None
+    assert rows[0]["account_context_status"] == "NOT_AVAILABLE_AT_DECISION"
+    assert rows[0]["account_context_persisted"] is False
+    assert rows[0]["account_context_age_ms_at_decision"] is None
+    assert "account_equity" not in rows[0]["features"]

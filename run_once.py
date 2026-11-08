@@ -2258,6 +2258,78 @@ def _find_recent_unresolved_engine_entry(symbol: str, direction: str, *, max_age
     return None
 
 
+def _remaining_tp_levels_after_partial_fills(
+    tp_levels: list[dict],
+    original_tp_orders: list[dict],
+    tp_filled_qty: dict,
+    hit_legs: set[str],
+    position_qty: float,
+) -> tuple[list[dict] | None, str | None]:
+    """Rebuild remaining TP allocation from immutable original leg sizes.
+
+    ``close_fraction`` is a weight consumed by ensure_directional_protection,
+    not an absolute quantity. After a partial terminal fill, passing the original
+    fractions would redistribute the filled quantity across the remaining
+    position. Use original exchange-confirmed TP quantities minus the aggregate
+    fills already booked for each leg instead. Return None when this cannot be
+    proven from persisted state; callers must then defer TP reconstruction.
+    """
+    filled_by_leg = {
+        str(leg).casefold(): max(0.0, float(value or 0.0))
+        for leg, value in (tp_filled_qty or {}).items()
+    }
+    if not any(value > 0 for value in filled_by_leg.values()):
+        return [dict(level) for level in tp_levels if str(level.get("leg", "")).casefold() not in hit_legs], None
+
+    original_qty_by_leg: dict[str, float] = {}
+    for order in original_tp_orders:
+        if not isinstance(order, dict):
+            continue
+        leg = str(order.get("leg") or "").strip().casefold()
+        if not leg:
+            continue
+        raw_qty = order.get("qty", order.get("orig_qty", order.get("origQty")))
+        try:
+            original_qty = float(raw_qty)
+        except (TypeError, ValueError, OverflowError):
+            return None, f"original TP quantity is unavailable for {leg}"
+        if not math.isfinite(original_qty) or original_qty <= 0 or leg in original_qty_by_leg:
+            return None, f"original TP quantity is invalid or ambiguous for {leg}"
+        original_qty_by_leg[leg] = original_qty
+
+    remaining: list[dict] = []
+    for level in tp_levels:
+        leg = str(level.get("leg", "")).strip()
+        leg_key = leg.casefold()
+        if leg_key in hit_legs:
+            continue
+        original_qty = original_qty_by_leg.get(leg_key)
+        if original_qty is None:
+            return None, f"original exchange TP allocation is missing for {leg}"
+        filled_qty = filled_by_leg.get(leg_key, 0.0)
+        tolerance = max(1e-12, original_qty * 1e-6)
+        residual_qty = original_qty - filled_qty
+        if residual_qty < -tolerance:
+            return None, f"booked TP fills exceed original allocation for {leg}"
+        if residual_qty > tolerance:
+            remaining.append({
+                "leg": leg,
+                "pnl_pct": float(level.get("pnl_pct", 0.0)),
+                # ensure_directional_protection normalizes these weights. Passing
+                # residual quantities preserves the original per-leg quantities.
+                "close_fraction": residual_qty,
+            })
+
+    total_remaining = sum(float(level["close_fraction"]) for level in remaining)
+    quantity_tolerance = max(1e-12, abs(float(position_qty)) * 1e-6)
+    if not remaining or abs(total_remaining - float(position_qty)) > quantity_tolerance:
+        return None, (
+            "remaining original TP allocations do not reconcile to exchange position: "
+            f"planned={total_remaining}, exchange={position_qty}"
+        )
+    return remaining, None
+
+
 def reconcile_all_open_positions() -> bool:
     """Reconcile positions; False means ownership/protection is not trustworthy."""
     started = time.time()
@@ -2518,20 +2590,41 @@ def reconcile_all_open_positions() -> bool:
                 continue
             log.warning("[RECON_TP_IDENTITY] recovered exchange-filled TP order identity event=%s symbol=%s legs=%s; deferring TP recreation until tracker books execution", event_id, symbol, [x.get("leg") for x in recovered_filled_orders])
 
-        remaining_levels = [x for x in tp_levels if str(x.get("leg", "")) not in hit_legs]
-        # Keep the original strategy fractions. Renormalizing all remaining legs
-        # to 100% can turn a missed TP1 into a second TP allocation on only half
-        # the position (the ACHUSDT 449/448 failure mode).
-        if tp_recovery_pending:
-            # Repair/verify the stop for the actual exchange quantity now, but do
-            # not place any new TP until tracker has booked the recovered fill and
-            # activated BE where appropriate.
+        remaining_levels = [x for x in tp_levels if str(x.get("leg", "")).casefold() not in {str(v).casefold() for v in hit_legs}]
+        partial_tp_pending = any(
+            isinstance(item, dict)
+            and str(item.get("reconciliation_state", "")).upper() == "PENDING_PARTIAL_FILL"
+            for item in active_tp_orders
+        )
+        tp_allocation_error = None
+        if tp_recovery_pending or partial_tp_pending:
+            # Do not replace an order while its partial-fill quantity/status is
+            # still unresolved. Repair/verify SL independently and retry TPs on
+            # the next cycle after tracker has authoritative execution evidence.
             tp_levels = []
         else:
-            tp_levels = [
-                {"leg": str(x.get("leg")), "pnl_pct": float(x.get("pnl_pct", 0.0)), "close_fraction": float(x.get("close_fraction", 0.0))}
-                for x in remaining_levels
-            ]
+            adjusted_levels, tp_allocation_error = _remaining_tp_levels_after_partial_fills(
+                tp_levels,
+                original_tp_orders,
+                trade.get("tp_filled_qty") or {},
+                {str(value).casefold() for value in hit_legs},
+                qty,
+            )
+            if adjusted_levels is None:
+                # Unknown allocation is not a zero-fill state. Preserve the last
+                # known TP identities, keep/repair SL, and block new entries until
+                # execution evidence allows an exact reconstruction.
+                tp_levels = []
+            else:
+                tp_levels = adjusted_levels
+
+        tp_deferred_reason = None
+        if tp_recovery_pending:
+            tp_deferred_reason = "tp_recovery_pending: defer TP recreation until recovered fill is booked"
+        elif partial_tp_pending:
+            tp_deferred_reason = "partial TP execution is still pending reconciliation; existing TP orders retained"
+        elif tp_allocation_error:
+            tp_deferred_reason = f"TP allocation cannot be safely reconstructed: {tp_allocation_error}"
 
         try:
             try:
@@ -2544,12 +2637,19 @@ def reconcile_all_open_positions() -> bool:
                     "error": f"ensure_directional_protection raised: {type(protection_exc).__name__}: {protection_exc}",
                 }
                 log.exception("[RECON_PROTECTION_EXCEPTION] %s %s event=%s; escalating to emergency close", symbol, side, event_id)
-            if tp_recovery_pending and result.get("status") == "PROTECTED" and not result.get("tp_orders"):
-                # A confirmed SL alone is not a complete TP recovery. Keep the SL,
-                # but make the incomplete state visible to reconciliation and block
-                # new entries until tracker books the recovered fill and restores TP.
+            if tp_deferred_reason and result.get("status") == "PROTECTED" and not result.get("tp_orders"):
+                # Keep a verified SL and retain the last-known TP identities. A
+                # partial/ambiguous fill must not be converted into a guessed
+                # allocation or erase evidence needed by the tracker on restart.
                 result["status"] = "SL_ONLY"
-                result["error"] = "tp_recovery_pending: TP recreation deferred until recovered fill is booked"
+                result["error"] = tp_deferred_reason
+                result["tp_orders"] = active_tp_orders
+                result["effective_tp_levels"] = (
+                    trade.get("effective_tp_levels")
+                    if isinstance(trade.get("effective_tp_levels"), list)
+                    else (setup.get("effective_tp_levels") if isinstance(setup.get("effective_tp_levels"), list) else [])
+                )
+                result["tp_mode"] = trade.get("tp_mode") or "multi_tp"
             if result.get("status") == "PROTECTION_READ_UNAVAILABLE":
                 # An openOrders API failure is an unknown protection state, not
                 # evidence that the SL/TP orders disappeared. Emergency MARKET

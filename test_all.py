@@ -6698,3 +6698,263 @@ def test_historical_be_close_keeps_be_order_as_canonical_and_computes_rr(monkeyp
     assert record["be_client_order_id"] == "EVT_BE_EVENT"
     assert record["realized_rr"] == pytest.approx(0.16)
     assert record["fill_accounting"]["status"] in {"VERIFIED", "VERIFIED_ORDER_EXECUTION"}
+
+
+def test_reconcile_partial_tp_fill_preserves_original_per_leg_remaining_quantities(monkeypatch):
+    """A partial TP1 fill must reduce TP1's target, not redistribute it to TP2."""
+    import run_once
+
+    protection_calls = []
+    trade = {
+        "event_id": "EVT_PARTIAL_TP_ALLOCATION",
+        "symbol": "AAA-USDT",
+        "direction": "LONG",
+        "closed": False,
+        "initial_qty": 1.0,
+        "remaining_qty": 0.7,
+        "planned_risk_pct": 10.0,
+        "hit_legs": [],
+        "tp_filled_qty": {"tp1": 0.3},
+        "tp_orders": [
+            {"leg": "tp1", "order_id": "TP1_ORIGINAL", "status": "PARTIAL_FILL_TERMINAL", "qty": 0.5, "executed_qty": 0.3},
+            {"leg": "tp2", "order_id": "TP2_ORIGINAL", "status": "NEW", "qty": 0.5, "executed_qty": 0.0},
+        ],
+        "setup": {
+            "tp_levels": [
+                {"leg": "tp1", "pnl_pct": 3.0, "close_fraction": 0.5},
+                {"leg": "tp2", "pnl_pct": 6.0, "close_fraction": 0.5},
+            ],
+            "protection_result": {"tp_orders": [
+                {"leg": "tp1", "order_id": "TP1_ORIGINAL", "client_order_id": "CID_TP1", "qty": 0.5, "pnl_pct": 3.0},
+                {"leg": "tp2", "order_id": "TP2_ORIGINAL", "client_order_id": "CID_TP2", "qty": 0.5, "pnl_pct": 6.0},
+            ]},
+        },
+    }
+    monkeypatch.setattr(run_once, "_load_active_trades_file", lambda: {"EVT_PARTIAL_TP_ALLOCATION": trade})
+    monkeypatch.setattr(run_once, "get_positions", lambda **kwargs: [
+        {"symbol": "AAA-USDT", "positionSide": "LONG", "positionAmt": "0.7", "avgPrice": "100"},
+    ])
+    monkeypatch.setattr(run_once, "ensure_directional_protection", lambda symbol, side, avg, qty, risk, levels, trade_id=None: (
+        protection_calls.append({"qty": qty, "levels": levels}) or
+        {"status": "PROTECTED", "tp_orders": [], "sl_result": {"order_id": "SL_OK"}, "effective_tp_levels": []}
+    ))
+    monkeypatch.setattr(run_once, "update_active_trade_protection", lambda *args, **kwargs: True)
+    monkeypatch.setattr(run_once.telemetry, "record_position_reconciliation", lambda **kwargs: None)
+    monkeypatch.setattr(run_once.telemetry, "record_state_conflict", lambda **kwargs: None)
+
+    assert run_once.reconcile_all_open_positions() is True
+    assert len(protection_calls) == 1
+    levels = {item["leg"]: item["close_fraction"] for item in protection_calls[0]["levels"]}
+    assert levels == pytest.approx({"tp1": 0.2, "tp2": 0.5})
+
+
+def test_reconcile_defers_tp_repair_while_partial_fill_is_unresolved(monkeypatch):
+    """An unresolved partial TP must retain its order identity and never be reallocated."""
+    import run_once
+
+    protection_calls = []
+    persisted = []
+    tp_orders = [
+        {"leg": "tp1", "order_id": "TP1_PENDING", "status": "PARTIALLY_FILLED", "qty": 0.5,
+         "executed_qty": 0.3, "reconciliation_state": "PENDING_PARTIAL_FILL"},
+        {"leg": "tp2", "order_id": "TP2_KEEP", "status": "NEW", "qty": 0.5, "executed_qty": 0.0},
+    ]
+    trade = {
+        "event_id": "EVT_PENDING_TP", "symbol": "AAA-USDT", "direction": "LONG", "closed": False,
+        "initial_qty": 1.0, "remaining_qty": 0.7, "planned_risk_pct": 10.0,
+        "hit_legs": [], "tp_filled_qty": {"tp1": 0.3}, "tp_orders": tp_orders,
+        "setup": {"tp_levels": [
+            {"leg": "tp1", "pnl_pct": 3.0, "close_fraction": 0.5},
+            {"leg": "tp2", "pnl_pct": 6.0, "close_fraction": 0.5},
+        ], "protection_result": {"tp_orders": [
+            {"leg": "tp1", "order_id": "TP1_PENDING", "qty": 0.5},
+            {"leg": "tp2", "order_id": "TP2_KEEP", "qty": 0.5},
+        ]}},
+    }
+    monkeypatch.setattr(run_once, "_load_active_trades_file", lambda: {"EVT_PENDING_TP": trade})
+    monkeypatch.setattr(run_once, "get_positions", lambda **kwargs: [
+        {"symbol": "AAA-USDT", "positionSide": "LONG", "positionAmt": "0.7", "avgPrice": "100"},
+    ])
+    monkeypatch.setattr(run_once, "ensure_directional_protection", lambda symbol, side, avg, qty, risk, levels, trade_id=None: (
+        protection_calls.append({"qty": qty, "levels": levels}) or
+        {"status": "PROTECTED", "tp_orders": [], "sl_result": {"order_id": "SL_OK"}, "effective_tp_levels": []}
+    ))
+    monkeypatch.setattr(run_once, "update_active_trade_protection", lambda symbol, side, tps, sl, *a, **k: persisted.append(list(tps)) or True)
+    monkeypatch.setattr(run_once.telemetry, "record_position_reconciliation", lambda **kwargs: None)
+    monkeypatch.setattr(run_once.telemetry, "record_state_conflict", lambda **kwargs: None)
+    monkeypatch.setattr(run_once, "_append_execution_ledger", lambda *a, **k: None)
+
+    assert run_once.reconcile_all_open_positions() is False
+    assert protection_calls == [{"qty": 0.7, "levels": []}]
+    assert [item["order_id"] for item in persisted[0]] == ["TP1_PENDING", "TP2_KEEP"]
+
+
+def test_directional_sl_reconcile_resizes_actual_position_then_is_idempotent_after_restart(monkeypatch):
+    """A stale SL is replaced for live qty; the next process pass reuses it without duplication."""
+    from event_engine import bingx
+
+    old_sl = {"orderId": "OLD_SL", "clientOrderId": "EVT_OLD_SL", "type": "STOP_MARKET",
+              "status": "NEW", "stopPrice": "90.00", "origQty": "1.00",
+              "positionSide": "LONG", "side": "SELL"}
+    open_orders = [old_sl]
+    posted = []
+    cancelled = []
+
+    def read_orders(*args, **kwargs):
+        return {"status": "ok", "sl_orders": list(open_orders), "tp_orders": []}
+
+    def fake_request(method, path, params=None, **kwargs):
+        posted.append(dict(params or {}))
+        order = {
+            "orderId": "NEW_SL", "clientOrderId": params["clientOrderId"],
+            "type": "STOP_MARKET", "status": "NEW", "stopPrice": params["stopPrice"],
+            "origQty": params["quantity"], "positionSide": params["positionSide"],
+            "side": params["side"],
+        }
+        open_orders.append(order)
+        return {"code": 0, "data": {"order": order}}
+
+    def fake_cancel(symbol, order_id):
+        cancelled.append(order_id)
+        open_orders[:] = [item for item in open_orders if str(item.get("orderId")) != str(order_id)]
+        return {"code": 0}
+
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)
+    monkeypatch.setattr(bingx, "get_open_protection_directional", read_orders)
+    monkeypatch.setattr(bingx, "get_position_mode", lambda **kwargs: "HEDGE")
+    monkeypatch.setattr(bingx, "get_contract", lambda symbol: {
+        "symbol": symbol, "quantityPrecision": 2, "pricePrecision": 2, "tradeMinQuantity": 0.01,
+    })
+    monkeypatch.setattr(bingx, "_current_close_price", lambda symbol: 100.0)
+    monkeypatch.setattr(bingx, "_request", fake_request)
+    monkeypatch.setattr(bingx, "cancel_order", fake_cancel)
+
+    first = bingx.ensure_directional_protection("AAA-USDT", "LONG", 100.0, 0.7, 10.0, [], trade_id="EVT_REPLAY")
+    assert first["status"] == "PROTECTED"
+    assert len(posted) == 1
+    assert posted[0]["quantity"] == "0.70"
+    assert cancelled == ["OLD_SL"]
+    assert [item["orderId"] for item in open_orders] == ["NEW_SL"]
+    assert open_orders[0]["origQty"] == "0.70"
+
+    # A new tracker/engine process performs the same reconciliation after restart.
+    second = bingx.ensure_directional_protection("AAA-USDT", "LONG", 100.0, 0.7, 10.0, [], trade_id="EVT_REPLAY")
+    assert second["status"] == "PROTECTED"
+    assert len(posted) == 1, "restart replay must not create a duplicate SL"
+    assert cancelled == ["OLD_SL"], "restart replay must not cancel the valid replacement"
+    assert len(open_orders) == 1
+
+
+def test_reconcile_sl_restarts_from_persisted_active_trade_state_without_duplicate_protection(tmp_path, monkeypatch):
+    """A fresh reconciliation pass must reload state and reuse exchange-visible SL/TP."""
+    import json
+    import run_once
+    from event_engine import bingx
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    active_path = data_dir / "active_trades.json"
+    monkeypatch.setattr(run_once, "DATA", data_dir)
+
+    tp_client_id = bingx.build_tp_client_order_id("tp1", "EVT_RESTART_FULL")
+    trade = {
+        "event_id": "EVT_RESTART_FULL", "symbol": "AAA-USDT", "direction": "LONG",
+        "closed": False, "initial_qty": 1.0, "remaining_qty": 0.7, "planned_risk_pct": 10.0,
+        "hit_legs": [], "tp_filled_qty": {},
+        "sl_order": {"order_id": "OLD_SL", "client_order_id": "EVT_OLD_SL", "qty": 1.0,
+                     "stop_price": 90.0, "protection_order_verified": True},
+        "tp_orders": [{"leg": "tp1", "order_id": "KEEP_TP", "client_order_id": tp_client_id,
+                       "qty": 0.7, "status": "NEW"}],
+        "setup": {
+            "risk_pct": 10.0,
+            "tp_levels": [{"leg": "tp1", "pnl_pct": 3.0, "close_fraction": 1.0}],
+            "protection_result": {"tp_orders": [
+                {"leg": "tp1", "order_id": "KEEP_TP", "client_order_id": tp_client_id,
+                 "qty": 0.7, "pnl_pct": 3.0},
+            ]},
+        },
+    }
+    active_path.write_text(json.dumps({"EVT_RESTART_FULL": trade}), encoding="utf-8")
+
+    exchange_orders = [
+        {"orderId": "OLD_SL", "clientOrderId": "EVT_OLD_SL", "type": "STOP_MARKET",
+         "status": "NEW", "stopPrice": "90.00", "origQty": "1.00",
+         "positionSide": "LONG", "side": "SELL"},
+        {"orderId": "KEEP_TP", "clientOrderId": tp_client_id, "type": "TAKE_PROFIT_MARKET",
+         "status": "NEW", "stopPrice": "103.00", "origQty": "0.70",
+         "positionSide": "LONG", "side": "SELL"},
+    ]
+    posted = []
+    cancelled = []
+    persisted_updates = []
+
+    def read_orders(*args, **kwargs):
+        return {
+            "status": "ok",
+            "sl_orders": [x for x in exchange_orders if x["type"] in {"STOP", "STOP_MARKET"}],
+            "tp_orders": [x for x in exchange_orders if x["type"] in {"TAKE_PROFIT_MARKET", "TAKE_PROFIT"}],
+        }
+
+    def fake_request(method, path, params=None, **kwargs):
+        params = dict(params or {})
+        posted.append(params)
+        order = {
+            "orderId": "NEW_SL", "clientOrderId": params["clientOrderId"],
+            "type": "STOP_MARKET", "status": "NEW", "stopPrice": params["stopPrice"],
+            "origQty": params["quantity"], "positionSide": params["positionSide"],
+            "side": params["side"],
+        }
+        exchange_orders.append(order)
+        return {"code": 0, "data": {"order": order}}
+
+    def fake_cancel(symbol, order_id):
+        cancelled.append(str(order_id))
+        exchange_orders[:] = [x for x in exchange_orders if str(x.get("orderId")) != str(order_id)]
+        return {"code": 0}
+
+    def persist_protection(symbol, side, tp_orders, sl_result, effective_tp_levels=None,
+                           tp_mode=None, effective_weighted_rr=None, *, event_id=None):
+        payload = json.loads(active_path.read_text(encoding="utf-8"))
+        owner = payload[str(event_id)]
+        owner["tp_orders"] = tp_orders
+        owner["sl_order"] = sl_result
+        owner["effective_tp_levels"] = effective_tp_levels or []
+        owner["tp_mode"] = tp_mode
+        active_path.write_text(json.dumps(payload), encoding="utf-8")
+        persisted_updates.append({"event_id": event_id, "sl": sl_result, "tps": tp_orders})
+        return True
+
+    monkeypatch.setattr(bingx, "to_bx_symbol", lambda symbol: symbol)
+    monkeypatch.setattr(bingx, "get_open_protection_directional", read_orders)
+    monkeypatch.setattr(bingx, "get_position_mode", lambda **kwargs: "HEDGE")
+    monkeypatch.setattr(bingx, "get_contract", lambda symbol: {
+        "symbol": symbol, "quantityPrecision": 2, "pricePrecision": 2, "tradeMinQuantity": 0.01,
+    })
+    monkeypatch.setattr(bingx, "_current_close_price", lambda symbol: 100.0)
+    monkeypatch.setattr(bingx, "_request", fake_request)
+    monkeypatch.setattr(bingx, "cancel_order", fake_cancel)
+    monkeypatch.setattr(run_once, "get_positions", lambda **kwargs: [
+        {"symbol": "AAA-USDT", "positionSide": "LONG", "positionAmt": "0.7", "avgPrice": "100"},
+    ])
+    monkeypatch.setattr(run_once, "update_active_trade_protection", persist_protection)
+    monkeypatch.setattr(run_once.telemetry, "record_position_reconciliation", lambda **kwargs: None)
+    monkeypatch.setattr(run_once.telemetry, "record_state_conflict", lambda **kwargs: None)
+    monkeypatch.setattr(run_once, "_append_execution_ledger", lambda *args, **kwargs: None)
+
+    # First process repairs a stale-size SL and persists the verified replacement.
+    assert run_once.reconcile_all_open_positions() is True
+    saved = json.loads(active_path.read_text(encoding="utf-8"))["EVT_RESTART_FULL"]
+    assert saved["sl_order"]["order_id"] == "NEW_SL"
+    assert saved["sl_order"]["qty"] == pytest.approx(0.7)
+    assert [x["order_id"] for x in saved["tp_orders"]] == ["KEEP_TP"]
+    assert cancelled == ["OLD_SL"]
+    assert len(posted) == 1
+
+    # Second call reloads active_trades.json (no in-memory trade cache) as after restart.
+    assert run_once.reconcile_all_open_positions() is True
+    saved_after_restart = json.loads(active_path.read_text(encoding="utf-8"))["EVT_RESTART_FULL"]
+    assert saved_after_restart["sl_order"]["order_id"] == "NEW_SL"
+    assert len(posted) == 1, "restart replay must not create a duplicate SL"
+    assert cancelled == ["OLD_SL"], "restart replay must not cancel the valid replacement"
+    assert len(exchange_orders) == 2, "one valid SL and one valid TP should remain"
+    assert len(persisted_updates) == 2
