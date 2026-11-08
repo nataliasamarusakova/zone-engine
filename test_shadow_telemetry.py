@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from event_engine import shadow
 
@@ -372,3 +373,139 @@ def test_prepared_counterfactual_falls_back_for_non_monotonic_close_times():
         "features": {"shadow_experiments": snap["experiments"]},
     }
     assert shadow.calculate_counterfactual_outcomes(obs, prepared_bars, bars_prepared=True) == shadow.calculate_counterfactual_outcomes(obs, bars)
+
+
+def test_mfe_plus_two_snapshot_is_explicitly_shadow_only():
+    signal = _signal("LONG")
+    signal.update({"sl": 90.0, "tp1": 103.0, "tp2": 106.0})
+    snap = shadow.build_entry_snapshot(signal, df_5m=_bars_5m([10] * 21), df_1h=_bars_1h())
+    exp = snap["experiments"]["CF_MFE_PROTECTION_PLUS_2"]
+    assert exp["activation_mfe_pct"] == 2.0
+    assert exp["locked_profit_levels_pct"] == [-1.0, 0.0, 0.5]
+    assert exp["standalone_management_only"] is True
+    assert exp["production_gate_applied"] is False
+    assert snap["experiment_version"] == "counterfactual-v3"
+    assert "CF_PENETRATION_PRIORITY" in snap["experiments"]
+    assert snap["applied"] is False
+
+
+def test_mfe_protection_activates_after_trigger_bar_and_tests_three_lock_levels():
+    signal = _signal("LONG")
+    signal.update({"sl": 90.0, "tp1": 103.0, "tp2": 106.0})
+    snap = shadow.build_entry_snapshot(signal, df_5m=_bars_5m([10] * 21), df_1h=_bars_1h())
+    obs = {
+        "event_id": "EVT_MFE_LONG",
+        "symbol": "TEST-USDT",
+        "direction": "LONG",
+        "reference_price": 100.0,
+        "source_event_ts": "2026-09-28T10:00:00Z",
+        "counterfactual_path_start_ts": "2026-09-28T10:00:00Z",
+        "features": {"shadow_experiments": snap},
+    }
+    future = pd.DataFrame([
+        # +2% MFE triggers at the close of this bar. Its low also crosses the
+        # hypothetical +0.5% stop, but that stop must not be active intrabar.
+        {"timestamp": "2026-09-28T10:05:00Z", "close_time": "2026-09-28T10:10:00Z", "open": 100.0, "high": 102.2, "low": 99.5, "close": 101.0},
+        {"timestamp": "2026-09-28T10:10:00Z", "close_time": "2026-09-28T10:15:00Z", "open": 101.0, "high": 102.0, "low": 99.5, "close": 100.0},
+    ])
+    out = shadow.calculate_counterfactual_outcomes(obs, future)["experiments"]
+    loss_lock = out["CF_MFE_PLUS_2_LOCK_MINUS_1_0"]
+    be_lock = out["CF_MFE_PLUS_2_LOCK_0_0"]
+    profit_lock = out["CF_MFE_PLUS_2_LOCK_PLUS_0_5"]
+    assert loss_lock["status"] == "PATH_NOT_EXITED"
+    assert be_lock["status"] == "STOP_AFTER_MFE_PROTECTION"
+    assert be_lock["exit_price"] == pytest.approx(100.0)
+    assert profit_lock["status"] == "STOP_AFTER_MFE_PROTECTION"
+    assert profit_lock["exit_price"] == pytest.approx(100.5)
+    assert profit_lock["mfe_activation_ts"] == "2026-09-28T10:10:00+00:00"
+    assert all(item["production_gate_applied"] is False for item in (loss_lock, be_lock, profit_lock))
+
+
+def test_mfe_protection_marks_same_bar_mfe_and_production_stop_ambiguous():
+    signal = _signal("LONG")
+    signal.update({"sl": 90.0, "tp1": 103.0, "tp2": 106.0})
+    snap = shadow.build_entry_snapshot(signal, df_5m=_bars_5m([10] * 21), df_1h=_bars_1h())
+    obs = {
+        "event_id": "EVT_MFE_AMBIGUOUS",
+        "symbol": "TEST-USDT",
+        "direction": "LONG",
+        "reference_price": 100.0,
+        "source_event_ts": "2026-09-28T10:00:00Z",
+        "features": {"shadow_experiments": snap},
+    }
+    future = pd.DataFrame([
+        {"timestamp": "2026-09-28T10:05:00Z", "close_time": "2026-09-28T10:10:00Z", "open": 100.0, "high": 102.2, "low": 89.0, "close": 99.0},
+    ])
+    out = shadow.calculate_counterfactual_outcomes(obs, future)["experiments"]
+    assert out["CF_MFE_PLUS_2_LOCK_MINUS_1_0"]["status"] == "AMBIGUOUS_MFE_AND_PRODUCTION_STOP_SAME_BAR"
+    assert out["CF_MFE_PLUS_2_LOCK_0_0"]["pnl_pct"] is None
+
+
+def test_mfe_protection_after_tp1_keeps_half_exit_and_residual_be_management():
+    signal = _signal("LONG")
+    signal.update({"sl": 90.0, "tp1": 103.0, "tp2": 106.0})
+    snap = shadow.build_entry_snapshot(signal, df_5m=_bars_5m([10] * 21), df_1h=_bars_1h())
+    obs = {
+        "event_id": "EVT_MFE_TP1",
+        "symbol": "TEST-USDT",
+        "direction": "LONG",
+        "reference_price": 100.0,
+        "source_event_ts": "2026-09-28T10:00:00Z",
+        "features": {"shadow_experiments": snap},
+    }
+    future = pd.DataFrame([
+        {"timestamp": "2026-09-28T10:05:00Z", "close_time": "2026-09-28T10:10:00Z", "open": 100.0, "high": 102.2, "low": 101.0, "close": 102.0},
+        {"timestamp": "2026-09-28T10:10:00Z", "close_time": "2026-09-28T10:15:00Z", "open": 102.0, "high": 103.2, "low": 101.5, "close": 103.0},
+        {"timestamp": "2026-09-28T10:15:00Z", "close_time": "2026-09-28T10:20:00Z", "open": 103.0, "high": 103.1, "low": 100.4, "close": 101.0},
+    ])
+    out = shadow.calculate_counterfactual_outcomes(obs, future)["experiments"]
+    profit_lock = out["CF_MFE_PLUS_2_LOCK_PLUS_0_5"]
+    assert profit_lock["status"] == "EXIT_AFTER_TP1_AND_MFE"
+    assert profit_lock["tp1_pnl_pct"] == pytest.approx(3.0)
+    assert profit_lock["residual_exit_pnl_pct"] == pytest.approx(0.5)
+    assert profit_lock["pnl_pct"] == pytest.approx(1.75)
+
+
+def test_mfe_protection_short_direction_is_mirrored():
+    signal = _signal("SHORT")
+    signal.update({"sl": 110.0, "tp1": 97.0, "tp2": 94.0})
+    snap = shadow.build_entry_snapshot(signal, df_5m=_bars_5m([10] * 21), df_1h=_bars_1h())
+    obs = {
+        "event_id": "EVT_MFE_SHORT",
+        "symbol": "TEST-USDT",
+        "direction": "SHORT",
+        "reference_price": 100.0,
+        "source_event_ts": "2026-09-28T10:00:00Z",
+        "features": {"shadow_experiments": snap},
+    }
+    future = pd.DataFrame([
+        {"timestamp": "2026-09-28T10:05:00Z", "close_time": "2026-09-28T10:10:00Z", "open": 100.0, "high": 100.5, "low": 97.8, "close": 99.0},
+        {"timestamp": "2026-09-28T10:10:00Z", "close_time": "2026-09-28T10:15:00Z", "open": 99.0, "high": 100.5, "low": 98.0, "close": 100.0},
+    ])
+    out = shadow.calculate_counterfactual_outcomes(obs, future)["experiments"]
+    assert out["CF_MFE_PLUS_2_LOCK_0_0"]["status"] == "STOP_AFTER_MFE_PROTECTION"
+    assert out["CF_MFE_PLUS_2_LOCK_0_0"]["exit_price"] == pytest.approx(100.0)
+    assert out["CF_MFE_PLUS_2_LOCK_PLUS_0_5"]["exit_price"] == pytest.approx(99.5)
+
+
+def test_penetration_priority_snapshot_is_informational_and_directional():
+    long_signal = _signal("LONG")
+    long_signal.update({"zone": {"top": 100.0, "btm": 90.0}, "sl": 90.0, "tp1": 103.0, "tp2": 106.0})
+    long_bars = _bars_5m([10] * 21)
+    long_bars.loc[long_bars.index[-1], "low"] = 92.0
+    long_snapshot = shadow.build_entry_snapshot(long_signal, df_5m=long_bars, df_1h=_bars_1h())
+    long_exp = long_snapshot["experiments"]["CF_PENETRATION_PRIORITY"]
+    assert long_exp["zone_penetration_ratio_raw"] == pytest.approx(0.8)
+    assert long_exp["priority"] == "HIGH"
+    assert long_exp["production_gate_applied"] is False
+    assert long_exp["signal_score_changed"] is False
+    assert long_exp["selection_order_changed"] is False
+
+    short_signal = _signal("SHORT")
+    short_signal.update({"zone": {"top": 110.0, "btm": 100.0}, "sl": 110.0, "tp1": 97.0, "tp2": 94.0})
+    short_bars = _bars_5m([10] * 21)
+    short_bars.loc[short_bars.index[-1], "high"] = 108.0
+    short_snapshot = shadow.build_entry_snapshot(short_signal, df_5m=short_bars, df_1h=_bars_1h())
+    short_exp = short_snapshot["experiments"]["CF_PENETRATION_PRIORITY"]
+    assert short_exp["zone_penetration_ratio_raw"] == pytest.approx(0.8)
+    assert short_exp["priority"] == "HIGH"

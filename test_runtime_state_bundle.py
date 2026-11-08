@@ -199,3 +199,87 @@ def test_runtime_state_bundle_snapshot_cli_supports_direct_script_invocation(tmp
     payload = json.loads(snapshot.read_text(encoding="utf-8"))
     assert payload["schema_version"] == 1
     assert "trades.jsonl" in payload["files"]
+
+
+TELEMETRY_RUNTIME_FILES = (
+    "data/pre_entry_features.jsonl",
+    "data/execution_quality.jsonl",
+    "data/emergency_exits.jsonl",
+)
+
+
+def test_new_runtime_state_bundles_require_all_execution_telemetry_journals(tmp_path):
+    data = _make_complete_state(tmp_path / "source")
+    for relative in TELEMETRY_RUNTIME_FILES:
+        path = data / Path(relative).relative_to("data")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+
+    bundle = tmp_path / "bundle"
+    manifest = create_bundle(data_dir=data, output_dir=bundle)
+    assert manifest["required_files_version"] == 2
+    bundled_paths = {item["path"] for item in manifest["files"]}
+    assert set(TELEMETRY_RUNTIME_FILES) <= bundled_paths
+
+    # A version-2 bundle cannot silently omit a telemetry journal.
+    missing = bundle / "data" / "emergency_exits.jsonl"
+    missing.unlink()
+    manifest_path = bundle / "runtime-state-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"] = [item for item in manifest["files"] if item["path"] != "data/emergency_exits.jsonl"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="Runtime-state bundle is missing required files: data/emergency_exits.jsonl"):
+        verify_bundle(bundle)
+
+
+def test_legacy_runtime_state_bundle_restores_empty_telemetry_journals(tmp_path):
+    data = _make_complete_state(tmp_path / "source")
+    for relative in TELEMETRY_RUNTIME_FILES:
+        path = data / Path(relative).relative_to("data")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+
+    retained_relative = "data/emergency_exits.jsonl"
+    retained_bytes = b'{"record_type":"EMERGENCY_EXIT","event_id":"EVT_OLD"}\n'
+    (data / "emergency_exits.jsonl").write_bytes(retained_bytes)
+    bundle = tmp_path / "legacy-bundle"
+    create_bundle(data_dir=data, output_dir=bundle)
+    manifest_path = bundle / "runtime-state-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    # Simulate a v5.5.19 artifact created before these journals became required:
+    # two journals were not yet created, while one already contains real history.
+    manifest.pop("required_files_version", None)
+    missing_legacy_files = set(TELEMETRY_RUNTIME_FILES) - {retained_relative}
+    manifest["files"] = [item for item in manifest["files"] if item["path"] not in missing_legacy_files]
+    for relative in missing_legacy_files:
+        (bundle / Path(relative)).unlink()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    verify_bundle(bundle)
+    restored = tmp_path / "restored" / "data"
+    restore_bundle(bundle_dir=bundle, data_dir=restored)
+    for relative in missing_legacy_files:
+        path = restored / Path(relative).relative_to("data")
+        assert path.is_file()
+        assert path.read_bytes() == b""
+    assert (restored / "emergency_exits.jsonl").read_bytes() == retained_bytes
+
+
+def test_runtime_state_bundle_rejects_unknown_required_files_version(tmp_path):
+    data = _make_complete_state(tmp_path / "source")
+    bundle = tmp_path / "bundle"
+    create_bundle(data_dir=data, output_dir=bundle)
+    manifest_path = bundle / "runtime-state-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["required_files_version"] = 99
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="Unsupported runtime-state required_files_version: 99"):
+        verify_bundle(bundle)
+
+
+def test_new_runtime_state_bundle_creation_rejects_missing_telemetry_journal(tmp_path):
+    data = _make_complete_state(tmp_path / "source")
+    missing = data / "execution_quality.jsonl"
+    missing.unlink()
+    with pytest.raises(RuntimeError, match="data/execution_quality.jsonl"):
+        create_bundle(data_dir=data, output_dir=tmp_path / "bundle")

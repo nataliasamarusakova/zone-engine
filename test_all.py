@@ -37,6 +37,9 @@ def _isolate_runtime_state(monkeypatch, tmp_path):
         "PROTECTION_LIFECYCLE_PATH": runtime_data / "protection_lifecycle.jsonl",
         "POSITION_RECONCILIATION_PATH": runtime_data / "position_reconciliation.jsonl",
         "EXCHANGE_ERRORS_PATH": runtime_data / "exchange_errors.jsonl",
+        "PRE_ENTRY_FEATURES_PATH": runtime_data / "pre_entry_features.jsonl",
+        "EXECUTION_QUALITY_PATH": runtime_data / "execution_quality.jsonl",
+        "EMERGENCY_EXITS_PATH": runtime_data / "emergency_exits.jsonl",
     }
     for name, value in telemetry_paths.items():
         monkeypatch.setattr(telemetry, name, value)
@@ -3326,11 +3329,14 @@ def test_emergency_be_rollback_keeps_protection_until_close_is_verified(monkeypa
     from event_engine import tracker
     calls = []
     monkeypatch.setattr(tracker, "get_position_directional", lambda *a, **k: {"status": "found", "positionAmt": 1.0, "avgPrice": 100.0})
-    monkeypatch.setattr(tracker, "get_open_protection_directional", lambda *a, **k: {
-        "status": "ok",
-        "sl_orders": [{"orderId": "SL1", "clientOrderId": "EVT_SL"}],
-        "tp_orders": [{"orderId": "TP1", "clientOrderId": "EVT_TP"}],
-    })
+    protection_reads = iter([
+        {"status": "ok", "sl_orders": [{"orderId": "SL1", "clientOrderId": "EVT_SL"}], "tp_orders": [{"orderId": "TP1", "clientOrderId": "EVT_TP"}]},  # discovery
+        {"status": "ok", "sl_orders": [{"orderId": "SL1", "clientOrderId": "EVT_SL"}], "tp_orders": [{"orderId": "TP1", "clientOrderId": "EVT_TP"}]},  # pre SL
+        {"status": "ok", "sl_orders": [], "tp_orders": [{"orderId": "TP1", "clientOrderId": "EVT_TP"}]},  # post SL
+        {"status": "ok", "sl_orders": [], "tp_orders": [{"orderId": "TP1", "clientOrderId": "EVT_TP"}]},  # pre TP
+        {"status": "ok", "sl_orders": [], "tp_orders": []},  # post TP
+    ])
+    monkeypatch.setattr(tracker, "get_open_protection_directional", lambda *a, **k: next(protection_reads, {"status": "ok", "sl_orders": [], "tp_orders": []}))
     monkeypatch.setattr(tracker, "cancel_order", lambda symbol, oid: calls.append(("cancel", oid)) or {"code": 0})
     monkeypatch.setattr(tracker, "close_position_market", lambda *a, **k: calls.append(("close",)) or {"status": "closed", "response": {"data": {"order": {"orderId": "C1"}}}})
     states = iter([{"status": "found", "positionAmt": 1.0}, {"status": "not_found"}])
@@ -3365,18 +3371,28 @@ def test_emergency_be_rollback_preserves_protection_when_close_is_unverified(mon
 
 def test_emergency_close_only_cancels_engine_owned_protection(monkeypatch):
     import run_once
-    monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: {
+    monkeypatch.setattr(run_once, "get_position_directional", lambda *a, **k: {"status": "not_found"})
+    owned_and_manual = {
         "status": "ok",
         "sl_orders": [
             {"orderId": "E1", "clientOrderId": "EVT_SL"},
             {"orderId": "M1", "clientOrderId": "MANUAL_SL"},
         ],
         "tp_orders": [{"orderId": "E2", "clientOrderId": "EVT_TP"}],
-    })
+    }
+    reads = iter([
+        owned_and_manual,  # discovery
+        owned_and_manual,  # pre E1
+        {"status": "ok", "sl_orders": [{"orderId": "M1", "clientOrderId": "MANUAL_SL"}], "tp_orders": [{"orderId": "E2", "clientOrderId": "EVT_TP"}]},  # post E1
+        {"status": "ok", "sl_orders": [{"orderId": "M1", "clientOrderId": "MANUAL_SL"}], "tp_orders": [{"orderId": "E2", "clientOrderId": "EVT_TP"}]},  # pre E2
+        {"status": "ok", "sl_orders": [{"orderId": "M1", "clientOrderId": "MANUAL_SL"}], "tp_orders": []},  # post E2
+    ])
+    monkeypatch.setattr(run_once, "get_open_protection_directional", lambda *a, **k: next(reads, {"status": "ok", "sl_orders": [{"orderId": "M1", "clientOrderId": "MANUAL_SL"}], "tp_orders": []}))
     cancelled = []
     monkeypatch.setattr(run_once, "cancel_order", lambda symbol, oid: cancelled.append(oid) or {"code": 0})
     out = run_once._cancel_engine_protection_before_emergency_close("AAA-USDT", "LONG")
     assert out["status"] == "ok"
+    assert out["verified"] is True
     assert cancelled == ["E1", "E2"]
 
 
@@ -3393,11 +3409,21 @@ def test_emergency_be_rollback_fallback_does_not_refresh_contracts(monkeypatch):
 
 
 def test_run_once_emergency_paths_preserve_protection_until_flat_verified():
+    import ast
     from pathlib import Path
     text = Path("run_once.py").read_text(encoding="utf-8")
+    tree = ast.parse(text)
+    execute_fn = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "execute_new_position")
+    emergency_calls = [
+        node for node in ast.walk(execute_fn)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_emergency_close_preserving_protection"
+    ]
     # All post-fill emergency paths use a helper that closes first and only then
-    # removes SL/TP; unverified closure must not cancel the remaining protection.
-    assert text.count("_emergency_close_preserving_protection(symbol, direction, qty, event_id)") >= 4
+    # removes SL/TP; every path also records its own diagnostic reason.
+    assert len(emergency_calls) >= 5
+    assert all(any(keyword.arg == "reason" for keyword in call.keywords) for call in emergency_calls)
     helper = text[text.index("def _emergency_close_preserving_protection"):text.index("def _rollback_after_registration_failure")]
     assert helper.index("_emergency_close_and_verify") < helper.index("_cancel_engine_protection_before_emergency_close")
     assert '"status": "deferred_until_flat_verified"' in helper
@@ -4859,6 +4885,7 @@ def test_registration_failure_after_protected_entry_rolls_back_and_verifies_clos
 
     signal = {
         "event_id": "EVT_REG_ROLLBACK",
+        "attempt_id": "ATT_REG_ROLLBACK",
         "symbol": "TEST-USDT",
         "type": "LONG",
         "entry": 100.0,
@@ -4919,15 +4946,17 @@ def test_registration_failure_after_protected_entry_rolls_back_and_verifies_clos
     def fake_cleanup(symbol, direction, known_order_ids=None):
         calls.append(("cleanup", set(known_order_ids or [])))
         return {"status": "ok", "cancelled": ["SL1", "TP1", "TP2"], "errors": []}
-    def fake_close(symbol, direction, qty, trade_id):
-        calls.append(("close", qty, trade_id))
+    def fake_close(symbol, direction, qty, trade_id, **kwargs):
+        calls.append(("close", qty, trade_id, kwargs))
         return {"status": "closed_verified"}
     monkeypatch.setattr(run_once, "_cancel_engine_protection_before_emergency_close", fake_cleanup)
     monkeypatch.setattr(run_once, "_emergency_close_and_verify", fake_close)
 
     out = run_once.execute_new_position(signal)
     assert out["status"] == "opened_then_emergency_closed"
-    assert calls[0] == ("close", 1.0, "EVT_REG_ROLLBACK")
+    assert calls[0][:3] == ("close", 1.0, "EVT_REG_ROLLBACK")
+    assert calls[0][3]["reason"].startswith("active_trade_registration_exception:")
+    assert calls[0][3]["attempt_id"] == "ATT_REG_ROLLBACK"
     assert calls[1] == ("cleanup", {"SL1", "TP1", "TP2"})
     assert out["rollback_verified"] is True
 
@@ -5545,10 +5574,10 @@ def test_bingx_short_final_gate_uses_economic_adverse_drift(monkeypatch):
 def test_bingx_tp_geometry_accepts_exchange_price_precision_rounding(monkeypatch):
     from event_engine import bingx
     states = iter([
-        {"status":"ok","sl_orders":[{"orderId":"SL1","clientOrderId":bingx.build_sl_client_order_id("EVT_ROUND"),"type":"STOP_MARKET","stopPrice":"90.0","origQty":"1.0","side":"SELL","positionSide":"LONG"}],"tp_orders":[]},
-        {"status":"ok","sl_orders":[{"orderId":"SL1","clientOrderId":bingx.build_sl_client_order_id("EVT_ROUND"),"type":"STOP_MARKET","stopPrice":"90.0","origQty":"1.0","side":"SELL","positionSide":"LONG"}],"tp_orders":[
-            {"orderId":"TP1","clientOrderId":"EVT_TP1","type":"TAKE_PROFIT_MARKET","stopPrice":"103.1267","origQty":"0.5","side":"SELL","positionSide":"LONG"},
-            {"orderId":"TP2","clientOrderId":"EVT_TP2","type":"TAKE_PROFIT_MARKET","stopPrice":"106.1304","origQty":"0.5","side":"SELL","positionSide":"LONG"},
+        {"status":"ok","sl_orders":[{"orderId":"SL1","clientOrderId":bingx.build_sl_client_order_id("EVT_ROUND"),"type":"STOP_MARKET","status":"NEW","stopPrice":"90.0","origQty":"1.0","side":"SELL","positionSide":"LONG","workingType":"MARK_PRICE","reduceOnly":"true","time":"1700000000000","updateTime":"1700000001000"}],"tp_orders":[]},
+        {"status":"ok","sl_orders":[{"orderId":"SL1","clientOrderId":bingx.build_sl_client_order_id("EVT_ROUND"),"type":"STOP_MARKET","status":"NEW","stopPrice":"90.0","origQty":"1.0","side":"SELL","positionSide":"LONG","workingType":"MARK_PRICE","reduceOnly":"true","time":"1700000000000","updateTime":"1700000001000"}],"tp_orders":[
+            {"orderId":"TP1","clientOrderId":"EVT_TP1","type":"TAKE_PROFIT_MARKET","status":"NEW","stopPrice":"103.1267","origQty":"0.5","side":"SELL","positionSide":"LONG","workingType":"MARK_PRICE","reduceOnly":"true","time":"1700000000000","updateTime":"1700000001000"},
+            {"orderId":"TP2","clientOrderId":"EVT_TP2","type":"TAKE_PROFIT_MARKET","status":"NEW","stopPrice":"106.1304","origQty":"0.5","side":"SELL","positionSide":"LONG","workingType":"MARK_PRICE","reduceOnly":"true","time":"1700000000000","updateTime":"1700000001000"},
         ]},
     ])
     monkeypatch.setattr(bingx, "get_open_protection_directional", lambda *a, **k: next(states))
@@ -5557,11 +5586,11 @@ def test_bingx_tp_geometry_accepts_exchange_price_precision_rounding(monkeypatch
     monkeypatch.setattr(bingx, "_current_close_price", lambda symbol: 100.0)
     def fake_verify(symbol, direction, **kwargs):
         if kwargs["order_kind"] == "STOP_MARKET":
-            order = {"orderId":"SL1","clientOrderId":kwargs["client_order_id"],"type":"STOP_MARKET","stopPrice":kwargs["expected_price"],"origQty":kwargs["expected_qty"],"side":"SELL","positionSide":"LONG"}
+            order = {"orderId":"SL1","clientOrderId":kwargs["client_order_id"],"type":"STOP_MARKET","status":"NEW","stopPrice":kwargs["expected_price"],"origQty":kwargs["expected_qty"],"side":"SELL","positionSide":"LONG","workingType":"MARK_PRICE","reduceOnly":"true","time":"1700000000000","updateTime":"1700000001000"}
         elif kwargs["client_order_id"].endswith("_TP1"):
-            order = {"orderId":"TP1","clientOrderId":kwargs["client_order_id"],"type":"TAKE_PROFIT_MARKET","stopPrice":"103.1267","origQty":kwargs["expected_qty"],"side":"SELL","positionSide":"LONG"}
+            order = {"orderId":"TP1","clientOrderId":kwargs["client_order_id"],"type":"TAKE_PROFIT_MARKET","status":"NEW","stopPrice":"103.1267","origQty":kwargs["expected_qty"],"side":"SELL","positionSide":"LONG","workingType":"MARK_PRICE","reduceOnly":"true","time":"1700000000000","updateTime":"1700000001000"}
         else:
-            order = {"orderId":"TP2","clientOrderId":kwargs["client_order_id"],"type":"TAKE_PROFIT_MARKET","stopPrice":"106.1304","origQty":kwargs["expected_qty"],"side":"SELL","positionSide":"LONG"}
+            order = {"orderId":"TP2","clientOrderId":kwargs["client_order_id"],"type":"TAKE_PROFIT_MARKET","status":"NEW","stopPrice":"106.1304","origQty":kwargs["expected_qty"],"side":"SELL","positionSide":"LONG","workingType":"MARK_PRICE","reduceOnly":"true","time":"1700000000000","updateTime":"1700000001000"}
         return {"status":"verified","order":order}
     monkeypatch.setattr(bingx, "_verify_open_order", fake_verify)
     monkeypatch.setattr(bingx, "_request", lambda method,path,params=None,**kwargs: {"code":0,"data":{"order":params or {}}})
@@ -5572,6 +5601,15 @@ def test_bingx_tp_geometry_accepts_exchange_price_precision_rounding(monkeypatch
     )
     assert out["status"] == "PROTECTED"
     assert out["protection_validation"]["tp_geometry_valid"] is True
+    assert out["sl_result"]["working_type"] == "MARK_PRICE"
+    assert out["sl_result"]["exchange_order_status"] == "NEW"
+    assert out["sl_result"]["reduce_only"] is True
+    assert out["sl_result"]["exchange_order_time_ms"] == 1_700_000_000_000
+    assert out["sl_result"]["verification_observed_at_ms"] is not None
+    assert out["tp_orders"][0]["working_type"] == "MARK_PRICE"
+    assert out["tp_orders"][0]["exchange_order_status"] == "NEW"
+    assert out["tp_orders"][0]["reduce_only"] is True
+    assert out["tp_orders"][0]["exchange_order_update_time_ms"] == 1_700_000_001_000
 
 
 def test_register_active_trade_missing_state_after_entry_fails_closed(tmp_path, monkeypatch):

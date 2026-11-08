@@ -1780,3 +1780,67 @@ def test_non_batch_scan_does_not_consume_bars_when_observation_write_fails(tmp_p
     assert result["bars_1h"] == result["bars_5m"] == 0
     assert persisted_bars == []
     assert not (tmp_path / "research_bar_cursors.json").exists()
+
+
+def test_penetration_70_to_100_is_recorded_as_shadow_priority_for_long_and_short():
+    long_zone = {"zone_id": "Z_LONG", "top": 105.0, "btm": 95.0, "poi": 100.0}
+    long_bar = {"timestamp": "2026-01-02T00:00:00Z", "open": 104.0, "high": 105.0, "low": 96.0, "close": 100.0, "volume": 100.0}
+    long_features = research.build_research_features(
+        symbol="AAA-USDT", direction="LONG", zone=long_zone, bar=long_bar,
+        df_1h=_df_1h(), touch_count_before_trigger=0, structure_room_r=1.0,
+    )
+    assert long_features["zone_penetration_ratio"] == pytest.approx(0.9)
+    assert long_features["shadow_penetration_70_100pct"] is True
+    assert long_features["shadow_penetration_priority"] == "HIGH"
+    assert long_features["shadow_penetration_priority_applied"] is False
+
+    short_zone = {"zone_id": "Z_SHORT", "top": 105.0, "btm": 95.0, "poi": 100.0}
+    short_bar = {"timestamp": "2026-01-02T00:00:00Z", "open": 96.0, "high": 104.0, "low": 95.0, "close": 100.0, "volume": 100.0}
+    short_features = research.build_research_features(
+        symbol="AAA-USDT", direction="SHORT", zone=short_zone, bar=short_bar,
+        df_1h=_df_1h(), touch_count_before_trigger=0, structure_room_r=1.0,
+    )
+    assert short_features["zone_penetration_ratio"] == pytest.approx(0.9)
+    assert short_features["shadow_penetration_70_100pct"] is True
+    assert short_features["shadow_penetration_priority"] == "HIGH"
+    assert short_features["shadow_penetration_priority_applied"] is False
+
+
+def test_penetration_priority_remains_normal_outside_70_to_100_percent():
+    zone = {"zone_id": "Z_LONG", "top": 105.0, "btm": 95.0, "poi": 100.0}
+    bar = {"timestamp": "2026-01-02T00:00:00Z", "open": 104.0, "high": 105.0, "low": 103.0, "close": 104.0, "volume": 100.0}
+    features = research.build_research_features(
+        symbol="AAA-USDT", direction="LONG", zone=zone, bar=bar,
+        df_1h=_df_1h(), touch_count_before_trigger=0, structure_room_r=1.0,
+    )
+    assert features["zone_penetration_ratio"] == pytest.approx(0.2)
+    assert features["shadow_penetration_70_100pct"] is False
+    assert features["shadow_penetration_priority"] == "NORMAL"
+    assert features["shadow_penetration_priority_applied"] is False
+
+
+def test_pre_entry_utc_session_vwap_uses_only_closed_bars_at_decision_boundary():
+    from event_engine import research
+
+    ts = pd.to_datetime([
+        "2026-11-08T09:50:00Z",
+        "2026-11-08T09:55:00Z",
+        "2026-11-08T10:00:00Z",
+    ], utc=True)
+    bars = pd.DataFrame([
+        {"timestamp": ts[0], "close_time": ts[0] + pd.Timedelta(minutes=5), "open": 99.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 10.0},
+        {"timestamp": ts[1], "close_time": ts[1] + pd.Timedelta(minutes=5), "open": 100.0, "high": 103.0, "low": 99.0, "close": 102.0, "volume": 20.0},
+        # This candle closes after the decision boundary and must not leak.
+        {"timestamp": ts[2], "close_time": ts[2] + pd.Timedelta(minutes=5), "open": 102.0, "high": 200.0, "low": 1.0, "close": 150.0, "volume": 10_000.0},
+    ])
+    decision_ts = "2026-11-08T10:00:00Z"
+    features = research._derive_time_series_features(
+        direction="LONG", df_5m=bars, df_1h=pd.DataFrame(),
+        decision_ts=decision_ts, btc_df_5m=pd.DataFrame(), btc_df_1h=pd.DataFrame(),
+    )
+    first_typical = (101.0 + 99.0 + 100.0) / 3.0
+    second_typical = (103.0 + 99.0 + 102.0) / 3.0
+    expected = (first_typical * 10.0 + second_typical * 20.0) / 30.0
+    assert features["session_vwap_kind"] == "UTC_DAY_TP_VWAP"
+    assert features["session_vwap_approx"] == pytest.approx(expected)
+    assert features["btc_return_1h_pct"] is None

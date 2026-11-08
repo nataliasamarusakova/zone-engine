@@ -33,6 +33,9 @@ def isolate_repository_research_data(monkeypatch, tmp_path):
         "PROTECTION_LIFECYCLE_PATH": runtime_data / "protection_lifecycle.jsonl",
         "POSITION_RECONCILIATION_PATH": runtime_data / "position_reconciliation.jsonl",
         "EXCHANGE_ERRORS_PATH": runtime_data / "exchange_errors.jsonl",
+        "PRE_ENTRY_FEATURES_PATH": runtime_data / "pre_entry_features.jsonl",
+        "EXECUTION_QUALITY_PATH": runtime_data / "execution_quality.jsonl",
+        "EMERGENCY_EXITS_PATH": runtime_data / "emergency_exits.jsonl",
     }
     for name, value in telemetry_paths.items():
         monkeypatch.setattr(telemetry, name, value)

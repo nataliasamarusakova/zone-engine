@@ -399,7 +399,7 @@ def test_size_guard_persists_failure_manifest_before_raising(tmp_path, monkeypat
     monkeypatch.setattr(retention, "_validate_state_unchanged", lambda before: None)
     monkeypatch.setattr(retention, "_pending_observations", lambda: [])
     monkeypatch.setattr(retention, "_pending_bar_cutoffs", lambda **kwargs: {})
-    monkeypatch.setattr(retention, "_protected_audit_refs", lambda: (set(), set()))
+    monkeypatch.setattr(retention, "_protected_audit_refs", lambda **_kwargs: (set(), set()))
 
     def fake_apply(path, **kwargs):
         path.write_text("compacted-but-unarchived\n", encoding="utf-8")

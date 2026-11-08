@@ -22,7 +22,7 @@ import pandas as pd
 import numpy as np
 
 from event_engine.analytics import save_scan
-from event_engine.binance import analysis_symbols_for_bingx, classify_bingx_contract, fetch_24h_ticker, fetch_klines as fetch_binance_klines
+from event_engine.binance import analysis_symbols_for_bingx, classify_bingx_contract, fetch_24h_ticker, fetch_book_ticker, fetch_klines as fetch_binance_klines
 from event_engine.bingx import (
     contracts,
     credentials_available,
@@ -37,6 +37,7 @@ from event_engine.bingx import (
     get_open_protection_directional,
     prepare_protection_capacity,
     get_execution_quote,
+    _cancel_engine_protection_orders_verified_detailed,
     OPEN_ORDERS_PATH,
     ORDER_PATH,
     POSITION_PATH,
@@ -138,6 +139,9 @@ MAX_ENTRY_SLIPPAGE_PCT = max(0.0, float(os.environ.get("MAX_ENTRY_SLIPPAGE_PCT",
 # too far in either direction before the order is submitted.
 MAX_ENTRY_SIGNAL_DISPLACEMENT_PCT = max(0.0, float(os.environ.get("MAX_ENTRY_SIGNAL_DISPLACEMENT_PCT", "1.00")))
 EXECUTION_QUOTE_MAX_AGE_SEC = max(0.0, float(os.environ.get("EXECUTION_QUOTE_MAX_AGE_SEC", "2.0")))
+CROSS_VENUE_BASIS_SHADOW_ENABLED = os.environ.get("CROSS_VENUE_BASIS_SHADOW_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+CROSS_VENUE_BASIS_MAX_OBSERVATION_SKEW_MS = max(0, int(os.environ.get("CROSS_VENUE_BASIS_MAX_OBSERVATION_SKEW_MS", "1500")))
+CROSS_VENUE_BASIS_BINANCE_TIMEOUT_SEC = max(0.05, min(2.0, float(os.environ.get("CROSS_VENUE_BASIS_BINANCE_TIMEOUT_SEC", "0.5"))))
 RESEARCH_RICH_CONTEXT_ENABLED = os.environ.get("RESEARCH_RICH_CONTEXT_ENABLED", "false").lower() == "true"
 
 # Trend Filter V1 is diagnostic-only by default. It never changes zone construction
@@ -1962,6 +1966,112 @@ def _market_spread_pct(binance_price: float | None, bingx_price: float | None) -
     return round(abs(bingx_price - binance_price) / binance_price * 100.0, 4)
 
 
+
+
+def _cross_venue_basis_symbol(signal: dict[str, Any]) -> str | None:
+    """Return the mapped Binance spot symbol only for Binance-backed crypto signals."""
+    snapshot = signal.get("market_snapshot") if isinstance(signal.get("market_snapshot"), dict) else {}
+    symbol = str(snapshot.get("binance_symbol") or "").strip().upper()
+    provider = str(snapshot.get("analysis_provider") or "").strip().lower()
+    asset_class = str(snapshot.get("asset_class") or "").strip().upper()
+    if not symbol or provider != "binance" or asset_class != "CRYPTO":
+        return None
+    return symbol
+
+
+def _build_cross_venue_basis_shadow(
+    direction: str,
+    binance_quote: dict[str, Any] | None,
+    bingx_quote: dict[str, Any] | None,
+    *,
+    max_observation_skew_ms: int = CROSS_VENUE_BASIS_MAX_OBSERVATION_SKEW_MS,
+) -> dict[str, Any]:
+    """Build a directional, local-observation-window basis annotation.
+
+    This is a research measurement only. Binance bookTicker has no exchange
+    event timestamp, so the two feeds are aligned by their local observation
+    timestamps and the quality is explicitly not promoted to exchange-synced.
+    """
+    side = str(direction or "").upper()
+    base: dict[str, Any] = {
+        "status": "NOT_CAPTURED",
+        "direction": side,
+        "source": "BINANCE_SPOT_BOOK_TICKER_VS_BINGX_EXECUTABLE_BOOK_TICKER",
+        "timestamp_quality": "LOCAL_OBSERVATION_WINDOW_ONLY",
+        "exchange_timestamps_verified": False,
+        "shadow_only": True,
+        "production_gate_applied": False,
+        "collection_mode": "OPTIONAL_BINANCE_BOOK_TICKER_REQUEST",
+        "score_changed": False,
+        "selection_order_changed": False,
+        "max_observation_skew_ms": int(max_observation_skew_ms),
+    }
+    if side not in {"LONG", "SHORT"}:
+        return {**base, "status": "INVALID_DIRECTION"}
+    if not isinstance(binance_quote, dict) or not isinstance(bingx_quote, dict):
+        return {**base, "status": "QUOTE_UNAVAILABLE"}
+    try:
+        binance_bid = float(binance_quote["bid"])
+        binance_ask = float(binance_quote["ask"])
+        bingx_bid = float(bingx_quote["bid"])
+        bingx_ask = float(bingx_quote["ask"])
+        binance_observed_ms = int(binance_quote["observed_at_ms"])
+        bingx_observed_ms = int(bingx_quote["quote_observed_at_ms"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return {**base, "status": "QUOTE_FIELDS_INCOMPLETE"}
+    numeric = (binance_bid, binance_ask, bingx_bid, bingx_ask)
+    if not all(math.isfinite(value) and value > 0 for value in numeric):
+        return {**base, "status": "INVALID_QUOTE_VALUES"}
+    if binance_ask < binance_bid or bingx_ask < bingx_bid:
+        return {**base, "status": "INVALID_QUOTE_SPREAD"}
+    binance_mid = (binance_bid + binance_ask) / 2.0
+    executable_bingx_price = bingx_ask if side == "LONG" else bingx_bid
+    basis_pct = (executable_bingx_price - binance_mid) / binance_mid * 100.0
+    directional_adverse_basis_pct = basis_pct if side == "LONG" else -basis_pct
+    skew_ms = abs(binance_observed_ms - bingx_observed_ms)
+    directional_favorable_basis_pct = -directional_adverse_basis_pct
+    if directional_adverse_basis_pct > 0.20:
+        basis_bucket = "DIRECTIONALLY_ADVERSE_GT_0_20"
+    elif directional_adverse_basis_pct < -0.20:
+        basis_bucket = "DIRECTIONALLY_FAVORABLE_GT_0_20"
+    elif abs(directional_adverse_basis_pct) <= 0.10:
+        basis_bucket = "NEUTRAL_WITHIN_PLUS_MINUS_0_10"
+    else:
+        basis_bucket = "INTERMEDIATE"
+    result = {
+        **base,
+        "binance_bid": binance_bid,
+        "binance_ask": binance_ask,
+        "binance_mid": binance_mid,
+        "bingx_bid": bingx_bid,
+        "bingx_ask": bingx_ask,
+        "bingx_executable_price": executable_bingx_price,
+        "basis_pct": basis_pct,
+        "directional_adverse_basis_pct": directional_adverse_basis_pct,
+        "directional_favorable_basis_pct": directional_favorable_basis_pct,
+        # These aliases deliberately mean local observation times; no exchange
+        # event timestamp is available for Binance spot bookTicker.
+        "binance_quote_time_ms": binance_observed_ms,
+        "bingx_quote_time_ms": bingx_observed_ms,
+        "binance_quote_observed_at_ms": binance_observed_ms,
+        "bingx_quote_observed_at_ms": bingx_observed_ms,
+        "observation_skew_ms": skew_ms,
+        "binance_request_duration_ms": binance_quote.get("request_duration_ms"),
+        "binance_timestamp_quality": binance_quote.get("timestamp_quality", "LOCAL_OBSERVATION_MIDPOINT_ONLY"),
+        "binance_exchange_timestamp_available": bool(binance_quote.get("exchange_timestamp_available", False)),
+        "bingx_quote_source": bingx_quote.get("quote_source"),
+        "bingx_quote_exchange_time_ms": bingx_quote.get("quote_exchange_time_ms"),
+        "basis_bucket": basis_bucket,
+        "basis_bucket_thresholds_pct": {
+            "neutral_abs_max": 0.10,
+            "directional_adverse_gt": 0.20,
+            "directional_favorable_magnitude_gt": 0.20,
+        },
+    }
+    if skew_ms > max(0, int(max_observation_skew_ms)):
+        return {**result, "status": "UNSYNCHRONIZED", "basis_usable": False, "basis_pct": None, "basis_pct_candidate": basis_pct}
+    return {**result, "status": "PRESENT", "basis_usable": True}
+
 def _normalize_position_direction(position: dict[str, Any]) -> str | None:
     """Normalize BingX position-side semantics into LONG/SHORT.
 
@@ -2264,14 +2374,24 @@ def reconcile_all_open_positions() -> bool:
                     event_id = str(unresolved_entry["event_id"])
                     log.critical("[RECON_ORPHAN_ENGINE_RECOVERY] attempting emergency close for known unresolved engine entry event=%s symbol=%s side=%s qty=%s", event_id, symbol, side, qty)
                     try:
-                        close_result = _emergency_close_and_verify(symbol, side, qty, event_id)
+                        close_result = _emergency_close_and_verify(
+                            symbol, side, qty, event_id,
+                            reason="ORPHAN_ENGINE_POSITION_RECOVERY",
+                            attempt_id=unresolved_entry.get("attempt_id"),
+                        )
                     except Exception as close_exc:
                         close_result = {"status": "close_unverified", "error": str(close_exc)}
                     if str(close_result.get("status", "")).lower() == "closed_verified":
                         try:
                             cleanup_result = _cancel_engine_protection_before_emergency_close(symbol, side)
                         except Exception as cleanup_exc:
-                            cleanup_result = {"status": "error", "error": str(cleanup_exc)}
+                            cleanup_result = {"status": "error", "verified": False, "cancelled": [], "remaining_order_ids": [], "errors": [str(cleanup_exc)]}
+                        telemetry.record_emergency_protection_cleanup(
+                            event_id=event_id, attempt_id=unresolved_entry.get("attempt_id"),
+                            position_id=event_id, symbol=symbol, direction=side,
+                            source="ORPHAN_ENGINE_POSITION_RECOVERY", close_event_ts_ms=None,
+                            retry_number=0, position_check={"status": "not_found"}, result=cleanup_result,
+                        )
                         _append_execution_ledger(event_id, None, "ORPHAN_ENGINE_POSITION_RECOVERY", {
                             "status": "closed_verified", "symbol": symbol, "direction": side,
                             "previous_exchange_qty": qty, "previous_exchange_avg_price": avg,
@@ -2511,7 +2631,11 @@ def reconcile_all_open_positions() -> bool:
                 unresolved = True
                 log.critical("[RECON_PROTECTION_UNVERIFIED] %s %s event=%s status=%s error=%s; attempting verified emergency close", symbol, side, event_id, result.get("status"), result.get("error"))
                 try:
-                    close_result = _emergency_close_and_verify(symbol, side, qty, str(event_id))
+                    close_result = _emergency_close_and_verify(
+                        symbol, side, qty, str(event_id),
+                        reason="RECON_PROTECTION_FAILURE",
+                        attempt_id=trade.get("attempt_id"),
+                    )
                 except Exception as close_exc:
                     close_result = {"status": "close_unverified", "error": str(close_exc)}
                 if str(close_result.get("status", "")).lower() == "closed_verified":
@@ -2522,7 +2646,15 @@ def reconcile_all_open_positions() -> bool:
                     try:
                         cleanup_result = _cancel_engine_protection_before_emergency_close(symbol, side)
                     except Exception as cleanup_exc:
-                        cleanup_result = {"status": "error", "error": str(cleanup_exc)}
+                        cleanup_result = {"status": "error", "verified": False, "cancelled": [], "remaining_order_ids": [], "errors": [str(cleanup_exc)]}
+                    telemetry.record_emergency_protection_cleanup(
+                        event_id=str(event_id), attempt_id=trade.get("attempt_id"),
+                        position_id=trade.get("position_id") or str(event_id),
+                        symbol=symbol, direction=side,
+                        source="RECON_PROTECTION_FAILURE_EMERGENCY_CLOSE",
+                        close_event_ts_ms=None, retry_number=0,
+                        position_check={"status": "not_found"}, result=cleanup_result,
+                    )
                     _append_execution_ledger(str(event_id), None, "RECON_PROTECTION_FAILURE_EMERGENCY_CLOSE", {"status": "closed_verified", "symbol": symbol, "direction": side, "close": close_result, "protection_cleanup": cleanup_result})
                 else:
                     _append_execution_ledger(str(event_id), None, "RECON_PROTECTION_FAILURE_EMERGENCY_CLOSE", {"status": "close_unverified", "symbol": symbol, "direction": side, "close": close_result, "action": "existing_exchange_protection_left_untouched"})
@@ -2897,40 +3029,59 @@ def _cancel_engine_protection_before_emergency_close(
     symbol: str,
     direction: str,
     known_order_ids: set[str] | None = None,
+    *, require_flat: bool = True,
 ) -> dict[str, Any]:
-    """Best-effort cleanup of engine-owned SL/TP orders before a MARKET rollback.
+    """Cancel engine-owned SL/TP and confirm exchange-side absence.
 
-    When exact protection order ids are known, restrict cancellation to those ids so
-    a failed registration cannot accidentally cancel a different event's protection.
+    Exact IDs restrict cleanup to the failed event's protection. A cancel
+    acknowledgement alone is never reported as a completed cleanup.
     """
-    result = {"status": "ok", "cancelled": [], "errors": []}
     try:
         existing = get_open_protection_directional(symbol, direction)
     except Exception as exc:
-        return {"status": "error", "cancelled": [], "errors": [str(exc)]}
-    if existing.get("status") != "ok":
-        return {"status": "error", "cancelled": [], "errors": [existing.get("error", "openOrders unavailable")]}
+        return {
+            "status": "error", "verified": False, "cancelled": [],
+            "already_absent": [], "remaining_order_ids": [], "errors": [str(exc)],
+        }
+    if not isinstance(existing, dict) or existing.get("status") != "ok":
+        error = existing.get("error", "openOrders unavailable") if isinstance(existing, dict) else "invalid openOrders response"
+        return {
+            "status": "error", "verified": False, "cancelled": [],
+            "already_absent": [], "remaining_order_ids": [], "errors": [error],
+        }
+
+    allowed = {str(value) for value in known_order_ids} if known_order_ids is not None else None
+    order_ids = []
     for order in list(existing.get("sl_orders", [])) + list(existing.get("tp_orders", [])):
         oid = str(order.get("orderId", ""))
         cid = str(order.get("clientOrderId", "")).upper()
         if not oid or not cid.startswith("EVT_"):
             continue
-        if known_order_ids is not None and oid not in {str(x) for x in known_order_ids}:
+        if allowed is not None and oid not in allowed:
             continue
-        try:
-            resp = cancel_order(symbol, oid)
-            if isinstance(resp, dict) and resp.get("code") in (0, "0"):
-                result["cancelled"].append(oid)
-            else:
-                result["errors"].append(f"{oid}: {resp}")
-        except Exception as exc:
-            result["errors"].append(f"{oid}: {exc}")
-    if result["errors"]:
-        result["status"] = "partial" if result["cancelled"] else "error"
-    return result
+        order_ids.append(oid)
+
+    def position_is_authoritatively_flat() -> bool:
+        if not require_flat:
+            return True
+        current = get_position_directional(symbol, direction)
+        return isinstance(current, dict) and current.get("status") == "not_found"
+
+    return _cancel_engine_protection_orders_verified_detailed(
+        symbol,
+        direction,
+        order_ids,
+        attempts=max(1, int(os.environ.get("EMERGENCY_PROTECTION_CANCEL_VERIFY_ATTEMPTS", "4"))),
+        read_open_orders=get_open_protection_directional,
+        cancel=cancel_order,
+        pre_cancel_guard=position_is_authoritatively_flat,
+    )
 
 
-def _emergency_close_and_verify(symbol: str, direction: str, qty: float, trade_id: str) -> dict[str, Any]:
+def _emergency_close_and_verify(
+    symbol: str, direction: str, qty: float, trade_id: str, *,
+    reason: str = "UNSPECIFIED_EMERGENCY_EXIT", attempt_id: str | None = None,
+) -> dict[str, Any]:
     """Close a safety-rollback position without overlapping ambiguous MARKET closes.
 
     A second close POST is allowed only when the preceding request is proven to
@@ -2944,6 +3095,24 @@ def _emergency_close_and_verify(symbol: str, direction: str, qty: float, trade_i
     verify_polls = max(2, int(os.environ.get("EMERGENCY_CLOSE_VERIFY_POLLS", "6")))
     last_qty = max(0.0, float(qty or 0.0))
     previous_close: dict[str, Any] | None = None
+
+    def _finish(result: dict[str, Any]) -> dict[str, Any]:
+        # The dedicated journal is observability only. It must never alter the
+        # verified-close decision or interrupt a safety rollback.
+        try:
+            telemetry.record_emergency_exit(
+                event_id=trade_id or None,
+                attempt_id=attempt_id,
+                position_id=trade_id or None,
+                symbol=symbol,
+                direction=direction,
+                reason=reason,
+                requested_qty=qty,
+                result=result,
+            )
+        except Exception as telemetry_exc:
+            log.warning("[EMERGENCY_EXIT_TELEMETRY] %s %s journal failed: %s", symbol, direction, telemetry_exc)
+        return result
 
     def _order_id_from_close(close_result: dict[str, Any] | None) -> str | None:
         if not isinstance(close_result, dict):
@@ -3012,7 +3181,7 @@ def _emergency_close_and_verify(symbol: str, direction: str, qty: float, trade_i
         except Exception as exc:
             current = {"status": "error", "error": str(exc)}
         if current.get("status") == "not_found":
-            return {"status": "closed_verified", "attempts": attempts, "verification": current}
+            return _finish({"status": "closed_verified", "attempts": attempts, "verification": current})
         if current.get("status") != "found":
             attempts.append({"status": "position_check_error", "error": current.get("error", "position not authoritatively found")})
             # Never submit based on an unknown position state.
@@ -3024,7 +3193,7 @@ def _emergency_close_and_verify(symbol: str, direction: str, qty: float, trade_i
             except (TypeError, ValueError):
                 pass
         if last_qty <= 0:
-            return {"status": "closed_verified", "attempts": attempts, "verification": current}
+            return _finish({"status": "closed_verified", "attempts": attempts, "verification": current})
 
         if previous_close is not None and not _previous_close_definitively_rejected(previous_close):
             # Previous POST may still be accepted/in-flight or may have succeeded
@@ -3048,7 +3217,7 @@ def _emergency_close_and_verify(symbol: str, direction: str, qty: float, trade_i
         except Exception as exc:
             verification = {"status": "verification_error", "error": str(exc)}
         if verification.get("status") == "not_found":
-            return {"status": "closed_verified", "attempts": attempts, "verification": verification, "verify_poll": poll + 1}
+            return _finish({"status": "closed_verified", "attempts": attempts, "verification": verification, "verify_poll": poll + 1})
         if verification.get("status") == "found":
             raw_verified_qty = verification.get("positionAmt")
             if raw_verified_qty is not None:
@@ -3058,12 +3227,12 @@ def _emergency_close_and_verify(symbol: str, direction: str, qty: float, trade_i
                     pass
         time.sleep(0.35)
 
-    return {
+    return _finish({
         "status": "close_unverified",
         "attempts": attempts,
         "verification": verification,
         "remaining_qty": last_qty if verification.get("status") == "found" else None,
-    }
+    })
 
 
 def _emergency_close_preserving_protection(
@@ -3073,10 +3242,14 @@ def _emergency_close_preserving_protection(
     trade_id: str,
     *,
     known_order_ids: set[str] | None = None,
+    reason: str = "UNSPECIFIED_EMERGENCY_EXIT",
+    attempt_id: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Attempt a verified close while retaining existing SL/TP until flatness is proven."""
     try:
-        close_result = _emergency_close_and_verify(symbol, direction, qty, trade_id)
+        close_result = _emergency_close_and_verify(
+            symbol, direction, qty, trade_id, reason=reason, attempt_id=attempt_id,
+        )
     except Exception as exc:
         close_result = {"status": "close_unverified", "attempts": [], "error": f"{type(exc).__name__}: {exc}"}
     if str(close_result.get("status", "")).lower() == "closed_verified":
@@ -3089,7 +3262,16 @@ def _emergency_close_preserving_protection(
     else:
         # Cancelling the last known SL/TP before an unverified close can leave a
         # still-open position naked. Preserve exchange protection and retry close.
-        cleanup = {"status": "deferred_until_flat_verified", "cancelled": [], "errors": []}
+        cleanup = {"status": "deferred_until_flat_verified", "verified": False, "cancelled": [], "remaining_order_ids": [], "errors": []}
+    try:
+        telemetry.record_emergency_protection_cleanup(
+            event_id=trade_id or None, attempt_id=attempt_id,
+            position_id=trade_id or None, symbol=symbol, direction=direction,
+            source="IMMEDIATE_POST_EMERGENCY_CLOSE", close_event_ts_ms=None,
+            retry_number=0, position_check=close_result.get("verification"), result=cleanup,
+        )
+    except Exception as telemetry_exc:
+        log.warning("[EMERGENCY_CLEANUP_TELEMETRY] %s %s journal failed: %s", symbol, direction, telemetry_exc)
     return close_result, cleanup
 
 
@@ -3156,6 +3338,8 @@ def _rollback_after_registration_failure(
 
     close_result, cleanup = _emergency_close_preserving_protection(
         symbol, direction, qty, event_id, known_order_ids=known_ids or None,
+        reason=str(reason),
+        attempt_id=(executed_signal or {}).get("attempt_id"),
     )
 
     rollback_verified = str(close_result.get("status")) == "closed_verified"
@@ -3669,6 +3853,22 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         }
     _append_execution_ledger(event_id, signal.get("attempt_id"), "PROTECTION_PREFLIGHT_READY", {"cancelled_order_ids": protection_capacity.get("cancelled_order_ids", []), "required_new_protection_orders": protection_capacity.get("required_new_protection_orders")})
 
+    # Optional inter-venue basis is a Shadow-only observation. It is disabled by
+    # default, bounded to one short no-retry Binance request, and never changes
+    # entry eligibility, score, size, price selection, or order parameters.
+    binance_basis_quote = None
+    basis_binance_symbol = _cross_venue_basis_symbol(signal)
+    basis_applicable = basis_binance_symbol is not None
+    if CROSS_VENUE_BASIS_SHADOW_ENABLED and basis_applicable:
+        try:
+            binance_basis_quote = fetch_book_ticker(
+                basis_binance_symbol,
+                timeout=CROSS_VENUE_BASIS_BINANCE_TIMEOUT_SEC,
+                retryable=False,
+            )
+        except Exception as basis_exc:
+            log.debug("[CROSS_VENUE_BASIS_SHADOW] %s unavailable: %s", symbol, type(basis_exc).__name__)
+
     # Revalidate against the actual BingX top-of-book immediately before MARKET.
     # The previous implementation validated the stale signal price and only
     # discovered changed risk/structure after the fill.
@@ -3678,6 +3878,24 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         log.error("[EXEC_BLOCKED_QUOTE] %s %s | %s", symbol, direction, reason)
         _append_execution_ledger(event_id, signal.get("attempt_id"), "QUOTE_UNAVAILABLE", {"status": "execution_quote_unavailable", "error": reason})
         return {"status": "execution_quote_unavailable", "error": reason, "symbol": symbol, "direction": direction}
+
+    if CROSS_VENUE_BASIS_SHADOW_ENABLED and basis_applicable:
+        signal["cross_venue_basis"] = _build_cross_venue_basis_shadow(
+            direction, binance_basis_quote, execution_quote,
+        )
+        signal["cross_venue_basis"]["binance_symbol"] = basis_binance_symbol
+        _append_execution_ledger(
+            event_id, signal.get("attempt_id"), "SHADOW_CROSS_VENUE_BASIS",
+            signal["cross_venue_basis"],
+        )
+    else:
+        signal["cross_venue_basis"] = {
+            "status": "DISABLED" if not CROSS_VENUE_BASIS_SHADOW_ENABLED else "NOT_APPLICABLE",
+            "shadow_only": True,
+            "production_gate_applied": False,
+            "collection_mode": "LOCAL_ONLY_NO_BINANCE_BASIS_REQUEST",
+            "reason": None if not CROSS_VENUE_BASIS_SHADOW_ENABLED else "requires_binance_provider_and_crypto_asset_class",
+        }
 
     _append_execution_ledger(event_id, signal.get("attempt_id"), "PRE_ENTRY_QUOTE", {
         "bid": execution_quote.get("bid"),
@@ -3853,6 +4071,28 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         quote_freshness_status=execution_quote.get("quote_freshness_status"),
         quote_unknown_age_policy=execution_quote.get("quote_unknown_age_policy"),
         execution_reference_quality=execution_quote.get("execution_reference_quality"),
+    )
+    # Persist all already-available signal features locally. This performs no
+    # additional exchange requests and happens before the final trigger-age check.
+    telemetry.record_pre_entry_feature_snapshot(
+        event_id=event_id,
+        attempt_id=signal.get("attempt_id"),
+        symbol=symbol,
+        direction=direction,
+        signal=signal,
+        quote=execution_quote,
+        code_commit_sha=CODE_COMMIT_SHA,
+    )
+    telemetry.record_execution_quality_snapshot(
+        event_id=event_id,
+        attempt_id=signal.get("attempt_id"),
+        symbol=symbol,
+        direction=direction,
+        stage="PRE_ENTRY",
+        quote=execution_quote,
+        signal_price=entry_price,
+        execution_reference_price=executable_price,
+        market_context=signal.get("pre_execution_market_context"),
     )
     # Final freshness check: no network call, sleep or other work may occur
     # between this check and open_market's MARKET POST. If the order-aged signal
@@ -4172,10 +4412,24 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         # loss into entry slippage and prematurely liquidate a valid existing position.
         execution_slippage_pct = None
         signed_entry_slippage_pct = None
+    telemetry.record_execution_quality_snapshot(
+        event_id=event_id,
+        attempt_id=signal.get("attempt_id"),
+        symbol=symbol,
+        direction=direction,
+        stage="POST_FILL",
+        quote=execution_quote,
+        signal_price=entry_price,
+        execution_reference_price=executable_reference_price,
+        fill_price=avg_price,
+        signed_slippage_pct=signed_entry_slippage_pct,
+        adverse_slippage_pct=execution_slippage_pct,
+        market_context=signal.get("pre_execution_market_context"),
+    )
     if execution_slippage_pct is not None and execution_slippage_pct > MAX_ENTRY_SLIPPAGE_PCT:
         reason = f"execution_slippage_pct={execution_slippage_pct:.4f}% > {MAX_ENTRY_SLIPPAGE_PCT:.4f}%"
         log.critical("[SAFETY_CLOSE] %s %s | %s", symbol, direction, reason)
-        close_result, cleanup = _emergency_close_preserving_protection(symbol, direction, qty, event_id)
+        close_result, cleanup = _emergency_close_preserving_protection(symbol, direction, qty, event_id, reason="ENTRY_SLIPPAGE_LIMIT_EXCEEDED", attempt_id=signal.get("attempt_id"))
         return {
             "status": _emergency_execution_status(close_result),
             "error": reason,
@@ -4200,7 +4454,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         reason = f"post-fill protection rebase failed: {exc}"
         log.critical("[SAFETY_CLOSE] %s %s | %s", symbol, direction, reason)
-        close_result, cleanup = _emergency_close_preserving_protection(symbol, direction, qty, event_id)
+        close_result, cleanup = _emergency_close_preserving_protection(symbol, direction, qty, event_id, reason="POST_FILL_REBASE_FAILED", attempt_id=signal.get("attempt_id"))
         return {"status": _emergency_execution_status(close_result), "error": reason, "order": order, "position": position, "close": close_result, "protection_cleanup": cleanup, "executed_signal": dict(signal)}
 
     sl_price = float(rebased["sl"])
@@ -4214,12 +4468,12 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     distinct, precision_reason = _validate_exchange_price_distinctness(actual_signal)
     if not distinct:
         log.critical("[SAFETY_CLOSE] %s %s | invalid exchange-rounded protection geometry | %s", symbol, direction, precision_reason)
-        close_result, cleanup = _emergency_close_preserving_protection(symbol, direction, qty, event_id)
+        close_result, cleanup = _emergency_close_preserving_protection(symbol, direction, qty, event_id, reason="POST_FILL_PRICE_PRECISION_INVALID", attempt_id=signal.get("attempt_id"))
         return {"status": _emergency_execution_status(close_result), "error": precision_reason, "order": order, "position": position, "close": close_result, "protection_cleanup": cleanup, "executed_signal": actual_signal}
     valid, reason = _validate_trade_geometry(actual_signal, require_structure_room=False)
     if not valid:
         log.critical("[SAFETY_CLOSE] %s %s | invalid post-fill protection geometry | %s", symbol, direction, reason)
-        close_result, cleanup = _emergency_close_preserving_protection(symbol, direction, qty, event_id)
+        close_result, cleanup = _emergency_close_preserving_protection(symbol, direction, qty, event_id, reason="POST_FILL_TRADE_GEOMETRY_INVALID", attempt_id=signal.get("attempt_id"))
         return {"status": _emergency_execution_status(close_result), "error": reason, "order": order, "position": position, "close": close_result, "protection_cleanup": cleanup, "executed_signal": actual_signal}
 
     setup["entry_reference"] = avg_price
@@ -4351,12 +4605,28 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         direction=direction,
         leg="SL",
         status=str(sl_result.get("status") or protection.get("status") or "UNKNOWN"),
+        exchange_order_status=sl_result.get("exchange_order_status"),
         price=sl_result.get("price") or sl_result.get("stop_price"),
         qty=sl_result.get("qty"),
         error=sl_result.get("error"),
         verified=(str(protection.get("status")) in {"PROTECTED", "SL_ONLY"}),
         protection_order_verified=sl_result.get("protection_order_verified"),
         execution_verified=sl_result.get("execution_verified"),
+        client_order_id=sl_result.get("client_order_id"),
+        order_type=sl_result.get("order_type"),
+        side=sl_result.get("side"),
+        position_side=sl_result.get("position_side") or sl_result.get("positionSide"),
+        working_type=sl_result.get("working_type"),
+        reduce_only=sl_result.get("reduce_only"),
+        close_position=sl_result.get("close_position"),
+        time_in_force=sl_result.get("time_in_force"),
+        stop_guaranteed=sl_result.get("stop_guaranteed"),
+        trigger_price=sl_result.get("trigger_price") or sl_result.get("stop_price"),
+        orig_qty=sl_result.get("orig_qty"),
+        executed_qty=sl_result.get("executed_qty"),
+        exchange_order_time_ms=sl_result.get("exchange_order_time_ms"),
+        exchange_order_update_time_ms=sl_result.get("exchange_order_update_time_ms"),
+        verification_observed_at_ms=sl_result.get("verification_observed_at_ms"),
     )
     for tp in protection.get("tp_orders", []) if isinstance(protection.get("tp_orders"), list) else []:
         if not isinstance(tp, dict):
@@ -4387,19 +4657,35 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
             direction=direction,
             leg=str(tp.get("leg", "TP")).upper(),
             status=str(tp.get("status", "UNKNOWN")),
+            exchange_order_status=tp.get("exchange_order_status"),
             price=tp.get("price"),
             qty=tp.get("qty"),
             pnl_pct=tp.get("pnl_pct"),
             execution_verified=tp.get("execution_verified"),
             protection_order_verified=tp.get("protection_order_verified"),
             fill_evidence_status=tp.get("fill_evidence_status"),
+            client_order_id=tp.get("client_order_id"),
+            order_type=tp.get("order_type"),
+            side=tp.get("side"),
+            position_side=tp.get("position_side") or tp.get("positionSide"),
+            working_type=tp.get("working_type"),
+            reduce_only=tp.get("reduce_only"),
+            close_position=tp.get("close_position"),
+            time_in_force=tp.get("time_in_force"),
+            stop_guaranteed=tp.get("stop_guaranteed"),
+            trigger_price=tp.get("trigger_price") or tp.get("price"),
+            orig_qty=tp.get("orig_qty"),
+            executed_qty=tp.get("executed_qty"),
+            exchange_order_time_ms=tp.get("exchange_order_time_ms"),
+            exchange_order_update_time_ms=tp.get("exchange_order_update_time_ms"),
+            verification_observed_at_ms=tp.get("verification_observed_at_ms"),
             error=tp.get("error"),
         )
     if protection.get("status") != "PROTECTED":
         log.critical("[SAFETY_CLOSE] %s %s | mandatory protection incomplete | %s", symbol, direction, protection)
         # Mandatory rule: never leave a newly-opened position live without BOTH
         # a verified SL and both TP legs. Attempt an immediate market rollback.
-        close_result, cleanup = _emergency_close_preserving_protection(symbol, direction, qty, event_id)
+        close_result, cleanup = _emergency_close_preserving_protection(symbol, direction, qty, event_id, reason="MANDATORY_PROTECTION_INCOMPLETE", attempt_id=signal.get("attempt_id"))
         try:
             time.sleep(0.25)
             verify_closed = get_position_directional(symbol, direction)
@@ -5103,13 +5389,60 @@ def main() -> None:
     successful_ids = _load_successful_trade_ids()
     terminal_event_ids = _load_terminal_event_ids()
     failed_ids = _load_failed_signal_ids()
+    position_snapshot_rows: list[dict[str, Any]] = []
+    position_snapshot_observed_at_ms: int | None = None
     if private_ready:
         try:
             with request_metrics.phase("execution_state_load"):
-                open_keys = _position_keys(get_positions())
+                raw_position_snapshot = get_positions()
+            if not isinstance(raw_position_snapshot, list) or any(not isinstance(row, dict) for row in raw_position_snapshot):
+                raise RuntimeError("initial positions snapshot has invalid shape")
+            position_snapshot_observed_at_ms = int(time.time() * 1000)
+            open_keys = _position_keys(raw_position_snapshot)
+            for row in raw_position_snapshot:
+                symbol_value = str(row.get("symbol") or row.get("contract") or "").upper()
+                try:
+                    amount = float(row.get("positionAmt", row.get("position_amt", 0.0)) or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if not symbol_value or not math.isfinite(amount) or abs(amount) <= 0:
+                    continue
+                side_value = str(row.get("positionSide") or row.get("position_side") or "").upper()
+                if side_value not in {"LONG", "SHORT"}:
+                    side_value = "LONG" if amount > 0 else "SHORT"
+                try:
+                    mark_price = float(row.get("markPrice", row.get("mark_price")))
+                    if not math.isfinite(mark_price) or mark_price <= 0:
+                        mark_price = None
+                except (TypeError, ValueError):
+                    mark_price = None
+                try:
+                    entry_price = float(row.get("avgPrice", row.get("entry_price", row.get("avg_price"))))
+                    if not math.isfinite(entry_price) or entry_price <= 0:
+                        entry_price = None
+                except (TypeError, ValueError):
+                    entry_price = None
+                notional = abs(amount) * mark_price if mark_price is not None else None
+                try:
+                    unrealized_pnl = float(row.get("unrealizedProfit", row.get("unrealized_profit")))
+                    if not math.isfinite(unrealized_pnl):
+                        unrealized_pnl = None
+                except (TypeError, ValueError):
+                    unrealized_pnl = None
+                position_snapshot_rows.append({
+                    "symbol": symbol_value,
+                    "direction": side_value,
+                    "quantity": abs(amount),
+                    "entry_price": entry_price,
+                    "mark_price": mark_price,
+                    "notional_usdt": notional,
+                    "unrealized_pnl": unrealized_pnl,
+                })
         except Exception as exc:
             log.exception("[POSITIONS] initial positions fetch failed; no new entries will be executed: %s", exc)
             open_keys = set()
+            position_snapshot_rows = []
+            position_snapshot_observed_at_ms = None
             private_ready = False
     else:
         open_keys = set()
@@ -5334,6 +5667,56 @@ def main() -> None:
                     # closed 5m trigger boundary, not the later scan wall-clock.
                     boundary_ms = _signal_decision_boundary_ts_ms(sig)
                     shadow_decision_ts = pd.Timestamp(boundary_ms, unit="ms", tz="UTC").isoformat() if boundary_ms is not None else sig.get("decision_boundary_ts")
+                    # Reuse the research module's causal closed-bar feature builder
+                    # before execution so UTC-session VWAP and BTC context are part
+                    # of the pre-entry snapshot. This is local calculation only:
+                    # no new API request, score change, or entry gate is introduced.
+                    try:
+                        causal_features = research._derive_time_series_features(
+                            direction=str(sig.get("type", "")),
+                            df_5m=pd.DataFrame(trigger_bars_raw),
+                            df_1h=df,
+                            decision_ts=shadow_decision_ts,
+                            btc_df_5m=btc_research_df_5m,
+                            btc_df_1h=btc_research_df_1h,
+                        )
+                    except Exception as feature_exc:
+                        causal_features = {}
+                        log.warning("[PRE_ENTRY_FEATURES] %s | causal market feature calculation failed: %s", _display_symbol(symbol), feature_exc)
+                    vwap_value = causal_features.get("session_vwap_approx")
+                    if vwap_value is not None:
+                        sig["vwap_context"] = {
+                            "status": "PRESENT",
+                            "kind": causal_features.get("session_vwap_kind") or "UTC_DAY_TP_VWAP",
+                            "session_vwap_approx": vwap_value,
+                            "session_vwap_distance_pct": causal_features.get("session_vwap_distance_pct"),
+                            "session_utc": causal_features.get("session_utc"),
+                            "as_of_decision_ts": shadow_decision_ts,
+                            "source_timeframe": "5m_closed_bars",
+                        }
+                    else:
+                        sig["vwap_context"] = {"status": "NOT_CAPTURED", "reason": "insufficient_closed_session_volume"}
+                    btc_fields = (
+                        "btc_return_5m_pct", "btc_return_1h_pct",
+                        "btc_ema50_distance_pct", "btc_ema200_distance_pct",
+                    )
+                    btc_context = {key: causal_features.get(key) for key in btc_fields if causal_features.get(key) is not None}
+                    trend_snapshot = sig.get("trend_filter") if isinstance(sig.get("trend_filter"), dict) else {}
+                    for key in ("btc_regime", "btc_bar_close_ts", "btc_chg_1h_pct", "btc_chg_4h_pct", "btc_bars", "btc_context_veto"):
+                        if trend_snapshot.get(key) is not None:
+                            btc_context[key] = trend_snapshot[key]
+                    sig["btc_context"] = {
+                        "status": "PRESENT" if btc_context else "NOT_CAPTURED",
+                        "as_of_decision_ts": shadow_decision_ts,
+                        "source": "EXISTING_CAUSAL_BTC_BARS_AND_TREND_SNAPSHOT",
+                        **btc_context,
+                    }
+                    sig["pre_entry_market_features"] = {
+                        **causal_features,
+                        "decision_boundary_ts": shadow_decision_ts,
+                        "feature_time_semantics": "CAUSAL_CLOSED_BARS_AT_DECISION_BOUNDARY",
+                        "feature_collection_mode": "LOCAL_NO_ADDITIONAL_MARKET_REQUESTS",
+                    }
                     sig["shadow_experiments"] = shadow.build_entry_snapshot(
                         sig, df_5m=pd.DataFrame(trigger_bars_raw), df_1h=df,
                         account_context=research_account_context, decision_ts=shadow_decision_ts
@@ -5793,6 +6176,48 @@ def main() -> None:
             continue
         _record_entry_decision(scan_id, signal, "EXECUTION_CLAIM", "claimed", selection_rank=rank, attempt_id=attempt_id, execution_status="CLAIMED", terminal=False)
         signal["attempt_id"] = attempt_id
+        if isinstance(research_account_context, dict):
+            margin_fields = (
+                "equity", "balance", "available_margin", "used_margin",
+                "freezed_margin", "unrealized_profit", "realized_profit",
+            )
+            margin_snapshot = {key: research_account_context[key] for key in margin_fields if research_account_context.get(key) is not None}
+            if margin_snapshot:
+                margin_snapshot.update({
+                    "source": "EXISTING_SCAN_START_ACCOUNT_CONTEXT",
+                    "account_context_id": research_account_context.get("account_context_id"),
+                    "captured_at_ms": research_account_context.get("captured_at_ms"),
+                    "capture_phase": "PRE_SCAN_NOT_PER_ORDER",
+                })
+                signal["margin_snapshot"] = margin_snapshot
+        # Reuse the already-fetched private position snapshot for forensic
+        # attribution only. It must never create portfolio admission limits or
+        # trigger any additional exchange request.
+        if position_snapshot_observed_at_ms is not None:
+            signal["open_positions_snapshot"] = {
+                "observed_at_ms": position_snapshot_observed_at_ms,
+                "source": "EXISTING_EXECUTION_STATE_PREFLIGHT",
+                "positions": position_snapshot_rows,
+            }
+            gross_notional = sum(
+                float(row["notional_usdt"]) for row in position_snapshot_rows
+                if row.get("notional_usdt") is not None
+            )
+            total_unrealized = sum(
+                float(row["unrealized_pnl"]) for row in position_snapshot_rows
+                if row.get("unrealized_pnl") is not None
+            )
+            signal["portfolio_context"] = {
+                "observed_at_ms": position_snapshot_observed_at_ms,
+                "source": "EXISTING_EXECUTION_STATE_PREFLIGHT",
+                "open_positions_count": len(position_snapshot_rows),
+                "long_positions_count": sum(1 for row in position_snapshot_rows if row["direction"] == "LONG"),
+                "short_positions_count": sum(1 for row in position_snapshot_rows if row["direction"] == "SHORT"),
+                "gross_open_notional_usdt": gross_notional,
+                "aggregate_unrealized_pnl": total_unrealized,
+                "telemetry_only": True,
+                "production_gate_applied": False,
+            }
         # Capture decision-time market context after the event claim but before the exchange order.
         # The attempt id is therefore present in the immutable context record without changing
         # the existing order/protection semantics. Collection remains fail-open.
