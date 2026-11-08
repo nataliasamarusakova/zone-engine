@@ -177,3 +177,15 @@ def test_close_evidence_uses_cumulative_order_average_with_cumulative_tp_quantit
     assert result["observed_exit_qty"] == pytest.approx(1.0)
     assert result["exit_vwap_confirmed"] == pytest.approx(105.0)
     assert result["latest"]["avg_price"] == pytest.approx(106.0)
+
+
+def test_filled_status_with_executed_quantity_above_original_quantity_is_not_confirmed():
+    order = {"leg": "tp1", "qty": 0.5}
+
+    state = _update_tp_reconciliation_state(
+        order, "FILLED", 0.6, 9_000, expected_qty=0.5,
+    )
+
+    assert state == "PARTIAL_FILL_TERMINAL"
+    assert order["last_exchange_executed_qty"] == 0.6
+    assert order["partial_fill_terminal_status"] == "FILLED_QTY_MISMATCH"

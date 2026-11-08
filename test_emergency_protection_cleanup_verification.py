@@ -487,3 +487,115 @@ def test_recovery_rechecks_position_if_same_symbol_direction_reopens_between_rea
     assert summary["attempted"] == 1
     assert summary["errors"] == 1
     assert cancelled == []
+
+
+def test_recovery_retry_budget_does_not_starve_events_behind_rate_limited_rows(
+    monkeypatch, tmp_path,
+):
+    import json
+    from event_engine import tracker, telemetry
+
+    journal = tmp_path / "emergency_exits.jsonl"
+    monkeypatch.setattr(telemetry, "EMERGENCY_EXITS_PATH", journal)
+    now_ms = 2_000_000_000_000
+    rows = [
+        {
+            "record_type": "EMERGENCY_EXIT", "event_id": "EVT_RATE_LIMITED",
+            "symbol": "AAA-USDT", "direction": "LONG", "status": "closed_verified",
+            "verified_flat": True,
+        },
+        {
+            "record_type": "EMERGENCY_PROTECTION_CLEANUP", "event_id": "EVT_RATE_LIMITED",
+            "symbol": "AAA-USDT", "direction": "LONG", "ts_ms": now_ms - 1_000,
+            "status": "partial", "verified": False,
+            "cleanup_result": {"status": "partial", "verified": False, "remaining_order_ids": ["SL-A"]},
+        },
+        {
+            "record_type": "EMERGENCY_EXIT", "event_id": "EVT_READY",
+            "symbol": "BBB-USDT", "direction": "SHORT", "status": "closed_verified",
+            "verified_flat": True,
+        },
+    ]
+    journal.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    monkeypatch.setenv("EMERGENCY_CLEANUP_RETRY_INTERVAL_SEC", "30")
+    cleanup_symbols = []
+    monkeypatch.setattr(tracker, "get_position_directional", lambda *_a, **_k: {"status": "not_found"})
+    monkeypatch.setattr(
+        tracker, "_cancel_engine_protection_before_emergency_close",
+        lambda symbol, _direction, **_kwargs: cleanup_symbols.append(symbol) or {
+            "status": "ok", "verified": True, "cancelled": [],
+            "already_absent": [], "remaining_order_ids": [], "errors": [],
+        },
+    )
+    monkeypatch.setattr(telemetry, "record_emergency_protection_cleanup", lambda **_kwargs: None)
+
+    summary = tracker.reconcile_pending_emergency_protection_cleanup(
+        max_events=1, now_ms=now_ms,
+    )
+
+    assert summary["pending"] == 2
+    assert summary["attempted"] == 1
+    assert summary["verified"] == 1
+    assert cleanup_symbols == ["BBB-USDT"]
+
+
+@pytest.mark.parametrize("deferred_state", ["active_owner", "position_open", "position_unknown"])
+def test_recovery_deferrals_do_not_consume_cleanup_retry_budget(
+    monkeypatch, tmp_path, deferred_state,
+):
+    import json
+    from event_engine import tracker, telemetry
+
+    journal = tmp_path / "emergency_exits.jsonl"
+    monkeypatch.setattr(telemetry, "EMERGENCY_EXITS_PATH", journal)
+    rows = [
+        {
+            "record_type": "EMERGENCY_EXIT", "event_id": "EVT_DEFERRED",
+            "symbol": "AAA-USDT", "direction": "LONG", "status": "closed_verified",
+            "verified_flat": True, "ts_ms": 1,
+        },
+        {
+            "record_type": "EMERGENCY_EXIT", "event_id": "EVT_ELIGIBLE",
+            "symbol": "BBB-USDT", "direction": "SHORT", "status": "closed_verified",
+            "verified_flat": True, "ts_ms": 2,
+        },
+    ]
+    journal.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    active_trades = (
+        {"EVT_CURRENT": {"symbol": "AAAUSDT", "direction": "LONG", "closed": False}}
+        if deferred_state == "active_owner" else {}
+    )
+    def position(symbol, _direction):
+        if symbol == "AAA-USDT":
+            if deferred_state == "position_open":
+                return {"status": "found", "positionAmt": 0.25}
+            if deferred_state == "position_unknown":
+                return {"status": "error", "error": "temporary timeout"}
+        return {"status": "not_found"}
+
+    cleanup_symbols = []
+    monkeypatch.setattr(tracker, "get_position_directional", position)
+    monkeypatch.setattr(
+        tracker, "_cancel_engine_protection_before_emergency_close",
+        lambda symbol, _direction, **_kwargs: cleanup_symbols.append(symbol) or {
+            "status": "ok", "verified": True, "cancelled": [],
+            "already_absent": [], "remaining_order_ids": [], "errors": [],
+        },
+    )
+    monkeypatch.setattr(telemetry, "record_emergency_protection_cleanup", lambda **_kwargs: None)
+
+    summary = tracker.reconcile_pending_emergency_protection_cleanup(
+        max_events=1, now_ms=2_000_000_000_000, active_trades=active_trades,
+    )
+
+    assert summary["attempted"] == 1
+    assert summary["verified"] == 1
+    assert cleanup_symbols == ["BBB-USDT"]
+    if deferred_state == "active_owner":
+        assert summary["deferred_active_trade_owner"] == 1
+    elif deferred_state == "position_open":
+        assert summary["deferred_position_open"] == 1
+    else:
+        assert summary["deferred_position_unknown"] == 1

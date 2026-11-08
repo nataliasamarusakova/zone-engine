@@ -564,21 +564,28 @@ def test_terminal_cancelled_tp_partial_fill_is_accounted_without_activating_be(
     assert repeated.get("be_activated") is not True
 
 
+@pytest.mark.parametrize(
+    ("executed_qty", "remaining_position_qty"),
+    [(0.3, 0.7), (0.6, 0.4)],
+    ids=["underfill", "overfill"],
+)
 def test_filled_tp_status_with_cumulative_quantity_mismatch_books_only_real_fill_and_does_not_activate_be(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    executed_qty: float,
+    remaining_position_qty: float,
 ):
     from event_engine import tracker
 
-    event_id = "EVT_TP1_FILLED_QTY_MISMATCH"
+    event_id = f"EVT_TP1_FILLED_QTY_MISMATCH_{executed_qty}"
     active_path = tmp_path / "active_trades.json"
     trade = {
         "event_id": event_id, "attempt_id": "ATT_FILLED_QTY_MISMATCH",
         "position_id": "POS_FILLED_QTY_MISMATCH", "symbol": "AAA-USDT",
         "direction": "LONG", "entry_price": 100.0, "initial_qty": 1.0,
-        "remaining_qty": 0.7, "entry_ts": 1_700_000_000_000, "closed": False,
+        "remaining_qty": remaining_position_qty, "entry_ts": 1_700_000_000_000, "closed": False,
         "tp_orders": [{"leg": "tp1", "order_id": "TP1-MISMATCH", "qty": 0.5}],
-        "sl_order": {"order_id": "SL-KEEP", "stop_price": 90.0, "qty": 0.7},
+        "sl_order": {"order_id": "SL-KEEP", "stop_price": 90.0, "qty": remaining_position_qty},
         "hit_legs": [], "completed_tp_legs": [], "tp_filled_qty": {}, "tp_fill_events": [],
         "realized_pnl_qty": 0.0, "realized_pnl_weighted_sum": 0.0,
         "peak_pnl_pct": 0.0, "mae_pct": 0.0, "max_drawdown_pct": 0.0,
@@ -595,8 +602,68 @@ def test_filled_tp_status_with_cumulative_quantity_mismatch_books_only_real_fill
     monkeypatch.setattr(tracker, "_enrich_tp_fill_event_from_exchange_history", lambda _symbol, event, **_kwargs: event)
     monkeypatch.setattr(tracker, "_get_order_execution_evidence", lambda *_args, **_kwargs: {
         "status": "ok", "order_id": "TP1-MISMATCH", "order_status": "FILLED",
-        "executed_qty": 0.3, "orig_qty": 0.5, "executed_qty_known": True,
+        "executed_qty": executed_qty, "orig_qty": 0.5, "executed_qty_known": True,
         "avg_price": 103.0, "execution_evidence_source": "ORDER_STATUS",
+    })
+    monkeypatch.setattr(tracker, "get_position_directional", lambda *_args, **_kwargs: {
+        "status": "found", "positionAmt": str(remaining_position_qty), "avgPrice": "100",
+    })
+
+    tracker.update_active_trades()
+
+    saved = json.loads(active_path.read_text(encoding="utf-8"))[event_id]
+    assert saved["tp_filled_qty"]["tp1"] == pytest.approx(executed_qty)
+    assert saved["realized_pnl_qty"] == pytest.approx(executed_qty)
+    assert saved["remaining_qty"] == pytest.approx(remaining_position_qty)
+    assert saved["tp_orders"][0]["reconciliation_state"] == "PARTIAL_FILL_TERMINAL"
+    assert saved["tp_orders"][0]["partial_fill_terminal_status"] == "FILLED_QTY_MISMATCH"
+    assert saved["tp_fill_events"][-1]["delta_qty"] == pytest.approx(executed_qty)
+    assert "tp1" not in saved["hit_legs"]
+    assert "tp1" not in saved["completed_tp_legs"]
+    assert saved.get("be_activated") is not True
+
+
+def test_tp_partial_fill_delta_is_scoped_to_the_current_exchange_order_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    from event_engine import tracker
+
+    active_path = tmp_path / "active_trades.json"
+    event_id = "EVT_TP1_ORDER_REPLACEMENT"
+    trade = {
+        "event_id": event_id, "attempt_id": "ATT_TP1_ORDER_REPLACEMENT",
+        "position_id": "POS_TP1_ORDER_REPLACEMENT", "symbol": "AAA-USDT",
+        "direction": "LONG", "entry_price": 100.0, "initial_qty": 1.0,
+        "remaining_qty": 0.8, "entry_ts": 1_700_000_000_000, "closed": False,
+        # The previous TP1 order was partially executed and replaced. The current
+        # active order has its own cumulative executedQty, starting from zero.
+        "tp_orders": [{"leg": "tp1", "order_id": "TP1-NEW", "qty": 0.5}],
+        "sl_order": {"order_id": "SL-KEEP", "stop_price": 90.0, "qty": 0.8},
+        "hit_legs": [], "completed_tp_legs": [], "tp_filled_qty": {"tp1": 0.2},
+        "tp_fill_events": [{
+            "leg": "tp1", "order_id": "TP1-OLD", "resolved_order_id": "TP1-OLD",
+            "executed_qty_total": 0.2, "delta_qty": 0.2, "avg_price": 103.0,
+            "avg_price_source": "ORDER_CUMULATIVE_AVG_FIRST_FILL",
+            "cumulative_avg_price": 103.0,
+        }],
+        "realized_pnl_qty": 0.2, "realized_pnl_weighted_sum": 0.6,
+        "peak_pnl_pct": 0.0, "mae_pct": 0.0, "max_drawdown_pct": 0.0,
+        "planned_risk_pct": 10.0, "planned_weighted_rr": 0.45,
+        "effective_weighted_rr": 0.45, "setup": {}, "tp_levels": [], "effective_tp_levels": [],
+    }
+    active_path.write_text(json.dumps({event_id: trade}), encoding="utf-8")
+    monkeypatch.setattr(tracker, "ACTIVE_TRADES_PATH", active_path)
+    monkeypatch.setattr(tracker, "TRADES_PATH", tmp_path / "trades.jsonl")
+    monkeypatch.setattr(tracker, "ACTIONS_PATH", tmp_path / "actions.jsonl")
+    monkeypatch.setattr(tracker, "fetch_klines", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(tracker, "_tracker_parallel_first_tp_read_enabled", lambda: False)
+    monkeypatch.setattr(tracker, "_send_tracker_notification", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(tracker, "_enrich_tp_fill_event_from_exchange_history", lambda _symbol, event, **_kwargs: event)
+    monkeypatch.setattr(tracker, "_get_order_execution_evidence", lambda *_args, **_kwargs: {
+        "status": "ok", "order_id": "TP1-NEW", "order_status": "PARTIALLY_FILLED",
+        "executed_qty": 0.1, "orig_qty": 0.3, "executed_qty_known": True,
+        "avg_price": 104.0, "execution_evidence_source": "ORDER_STATUS",
     })
     monkeypatch.setattr(tracker, "get_position_directional", lambda *_args, **_kwargs: {
         "status": "found", "positionAmt": "0.7", "avgPrice": "100",
@@ -607,10 +674,37 @@ def test_filled_tp_status_with_cumulative_quantity_mismatch_books_only_real_fill
     saved = json.loads(active_path.read_text(encoding="utf-8"))[event_id]
     assert saved["tp_filled_qty"]["tp1"] == pytest.approx(0.3)
     assert saved["realized_pnl_qty"] == pytest.approx(0.3)
-    assert saved["remaining_qty"] == pytest.approx(0.7)
-    assert saved["tp_orders"][0]["reconciliation_state"] == "PARTIAL_FILL_TERMINAL"
-    assert saved["tp_orders"][0]["partial_fill_terminal_status"] == "FILLED_QTY_MISMATCH"
-    assert saved["tp_fill_events"][-1]["delta_qty"] == pytest.approx(0.3)
-    assert "tp1" not in saved["hit_legs"]
-    assert "tp1" not in saved["completed_tp_legs"]
+    assert len(saved["tp_fill_events"]) == 2
+    assert saved["tp_fill_events"][-1]["order_id"] == "TP1-NEW"
+    assert saved["tp_fill_events"][-1]["delta_qty"] == pytest.approx(0.1)
+    assert saved["tp_fill_events"][-1]["avg_price_source"] == "ORDER_CUMULATIVE_AVG_FIRST_FILL"
     assert saved.get("be_activated") is not True
+
+    # A later cumulative snapshot from the same replacement order must be
+    # differenced against that order's own prior notional, not the old order's.
+    monkeypatch.setattr(tracker, "_get_order_execution_evidence", lambda *_args, **_kwargs: {
+        "status": "ok", "order_id": "TP1-NEW", "order_status": "PARTIALLY_FILLED",
+        "executed_qty": 0.3, "orig_qty": 0.5, "executed_qty_known": True,
+        "avg_price": 105.0, "execution_evidence_source": "ORDER_STATUS",
+    })
+    monkeypatch.setattr(tracker, "get_position_directional", lambda *_args, **_kwargs: {
+        "status": "found", "positionAmt": "0.5", "avgPrice": "100",
+    })
+    tracker.update_active_trades()
+    second = json.loads(active_path.read_text(encoding="utf-8"))[event_id]
+    incremental_price = (0.3 * 105.0 - 0.1 * 104.0) / 0.2
+    assert second["tp_filled_qty"]["tp1"] == pytest.approx(0.5)
+    assert second["realized_pnl_qty"] == pytest.approx(0.5)
+    assert second["remaining_qty"] == pytest.approx(0.5)
+    assert second["tp_fill_events"][-1]["delta_qty"] == pytest.approx(0.2)
+    assert second["tp_fill_events"][-1]["avg_price"] == pytest.approx(incremental_price)
+    assert second["tp_fill_events"][-1]["avg_price_source"] == "ORDER_CUMULATIVE_AVG_DIFFERENCED"
+    assert second["realized_pnl_weighted_sum"] == pytest.approx(2.1)
+    event_count = len(second["tp_fill_events"])
+
+    # Re-reading the same cumulative exchange response must not book it twice.
+    tracker.update_active_trades()
+    repeated = json.loads(active_path.read_text(encoding="utf-8"))[event_id]
+    assert repeated["tp_filled_qty"]["tp1"] == pytest.approx(0.5)
+    assert repeated["realized_pnl_qty"] == pytest.approx(0.5)
+    assert len(repeated["tp_fill_events"]) == event_count
