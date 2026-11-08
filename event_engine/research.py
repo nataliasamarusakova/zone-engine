@@ -2071,6 +2071,19 @@ def record_scan_symbol(
             account_context = account_payload
         else:
             account_context = dict(account_payload, persisted=False)
+    account_context_captured_at = (
+        _parse_timestamp(account_context.get("captured_at") or account_context.get("captured_at_ms"))
+        if account_context else None
+    )
+
+    def _account_context_for_boundary(boundary_ts: Any) -> dict[str, Any] | None:
+        if not isinstance(account_context, dict) or account_context_captured_at is None:
+            return None
+        boundary = _parse_timestamp(boundary_ts)
+        if boundary is None or account_context_captured_at > boundary:
+            return None
+        return account_context
+
     if market_context:
         context_payload = dict(market_context)
         context_payload.update({"scan_id": scan_id, "strategy_version": strategy_version, "code_commit_sha": code_commit_sha, "symbol": symbol.upper(), "provider": provider, "source": source})
@@ -2120,15 +2133,16 @@ def record_scan_symbol(
     # Production signals receive the richest record, including target/score/visit data.
     for signal in signals:
         signal_boundary_ts = signal.get("decision_boundary_ts") or decision_ts
+        signal_account_context = _account_context_for_boundary(signal_boundary_ts)
         # In deferred mode the first pass had no account snapshot, so its immutable-looking
         # shadow dict can contain CF_CORRELATION=CONTEXT_UNAVAILABLE. If a persisted
         # decision-time account snapshot is available now, rebuild the snapshot before both
         # the observation and counterfactual journal consume it.
-        if account_context is not None:
+        if signal_account_context is not None:
             try:
                 signal["shadow_experiments"] = shadow.build_entry_snapshot(
                     signal, df_5m=closed_5m_df, df_1h=df_1h,
-                    account_context=account_context, decision_ts=signal_boundary_ts,
+                    account_context=signal_account_context, decision_ts=signal_boundary_ts,
                 )
             except Exception as exc:
                 _record_error("counterfactual_snapshot_refresh", COUNTERFACTUAL_EXPERIMENTS_PATH, exc, symbol=symbol)
@@ -2136,7 +2150,7 @@ def record_scan_symbol(
         observations.append(_observation_from_signal(
             signal, scan_id=scan_id, strategy_version=strategy_version,
             code_commit_sha=code_commit_sha, df_1h=df_1h, df_5m=closed_5m_df, decision_ts=signal_boundary_ts,
-            provider=provider, source=source, market_context=signal_context, account_context=account_context, btc_df_5m=btc_df_5m, btc_df_1h=btc_df_1h,
+            provider=provider, source=source, market_context=signal_context, account_context=signal_account_context, btc_df_5m=btc_df_5m, btc_df_1h=btc_df_1h,
         ))
 
     # Every actual touch boundary that did NOT create a signal is retained as research data.
@@ -2147,10 +2161,12 @@ def record_scan_symbol(
         zone_key = str(event.get("zone_key", ""))
         zone = zones.get(zone_key)
         direction = str(event.get("direction", "")).upper()
+        event_decision_ts = _event_decision_boundary_ts(event) or decision_ts
+        event_account_context = _account_context_for_boundary(event_decision_ts)
         built = build_observation_from_touch_event(
             event=event, symbol=symbol, zone=zone, direction=direction, df_1h=df_1h, df_5m=closed_5m_df,
-            zone_visit_id=str(event.get("visit_id") or ""), scan_id=scan_id, decision_ts=(_event_decision_boundary_ts(event) or decision_ts),
-            strategy_version=strategy_version, code_commit_sha=code_commit_sha, provider=provider, source=source, market_context=market_context, account_context=account_context, btc_df_5m=btc_df_5m, btc_df_1h=btc_df_1h,
+            zone_visit_id=str(event.get("visit_id") or ""), scan_id=scan_id, decision_ts=event_decision_ts,
+            strategy_version=strategy_version, code_commit_sha=code_commit_sha, provider=provider, source=source, market_context=market_context, account_context=event_account_context, btc_df_5m=btc_df_5m, btc_df_1h=btc_df_1h,
         )
         if built:
             observations.append(built)
@@ -2166,6 +2182,7 @@ def record_scan_symbol(
             "close": event.get("close"), "volume": event.get("volume"),
         }
         rearm_decision_ts = _event_decision_boundary_ts(event) or decision_ts
+        rearm_account_context = _account_context_for_boundary(rearm_decision_ts)
         observations.append({
             "observation_id": observation_id("REARM", symbol, direction, str(zone.get("zone_id") or zone_key), event.get("timestamp"), visit_id=str(event.get("visit_id") or "")),
             "schema_version": RESEARCH_SCHEMA_VERSION,
@@ -2173,12 +2190,12 @@ def record_scan_symbol(
             "event_type": "REARM",
             "source_event_reason": "zone_rearmed",
             "scan_id": scan_id, "strategy_version": strategy_version, "code_commit_sha": code_commit_sha,
-            "provider": provider, "source": source, "market_context_id": (market_context or {}).get("context_id"), "account_context_id": (account_context or {}).get("account_context_id"),
+            "provider": provider, "source": source, "market_context_id": (market_context or {}).get("context_id"), "account_context_id": (rearm_account_context or {}).get("account_context_id"),
             "symbol": symbol.upper(), "direction": direction, "observation_ts": (_event_decision_boundary_ts(event) or decision_ts), "source_event_ts": event.get("timestamp"), "counterfactual_path_start_ts": (_event_decision_boundary_ts(event) or decision_ts),
             "decision_boundary_ts": (_event_decision_boundary_ts(event) or decision_ts), "decision_boundary_kind": "CLOSED_5M_EVENT_CLOSE",
             "reference_price": event.get("close"), "zone_id": zone.get("zone_id") or zone_key,
             "zone_visit_id": event.get("visit_id"), "zone": sanitize(zone), "entry_bar": sanitize(bar),
-            "features": build_research_features(symbol=symbol, direction=direction, zone=zone, bar=bar, df_1h=df_1h, df_5m=closed_5m_df, decision_ts=rearm_decision_ts, market_context=market_context, btc_df_5m=btc_df_5m, btc_df_1h=btc_df_1h),
+            "features": build_research_features(symbol=symbol, direction=direction, zone=zone, bar=bar, df_1h=df_1h, df_5m=closed_5m_df, decision_ts=rearm_decision_ts, market_context=market_context, account_context=rearm_account_context, btc_df_5m=btc_df_5m, btc_df_1h=btc_df_1h),
             "research": {"source": "shadow_research_v1", "production_gate_applied": False, "outcome_class": "HYPOTHETICAL_FORWARD_OUTCOME"},
             "recorded_at": _now_iso(),
         })
@@ -2196,6 +2213,7 @@ def record_scan_symbol(
         ts = bar.get("timestamp")
         zid = str(zone.get("zone_id") or zone_key)
         nearest_decision_ts = _event_decision_boundary_ts({"timestamp": ts}) or decision_ts
+        nearest_account_context = _account_context_for_boundary(nearest_decision_ts)
         observations.append({
             "observation_id": observation_id("NEAREST_APPROACH", symbol, direction, zid, ts),
             "schema_version": RESEARCH_SCHEMA_VERSION,
@@ -2203,13 +2221,13 @@ def record_scan_symbol(
             "event_type": "NEAREST_APPROACH",
             "source_event_reason": "closest_midpoint_without_touch",
             "scan_id": scan_id, "strategy_version": strategy_version, "code_commit_sha": code_commit_sha,
-            "provider": provider, "source": source, "market_context_id": (market_context or {}).get("context_id"), "account_context_id": (account_context or {}).get("account_context_id"),
+            "provider": provider, "source": source, "market_context_id": (market_context or {}).get("context_id"), "account_context_id": (nearest_account_context or {}).get("account_context_id"),
             "symbol": symbol.upper(), "direction": direction, "observation_ts": (_event_decision_boundary_ts({"timestamp": ts}) or decision_ts), "source_event_ts": ts, "counterfactual_path_start_ts": (_event_decision_boundary_ts({"timestamp": ts}) or decision_ts),
             "decision_boundary_ts": (_event_decision_boundary_ts({"timestamp": ts}) or decision_ts), "decision_boundary_kind": "CLOSED_5M_EVENT_CLOSE",
             "reference_price": bar.get("close"), "zone_id": zid,
             "zone_visit_id": (symbol_state.get("zones", {}).get(zone_key) or {}).get("visit_id"),
             "zone": sanitize(zone), "entry_bar": sanitize(bar),
-            "features": {**build_research_features(symbol=symbol, direction=direction, zone=zone, bar=bar, df_1h=df_1h, df_5m=closed_5m_df, decision_ts=nearest_decision_ts, market_context=market_context, btc_df_5m=btc_df_5m, btc_df_1h=btc_df_1h), "distance_to_midpoint_pct": distance},
+            "features": {**build_research_features(symbol=symbol, direction=direction, zone=zone, bar=bar, df_1h=df_1h, df_5m=closed_5m_df, decision_ts=nearest_decision_ts, market_context=market_context, account_context=nearest_account_context, btc_df_5m=btc_df_5m, btc_df_1h=btc_df_1h), "distance_to_midpoint_pct": distance},
             "research": {"source": "shadow_research_v1", "production_gate_applied": False, "outcome_class": "HYPOTHETICAL_FORWARD_OUTCOME"},
             "recorded_at": _now_iso(),
         })
@@ -2217,12 +2235,13 @@ def record_scan_symbol(
     # Persist one immutable counterfactual snapshot per production signal.
     for signal in signals:
         try:
+            signal_decision_ts = signal.get("decision_boundary_ts") or decision_ts
+            signal_account_context = _account_context_for_boundary(signal_decision_ts)
             snap = signal.get("shadow_experiments")
-            if not isinstance(snap, dict):
-                signal_decision_ts = signal.get("decision_boundary_ts") or decision_ts
+            if signal_account_context is None or not isinstance(snap, dict):
                 snap = shadow.build_entry_snapshot(
                     signal, df_5m=closed_5m_df, df_1h=df_1h,
-                    account_context=account_context, decision_ts=signal_decision_ts
+                    account_context=signal_account_context, decision_ts=signal_decision_ts
                 )
                 signal["shadow_experiments"] = snap
             record_counterfactual_snapshot(
@@ -2238,13 +2257,6 @@ def record_scan_symbol(
         except Exception as exc:
             _record_error("counterfactual_snapshot_build", COUNTERFACTUAL_EXPERIMENTS_PATH, exc, symbol=symbol)
 
-    account_context_persisted = bool(account_context and account_context.get("account_context_id")) and bool(account_context.get("persisted", True))
-    account_context_age_ms_at_decision = None
-    if account_context:
-        captured_at = _parse_timestamp(account_context.get("captured_at"))
-        decision_parsed = _parse_timestamp(decision_ts)
-        if captured_at is not None and decision_parsed is not None:
-            account_context_age_ms_at_decision = max(0.0, (decision_parsed - captured_at).total_seconds() * 1000.0)
     for observation in observations:
         has_linked_context = bool(observation.get("market_context_id"))
         existing_ctx_persisted = observation.get("market_context_persisted")
@@ -2258,11 +2270,29 @@ def record_scan_symbol(
                 observation["market_context_status"] = "PERSISTENCE_FAILED"
             else:
                 observation["market_context_status"] = "PERSISTENCE_FAILED" if (has_linked_context or market_context) else "NOT_COLLECTED"
-        observation["account_context_persisted"] = account_context_persisted
-        observation["account_context_status"] = ("PERSISTED" if account_context_persisted else ("PERSISTENCE_FAILED" if account_context else "NOT_COLLECTED"))
+        linked_account_context = bool(
+            account_context
+            and account_context.get("account_context_id")
+            and observation.get("account_context_id") == account_context.get("account_context_id")
+        )
+        observation["account_context_persisted"] = bool(linked_account_context and account_context.get("persisted", True))
+        if linked_account_context:
+            observation["account_context_status"] = "PERSISTED" if observation["account_context_persisted"] else "PERSISTENCE_FAILED"
+        elif account_context:
+            observation["account_context_status"] = "NOT_AVAILABLE_AT_DECISION"
+            observation["account_context_id"] = None
+            observation["account_context_persisted"] = False
+        else:
+            observation["account_context_status"] = "NOT_COLLECTED"
         if market_context:
             observation["market_context_age_ms_at_decision"] = market_context.get("context_age_ms_at_decision")
-        observation["account_context_age_ms_at_decision"] = account_context_age_ms_at_decision
+        observation_decision = _parse_timestamp(observation.get("decision_boundary_ts") or decision_ts)
+        if linked_account_context and account_context_captured_at is not None and observation_decision is not None:
+            observation["account_context_age_ms_at_decision"] = max(
+                0.0, (observation_decision - account_context_captured_at).total_seconds() * 1000.0
+            )
+        else:
+            observation["account_context_age_ms_at_decision"] = None
 
     observations_persisted = True
     try:
