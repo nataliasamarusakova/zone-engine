@@ -104,8 +104,15 @@ def format_price(value: float | None, tick_size: float | None) -> str:
     if tick_size is not None and tick_size > 0:
         try:
             quantum = Decimal(str(tick_size))
-            rounded = Decimal(str(value)).quantize(quantum, rounding=ROUND_HALF_UP)
-            places = max(0, -quantum.as_tuple().exponent)
+            if not quantum.is_finite() or quantum <= 0:
+                raise InvalidOperation
+            # quantize() matches decimal places, not increments (e.g. 0.05).
+            # Round in units of the actual exchange tick, then restore the price.
+            units = (Decimal(str(value)) / quantum).quantize(
+                Decimal("1"), rounding=ROUND_HALF_UP
+            )
+            rounded = units * quantum
+            places = max(0, -quantum.normalize().as_tuple().exponent)
             return f"{rounded:.{places}f}"
         except (InvalidOperation, ValueError):
             pass

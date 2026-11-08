@@ -956,10 +956,10 @@ def test_exact_zone_containment_has_no_proximity_padding():
     import run_once
     demand = [{"btm": 100.0, "top": 105.0}]
     supply = [{"btm": 110.0, "top": 115.0}]
-    assert run_once._price_position(105.0, demand, supply) == "🟢 В зоне DEMAND"
-    assert run_once._price_position(105.1, demand, supply) == "⚪ Вне зон (Ждать)"
-    assert run_once._price_position(109.9, demand, supply) == "⚪ Вне зон (Ждать)"
-    assert run_once._price_position(110.0, demand, supply) == "🔴 В зоне SUPPLY"
+    assert run_once._price_position(105.0, demand, supply) == "🟢 Внутри 1h DEMAND (не сигнал)"
+    assert run_once._price_position(105.1, demand, supply) == "⚪ Вне 1h зон (ждать)"
+    assert run_once._price_position(109.9, demand, supply) == "⚪ Вне 1h зон (ждать)"
+    assert run_once._price_position(110.0, demand, supply) == "🔴 Внутри 1h SUPPLY (не сигнал)"
 
 def test_target_levels_stop_and_ordering_from_nearest_obstacle():
     from event_engine.signals import _targets_from_nearest_obstacle
@@ -1658,9 +1658,9 @@ def test_price_position_does_not_call_nearby_price_inside_zone():
     from run_once import _price_position
     demand = [{"btm": 100.0, "top": 110.0}]
     supply = [{"btm": 120.0, "top": 130.0}]
-    assert _price_position(119.0, demand, supply) == "⚪ Вне зон (Ждать)"
-    assert _price_position(120.0, demand, supply) == "🔴 В зоне SUPPLY"
-    assert _price_position(110.0, demand, supply) == "🟢 В зоне DEMAND"
+    assert _price_position(119.0, demand, supply) == "⚪ Вне 1h зон (ждать)"
+    assert _price_position(120.0, demand, supply) == "🔴 Внутри 1h SUPPLY (не сигнал)"
+    assert _price_position(110.0, demand, supply) == "🟢 Внутри 1h DEMAND (не сигнал)"
 
 
 def test_directional_zone_requires_exact_midpoint_touch():

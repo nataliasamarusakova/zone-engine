@@ -134,3 +134,30 @@ def test_metrics_keep_exact_operation_average_and_late_slowest_items(monkeypatch
         request_metrics.log_summary(logging.getLogger("request_metrics_bounded_test"))
     assert "avg_s=33.010" in caplog.text
     assert "label=very-slow-later seconds=99.000" in caplog.text
+
+
+def test_scan_summary_distinguishes_1h_zone_position_from_5m_signal():
+    from event_engine.analytics import _line
+
+    line = _line({
+        "symbol": "TURBO-USDT",
+        "current_price": 0.000713,
+        "price_position_reference_price": 0.000713,
+        "price_position_reference_timestamp": "2026-11-08T13:59:59.999000+00:00",
+        "price_position": "🟢 Внутри 1h DEMAND (не сигнал)",
+        "fresh_signal": "—",
+        "active_demand": 3,
+        "active_supply": 10,
+        "market_source": "binance_spot",
+        "binance_price": 0.000713,
+        "bingx_price": None,
+        "market_spread_pct": None,
+        "asset_class": "CRYPTO",
+    })
+
+    assert "1h_close=0.000713" in line
+    assert "Положение_1h_engine_zones=🟢 Внутри 1h DEMAND (не сигнал)" in line
+    assert "Сигнал_5m=—" in line
+    assert "trigger_status=UNKNOWN" in line
+    assert "BingX_quote=None" in line
+    assert "Binance=" not in line

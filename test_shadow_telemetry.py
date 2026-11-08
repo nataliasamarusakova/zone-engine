@@ -187,10 +187,10 @@ def test_trailing_does_not_use_current_bar_high_for_same_bar_stop():
         "source_event_ts": "2026-09-28T10:00:00Z",
         "features": {"shadow_experiments": snap["experiments"]},
     }
-    hist = _bars_5m([10] * 30).tail(20).copy()
+    hist = _bars_5m([10] * 21).copy()
     future = pd.DataFrame([
         {"timestamp": "2026-09-28T10:05:00Z", "close_time": "2026-09-28T10:10:00Z", "open": 100, "high": 103.2, "low": 99.5, "close": 103.0},
-        {"timestamp": "2026-09-28T10:10:00Z", "close_time": "2026-09-28T10:15:00Z", "open": 103, "high": 120.0, "low": 101.0, "close": 110.0},
+        {"timestamp": "2026-09-28T10:10:00Z", "close_time": "2026-09-28T10:15:00Z", "open": 103, "high": 120.0, "low": 102.9, "close": 110.0},
         {"timestamp": "2026-09-28T10:15:00Z", "close_time": "2026-09-28T10:20:00Z", "open": 110, "high": 111.0, "low": 100.0, "close": 105.0},
     ])
     all_bars = pd.concat([hist, future], ignore_index=True)

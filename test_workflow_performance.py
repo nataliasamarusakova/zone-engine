@@ -162,3 +162,11 @@ def test_zone_lookup_fallback_key_matches_visit_key_without_zone_id():
     old_zone = {"start": 7, "top": 101.25, "btm": 99.75}
     old_key = run_once._zone_visit_key(old_zone, "SUPPLY")
     assert research._zone_lookup([], [old_zone])[old_key] is old_zone
+
+
+def test_production_workflow_does_not_enable_verbose_request_timing_metrics():
+    from pathlib import Path
+
+    workflow = Path(".github/workflows/event-engine.yml").read_text(encoding="utf-8")
+    assert 'REQUEST_TIMING_METRICS: "true"' not in workflow
+    assert "REQUEST_TIMING_METRICS" not in workflow

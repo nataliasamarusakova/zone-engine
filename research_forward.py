@@ -394,25 +394,55 @@ def _first_expected_bar_open_ns(observation_ts_ns: int, decision_boundary_kind: 
     return ((observation_ts_ns // interval_ns) + 1) * interval_ns
 
 
+def _expected_path_grid(
+    observation_ts_ns: int,
+    target_ts_ns: int,
+    decision_boundary_kind: str | None,
+) -> tuple[int, int, int]:
+    """Return (first expected open, last expected open, expected bar count)."""
+    interval_ns = 5 * 60 * 1_000_000_000
+    first_expected_ns = _first_expected_bar_open_ns(observation_ts_ns, decision_boundary_kind)
+    last_expected_ns = target_ts_ns - interval_ns
+    if last_expected_ns < first_expected_ns:
+        return first_expected_ns, last_expected_ns, 0
+    count = int((last_expected_ns - first_expected_ns) // interval_ns) + 1
+    return first_expected_ns, last_expected_ns, count
+
+
 def _path_gap_count(
     bars: pd.DataFrame,
     observation_ts: pd.Timestamp,
     target_ts: pd.Timestamp,
     decision_boundary_kind: str | None = None,
 ) -> int:
-    """Count missing 5m bars up to target_ts using candle-open timestamps."""
-    path = bars.loc[(bars["timestamp"] >= observation_ts) & (bars["close_time"] <= target_ts), ["timestamp", "close_time"]].sort_values("timestamp")
-    if path.empty:
-        return 0
+    """Count all missing 5m opens in the expected interval through target_ts.
+
+    Count against the complete expected grid rather than only leading/interior
+    differences. This also detects missing trailing candles immediately before
+    the target horizon, even when later bars already exist in the loaded series.
+    """
     interval_ns = 5 * 60 * 1_000_000_000
-    first_expected_ns = _first_expected_bar_open_ns(int(observation_ts.value), decision_boundary_kind)
-    first_expected = pd.Timestamp(first_expected_ns, unit="ns", tz="UTC")
-    first_delta = path.iloc[0]["timestamp"] - first_expected
-    gaps = max(0, int(round(first_delta.total_seconds() / 300.0)))
-    diffs = path["timestamp"].diff().dropna()
-    for delta in diffs:
-        gaps += max(0, int(round(delta.total_seconds() / 300.0)) - 1)
-    return gaps
+    first_ns, last_ns, expected_count = _expected_path_grid(
+        int(observation_ts.value), int(target_ts.value), decision_boundary_kind
+    )
+    if expected_count == 0:
+        return 0
+    path = bars.loc[
+        (bars["timestamp"] >= observation_ts)
+        & (bars["timestamp"] <= pd.Timestamp(last_ns, unit="ns", tz="UTC"))
+        & (bars["close_time"] <= target_ts),
+        "timestamp",
+    ]
+    if path.empty:
+        return expected_count
+    opens_ns = path.drop_duplicates().astype("int64").to_numpy()
+    on_grid = (
+        (opens_ns >= first_ns)
+        & (opens_ns <= last_ns)
+        & (((opens_ns - first_ns) % interval_ns) == 0)
+    )
+    observed_expected = int(np.unique(opens_ns[on_grid]).size)
+    return max(0, expected_count - observed_expected)
 
 
 def _path_gap_count_indexed(
@@ -423,21 +453,21 @@ def _path_gap_count_indexed(
 ) -> int:
     start = index.start_at_timestamp(observation_ts_ns)
     end = index.end_at_close(target_ts_ns)
-    interval_ns = 5 * 60 * 1_000_000_000
-    first_expected_ns = _first_expected_bar_open_ns(observation_ts_ns, decision_boundary_kind)
-    if end <= start:
-        last_expected_ns = target_ts_ns - interval_ns
-        if last_expected_ns < first_expected_ns:
-            return 0
-        return int((last_expected_ns - first_expected_ns) // interval_ns) + 1
+    first_ns, last_ns, expected_count = _expected_path_grid(
+        observation_ts_ns, target_ts_ns, decision_boundary_kind
+    )
+    if expected_count == 0:
+        return 0
     ts = index.ts_ns[start:end]
     if ts.size == 0:
-        return 0
-    gaps = max(0, int(round((int(ts[0]) - first_expected_ns) / interval_ns)))
-    if ts.size > 1:
-        diffs = np.diff(ts) // interval_ns
-        gaps += int(np.maximum(diffs - 1, 0).sum())
-    return gaps
+        return expected_count
+    on_grid = (
+        (ts >= first_ns)
+        & (ts <= last_ns)
+        & (((ts - first_ns) % (5 * 60 * 1_000_000_000)) == 0)
+    )
+    observed_expected = int(np.unique(ts[on_grid]).size)
+    return max(0, expected_count - observed_expected)
 
 
 def _pct_return(direction: str, reference: float, price: float) -> float | None:

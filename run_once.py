@@ -1937,16 +1937,21 @@ def _private_layer_ready() -> bool:
 
 
 def _price_position(price: float, demand: list[dict], supply: list[dict]) -> str:
-    # Display status must reflect the literal zone boundaries. Do not add
-    # percentage padding here: a price below Supply or above Demand is not
-    # "in the zone" merely because it is close to it.
+    """Describe the last closed 1h close versus engine-generated 1h zones.
+
+    This is a display/scan-state label only. It is not a 5m trigger, a fresh
+    signal, or permission to enter. Keep literal boundaries: no proximity
+    padding is allowed here.
+    """
     in_dem = any(float(z["btm"]) <= price <= float(z["top"]) for z in demand)
     in_sup = any(float(z["btm"]) <= price <= float(z["top"]) for z in supply)
+    if in_dem and in_sup:
+        return "⚠️ Перекрытие 1h DEMAND/SUPPLY (не сигнал)"
     if in_dem:
-        return "🟢 В зоне DEMAND"
+        return "🟢 Внутри 1h DEMAND (не сигнал)"
     if in_sup:
-        return "🔴 В зоне SUPPLY"
-    return "⚪ Вне зон (Ждать)"
+        return "🔴 Внутри 1h SUPPLY (не сигнал)"
+    return "⚪ Вне 1h зон (ждать)"
 
 
 def _bingx_last_price(contract: dict[str, Any]) -> float | None:
@@ -5663,7 +5668,10 @@ def main() -> None:
                     "market_source": source_name,
                     "binance_symbol": binance_symbol,
                     "asset_class": meta.get("asset_class", "UNKNOWN"),
-                    "price_position": _price_position(latest_price, demand, supply),
+                    "price_position": "⚪ Данные устарели (положение не оценивается)",
+                    "price_position_basis": "STALE_1H_DATA_NOT_EVALUATED",
+                    "price_position_reference_price": latest_price,
+                    "price_position_reference_timestamp": latest_closed_time.isoformat(),
                     "fresh_signal": "—",
                     "active_demand": len(demand),
                     "active_supply": len(supply),
@@ -6036,6 +6044,9 @@ def main() -> None:
                 "binance_symbol": binance_symbol,
                 "asset_class": meta.get("asset_class", "UNKNOWN"),
                 "price_position": price_position,
+                "price_position_basis": "LAST_CLOSED_1H_CLOSE_VS_ENGINE_GENERATED_1H_ZONES",
+                "price_position_reference_price": latest_price,
+                "price_position_reference_timestamp": latest_closed_time.isoformat(),
                 "fresh_signal": fresh_text,
                 "active_demand": len(demand),
                 "active_supply": len(supply),
