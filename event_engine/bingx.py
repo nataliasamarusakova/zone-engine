@@ -922,6 +922,33 @@ def get_all_open_twap_orders(*, timeout_sec: float | None = None, retryable: boo
     raise RuntimeError("[BINGX] get_all_open_twap_orders returned an unrecognized response shape; refusing clean start")
 
 
+def _parse_optional_exchange_bool(value: Any) -> bool | None:
+    """Parse an exchange boolean without turning an omitted field into False."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1", "yes", "y"}:
+        return True
+    if normalized in {"false", "0", "no", "n"}:
+        return False
+    return None
+
+
+def _optional_exchange_float(order: dict[str, Any], key: str) -> float | None:
+    raw = order.get(key)
+    if raw in (None, ""):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) else None
+
+
 def get_order(
     symbol: str,
     order_id: str | int | None = None,
@@ -1003,7 +1030,15 @@ def get_order(
     executed_qty_raw = order.get("executedQty")
     if executed_qty_raw in (None, ""):
         executed_qty_raw = order.get("cumQty")
-    executed_qty_known = executed_qty_raw not in (None, "")
+    try:
+        executed_qty_value = float(executed_qty_raw) if executed_qty_raw not in (None, "") else None
+        executed_qty_known = (
+            executed_qty_value is not None
+            and math.isfinite(executed_qty_value)
+            and executed_qty_value >= 0.0
+        )
+    except (TypeError, ValueError, OverflowError):
+        executed_qty_known = False
 
     return {
         "status": "ok",
@@ -1013,6 +1048,13 @@ def get_order(
         "side": str(order.get("side", "")).upper(),
         "position_side": str(order.get("positionSide", "")).upper(),
         "order_type": str(order.get("type", "")).upper(),
+        "working_type": str(order.get("workingType") or "").upper() or None,
+        "reduce_only": _parse_optional_exchange_bool(order.get("reduceOnly")),
+        "close_position": _parse_optional_exchange_bool(order.get("closePosition")),
+        "time_in_force": str(order.get("timeInForce") or "").upper() or None,
+        "stop_guaranteed": _parse_optional_exchange_bool(order.get("stopGuaranteed")),
+        "activation_price": _optional_exchange_float(order, "activationPrice"),
+        "price_rate": _optional_exchange_float(order, "priceRate"),
         "avg_price": _num("avgPrice"),
         "trigger_price": _num("stopPrice"),
         "executed_qty": _num("executedQty", "cumQty"),
@@ -1125,6 +1167,7 @@ def get_fill_orders(
     *,
     order_id: str | int | None = None,
     limit: int = 1000,
+    timeout_sec: float | None = None,
 ) -> list[dict]:
     """Return exchange-confirmed perpetual-swap fills in a time window.
 
@@ -1159,7 +1202,13 @@ def get_fill_orders(
         ALL_FILL_ORDERS_PATH,
         params,
         signed=True,
-        timeout_sec=min(5.0, float(os.environ.get("FILL_HISTORY_TIMEOUT_SEC", "5"))),
+        timeout_sec=min(
+            5.0,
+            max(0.2, float(
+                timeout_sec if timeout_sec is not None
+                else os.environ.get("FILL_HISTORY_TIMEOUT_SEC", "5")
+            )),
+        ),
         retryable=False,
     )
     if not isinstance(resp, dict):
@@ -2365,56 +2414,113 @@ def _client_order_id_matches_base(client_order_id: str, base_client_order_id: st
     return stem == expected_stem
 
 
-def _cancel_engine_protection_orders_verified(
-    symbol: str, direction: str, order_ids: list[str], *, attempts: int = 4,
-) -> tuple[bool, str | None]:
-    """Cancel known engine-owned protective orders and verify exchange absence.
+def _cancel_engine_protection_orders_verified_detailed(
+    symbol: str,
+    direction: str,
+    order_ids: list[str],
+    *,
+    attempts: int = 4,
+    read_open_orders=None,
+    cancel=None,
+    pre_cancel_guard=None,
+) -> dict[str, Any]:
+    """Cancel known engine-owned protection and report only exchange-verified absence.
 
-    The caller must have identified these IDs as belonging to the repaired TP
-    leg/SL. A cancel acknowledgement alone is insufficient because cancellation
-    may be asynchronous; openOrders is polled before success is reported.
+    A successful cancel HTTP acknowledgement is not proof that an order has left
+    openOrders. This detailed form is shared by emergency cleanup paths so their
+    telemetry can distinguish cancelled, already absent and still-visible orders.
+    Optional callables preserve each caller's existing dependency/test boundary.
     """
     unique_ids = list(dict.fromkeys(str(value) for value in order_ids if str(value)))
+    reader = read_open_orders or get_open_protection_directional
+    cancel_fn = cancel or cancel_order
+    result: dict[str, Any] = {
+        "status": "ok",
+        "verified": True,
+        "cancelled": [],
+        "already_absent": [],
+        "remaining_order_ids": [],
+        "errors": [],
+    }
     for order_id in unique_ids:
         try:
-            before = get_open_protection_directional(symbol, direction)
+            before = reader(symbol, direction)
         except Exception as exc:
-            return False, f"pre-cancel openOrders failed for {order_id}: {exc}"
+            result["errors"].append(f"pre-cancel openOrders failed for {order_id}: {exc}")
+            result["remaining_order_ids"].append(order_id)
+            continue
         if not isinstance(before, dict) or before.get("status") != "ok":
-            return False, f"pre-cancel openOrders unavailable for {order_id}"
-        all_orders = list(before.get("sl_orders", [])) + list(before.get("tp_orders", []))
-        matched = next((item for item in all_orders if str(item.get("orderId", "")) == order_id), None)
+            result["errors"].append(f"pre-cancel openOrders unavailable for {order_id}")
+            result["remaining_order_ids"].append(order_id)
+            continue
+        before_orders = list(before.get("sl_orders", [])) + list(before.get("tp_orders", []))
+        matched = next((item for item in before_orders if str(item.get("orderId", "")) == order_id), None)
         if matched is None:
+            result["already_absent"].append(order_id)
             continue
         if not str(matched.get("clientOrderId", "")).upper().startswith("EVT_"):
-            return False, f"refusing to cancel non-engine order {order_id}"
+            result["errors"].append(f"refusing to cancel non-engine order {order_id}")
+            result["remaining_order_ids"].append(order_id)
+            continue
+
+        if pre_cancel_guard is not None:
+            try:
+                guard_passed = bool(pre_cancel_guard())
+            except Exception as exc:
+                guard_passed = False
+                guard_error = f"position flatness guard failed for {order_id}: {exc}"
+            else:
+                guard_error = f"position is not authoritatively flat before cancelling {order_id}"
+            if not guard_passed:
+                result["errors"].append(guard_error)
+                result["remaining_order_ids"].append(order_id)
+                continue
+
+        cancel_error = None
         try:
-            cancel_order(symbol, order_id)
+            cancel_fn(symbol, order_id)
         except Exception as exc:
-            # Still verify the exchange state: a timeout can occur after the
-            # exchange accepted the cancellation.
-            log.warning("[BINGX] cancel request raised for stale protection %s: %s", order_id, exc)
+            # Cancellation may have succeeded remotely despite a transport error.
+            cancel_error = f"cancel request raised for {order_id}: {exc}"
+
         absent = False
-        last_error = "cancel not yet visible as absent"
-        for attempt in range(max(1, attempts)):
+        last_error = cancel_error or f"order {order_id} remains visible after cancellation"
+        for attempt in range(max(1, int(attempts))):
             if attempt:
                 time.sleep(0.15 * attempt)
             try:
-                after = get_open_protection_directional(symbol, direction)
+                after = reader(symbol, direction)
             except Exception as exc:
-                last_error = f"post-cancel openOrders failed: {exc}"
+                last_error = f"post-cancel openOrders failed for {order_id}: {exc}"
                 continue
             if not isinstance(after, dict) or after.get("status") != "ok":
-                last_error = "post-cancel openOrders unavailable"
+                last_error = f"post-cancel openOrders unavailable for {order_id}"
                 continue
             after_orders = list(after.get("sl_orders", [])) + list(after.get("tp_orders", []))
             if not any(str(item.get("orderId", "")) == order_id for item in after_orders):
                 absent = True
                 break
             last_error = f"order {order_id} remains visible after cancellation"
-        if not absent:
-            return False, last_error
-    return True, None
+        if absent:
+            result["cancelled"].append(order_id)
+        else:
+            result["errors"].append(last_error)
+            result["remaining_order_ids"].append(order_id)
+
+    result["verified"] = not result["remaining_order_ids"] and not result["errors"]
+    if not result["verified"]:
+        result["status"] = "partial" if result["cancelled"] or result["already_absent"] else "error"
+    return result
+
+
+def _cancel_engine_protection_orders_verified(
+    symbol: str, direction: str, order_ids: list[str], *, attempts: int = 4,
+) -> tuple[bool, str | None]:
+    """Compatibility wrapper: true only after every requested order is absent."""
+    result = _cancel_engine_protection_orders_verified_detailed(
+        symbol, direction, order_ids, attempts=attempts,
+    )
+    return bool(result["verified"]), ("; ".join(result["errors"]) if result["errors"] else None)
 
 
 def _allocate_tp_quantities(position_qty: float, precision: int, min_qty: float, fractions: list[float]) -> list[float]:
@@ -3658,6 +3764,57 @@ def _order_qty(order: dict) -> float:
         return 0.0
 
 
+def _order_lifecycle_metadata(
+    order: dict[str, Any], *, verification_observed_at_ms: int | None = None,
+) -> dict[str, Any]:
+    """Expose exchange order facts without inferring fields omitted by BingX."""
+    if not isinstance(order, dict):
+        order = {}
+
+    def optional_ms(key: str) -> int | None:
+        raw = order.get(key)
+        if raw in (None, ""):
+            return None
+        try:
+            value = int(float(raw))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return value if value > 0 else None
+
+    executed_raw = order.get("executedQty")
+    if executed_raw in (None, ""):
+        executed_raw = order.get("cumQty")
+    try:
+        executed_qty = float(executed_raw) if executed_raw not in (None, "") else None
+        if executed_qty is not None and (not math.isfinite(executed_qty) or executed_qty < 0.0):
+            executed_qty = None
+    except (TypeError, ValueError, OverflowError):
+        executed_qty = None
+
+    return {
+        "order_id": str(order.get("orderId") or order.get("orderID") or "") or None,
+        "client_order_id": str(order.get("clientOrderId") or "") or None,
+        "order_type": str(order.get("type") or "").upper() or None,
+        "exchange_order_status": str(order.get("status") or "").upper() or None,
+        "side": str(order.get("side") or "").upper() or None,
+        "position_side": str(order.get("positionSide") or "").upper() or None,
+        "working_type": str(order.get("workingType") or "").upper() or None,
+        "reduce_only": _parse_optional_exchange_bool(order.get("reduceOnly")),
+        "close_position": _parse_optional_exchange_bool(order.get("closePosition")),
+        "time_in_force": str(order.get("timeInForce") or "").upper() or None,
+        "stop_guaranteed": _parse_optional_exchange_bool(order.get("stopGuaranteed")),
+        "activation_price": _optional_exchange_float(order, "activationPrice"),
+        "price_rate": _optional_exchange_float(order, "priceRate"),
+        "trigger_price": _optional_exchange_float(order, "stopPrice"),
+        "orig_qty": _optional_exchange_float(order, "origQty"),
+        "executed_qty": executed_qty,
+        "executed_qty_known": executed_qty is not None,
+        "exchange_order_time_ms": optional_ms("time"),
+        "exchange_order_update_time_ms": optional_ms("updateTime"),
+        "verification_observed_at_ms": verification_observed_at_ms,
+    }
+
+
 def _find_open_order_by_client_id(orders: list[dict], client_order_id: str) -> dict | None:
     target = str(client_order_id or "").upper()
     if not target:
@@ -3708,7 +3865,12 @@ def _verify_open_order(
                 price_ok = _format_price(actual_price, price_precision) == _format_price(expected_price, price_precision)
                 qty_ok = _qty_matches_position(qty, expected_qty)
                 if type_ok and side_ok and position_side_ok and price_ok and qty_ok:
-                    return {"status": "verified", "order": order, "attempt": attempt + 1}
+                    return {
+                        "status": "verified",
+                        "order": order,
+                        "attempt": attempt + 1,
+                        "verification_observed_at_ms": int(time.time() * 1000),
+                    }
         if attempt + 1 < max(1, max_attempts):
             time.sleep(0.25 * (attempt + 1))
     return {"status": "not_found", "client_order_id": client_order_id}
@@ -3920,6 +4082,7 @@ def ensure_directional_protection(
             "positionSide": str(sl.get("positionSide", "")).upper(),
             "protection_order_verified": True,
             "execution_verified": None,
+            **_order_lifecycle_metadata(sl, verification_observed_at_ms=int(time.time() * 1000)),
         }
     else:
         sl_requery_required = True
@@ -3982,6 +4145,7 @@ def ensure_directional_protection(
                 "positionSide": str(order.get("positionSide", "")).upper(),
                 "protection_order_verified": True,
                 "execution_verified": None,
+                **_order_lifecycle_metadata(order, verification_observed_at_ms=verify.get("verification_observed_at_ms")),
             }
         else:
             # A successful POST response only acknowledges submission; it does not
@@ -4018,6 +4182,7 @@ def ensure_directional_protection(
                 "positionSide": str(order.get("positionSide", "")).upper(),
                 "protection_order_verified": True,
                 "execution_verified": None,
+                **_order_lifecycle_metadata(order, verification_observed_at_ms=verify.get("verification_observed_at_ms")),
             }
 
     if sl_requery_required:
@@ -4174,6 +4339,7 @@ def ensure_directional_protection(
                         "expected_tp_price": tp_price,
                         "protection_order_verified": True,
                         "execution_verified": None,
+                        **_order_lifecycle_metadata(existing_leg, verification_observed_at_ms=int(time.time() * 1000)),
                     }
                 )
                 continue
@@ -4276,6 +4442,7 @@ def ensure_directional_protection(
                 "qty": _order_qty(order), "pnl_pct": pnl_pct,
                 "protection_order_verified": True,
                 "execution_verified": None,
+                **_order_lifecycle_metadata(order, verification_observed_at_ms=verify.get("verification_observed_at_ms")),
             })
             continue
 
@@ -4302,6 +4469,7 @@ def ensure_directional_protection(
             "price": float(order.get("stopPrice", 0) or order.get("price", 0) or tp_price),
             "qty": _order_qty(order), "pnl_pct": pnl_pct,
             "expected_tp_price": tp_price, "protection_order_verified": True, "execution_verified": None,
+            **_order_lifecycle_metadata(order, verification_observed_at_ms=verify.get("verification_observed_at_ms")),
         })
 
     successful_tps = [t for t in tp_results if t.get("status") in {"created", "already_exists", "reconciled_after_post_error"}]

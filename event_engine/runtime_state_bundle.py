@@ -28,6 +28,14 @@ else:  # pragma: no cover - exercised by the subprocess CLI regression test
 
 BUNDLE_FORMAT = "zone-engine-runtime-state"
 BUNDLE_SCHEMA_VERSION = 2
+# required_files_version evolves independently from the bundle wire format so
+# old verified artifacts remain restorable when new empty journals are introduced.
+REQUIRED_FILES_VERSION = 2
+EXECUTION_TELEMETRY_FILES = (
+    "data/pre_entry_features.jsonl",
+    "data/execution_quality.jsonl",
+    "data/emergency_exits.jsonl",
+)
 MANIFEST_NAME = "runtime-state-manifest.json"
 
 # Files managed by a separate retention-artifact chain or generated locally are not
@@ -67,6 +75,9 @@ REQUIRED_FILES = (
     "data/research_outcome_state.json",
     "data/research_outcomes.jsonl",
     "data/zone_observations.jsonl",
+    # Execution telemetry is a durable part of the runtime audit state, even
+    # when a journal is empty on a clean first run.
+    *EXECUTION_TELEMETRY_FILES,
     # Retention state/manifest are persisted here; the archive payload itself is separate.
     "data/data_retention_manifest.json",
     "data/runtime_version.json",
@@ -146,6 +157,7 @@ def create_bundle(
     manifest = {
         "format": BUNDLE_FORMAT,
         "schema_version": BUNDLE_SCHEMA_VERSION,
+        "required_files_version": REQUIRED_FILES_VERSION,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "source_commit": source_commit,
         "run_id": run_id,
@@ -166,8 +178,10 @@ def create_bundle(
 
 
 
-def _validate_required_paths(paths: set[str]) -> None:
-    missing = sorted(set(REQUIRED_FILES) - paths)
+def _validate_required_paths(
+    paths: set[str], *, required_files: tuple[str, ...] = REQUIRED_FILES,
+) -> None:
+    missing = sorted(set(required_files) - paths)
     if missing:
         raise RuntimeError("Runtime-state bundle is missing required files: " + ", ".join(missing))
 
@@ -246,7 +260,16 @@ def verify_bundle(bundle_dir: Path) -> dict[str, Any]:
             raise RuntimeError(f"Invalid size/checksum for runtime-state file: {rel}")
         expected[rel] = record
 
-    _validate_required_paths(set(expected))
+    required_files_version = manifest.get("required_files_version", 1)
+    if isinstance(required_files_version, bool) or not isinstance(required_files_version, int):
+        raise RuntimeError("Runtime-state manifest has an invalid required_files_version")
+    if required_files_version not in {1, REQUIRED_FILES_VERSION}:
+        raise RuntimeError(f"Unsupported runtime-state required_files_version: {required_files_version}")
+    required_files = (
+        tuple(path for path in REQUIRED_FILES if path not in EXECUTION_TELEMETRY_FILES)
+        if required_files_version == 1 else REQUIRED_FILES
+    )
+    _validate_required_paths(set(expected), required_files=required_files)
     actual: set[str] = set()
     for path in bundle_dir.rglob("*"):
         if path.is_symlink():
@@ -292,6 +315,11 @@ def restore_bundle(*, bundle_dir: Path, data_dir: Path) -> None:
         tmp = Path(temporary)
         staged_data = tmp / "staged-data"
         shutil.copytree(bundle_dir / "data", staged_data)
+        # v5.5.19 and older bundles predate the three execution telemetry
+        # journals. Their absence is valid for a legacy manifest; materialize
+        # empty files during restore so the new runtime has a complete inventory.
+        for relative in EXECUTION_TELEMETRY_FILES:
+            (staged_data / Path(relative).relative_to("data")).touch(exist_ok=True)
         backup_data = tmp / "backup-data"
         had_data = data_dir.exists()
         moved_data = installed_data = False

@@ -1314,6 +1314,9 @@ def build_research_features(
         "shadow_directional_threshold": 0.30,
         "shadow_penetration_le_20pct": None,
         "shadow_penetration_le_50pct": None,
+        "shadow_penetration_70_100pct": None,
+        "shadow_penetration_priority": "UNKNOWN",
+        "shadow_penetration_priority_applied": False,
         "shadow_volume_ge_0_8": None,
         "shadow_volume_ge_1_2": None,
         "shadow_volume_ge_1_5": None,
@@ -1340,6 +1343,12 @@ def build_research_features(
         if penetration is not None:
             features["shadow_penetration_le_20pct"] = penetration <= 0.20
             features["shadow_penetration_le_50pct"] = penetration <= 0.50
+            deep_penetration = 0.70 <= penetration <= 1.00
+            features["shadow_penetration_70_100pct"] = deep_penetration
+            features["shadow_penetration_priority"] = "HIGH" if deep_penetration else "NORMAL"
+            # Informational research annotation only. It is never consumed by
+            # run_once execution gates, scoring, or signal ordering.
+            features["shadow_penetration_priority_applied"] = False
 
     trigger_ts_for_features = _parse_timestamp(bar.get("timestamp"))
     decision_ts_for_features = _parse_timestamp(decision_ts)
@@ -1873,6 +1882,9 @@ def _observation_from_signal(
         "directional_close_location": features.get("directional_close_location"),
         "zone_age_hours": features.get("zone_age_hours"),
         "zone_penetration_ratio": features.get("zone_penetration_ratio"),
+        "shadow_penetration_70_100pct": features.get("shadow_penetration_70_100pct"),
+        "shadow_penetration_priority": features.get("shadow_penetration_priority"),
+        "shadow_penetration_priority_applied": False,
     })
 
     shadow_snapshot = signal.get("shadow_experiments")

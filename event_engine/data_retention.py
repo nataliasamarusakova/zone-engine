@@ -308,43 +308,137 @@ def check_staged_size_guard(*, limit_bytes: int = GITHUB_SIZE_GUARD_BYTES) -> di
     return result
 
 
-def _protected_audit_refs() -> tuple[set[str], set[str]]:
-    """Return (observation_ids, generic refs) tied to trade/decision state.
+UNRESOLVED_AUDIT_REF_PROTECTION_HOURS = 2
 
-    Generic refs intentionally include scan/zone-visit identifiers because
-    zone observations store many lifecycle links on those fields rather than
-    as a top-level event_id. This prevents size-guard archival from severing
-    the research-to-trade audit chain.
+
+def _protected_audit_refs(*, now: datetime | None = None) -> tuple[set[str], set[str]]:
+    """Return audit refs for active trades and recent unresolved executions.
+
+    Closed historical events remain available in the immutable retention
+    archive; they must not pin every related telemetry row in the live JSONL
+    forever. Active local owners are protected regardless of age. Recent
+    unresolved attempts are protected for the same bounded two-hour recovery
+    window used by the orphan-entry recovery path. Rows without a parseable
+    timestamp are kept conservatively because their age cannot be proven.
     """
+    current = now or _utc_now()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    else:
+        current = current.astimezone(timezone.utc)
+    unresolved_cutoff = current - timedelta(hours=UNRESOLVED_AUDIT_REF_PROTECTION_HOURS)
+
     observation_ids: set[str] = set()
-    generic_refs: set[str] = set()
-    for name in ("trades.jsonl", "entry_decisions.jsonl"):
-        path = DATA_DIR / name
-        if not path.exists():
-            continue
-        for _, row in _iter_jsonl(path):
-            for field in ("observation_id",):
-                value = row.get(field)
-                if value not in (None, ""):
-                    observation_ids.add(str(value))
+    active_refs = _active_trade_refs()
+    generic_refs: set[str] = set(active_refs)
+
+    def row_refs(row: dict[str, Any]) -> tuple[set[str], set[str]]:
+        observations: set[str] = set()
+        refs: set[str] = set()
+        value = row.get("observation_id")
+        if value not in (None, ""):
+            observations.add(str(value))
+        for field in (
+            "event_id", "attempt_id", "decision_id", "position_id",
+            "signal_id", "scan_id", "zone_visit_id",
+        ):
+            value = row.get(field)
+            if value not in (None, ""):
+                refs.add(str(value))
+        for nested_name in ("signal_snapshot", "executed_signal", "signal"):
+            nested = row.get(nested_name)
+            if not isinstance(nested, dict):
+                continue
             for field in (
                 "event_id", "attempt_id", "decision_id", "position_id",
-                "signal_id", "scan_id", "zone_visit_id",
+                "signal_id", "scan_id", "zone_visit_id", "observation_id", "context_id",
             ):
-                value = row.get(field)
-                if value not in (None, ""):
-                    generic_refs.add(str(value))
-            for nested_name in ("signal_snapshot", "executed_signal", "signal"):
-                nested = row.get(nested_name)
-                if isinstance(nested, dict):
-                    for field in ("event_id", "attempt_id", "decision_id", "position_id", "signal_id", "scan_id", "zone_visit_id", "observation_id", "context_id"):
-                        value = nested.get(field)
+                value = nested.get(field)
+                if value in (None, ""):
+                    continue
+                if field == "observation_id":
+                    observations.add(str(value))
+                else:
+                    refs.add(str(value))
+        return observations, refs
+
+    def recent_or_unknown(row: dict[str, Any]) -> bool:
+        parsed = None
+        for field in ("decision_ts", "recorded_at", "opened_ts", "ts_ms", "ts", "timestamp"):
+            value = row.get(field)
+            if value in (None, ""):
+                continue
+            parsed = _parse_ts(value)
+            if parsed is not None:
+                break
+        return parsed is None or parsed >= unresolved_cutoff
+
+    trades_path = DATA_DIR / "trades.jsonl"
+    entry_decisions_path = DATA_DIR / "entry_decisions.jsonl"
+    closed_refs: set[str] = set()
+
+    # First pass only collects terminal identity refs. Do not materialize these
+    # append-only journals in memory: they are not size-guard candidates and may
+    # grow for the lifetime of the engine.
+    if trades_path.exists():
+        with research._FileLock(trades_path):
+            for _, row in _iter_jsonl(trades_path):
+                record_type = str(row.get("record_type", "")).upper()
+                status = str(row.get("status", "")).lower()
+                result = row.get("result") if isinstance(row.get("result"), dict) else {}
+                result_status = str(result.get("status", "")).lower()
+                verified_rollback = record_type == "TRADE_ROLLBACK" and status == "opened_then_emergency_closed"
+                verified_emergency_entry = result_status == "opened_then_emergency_closed"
+                if record_type == "TRADE_CLOSE" or verified_rollback or verified_emergency_entry:
+                    for field in ("event_id", "attempt_id", "position_id"):
+                        value = row.get(field)
                         if value not in (None, ""):
-                            value_s = str(value)
-                            if field == "observation_id":
-                                observation_ids.add(value_s)
-                            else:
-                                generic_refs.add(value_s)
+                            closed_refs.add(str(value))
+
+    def add_row_refs(row: dict[str, Any]) -> None:
+        observations, refs = row_refs(row)
+        observation_ids.update(observations)
+        generic_refs.update(refs)
+
+    def identity_refs(row: dict[str, Any]) -> set[str]:
+        return {
+            str(row.get(field)) for field in ("event_id", "attempt_id", "position_id")
+            if row.get(field) not in (None, "")
+        }
+
+    if trades_path.exists():
+        with research._FileLock(trades_path):
+            for _, row in _iter_jsonl(trades_path):
+                row_identity_refs = identity_refs(row)
+                active_related = bool(row_identity_refs & active_refs)
+                record_type = str(row.get("record_type", "")).upper()
+                status = str(row.get("status", "")).lower()
+                result = row.get("result") if isinstance(row.get("result"), dict) else {}
+                result_status = str(result.get("status", "")).lower()
+                unresolved_trade = (
+                    record_type == "TRADE_OPEN" and not (row_identity_refs & closed_refs)
+                ) or (
+                    record_type == "TRADE_ROLLBACK"
+                    and status != "opened_then_emergency_closed"
+                ) or result_status in {
+                    "opened_emergency_close_unverified",
+                    "opened_registration_failed_close_unverified",
+                    "entry_state_unverified",
+                    "entry_state_unverified_protected",
+                }
+                if active_related or (unresolved_trade and recent_or_unknown(row) and not (row_identity_refs & closed_refs)):
+                    add_row_refs(row)
+
+    if entry_decisions_path.exists():
+        with research._FileLock(entry_decisions_path):
+            for _, row in _iter_jsonl(entry_decisions_path):
+                row_identity_refs = identity_refs(row)
+                active_related = bool(row_identity_refs & active_refs)
+                resolved_by_trade = bool(row_identity_refs & closed_refs)
+                unresolved_recent = row.get("terminal") is not True and recent_or_unknown(row)
+                if active_related or (unresolved_recent and not resolved_by_trade):
+                    add_row_refs(row)
+
     return observation_ids, generic_refs
 
 
@@ -479,6 +573,39 @@ def _size_guard_plan(path: Path, *, now: datetime, pending_ids: set[str], pendin
             captured = _parse_ts(row.get("captured_at_ms") or row.get("captured_at") or row.get("recorded_at"))
             return captured is None or captured >= now - timedelta(hours=h)
         return [(f"keep_recent_market_context_{h}h_with_link_protection", lambda row, h=h: keep_context(row, h)) for h in hours]
+    if name in {
+        "pre_entry_features.jsonl",
+        "execution_quality.jsonl",
+        "emergency_exits.jsonl",
+    }:
+        # These append-only telemetry journals are part of the durable runtime
+        # state bundle. Keep a recent working window, but archive older rows
+        # through the same immutable pre-compaction snapshot and per-policy
+        # pruned-delta path used by the research journals. A row is never pruned
+        # merely because its timestamp or lifecycle links are missing/unknown.
+        hours = [2160, 720, 336, 168, 72, 24]
+
+        def keep_execution_telemetry(row: dict[str, Any], h: int) -> bool:
+            refs = _zone_observation_refs(row)
+            if refs & protected_refs or refs & protected_observation_ids:
+                return True
+            observation_id = str(row.get("observation_id") or "")
+            if observation_id and observation_id in pending_ids:
+                return True
+            raw_ts = next(
+                (row.get(field) for field in ("ts_ms", "ts", "timestamp") if row.get(field) not in (None, "")),
+                None,
+            )
+            ts = _parse_ts(raw_ts)
+            return ts is None or ts >= now - timedelta(hours=h)
+
+        return [
+            (
+                f"keep_recent_execution_telemetry_{h}h_with_link_protection",
+                lambda row, h=h: keep_execution_telemetry(row, h),
+            )
+            for h in hours
+        ]
     if name == "position_reconciliation.jsonl":
         # Size-based escalation for reconciliation is handled later by retaining
         # terminal/anomaly rows and the last healthy FOUND snapshot. The generic
@@ -684,7 +811,7 @@ def apply_size_guard(*, now: datetime | None = None, archive_root: Path | None =
     pending_bar_cutoffs = _pending_bar_cutoffs(
         five_m_cutoff=now - timedelta(hours=36), pending=pending,
     )
-    protected_observation_ids, protected_refs = _protected_audit_refs()
+    protected_observation_ids, protected_refs = _protected_audit_refs(now=now)
     candidates = [
         DATA_DIR / "market_bars_5m.jsonl",
         DATA_DIR / "market_bars_1h.jsonl",
@@ -693,6 +820,9 @@ def apply_size_guard(*, now: datetime | None = None, archive_root: Path | None =
         DATA_DIR / "counterfactual_experiments.jsonl",
         DATA_DIR / "position_reconciliation.jsonl",
         DATA_DIR / "market_context.jsonl",
+        DATA_DIR / "pre_entry_features.jsonl",
+        DATA_DIR / "execution_quality.jsonl",
+        DATA_DIR / "emergency_exits.jsonl",
     ]
     results = {"schema_version": 1, "mode": "size_guard", "started_at": now.isoformat(), "files": {}}
     manifest_path = DATA_DIR / "data_retention_manifest.json"
@@ -1295,6 +1425,9 @@ _SIZE_GUARD_RESTORE_ALLOWLIST = {
     "counterfactual_experiments.jsonl",
     "position_reconciliation.jsonl",
     "market_context.jsonl",
+    "pre_entry_features.jsonl",
+    "execution_quality.jsonl",
+    "emergency_exits.jsonl",
 }
 
 

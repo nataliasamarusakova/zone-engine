@@ -43,6 +43,8 @@ from event_engine.bingx import (
     _client_order_id_matches_base,
     _add_reduce_only_for_one_way,
     _cancel_engine_protection_orders_verified,
+    _cancel_engine_protection_orders_verified_detailed,
+    _order_lifecycle_metadata,
     thread_local_retry_session,
 )
 from event_engine.telegram import send as send_tg
@@ -1460,35 +1462,231 @@ def _notify_be_failure(symbol: str, direction: str, detail: str, *, event_id: st
     _send_tracker_notification("BE_FAILURE", event_id, text, symbol=symbol)
 
 
-def _cancel_engine_protection_before_emergency_close(symbol: str, direction: str) -> dict:
-    """Cancel engine-owned SL/TP orders before a MARKET safety rollback."""
-    result = {"status": "ok", "cancelled": [], "errors": []}
+def _cancel_engine_protection_before_emergency_close(
+    symbol: str, direction: str, known_order_ids: set[str] | None = None,
+    *, require_flat: bool = True,
+) -> dict:
+    """Cancel engine-owned SL/TP and verify exchange-side absence."""
     try:
         existing = get_open_protection_directional(symbol, direction)
     except Exception as exc:
-        return {"status": "error", "cancelled": [], "errors": [str(exc)]}
-    if existing.get("status") != "ok":
-        return {"status": "error", "cancelled": [], "errors": [existing.get("error", "openOrders unavailable")]}
+        return {
+            "status": "error", "verified": False, "cancelled": [],
+            "already_absent": [], "remaining_order_ids": [], "errors": [str(exc)],
+        }
+    if not isinstance(existing, dict) or existing.get("status") != "ok":
+        error = existing.get("error", "openOrders unavailable") if isinstance(existing, dict) else "invalid openOrders response"
+        return {
+            "status": "error", "verified": False, "cancelled": [],
+            "already_absent": [], "remaining_order_ids": [], "errors": [error],
+        }
+
+    allowed = {str(value) for value in known_order_ids} if known_order_ids is not None else None
+    order_ids = []
     for order in list(existing.get("sl_orders", [])) + list(existing.get("tp_orders", [])):
         oid = str(order.get("orderId", ""))
         cid = str(order.get("clientOrderId", "")).upper()
-        if not oid or not cid.startswith("EVT_"):
+        if oid and cid.startswith("EVT_") and (allowed is None or oid in allowed):
+            order_ids.append(oid)
+
+    def position_is_authoritatively_flat() -> bool:
+        if not require_flat:
+            return True
+        current = get_position_directional(symbol, direction)
+        return isinstance(current, dict) and current.get("status") == "not_found"
+
+    return _cancel_engine_protection_orders_verified_detailed(
+        symbol,
+        direction,
+        order_ids,
+        attempts=max(1, int(os.environ.get("EMERGENCY_PROTECTION_CANCEL_VERIFY_ATTEMPTS", "4"))),
+        read_open_orders=get_open_protection_directional,
+        cancel=cancel_order,
+        pre_cancel_guard=position_is_authoritatively_flat,
+    )
+
+
+def reconcile_pending_emergency_protection_cleanup(
+    *, max_events: int | None = None, now_ms: int | None = None,
+    active_trades: dict[str, Any] | None = None,
+) -> dict[str, int]:
+    """Retry residual engine protection cleanup from the durable emergency journal.
+
+    This runs independently of active_trades.json so orphan/rollback events are
+    still recovered after restart, including when the local trade was already
+    marked closed or no local trade owner exists. A fresh authoritative position
+    read is required before cleanup, and the shared cancel helper rechecks
+    flatness immediately before each cancellation to avoid removing protection
+    from a newly reopened position.
+    """
+    summary = {
+        "pending": 0, "attempted": 0, "verified": 0,
+        "deferred_position_open": 0, "deferred_position_unknown": 0,
+        "deferred_active_trade_owner": 0, "rate_limited": 0, "errors": 0,
+    }
+    path = telemetry.EMERGENCY_EXITS_PATH
+    if not isinstance(path, Path):
+        path = Path(path)
+    if not path.exists():
+        return summary
+
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            raw_lines = list(fh)
+    except OSError as exc:
+        log.error("[EMERGENCY_CLEANUP_RECOVERY] cannot read %s: %s", path, exc)
+        summary["errors"] += 1
+        return summary
+
+    states: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for line_number, line in enumerate(raw_lines, 1):
+        if not line.strip():
             continue
         try:
-            resp = cancel_order(symbol, oid)
-        except Exception as exc:
-            result["errors"].append(f"{oid}: {exc}")
+            record = json.loads(line)
+        except (TypeError, ValueError):
+            log.warning("[EMERGENCY_CLEANUP_RECOVERY] ignoring malformed journal row %s:%d", path.name, line_number)
             continue
-        if isinstance(resp, dict) and resp.get("code") in (0, "0"):
-            result["cancelled"].append(oid)
+        if not isinstance(record, dict):
+            continue
+        record_type = str(record.get("record_type") or "").upper()
+        event_id = str(record.get("event_id") or record.get("position_id") or "").strip()
+        symbol = str(record.get("symbol") or "").strip().upper()
+        direction = str(record.get("direction") or "").strip().upper()
+        if not event_id or not symbol or direction not in {"LONG", "SHORT"}:
+            continue
+        key = (event_id, symbol, direction)
+        if record_type == "EMERGENCY_EXIT":
+            close_status = str(record.get("status") or "").lower()
+            verified_flat = record.get("verified_flat") is True or close_status in {"closed_verified", "already_closed"}
+            if not verified_flat:
+                # A newer unverified close attempt supersedes an earlier success
+                # for this key until flatness is proven again.
+                states[key] = {"close": record, "latest_cleanup": None, "verified_flat": False}
+                continue
+            states[key] = {"close": record, "latest_cleanup": None, "verified_flat": True}
+        elif record_type == "EMERGENCY_PROTECTION_CLEANUP" and key in states:
+            states[key]["latest_cleanup"] = record
+
+    pending: list[tuple[tuple[str, str, str], dict[str, Any]]] = []
+    for key, state in states.items():
+        if not state.get("verified_flat"):
+            continue
+        close_record = state.get("close") if isinstance(state.get("close"), dict) else {}
+        embedded = close_record.get("cleanup_after_flat_verified") if isinstance(close_record.get("cleanup_after_flat_verified"), dict) else {}
+        latest_cleanup = state.get("latest_cleanup") if isinstance(state.get("latest_cleanup"), dict) else {}
+        resolved_embedded = embedded.get("status") == "ok" and embedded.get("verified") is True
+        resolved_journal = latest_cleanup.get("status") == "ok" and latest_cleanup.get("verified") is True
+        if resolved_embedded or resolved_journal:
+            continue
+        pending.append((key, state))
+
+    summary["pending"] = len(pending)
+    try:
+        limit = max(1, int(max_events if max_events is not None else os.environ.get("EMERGENCY_CLEANUP_RECOVERY_MAX_PER_RUN", "5")))
+    except (TypeError, ValueError):
+        limit = 5
+    try:
+        min_interval_ms = max(0, int(float(os.environ.get("EMERGENCY_CLEANUP_RETRY_INTERVAL_SEC", "30")) * 1000))
+    except (TypeError, ValueError):
+        min_interval_ms = 30_000
+    timestamp_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+
+    processed_candidates = 0
+    for key, state in pending:
+        if processed_candidates >= limit:
+            break
+        processed_candidates += 1
+        event_id, symbol, direction = key
+        symbol_key = _position_snapshot_symbol_key(symbol).replace("_", "")
+        if isinstance(active_trades, dict) and any(
+            isinstance(trade, dict)
+            and not trade.get("closed", False)
+            and _position_snapshot_symbol_key(trade.get("symbol")).replace("_", "") == symbol_key
+            and str(trade.get("direction") or "").strip().upper() == direction
+            for trade in active_trades.values()
+        ):
+            summary["deferred_active_trade_owner"] += 1
+            continue
+        close_record = state["close"]
+        latest_cleanup = state.get("latest_cleanup") if isinstance(state.get("latest_cleanup"), dict) else {}
+        latest_cleanup_result = latest_cleanup.get("cleanup_result") if isinstance(latest_cleanup.get("cleanup_result"), dict) else latest_cleanup
+        latest_cleanup_ts = int(_safe_float(latest_cleanup.get("ts_ms"), 0.0))
+        if latest_cleanup_ts and timestamp_ms - latest_cleanup_ts < min_interval_ms:
+            summary["rate_limited"] += 1
+            continue
+
+        try:
+            position_check = get_position_directional(symbol, direction)
+        except Exception as exc:
+            position_check = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+        if not isinstance(position_check, dict) or position_check.get("status") != "not_found":
+            if isinstance(position_check, dict) and position_check.get("status") == "found":
+                summary["deferred_position_open"] += 1
+                log.warning(
+                    "[EMERGENCY_CLEANUP_RECOVERY_DEFERRED] event=%s %s %s: position is open; preserving its protection",
+                    event_id, symbol, direction,
+                )
+            else:
+                summary["deferred_position_unknown"] += 1
+                log.warning(
+                    "[EMERGENCY_CLEANUP_RECOVERY_DEFERRED] event=%s %s %s: position state is unknown (%s)",
+                    event_id, symbol, direction,
+                    position_check.get("error") if isinstance(position_check, dict) else "invalid response",
+                )
+            continue
+
+        previous_cleanup = latest_cleanup_result if isinstance(latest_cleanup_result, dict) else {}
+        if not previous_cleanup:
+            previous_cleanup = close_record.get("cleanup_after_flat_verified") if isinstance(close_record.get("cleanup_after_flat_verified"), dict) else {}
+        remaining_ids = previous_cleanup.get("remaining_order_ids") if isinstance(previous_cleanup, dict) else None
+        known_order_ids = {str(value) for value in remaining_ids if str(value)} if isinstance(remaining_ids, list) else set()
+        try:
+            cleanup_result = _cancel_engine_protection_before_emergency_close(
+                symbol, direction,
+                known_order_ids=known_order_ids or None,
+                require_flat=True,
+            )
+        except Exception as exc:
+            cleanup_result = {
+                "status": "error", "verified": False, "cancelled": [],
+                "already_absent": [], "remaining_order_ids": sorted(known_order_ids),
+                "errors": [f"{type(exc).__name__}: {exc}"],
+            }
+        retry_number = int(_safe_float(latest_cleanup.get("retry_number"), 0.0)) + 1
+        try:
+            telemetry.record_emergency_protection_cleanup(
+                event_id=event_id,
+                attempt_id=close_record.get("attempt_id"),
+                position_id=close_record.get("position_id") or event_id,
+                symbol=symbol,
+                direction=direction,
+                source="POST_RESTART_RECOVERY",
+                close_event_ts_ms=int(_safe_float(close_record.get("ts_ms"), 0.0)) or None,
+                retry_number=retry_number,
+                position_check=position_check,
+                result=cleanup_result,
+            )
+        except Exception as exc:
+            log.error("[EMERGENCY_CLEANUP_RECOVERY_JOURNAL_FAILED] event=%s error=%s", event_id, exc)
+            summary["errors"] += 1
+            continue
+
+        summary["attempted"] += 1
+        if cleanup_result.get("status") == "ok" and cleanup_result.get("verified") is True:
+            summary["verified"] += 1
+            log.info("[EMERGENCY_CLEANUP_RECOVERY_VERIFIED] event=%s %s %s cancelled=%s already_absent=%s", event_id, symbol, direction, cleanup_result.get("cancelled", []), cleanup_result.get("already_absent", []))
         else:
-            result["errors"].append(f"{oid}: {resp}")
-    if result["errors"]:
-        result["status"] = "partial" if result["cancelled"] else "error"
-    return result
+            summary["errors"] += 1
+            log.error("[EMERGENCY_CLEANUP_RECOVERY_PENDING] event=%s %s %s cleanup=%s", event_id, symbol, direction, cleanup_result)
+
+    return summary
 
 
-def _emergency_close_after_be_failure(symbol: str, direction: str, qty: float, trade_id: str | None) -> dict:
+def _emergency_close_after_be_failure(
+    symbol: str, direction: str, qty: float, trade_id: str | None, *,
+    event_id: str | None = None, attempt_id: str | None = None,
+) -> dict:
     """Close and verify a position after BE protection cannot be proven.
 
     The MARKET close POST is never blindly retried. After an accepted POST we
@@ -1499,6 +1697,22 @@ def _emergency_close_after_be_failure(symbol: str, direction: str, qty: float, t
     attempts: list[dict] = []
     polls = max(4, int(os.environ.get("BE_FAILURE_CLOSE_POLLS", "12")))
     poll_delay = max(0.15, float(os.environ.get("BE_FAILURE_CLOSE_POLL_SEC", "0.5")))
+
+    def _finish(payload: dict) -> dict:
+        try:
+            telemetry.record_emergency_exit(
+                event_id=event_id or trade_id or None,
+                attempt_id=attempt_id,
+                position_id=event_id or trade_id or None,
+                symbol=symbol,
+                direction=direction,
+                reason="BE_PROTECTION_FAILURE_OLD_SL_UNVERIFIED",
+                requested_qty=qty,
+                result=payload,
+            )
+        except Exception as telemetry_exc:
+            log.warning("[TRACKER_BE_EMERGENCY_TELEMETRY] %s %s journal failed: %s", symbol, direction, telemetry_exc)
+        return payload
 
     def _extract_directional_from_positions(rows: list[dict]) -> dict:
         wanted = str(direction).upper()
@@ -1591,19 +1805,19 @@ def _emergency_close_after_be_failure(symbol: str, direction: str, qty: float, t
 
     initial = _authoritative_position_read()
     if initial.get("status") == "not_found":
-        return _finalize_verified_flat({"status": "already_closed", "attempts": attempts, "remaining_qty": 0.0, "last_known_qty": 0.0})
+        return _finish(_finalize_verified_flat({"status": "already_closed", "attempts": attempts, "remaining_qty": 0.0, "last_known_qty": 0.0}))
     if initial.get("status") != "found":
-        return {
+        return _finish({
             "status": "close_unverified",
             "error": initial.get("error", "position state unavailable"),
             "attempts": attempts,
             "remaining_qty": None,
             "last_known_qty": max(0.0, float(qty or 0.0)),
-        }
+        })
 
     current_qty = abs(_safe_float(initial.get("positionAmt"), qty))
     if current_qty <= 0:
-        return _finalize_verified_flat({"status": "already_closed", "attempts": attempts, "remaining_qty": 0.0, "last_known_qty": 0.0})
+        return _finish(_finalize_verified_flat({"status": "already_closed", "attempts": attempts, "remaining_qty": 0.0, "last_known_qty": 0.0}))
 
     # Keep the verified old SL/TP active while the emergency MARKET close is
     # in flight. Cancelling first creates an avoidable naked-position window if
@@ -1637,7 +1851,7 @@ def _emergency_close_after_be_failure(symbol: str, direction: str, qty: float, t
         verification = _authoritative_position_read()
         last_verification = verification
         if verification.get("status") == "not_found":
-            return _finalize_verified_flat({
+            return _finish(_finalize_verified_flat({
                 "status": "closed_verified",
                 "attempts": attempts,
                 "verification": verification,
@@ -1645,12 +1859,12 @@ def _emergency_close_after_be_failure(symbol: str, direction: str, qty: float, t
                 "remaining_qty": 0.0,
                 "last_known_qty": 0.0,
                 "order_filled": order_filled,
-            })
+            }))
         if verification.get("status") == "found":
             remaining = abs(_safe_float(verification.get("positionAmt"), last_known_qty))
             last_known_qty = remaining
             if remaining <= 1e-12 and (order_filled or accepted_order_id):
-                return _finalize_verified_flat({
+                return _finish(_finalize_verified_flat({
                     "status": "closed_verified",
                     "attempts": attempts,
                     "verification": verification,
@@ -1658,31 +1872,31 @@ def _emergency_close_after_be_failure(symbol: str, direction: str, qty: float, t
                     "remaining_qty": 0.0,
                     "last_known_qty": 0.0,
                     "order_filled": order_filled,
-                })
+                }))
         time.sleep(poll_delay)
 
     final_verification = _authoritative_position_read()
     if final_verification.get("status") == "not_found":
-        return _finalize_verified_flat({
+        return _finish(_finalize_verified_flat({
             "status": "closed_verified",
             "attempts": attempts,
             "verification": final_verification,
             "remaining_qty": 0.0,
             "last_known_qty": 0.0,
             "order_filled": order_filled,
-        })
+        }))
     if final_verification.get("status") == "found":
         confirmed_qty = abs(_safe_float(final_verification.get("positionAmt"), last_known_qty))
-        return {
+        return _finish({
             "status": "close_unverified",
             "attempts": attempts,
             "verification": final_verification,
             "remaining_qty": confirmed_qty,
             "last_known_qty": confirmed_qty,
             "order_filled": order_filled,
-        }
+        })
 
-    return {
+    return _finish({
         "status": "close_unverified",
         "attempts": attempts,
         "verification": final_verification or last_verification,
@@ -1690,7 +1904,7 @@ def _emergency_close_after_be_failure(symbol: str, direction: str, qty: float, t
         "remaining_qty": None,
         "last_known_qty": last_known_qty,
         "order_filled": order_filled,
-    }
+    })
 
 def _is_break_even_stop_shape_valid(
     order: dict,
@@ -1837,6 +2051,7 @@ def _cancel_conflicted_be_if_old_sl_verified(
 def _move_sl_to_break_even(
     symbol: str, direction: str, entry_price: float, qty: float, old_sl_id: str | None, trade_id: str | None = None,
     old_sl_price: float | None = None, owner_event_id: str | None = None,
+    attempt_id: str | None = None,
 ) -> dict:
     """Move the stop-loss to break-even without leaving an unprotected window.
 
@@ -1992,6 +2207,7 @@ def _move_sl_to_break_even(
                             "stop_price": entry_price,
                             "old_sl_cleanup_pending": True,
                             "old_sl_cleanup_pending_order_id": str(stale_be_id),
+                            **_order_lifecycle_metadata(order, verification_observed_at_ms=int(time.time() * 1000)),
                         }
                 old_cancelled = True
                 cancel_note = ""
@@ -2011,12 +2227,14 @@ def _move_sl_to_break_even(
                         "stop_price": entry_price,
                         "old_sl_cleanup_pending": True,
                         "old_sl_cleanup_pending_order_id": str(old_sl_id),
+                        **_order_lifecycle_metadata(order, verification_observed_at_ms=int(time.time() * 1000)),
                     }
                 return {
                     "status": "created",
                     "order_id": existing_id,
                     "client_order_id": cid or be_client_id,
                     "stop_price": entry_price,
+                    **_order_lifecycle_metadata(order, verification_observed_at_ms=int(time.time() * 1000)),
                 }
 
     def _restore_old_sl() -> bool:
@@ -2112,7 +2330,10 @@ def _move_sl_to_break_even(
 
         # At this point the original SL is not proven to exist. The position is
         # therefore not allowed to remain live in an unverified protection state.
-        rollback = _emergency_close_after_be_failure(symbol, direction, qty, trade_token)
+        rollback = _emergency_close_after_be_failure(
+            symbol, direction, qty, trade_token,
+            event_id=owner_event_id, attempt_id=attempt_id,
+        )
         _notify_be_failure(symbol, direction, f"{error}; restore=failed; rollback={rollback.get('status')}", event_id=trade_id or "", rollback=rollback)
         return {
             "status": "error",
@@ -2156,6 +2377,7 @@ def _move_sl_to_break_even(
     # BingX may acknowledge the order before it appears in open-orders. Poll
     # GET/openOrders rather than treating the first read as a definitive failure.
     found = False
+    verified_be_order: dict[str, Any] | None = None
     polls = max(3, int(os.environ.get("BE_VERIFY_POLLS", "5")))
     delay = max(0.10, float(os.environ.get("BE_VERIFY_POLL_SEC", "0.30")))
     for attempt in range(polls):
@@ -2164,15 +2386,16 @@ def _move_sl_to_break_even(
         except Exception as exc:
             verified_after = {"status": "error", "error": str(exc)}
         if verified_after.get("status") == "ok":
-            if any(
-                str(o.get("orderId", "")) == new_order_id
+            verified_be_order = next((
+                candidate for candidate in verified_after.get("sl_orders", [])
+                if str(candidate.get("orderId", "")) == new_order_id
                 and _is_valid_break_even_stop(
-                    o, direction, entry_price, qty, price_precision,
+                    candidate, direction, entry_price, qty, price_precision,
                     expected_client_order_id=be_client_id,
                 )
-                and str(o.get("clientOrderId") or be_client_id).upper() == be_client_id.upper()
-                for o in verified_after.get("sl_orders", [])
-            ):
+                and str(candidate.get("clientOrderId") or be_client_id).upper() == be_client_id.upper()
+            ), None)
+            if verified_be_order is not None:
                 found = True
                 break
         if attempt + 1 < polls:
@@ -2241,11 +2464,15 @@ def _move_sl_to_break_even(
             old_cleanup_error = f"old SL cleanup failed: {cancel_note}"
             log.error("[TRACKER] %s %s: BE verified but old SL cleanup failed: %s", direction, symbol, cancel_note)
 
+    lifecycle_order = dict(order) if isinstance(order, dict) else {}
+    if isinstance(verified_be_order, dict):
+        lifecycle_order.update({key: value for key, value in verified_be_order.items() if value not in (None, "")})
     result = {
         "status": "created" if old_cleanup_error is None else "created_cleanup_pending",
         "order_id": new_order_id,
         "client_order_id": order.get("clientOrderId") or be_client_id,
         "stop_price": entry_price,
+        **_order_lifecycle_metadata(lifecycle_order, verification_observed_at_ms=int(time.time() * 1000)),
     }
     if old_cleanup_error:
         result["error"] = old_cleanup_error
@@ -2556,6 +2783,120 @@ def _get_order_execution_evidence(
     info["fill_realized_pnl_status"] = "UNAVAILABLE"
     info["fill_fee_status"] = "UNAVAILABLE"
     return info if info.get("status") == "ok" else None
+
+
+def _enrich_tp_fill_event_from_exchange_history(
+    symbol: str, event: dict[str, Any], *, entry_ts_ms: int,
+    previous_qty: float, executed_qty: float, delta_qty: float, now_ms: int,
+) -> dict[str, Any]:
+    """Best-effort attach exact per-fill timestamps to an already-accounted TP delta.
+
+    This runs only after TP handling/BE protection actions have completed. Fill-history
+    availability never changes execution quantity, average price, TP classification, or
+    the protection decision. An aggregate order update is retained as an explicitly
+    labelled fallback when the exchange fill ledger cannot prove the exact delta.
+    """
+    order_id = str(event.get("resolved_order_id") or event.get("order_id") or "").strip()
+    fallback_time = _optional_float(event.get("order_update_time_ms"))
+    if fallback_time is None:
+        fallback_time = _optional_float(event.get("order_time_ms"))
+    # A candidate timestamp derived from the whole order ledger must never survive
+    # when the exact newly-accounted delta cannot be isolated below.
+    event["fill_time_ms"] = None
+    event["fill_time_start_ms"] = None
+    event["fill_time_source"] = (
+        "ORDER_UPDATE_TIME_FALLBACK" if fallback_time is not None else "UNAVAILABLE"
+    )
+    event["fill_timestamp_status"] = (
+        "FALLBACK_ONLY" if fallback_time is not None else "UNAVAILABLE"
+    )
+    event["fill_history_qty_total"] = None
+    event["fill_history_delta_qty"] = None
+    event["fill_trade_ids"] = []
+    event["fill_trade_ids_complete"] = False
+
+    if not order_id:
+        event["fill_timestamp_status"] = "UNAVAILABLE_ORDER_ID"
+        return event
+
+    fills = event.get("_fill_history")
+    if not isinstance(fills, list) or not fills:
+        start_ms = max(0, int(entry_ts_ms or now_ms) - 60_000)
+        end_ms = max(start_ms, int(now_ms) + 60_000)
+        try:
+            fills = get_fill_orders(
+                symbol, start_ms, end_ms, order_id=order_id, limit=1000,
+                timeout_sec=1.0,
+            )
+        except Exception as exc:
+            event["fill_timestamp_status"] = "FILL_HISTORY_QUERY_FAILED"
+            event["fill_history_error_type"] = type(exc).__name__
+            return event
+
+    exact_rows: list[dict[str, Any]] = []
+    for row in fills if isinstance(fills, list) else []:
+        if not isinstance(row, dict) or str(row.get("order_id", "")).strip() != order_id:
+            continue
+        qty_value = _optional_float(row.get("qty"))
+        price_value = _optional_float(row.get("price"))
+        time_value = _optional_float(row.get("time_ms"))
+        if qty_value is None or qty_value <= 0 or price_value is None or price_value <= 0:
+            event["fill_timestamp_status"] = "FILL_HISTORY_INCOMPLETE_ROW"
+            return event
+        exact_rows.append({
+            "qty": float(qty_value),
+            "price": float(price_value),
+            "time_ms": int(time_value) if time_value is not None and time_value > 0 else None,
+            "trade_id": str(row.get("trade_id")) if row.get("trade_id") not in (None, "") else None,
+        })
+
+    if not exact_rows:
+        event["fill_timestamp_status"] = "FILL_HISTORY_EMPTY"
+        return event
+
+    exact_rows.sort(key=lambda row: (row["time_ms"] is None, row["time_ms"] or 0, row["trade_id"] or ""))
+    ledger_qty = sum(row["qty"] for row in exact_rows)
+    tolerance = max(1e-12, abs(float(executed_qty or 0.0)) * 1e-8)
+    event["fill_history_qty_total"] = ledger_qty
+    if abs(ledger_qty - float(executed_qty or 0.0)) > tolerance:
+        event["fill_timestamp_status"] = "FILL_HISTORY_CUMULATIVE_QTY_MISMATCH"
+        return event
+
+    previous = max(0.0, float(previous_qty or 0.0))
+    target_end = max(previous, float(executed_qty or 0.0))
+    cursor = 0.0
+    selected: list[dict[str, Any]] = []
+    for row in exact_rows:
+        row_start = cursor
+        row_end = cursor + row["qty"]
+        cursor = row_end
+        if row_end <= previous + tolerance:
+            continue
+        if row_start < previous - tolerance or row_end > target_end + tolerance:
+            event["fill_timestamp_status"] = "FILL_DELTA_BOUNDARY_AMBIGUOUS"
+            return event
+        selected.append(row)
+
+    selected_qty = sum(row["qty"] for row in selected)
+    if not selected or abs(selected_qty - float(delta_qty or 0.0)) > tolerance:
+        event["fill_timestamp_status"] = "FILL_HISTORY_DELTA_QTY_MISMATCH"
+        event["fill_history_delta_qty"] = selected_qty
+        return event
+    if any(row["time_ms"] is None for row in selected):
+        event["fill_timestamp_status"] = "FILL_TIMESTAMP_MISSING_IN_LEDGER"
+        return event
+
+    times = [int(row["time_ms"]) for row in selected]
+    trade_ids = [row["trade_id"] for row in selected if row.get("trade_id")]
+    event["fill_time_ms"] = max(times)
+    event["fill_time_start_ms"] = min(times)
+    event["fill_time_source"] = "EXCHANGE_FILL_HISTORY"
+    event["fill_timestamp_status"] = "EXACT_FILL_TIMESTAMP_CONFIRMED"
+    event["fill_history_delta_qty"] = selected_qty
+    event["fill_trade_ids"] = trade_ids
+    event["fill_trade_ids_complete"] = len(trade_ids) == len(selected)
+    event["fill_history_row_count"] = len(selected)
+    return event
 
 
 def _collect_trade_fill_accounting(trade: dict, now_ms: int) -> dict[str, Any]:
@@ -3258,7 +3599,12 @@ def _close_execution_evidence(trade: dict, fill_accounting: dict[str, Any]) -> d
                 or (event_client_key and event_client_key in represented_client_ids)):
             continue
         qty = _optional_float(event.get("executed_qty_total")) or _optional_float(event.get("delta_qty"))
-        px = _optional_float(event.get("avg_price"))
+        # New tracker events distinguish the incremental fill price used for
+        # realized-PnL deltas from the cumulative order VWAP used with the
+        # cumulative executed quantity during whole-trade close reconciliation.
+        # Legacy events only have avg_price, which historically represented the
+        # cumulative order average.
+        px = _optional_float(event.get("cumulative_avg_price")) or _optional_float(event.get("avg_price"))
         # An orderless event cannot be deduplicated against exchange execution
         # evidence, so do not use it for cross-leg quantity reconciliation.
         if qty is None or px is None or qty <= 0 or px <= 0:
@@ -3550,6 +3896,126 @@ def _reconciliation_status(local_qty: float, exchange_qty: float, base_status: s
     return "FOUND" if math.isclose(local, exchange, rel_tol=rel_tol, abs_tol=abs_tol) else "FOUND_QTY_MISMATCH"
 
 
+def _incremental_tp_fill_average_price(
+    *,
+    cumulative_qty: float,
+    cumulative_avg_price: float,
+    previous_accounted_qty: float,
+    previous_accounted_notional: float | None,
+) -> float | None:
+    """Derive the average price of only the newly observed cumulative fill delta.
+
+    Exchange ``avgPrice`` is cumulative for an order. Applying it directly to a
+    later quantity delta misstates realized PnL whenever fills occur at different
+    prices. The incremental notional is therefore cumulative notional less the
+    notional already booked for the order. Unknown prior notional fails closed.
+    """
+    try:
+        cumulative_qty = float(cumulative_qty)
+        cumulative_avg_price = float(cumulative_avg_price)
+        previous_accounted_qty = float(previous_accounted_qty)
+        if previous_accounted_notional is None:
+            return None
+        previous_accounted_notional = float(previous_accounted_notional)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    values = (cumulative_qty, cumulative_avg_price, previous_accounted_qty, previous_accounted_notional)
+    if not all(math.isfinite(value) for value in values):
+        return None
+    if cumulative_qty <= 0 or cumulative_avg_price <= 0 or previous_accounted_qty < 0 or previous_accounted_notional < 0:
+        return None
+    tolerance = max(1e-12, abs(cumulative_qty) * 1e-9)
+    delta_qty = cumulative_qty - previous_accounted_qty
+    if delta_qty <= tolerance:
+        return None
+    incremental_notional = cumulative_qty * cumulative_avg_price - previous_accounted_notional
+    if not math.isfinite(incremental_notional) or incremental_notional <= 0:
+        return None
+    incremental_avg_price = incremental_notional / delta_qty
+    if not math.isfinite(incremental_avg_price) or incremental_avg_price <= 0:
+        return None
+    return incremental_avg_price
+
+
+def _update_tp_reconciliation_state(
+    tp_order: dict[str, Any], order_status: str, executed_qty: float, now_ms: int,
+    *, expected_qty: float | None = None, avg_price: float | None = None,
+) -> str:
+    """Persist an explicit partial-fill lifecycle without inferring completion.
+
+    BingX reports cumulative executedQty. A PARTIALLY_FILLED TP remains pending
+    until the exchange reports a terminal state; this marker is observational and
+    does not activate BE or change the position quantity.
+    """
+    if not isinstance(tp_order, dict):
+        return "INVALID_ORDER_RECORD"
+    status = str(order_status or "").upper()
+    try:
+        reported_cumulative = max(0.0, float(executed_qty or 0.0))
+        if not math.isfinite(reported_cumulative):
+            reported_cumulative = 0.0
+    except (TypeError, ValueError):
+        reported_cumulative = 0.0
+    previous_state = str(tp_order.get("reconciliation_state") or "").upper()
+    previous_cumulative = max(0.0, _safe_float(tp_order.get("last_exchange_executed_qty"), 0.0))
+    # Cumulative executedQty is monotonic for an exchange order. Keep the
+    # high-water mark even when a later read is stale/incomplete, while keeping
+    # the raw latest observation separately for diagnostics.
+    cumulative = max(previous_cumulative, reported_cumulative)
+    tp_order["last_exchange_reported_executed_qty"] = reported_cumulative
+    tp_order["last_exchange_executed_qty"] = cumulative
+    # Keep avgPrice tied to the cumulative quantity it describes. A later stale
+    # response with executedQty=0/avgPrice=0 must not erase the last valid price
+    # evidence for a previously observed partial fill.
+    try:
+        reported_avg_price = float(avg_price) if avg_price not in (None, "") else None
+        if reported_avg_price is not None and (not math.isfinite(reported_avg_price) or reported_avg_price <= 0):
+            reported_avg_price = None
+    except (TypeError, ValueError, OverflowError):
+        reported_avg_price = None
+    if reported_avg_price is not None and reported_cumulative >= previous_cumulative and reported_cumulative > 0:
+        tp_order["last_exchange_avg_price"] = reported_avg_price
+        tp_order["last_exchange_avg_price_qty"] = reported_cumulative
+    tp_order["last_reconciled_ts"] = int(now_ms)
+    terminal_states = {"FILLED_CONFIRMED", "PARTIAL_FILL_TERMINAL", "TERMINAL_NO_FILL"}
+    expected = _safe_float(expected_qty, 0.0) if expected_qty is not None else _safe_float(tp_order.get("qty"), 0.0)
+    qty_tolerance = max(1e-12, abs(expected) * 1e-6) if expected > 0 else 1e-12
+    if status == "FILLED" and cumulative > 0:
+        if expected > 0 and cumulative + qty_tolerance < expected:
+            # A terminal FILLED label with less than the order's original quantity
+            # is internally inconsistent. Book the real cumulative execution, but
+            # do not call the TP leg complete or activate BE from this response.
+            tp_order["reconciliation_state"] = "PARTIAL_FILL_TERMINAL"
+            tp_order["partial_fill_terminal_status"] = "FILLED_QTY_MISMATCH"
+        else:
+            tp_order["reconciliation_state"] = "FILLED_CONFIRMED"
+            tp_order["partial_fill_terminal_status"] = None
+        tp_order.pop("partial_fill_since_ts", None)
+    elif previous_state == "FILLED_CONFIRMED":
+        # A stale contradictory CANCELED/NEW/PARTIALLY_FILLED response cannot
+        # downgrade a previously quantity-confirmed FILLED lifecycle.
+        tp_order["reconciliation_state"] = previous_state
+        tp_order["partial_fill_terminal_status"] = None
+    elif status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}:
+        tp_order["reconciliation_state"] = "PARTIAL_FILL_TERMINAL" if cumulative > 0 else "TERMINAL_NO_FILL"
+        tp_order.pop("partial_fill_since_ts", None)
+        tp_order["partial_fill_terminal_status"] = status
+    elif previous_state in terminal_states:
+        # A stale PARTIALLY_FILLED/NEW response or a transient unknown status
+        # must not move a terminal order back into a pending lifecycle state.
+        tp_order["reconciliation_state"] = previous_state
+    elif status == "PARTIALLY_FILLED" and cumulative > 0:
+        tp_order["reconciliation_state"] = "PENDING_PARTIAL_FILL"
+        tp_order.setdefault("partial_fill_since_ts", int(now_ms))
+    elif previous_state == "PENDING_PARTIAL_FILL":
+        # A transient or incomplete response is not evidence that the partial
+        # execution has completed or disappeared. Preserve the pending marker.
+        tp_order["reconciliation_state"] = previous_state
+    else:
+        tp_order["reconciliation_state"] = status or "UNKNOWN"
+    return str(tp_order["reconciliation_state"])
+
+
 def _clear_completed_tp_recovery_markers(trade: dict[str, Any]) -> bool:
     """Clear recovery blockers once recovered fills are authoritatively booked.
 
@@ -3604,6 +4070,10 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
     # stage, missing state must fail closed rather than be interpreted as an empty
     # portfolio. Fresh-start bootstrap happens only in the top-level run preflight.
     trades = _load_active_trades_required()
+    try:
+        reconcile_pending_emergency_protection_cleanup(active_trades=trades)
+    except Exception as cleanup_recovery_exc:
+        log.error("[EMERGENCY_CLEANUP_RECOVERY] pass failed: %s", cleanup_recovery_exc)
     if not trades:
         return
 
@@ -3802,6 +4272,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                     symbol, direction, entry_price, rem_qty, old_sl_id,
                     str(event_id).replace("EVT_", ""), old_sl_price=old_sl_price,
                     owner_event_id=str(event_id),
+                    attempt_id=trade.get("attempt_id"),
                 )
                 retry_status = str(retry.get("status", "")).lower()
                 if retry_status in {"created", "created_cleanup_pending"}:
@@ -3834,7 +4305,9 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                         trade["be_failure_rollback_verified_ts"] = now_ms
 
             # Проверка исполнения Тейк-Профитов
+            tp_fill_event = None
             for tp_index, tp in enumerate(tp_orders_for_evidence):
+                tp_fill_event = None
                 leg = str(tp.get("leg", ""))
                 order_id = tp.get("order_id")
                 if not leg or not order_id:
@@ -3913,13 +4386,44 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                         )
 
                 order_status = str(order_info.get("order_status", "")).upper()
-                if order_status not in {"PARTIALLY_FILLED", "FILLED"}:
-                    continue
-                leg_already_hit = leg in hit_legs
-
-                executed_qty = max(0.0, _safe_float(order_info.get("executed_qty", 0.0)))
+                observed_executed_qty = max(0.0, _safe_float(order_info.get("executed_qty", 0.0)))
+                expected_tp_qty = max(
+                    0.0,
+                    _safe_float(order_info.get("orig_qty"), 0.0),
+                    _safe_float(tp.get("qty"), 0.0),
+                )
+                reconciliation_state = _update_tp_reconciliation_state(
+                    tp, order_status, observed_executed_qty, now_ms,
+                    expected_qty=expected_tp_qty if expected_tp_qty > 0 else None,
+                    avg_price=order_info.get("avg_price"),
+                )
+                observed_executed_qty = max(0.0, _safe_float(order_info.get("executed_qty", 0.0)))
+                persisted_executed_qty = max(0.0, _safe_float(tp.get("last_exchange_executed_qty"), 0.0))
+                executed_qty = max(observed_executed_qty, persisted_executed_qty)
+                executed_qty_source = (
+                    "PERSISTED_EXCHANGE_HIGH_WATER_MARK"
+                    if persisted_executed_qty > observed_executed_qty
+                    else "CURRENT_ORDER_STATUS"
+                )
                 previous_qty = max(0.0, _safe_float(filled_by_leg.get(leg, 0.0)))
                 delta_qty = max(0.0, executed_qty - previous_qty)
+                qty_tolerance = max(1e-12, abs(expected_tp_qty) * 1e-6, abs(previous_qty) * 1e-9)
+                terminal_partial_fill = (
+                    reconciliation_state == "PARTIAL_FILL_TERMINAL"
+                    and delta_qty > qty_tolerance
+                )
+                terminal_fill_delta = (
+                    reconciliation_state in {"PARTIAL_FILL_TERMINAL", "FILLED_CONFIRMED"}
+                    and delta_qty > qty_tolerance
+                )
+                tp_fully_filled = (
+                    order_status == "FILLED"
+                    and (expected_tp_qty <= 0 or executed_qty + qty_tolerance >= expected_tp_qty)
+                    and reconciliation_state == "FILLED_CONFIRMED"
+                )
+                if order_status not in {"PARTIALLY_FILLED", "FILLED"} and not terminal_fill_delta:
+                    continue
+                leg_already_hit = leg in hit_legs
 
                 if delta_qty <= 0:
                     # A status=FILLED response with zero execution remains
@@ -3928,9 +4432,95 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                     # above must provide real execution evidence first.
                     continue
 
-                exec_price = _safe_float(order_info.get("avg_price"), 0.0)
-                if exec_price <= 0:
-                    log.warning("[TRACKER_TP] %s %s %s has no actual avgPrice; deferring realized PnL", symbol, direction, leg)
+                observed_avg_price = _safe_float(order_info.get("avg_price"), 0.0)
+                persisted_avg_price = _safe_float(tp.get("last_exchange_avg_price"), 0.0)
+                persisted_avg_price_qty = _safe_float(tp.get("last_exchange_avg_price_qty"), 0.0)
+                if observed_avg_price > 0 and observed_executed_qty >= executed_qty:
+                    cumulative_avg_price = observed_avg_price
+                    cumulative_avg_price_source = "CURRENT_ORDER_STATUS_AVG_PRICE"
+                elif (
+                    persisted_avg_price > 0
+                    and abs(persisted_avg_price_qty - executed_qty) <= max(1e-12, expected_tp_qty * 1e-6)
+                ):
+                    cumulative_avg_price = persisted_avg_price
+                    cumulative_avg_price_source = "PERSISTED_EXCHANGE_CUMULATIVE_AVG_PRICE"
+                else:
+                    cumulative_avg_price = 0.0
+                    cumulative_avg_price_source = "UNAVAILABLE"
+                if cumulative_avg_price <= 0:
+                    log.warning("[TRACKER_TP] %s %s %s has no actual cumulative avgPrice; deferring realized PnL", symbol, direction, leg)
+                    continue
+
+                current_exchange_order_id = str(
+                    order_info.get("resolved_order_id") or order_info.get("order_id") or order_id
+                )
+                prior_leg_events = [
+                    event for event in (trade.get("tp_fill_events") or [])
+                    if isinstance(event, dict) and str(event.get("leg") or "").lower() == leg
+                ]
+                trusted_avg_sources = {
+                    "ORDER_CUMULATIVE_AVG_FIRST_FILL",
+                    "ORDER_CUMULATIVE_AVG_DIFFERENCED",
+                }
+                prior_event_qty = 0.0
+                prior_event_notional = 0.0
+                prior_events_fully_trusted = True
+                for prior_event in prior_leg_events:
+                    try:
+                        prior_delta = float(prior_event.get("delta_qty"))
+                        prior_price = float(prior_event.get("avg_price"))
+                    except (TypeError, ValueError, OverflowError):
+                        prior_events_fully_trusted = False
+                        break
+                    prior_order_id = str(prior_event.get("resolved_order_id") or prior_event.get("order_id") or "")
+                    if (
+                        not math.isfinite(prior_delta) or prior_delta <= 0
+                        or not math.isfinite(prior_price) or prior_price <= 0
+                        or prior_event.get("avg_price_source") not in trusted_avg_sources
+                        or prior_order_id != current_exchange_order_id
+                    ):
+                        prior_events_fully_trusted = False
+                        break
+                    prior_event_qty += prior_delta
+                    prior_event_notional += prior_delta * prior_price
+                if previous_qty <= qty_tolerance:
+                    previous_accounted_notional = 0.0
+                    prior_events_fully_trusted = not prior_leg_events
+                elif (
+                    prior_events_fully_trusted
+                    and abs(prior_event_qty - previous_qty) <= qty_tolerance
+                ):
+                    previous_accounted_notional = prior_event_notional
+                else:
+                    previous_accounted_notional = None
+
+                incremental_avg_price = _incremental_tp_fill_average_price(
+                    cumulative_qty=executed_qty,
+                    cumulative_avg_price=cumulative_avg_price,
+                    previous_accounted_qty=previous_qty,
+                    previous_accounted_notional=previous_accounted_notional,
+                ) if previous_accounted_notional is not None else None
+                if incremental_avg_price is not None:
+                    exec_price = incremental_avg_price
+                    exec_price_source = (
+                        "ORDER_CUMULATIVE_AVG_FIRST_FILL"
+                        if previous_qty <= qty_tolerance
+                        else "ORDER_CUMULATIVE_AVG_DIFFERENCED"
+                    )
+                elif previous_accounted_notional is None:
+                    # Preserve historical accounting when prior v5.5.22 fill
+                    # events have no trusted incremental notional marker. Make
+                    # the approximation explicit rather than claiming precision.
+                    exec_price = cumulative_avg_price
+                    exec_price_source = "CUMULATIVE_ORDER_AVG_FALLBACK_PRIOR_LEDGER_UNVERIFIED"
+                else:
+                    # Prior ledger notional is trusted but contradicts the new
+                    # cumulative exchange average. Do not manufacture an
+                    # incremental price or realized PnL from inconsistent data.
+                    log.error(
+                        "[TRACKER_TP] %s %s %s cumulative avgPrice conflicts with trusted prior fill notional; deferring PnL",
+                        symbol, direction, leg,
+                    )
                     continue
                 pnl_tp = _calc_trade_pnl_pct(entry_price, exec_price, direction)
                 tp_ok, tp_classification = _classify_tp_fill(direction, entry_price, exec_price)
@@ -3972,7 +4562,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                 realized_qty += delta_qty
                 realized_weighted += delta_qty * pnl_tp
                 filled_by_leg[leg] = executed_qty
-                if order_status == "FILLED" and not leg_already_hit:
+                if tp_fully_filled and not leg_already_hit:
                     # Execution status consumes the target for RR projections even
                     # if its fill is adverse. Keep `hit_legs` reserved for validated
                     # TP hits because it also gates TP1 -> break-even activation.
@@ -3992,28 +4582,55 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                 trade["realized_weighted_rr"] = rr_realized
                 trade["remaining_weighted_rr"] = rr_remaining
                 trade["last_tp_exec_price"] = exec_price
-                trade.setdefault("tp_fill_events", []).append({
+                tp_fill_event = {
                     "ts": now_ms,
                     "leg": leg,
                     "order_id": order_id,
+                    "resolved_order_id": order_info.get("resolved_order_id") or order_info.get("order_id") or order_id,
                     "client_order_id": str(tp.get("client_order_id") or "") or None,
                     "order_status": order_status,
+                    "exchange_order_status": order_info.get("order_status"),
+                    "side": order_info.get("side"),
+                    "position_side": order_info.get("position_side"),
+                    "order_type": order_info.get("order_type"),
+                    "working_type": order_info.get("working_type"),
+                    "reduce_only": order_info.get("reduce_only"),
+                    "close_position": order_info.get("close_position"),
+                    "time_in_force": order_info.get("time_in_force"),
+                    "stop_guaranteed": order_info.get("stop_guaranteed"),
+                    "activation_price": order_info.get("activation_price"),
+                    "price_rate": order_info.get("price_rate"),
+                    "order_time_ms": order_info.get("time_ms"),
+                    "order_update_time_ms": order_info.get("update_time_ms"),
+                    "executed_qty_known": order_info.get("executed_qty_known"),
+                    "executed_qty_observed": observed_executed_qty,
+                    "executed_qty_source": executed_qty_source,
                     "executed_qty_total": executed_qty,
                     "delta_qty": delta_qty,
                     "avg_price": exec_price,
+                    "avg_price_source": exec_price_source,
+                    "cumulative_avg_price": cumulative_avg_price,
+                    "cumulative_avg_price_source": cumulative_avg_price_source,
+                    "cumulative_avg_price_qty": executed_qty,
+                    "previous_accounted_notional": previous_accounted_notional,
+                    "observed_avg_price": observed_avg_price,
                     "pnl_pct": pnl_tp,
                     "remaining_qty": rem_qty,
                     "classification": tp_classification,
                     "execution_evidence_source": order_info.get("execution_evidence_source"),
                     "fill_evidence_status": "CONFIRMED",
-                    "fill_time_ms": max((int(_optional_float(f.get("time_ms"))) for f in (order_info.get("fill_history") or []) if _optional_float(f.get("time_ms")) is not None), default=None),
+                    "fill_time_ms": None,
+                    "fill_time_source": "PENDING_ENRICHMENT",
+                    "fill_timestamp_status": "PENDING_ENRICHMENT",
                     "order_update_time_ms": order_info.get("update_time_ms"),
                     "order_time_ms": order_info.get("time_ms"),
                     "trigger_price": _safe_float(order_info.get("trigger_price"), 0.0) or None,
                     "fill_realized_pnl_abs": order_info.get("fill_realized_pnl_abs"),
                     "fill_fee_raw": order_info.get("fill_fee_raw"),
                     "fill_trade_ids": order_info.get("fill_trade_ids", []),
-                })
+                    "_fill_history": order_info.get("fill_history") if isinstance(order_info.get("fill_history"), list) else None,
+                }
+                trade.setdefault("tp_fill_events", []).append(tp_fill_event)
                 telemetry.record_protection_event(
                     event_id=event_id,
                     attempt_id=trade.get("attempt_id") or ((trade.get("setup") or {}).get("attempt_id") if isinstance(trade.get("setup"), dict) else None),
@@ -4022,13 +4639,31 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                     symbol=symbol,
                     direction=direction,
                     leg=leg.upper(),
-                    status="FILLED" if order_status == "FILLED" else "PARTIALLY_FILLED",
+                    status=order_status,
+                    reconciliation_state=reconciliation_state,
+                    terminal_partial_fill=terminal_partial_fill,
+                    terminal_fill_delta=terminal_fill_delta,
+                    tp_fully_filled=tp_fully_filled,
+                    expected_tp_qty=expected_tp_qty or None,
                     executed_qty_total=executed_qty,
                     delta_qty=delta_qty,
                     avg_price=exec_price,
+                    avg_price_source=exec_price_source,
+                    cumulative_avg_price=cumulative_avg_price,
+                    cumulative_avg_price_source=cumulative_avg_price_source,
                     pnl_pct=pnl_tp,
                     remaining_qty=rem_qty,
+                    order_time_ms=order_info.get("time_ms"),
                     order_update_time_ms=order_info.get("update_time_ms"),
+                    side=order_info.get("side"),
+                    position_side=order_info.get("position_side"),
+                    order_type=order_info.get("order_type"),
+                    working_type=order_info.get("working_type"),
+                    reduce_only=order_info.get("reduce_only"),
+                    close_position=order_info.get("close_position"),
+                    time_in_force=order_info.get("time_in_force"),
+                    stop_guaranteed=order_info.get("stop_guaranteed"),
+                    executed_qty_known=order_info.get("executed_qty_known"),
                     classification=tp_classification,
                     fill_evidence_status="CONFIRMED",
                     economic_validation_passed=tp_ok,
@@ -4043,7 +4678,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                         owner_event_ids=[event_id], leg=leg, entry_price=entry_price, fill_price=exec_price, pnl_pct=pnl_tp,
                     )
 
-                if order_status == "FILLED" and not leg_already_hit and tp_ok:
+                if tp_fully_filled and not leg_already_hit and tp_ok:
                     hit_legs.add(leg)
                     # Persist idempotency markers before side effects that may fail.
                     trade["hit_legs"] = sorted(hit_legs)
@@ -4093,6 +4728,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                             trade_id=str(event_id).replace("EVT_", ""),
                             old_sl_price=old_sl_price,
                             owner_event_id=str(event_id),
+                            attempt_id=trade.get("attempt_id"),
                         )
                         if new_sl.get("status") in {"created", "created_cleanup_pending"}:
                             be_order_ids = _protection_order_ids([], new_sl)
@@ -4138,11 +4774,19 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                                     direction=direction,
                                     leg="BE_SL",
                                     status="ACTIVATED",
+                                    exchange_order_status=new_sl.get("exchange_order_status"),
                                     stop_price=_safe_float(new_sl.get("stop_price"), entry_price),
                                     qty=rem_qty,
                                     trigger_ts_ms=now_ms,
                                     trigger_rule="tp1_filled",
                                     trigger_peak_r=peak_r,
+                                    working_type=new_sl.get("working_type"),
+                                    reduce_only=new_sl.get("reduce_only"),
+                                    close_position=new_sl.get("close_position"),
+                                    time_in_force=new_sl.get("time_in_force"),
+                                    exchange_order_time_ms=new_sl.get("exchange_order_time_ms"),
+                                    exchange_order_update_time_ms=new_sl.get("exchange_order_update_time_ms"),
+                                    verification_observed_at_ms=new_sl.get("verification_observed_at_ms"),
                                 )
                                 log.info(
                                     "[TRACKER_BE_ACTIVATED] %s (%s) TP1 taken. Stop-loss moved to Break-Even: %.8g (Risk: 0.00%%)",
@@ -4164,6 +4808,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                                 direction=direction,
                                 leg="BE_SL",
                                 status="FAILED",
+                                exchange_order_status=new_sl.get("exchange_order_status"),
                                 stop_price=_safe_float(new_sl.get("stop_price"), entry_price),
                                 qty=rem_qty,
                                 trigger_ts_ms=now_ms,
@@ -4175,6 +4820,44 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                                 "[TRACKER_BE_FAILED] %s (%s) Failed to move SL to Break-Even: %s",
                                 trade.get("name", symbol), symbol, new_sl.get("error")
                             )
+
+                # Enrich the already-accounted TP delta with per-fill timestamps only
+                # after any TP1 -> BE safety action has completed. This best-effort read
+                # must never delay or affect protective-order placement.
+                if isinstance(tp_fill_event, dict):
+                    try:
+                        _enrich_tp_fill_event_from_exchange_history(
+                            symbol, tp_fill_event,
+                            entry_ts_ms=int(_safe_float(trade.get("entry_ts"), 0.0)),
+                            previous_qty=previous_qty,
+                            executed_qty=executed_qty,
+                            delta_qty=delta_qty,
+                            now_ms=now_ms,
+                        )
+                        tp_fill_event.pop("_fill_history", None)
+                        if leg.upper() == "TP1" and tp_fill_event.get("fill_time_source") == "EXCHANGE_FILL_HISTORY" and trade.get("be_activated"):
+                            trade["be_trigger_ts"] = tp_fill_event.get("fill_time_ms")
+                            trade["be_trigger_timestamp_source"] = "EXCHANGE_FILL_HISTORY"
+                        telemetry.record_protection_event(
+                            event_id=event_id,
+                            attempt_id=trade.get("attempt_id"),
+                            position_id=trade.get("position_id") or event_id,
+                            order_id=str(tp_fill_event.get("resolved_order_id") or order_id),
+                            symbol=symbol,
+                            direction=direction,
+                            leg=leg.upper(),
+                            status="FILL_TIMESTAMP_ENRICHED" if tp_fill_event.get("fill_time_source") == "EXCHANGE_FILL_HISTORY" else "FILL_TIMESTAMP_FALLBACK",
+                            fill_time_ms=tp_fill_event.get("fill_time_ms"),
+                            fill_time_source=tp_fill_event.get("fill_time_source"),
+                            fill_timestamp_status=tp_fill_event.get("fill_timestamp_status"),
+                            fill_trade_ids=tp_fill_event.get("fill_trade_ids", []),
+                            fill_trade_ids_complete=tp_fill_event.get("fill_trade_ids_complete", False),
+                        )
+                    except Exception as fill_timestamp_exc:
+                        tp_fill_event.pop("_fill_history", None)
+                        tp_fill_event["fill_timestamp_status"] = "ENRICHMENT_ERROR"
+                        tp_fill_event["fill_timestamp_error_type"] = type(fill_timestamp_exc).__name__
+                        log.warning("[TRACKER_TP_FILL_TIMESTAMP] %s %s %s enrichment failed: %s", symbol, direction, leg, fill_timestamp_exc)
 
             trade["hit_legs"] = sorted(hit_legs)
             trade["tp_filled_qty"] = filled_by_leg

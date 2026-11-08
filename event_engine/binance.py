@@ -20,6 +20,7 @@ BASE_URL = os.environ.get("BINANCE_MARKET_BASE_URL", "https://data-api.binance.v
 EXCHANGE_INFO_PATH = "/api/v3/exchangeInfo"
 KLINES_PATH = "/api/v3/klines"
 TICKER_24H_PATH = "/api/v3/ticker/24hr"
+BOOK_TICKER_PATH = "/api/v3/ticker/bookTicker"
 
 _CACHE: dict[str, Any] = {"ts": 0.0, "symbols": {}, "raw": []}
 _CACHE_TTL = max(60, int(os.environ.get("BINANCE_EXCHANGE_INFO_TTL_SEC", "1800")))
@@ -263,3 +264,66 @@ def fetch_24h_ticker(symbol: str) -> dict[str, Any] | None:
     bsym = normalize_symbol(symbol)
     payload = _get(TICKER_24H_PATH, {"symbol": bsym}, timeout=8.0)
     return payload if isinstance(payload, dict) else None
+
+
+def fetch_book_ticker(
+    symbol: str,
+    *,
+    timeout: float = 0.5,
+    retryable: bool = False,
+) -> dict[str, Any] | None:
+    """Fetch Binance spot best bid/ask with a bounded local observation window.
+
+    Binance bookTicker does not provide an exchange event timestamp. The returned
+    timestamp is therefore the midpoint of the local request interval and is
+    explicitly labelled as local-observation time, not exchange time. Callers
+    must not describe it as an exchange-synchronized quote.
+    """
+    bsym = normalize_symbol(symbol)
+    try:
+        timeout_value = max(0.05, min(2.0, float(timeout)))
+    except (TypeError, ValueError):
+        timeout_value = 0.5
+    started_ms = int(time.time() * 1000)
+    try:
+        payload = _get(
+            BOOK_TICKER_PATH,
+            {"symbol": bsym},
+            timeout=timeout_value,
+            retryable=bool(retryable),
+        )
+    except Exception as exc:
+        log.debug("[BINANCE_BOOK_TICKER] %s unavailable: %s", bsym, type(exc).__name__)
+        return None
+    finished_ms = int(time.time() * 1000)
+    if not isinstance(payload, dict):
+        return None
+    payload_symbol = normalize_symbol(str(payload.get("symbol") or bsym))
+    if payload_symbol != bsym:
+        return None
+    try:
+        bid = float(payload.get("bidPrice"))
+        ask = float(payload.get("askPrice"))
+        bid_qty = float(payload.get("bidQty"))
+        ask_qty = float(payload.get("askQty"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    values = (bid, ask, bid_qty, ask_qty)
+    if not all(math.isfinite(value) for value in values):
+        return None
+    if bid <= 0 or ask <= 0 or ask < bid or bid_qty < 0 or ask_qty < 0:
+        return None
+    return {
+        "symbol": bsym,
+        "bid": bid,
+        "ask": ask,
+        "bid_qty": bid_qty,
+        "ask_qty": ask_qty,
+        "mid": (bid + ask) / 2.0,
+        "observed_at_ms": (started_ms + finished_ms) // 2,
+        "request_started_at_ms": started_ms,
+        "request_finished_at_ms": finished_ms,
+        "request_duration_ms": max(0, finished_ms - started_ms),
+        "timestamp_quality": "LOCAL_OBSERVATION_MIDPOINT_ONLY",
+        "exchange_timestamp_available": False,
+    }

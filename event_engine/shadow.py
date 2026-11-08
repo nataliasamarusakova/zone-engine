@@ -10,13 +10,15 @@ import numpy as np
 
 
 SHADOW_SCHEMA_VERSION = 1
-SHADOW_EXPERIMENT_VERSION = "counterfactual-v2"
+SHADOW_EXPERIMENT_VERSION = "counterfactual-v3"
 
 VOLUME_5M_THRESHOLDS = (0.8, 1.0, 1.2, 1.5, 1.8, 2.0)
 VOLUME_1H_THRESHOLDS = (0.8, 1.0, 1.2, 1.5, 1.8, 2.0)
 ATR_5M_MIN_THRESHOLDS = (0.10, 0.20, 0.30, 0.40, 0.50, 0.75, 1.00)
 TRAIL_ATR_MULTIPLIERS = (0.75, 1.0, 1.5)
 DELAYED_BE_BARS = (1, 2)
+MFE_PROTECTION_ACTIVATION_PCT = 2.0
+MFE_PROTECTION_LOCK_LEVELS_PCT = (-1.0, 0.0, 0.5)
 PRODUCTION_TP1_FRACTION = 0.50
 PRODUCTION_STOP_PCT = 10.0
 PRODUCTION_TP1_PCT = 3.0
@@ -282,6 +284,20 @@ def build_entry_snapshot(
     tp1_rr = entry + structural_risk_abs * TP1_R_MULT if direction == "LONG" and structural_risk_abs is not None else entry - structural_risk_abs * TP1_R_MULT if direction == "SHORT" and structural_risk_abs is not None else None
     tp2_rr = entry + structural_risk_abs * TP2_R_MULT if direction == "LONG" and structural_risk_abs is not None else entry - structural_risk_abs * TP2_R_MULT if direction == "SHORT" and structural_risk_abs is not None else None
 
+    penetration_ratio = None
+    if trigger_bar is not None and top is not None and bottom is not None and top > bottom:
+        trigger_low = _finite(trigger_bar.get("low"))
+        trigger_high = _finite(trigger_bar.get("high"))
+        width = top - bottom
+        if direction == "LONG" and trigger_low is not None:
+            penetration_ratio = (top - trigger_low) / width
+        elif direction == "SHORT" and trigger_high is not None:
+            penetration_ratio = (trigger_high - bottom) / width
+    penetration_priority = (
+        "HIGH" if penetration_ratio is not None and 0.70 <= penetration_ratio <= 1.00
+        else "NORMAL" if penetration_ratio is not None else "UNKNOWN"
+    )
+
     trigger_session_hour = int(entry_ts.hour)
     decision_session_hour = int(decision_ts_parsed.hour)
     session_hour = decision_session_hour
@@ -484,6 +500,27 @@ def build_entry_snapshot(
                 "production_sl": production_sl,
                 "production_tp1": production_tp1,
                 "production_tp2": production_tp2,
+                "tp1_fraction": PRODUCTION_TP1_FRACTION,
+                "standalone_management_only": True,
+                "production_gate_applied": False,
+            },
+            "CF_PENETRATION_PRIORITY": {
+                "version": 1,
+                "zone_penetration_ratio_raw": penetration_ratio,
+                "priority": penetration_priority,
+                "priority_threshold": {"min_inclusive": 0.70, "max_inclusive": 1.00},
+                "standalone_management_only": True,
+                "production_gate_applied": False,
+                "signal_score_changed": False,
+                "selection_order_changed": False,
+            },
+            "CF_MFE_PROTECTION_PLUS_2": {
+                "version": 1,
+                "activation_mfe_pct": MFE_PROTECTION_ACTIVATION_PCT,
+                "locked_profit_levels_pct": list(MFE_PROTECTION_LOCK_LEVELS_PCT),
+                "activation_semantics": "after_completed_future_bar_reaches_mfe_threshold",
+                "stop_semantics": "new_stop_first_active_on_next_completed_bar",
+                "same_bar_policy": "ambiguous_when_mfe_coexists_with_stop_or_tp1",
                 "tp1_fraction": PRODUCTION_TP1_FRACTION,
                 "standalone_management_only": True,
                 "production_gate_applied": False,
@@ -793,6 +830,166 @@ def _simulate_management_only(
         "standalone_management_only": True,
     }
 
+def _simulate_mfe_protection(
+    future: pd.DataFrame,
+    *,
+    direction: str,
+    entry: float,
+    production_stop: float,
+    production_tp1: float,
+    production_tp2: float,
+    activation_mfe_pct: float,
+    locked_profit_pct: float,
+) -> dict[str, Any]:
+    """Simulate a +MFE stop lock without intrabar look-ahead.
+
+    A completed candle that reaches the MFE threshold only activates the new
+    stop for the *next* candle. If that same candle also touches the old stop
+    or TP1, OHLC data cannot prove event order and the result is marked
+    ambiguous. After TP1, the residual half uses the tighter of the MFE lock
+    and the existing production BE-at-entry rule. This is research-only.
+    """
+    base = {
+        "standalone_management_only": True,
+        "production_gate_applied": False,
+        "activation_mfe_pct": float(activation_mfe_pct),
+        "locked_profit_pct": float(locked_profit_pct),
+        "mfe_activation_ts": None,
+        "tp1_fill_ts": None,
+        "exit_ts": None,
+        "exit_price": None,
+        "pnl_pct": None,
+        "bars_to_exit": None,
+    }
+    if future is None or future.empty or entry <= 0:
+        return {**base, "status": "INSUFFICIENT_PATH", "exit": None}
+
+    direction = str(direction).upper()
+    if direction not in {"LONG", "SHORT"}:
+        return {**base, "status": "INVALID_DIRECTION", "exit": None}
+
+    mfe_trigger = (
+        entry * (1.0 + float(activation_mfe_pct) / 100.0)
+        if direction == "LONG"
+        else entry * (1.0 - float(activation_mfe_pct) / 100.0)
+    )
+    lock_stop = (
+        entry * (1.0 + float(locked_profit_pct) / 100.0)
+        if direction == "LONG"
+        else entry * (1.0 - float(locked_profit_pct) / 100.0)
+    )
+    activated = False
+    tp1_realized = False
+    activation_ts = None
+    tp1_fill_ts = None
+    current_stop = float(production_stop)
+    future = future.reset_index(drop=True)
+
+    def finish(status: str, exit_name: str | None, price: float | None, idx: int, ts: Any, *, tp1_pnl: float | None = None) -> dict[str, Any]:
+        out = dict(base)
+        out.update({
+            "status": status,
+            "exit": exit_name,
+            "exit_price": float(price) if price is not None else None,
+            "exit_ts": ts.isoformat() if ts is not None else None,
+            "bars_to_exit": int(idx) + 1,
+            "mfe_activation_ts": activation_ts.isoformat() if activation_ts is not None else None,
+            "tp1_fill_ts": tp1_fill_ts.isoformat() if tp1_fill_ts is not None else None,
+        })
+        if price is not None:
+            if tp1_realized:
+                out["tp1_pnl_pct"] = _pct_return(direction, entry, float(production_tp1))
+                out["residual_exit_pnl_pct"] = _pct_return(direction, entry, float(price))
+                out["pnl_pct"] = _weighted_partial_exit_pnl(direction, entry, float(production_tp1), float(price))
+            else:
+                out["pnl_pct"] = _pct_return(direction, entry, float(price))
+        else:
+            out["pnl_pct"] = None
+        return out
+
+    for idx, row in future.iterrows():
+        high = _finite(row.get("high"))
+        low = _finite(row.get("low"))
+        close_time = _parse_ts(row.get("close_time"))
+        if high is None or low is None or close_time is None:
+            return finish("INVALID_FUTURE_BAR", None, None, idx, close_time)
+
+        if tp1_realized:
+            stop_hit = _directional_hit(direction, high, low, current_stop, False)
+            tp2_hit = _directional_hit(direction, high, low, float(production_tp2), True)
+            if stop_hit and tp2_hit:
+                return finish("AMBIGUOUS_POST_TP1_BAR", "AMBIGUOUS", None, idx, close_time)
+            if stop_hit:
+                return finish("EXIT_AFTER_TP1_AND_MFE", "MFE_PROTECTION_OR_BE", current_stop, idx, close_time)
+            if tp2_hit:
+                return finish("TP2_AFTER_TP1_AND_MFE", "PRODUCTION_TP2", production_tp2, idx, close_time)
+            continue
+
+        if activated:
+            locked_stop_hit = _directional_hit(direction, high, low, current_stop, False)
+            tp1_hit = _directional_hit(direction, high, low, float(production_tp1), True)
+            tp2_hit = _directional_hit(direction, high, low, float(production_tp2), True)
+            if locked_stop_hit and (tp1_hit or tp2_hit):
+                return finish("AMBIGUOUS_MFE_STOP_AND_TARGET_SAME_BAR", "AMBIGUOUS", None, idx, close_time)
+            if locked_stop_hit:
+                return finish("STOP_AFTER_MFE_PROTECTION", "MFE_PROTECTION", current_stop, idx, close_time)
+            if tp2_hit:
+                tp1_realized = True
+                tp1_fill_ts = close_time
+                return finish("TP1_AND_TP2_AFTER_MFE_SAME_BAR", "PRODUCTION_TP2", production_tp2, idx, close_time)
+            if tp1_hit:
+                tp1_realized = True
+                tp1_fill_ts = close_time
+                current_stop = max(lock_stop, float(entry)) if direction == "LONG" else min(lock_stop, float(entry))
+            continue
+
+        production_stop_hit = _directional_hit(direction, high, low, current_stop, False)
+        tp1_hit = _directional_hit(direction, high, low, float(production_tp1), True)
+        tp2_hit = _directional_hit(direction, high, low, float(production_tp2), True)
+        mfe_hit = _directional_hit(direction, high, low, mfe_trigger, True)
+
+        if production_stop_hit and mfe_hit:
+            return finish("AMBIGUOUS_MFE_AND_PRODUCTION_STOP_SAME_BAR", "AMBIGUOUS", None, idx, close_time)
+        if production_stop_hit and (tp1_hit or tp2_hit):
+            return finish("AMBIGUOUS_PRE_TP1_BAR", "AMBIGUOUS", None, idx, close_time)
+        if production_stop_hit:
+            return finish("STOP_BEFORE_MFE", "PRODUCTION_SL", production_stop, idx, close_time)
+        if tp2_hit:
+            if mfe_hit:
+                return finish("AMBIGUOUS_MFE_AND_TP_SAME_BAR", "AMBIGUOUS", None, idx, close_time)
+            # Both production targets lie inside this bar; preserve the engine's
+            # existing conservative weighted partial-exit accounting convention.
+            tp1_realized = True
+            tp1_fill_ts = close_time
+            current_stop = float(entry)
+            return finish("TP1_AND_TP2_SAME_BAR", "PRODUCTION_TP2", production_tp2, idx, close_time)
+        if tp1_hit:
+            if mfe_hit:
+                return finish("AMBIGUOUS_MFE_AND_TP1_SAME_BAR", "AMBIGUOUS", None, idx, close_time)
+            tp1_realized = True
+            tp1_fill_ts = close_time
+            current_stop = float(entry)
+            continue
+        if mfe_hit:
+            activated = True
+            activation_ts = close_time
+            current_stop = lock_stop
+            # Deliberately do not evaluate the newly-created stop against this
+            # candle's low/high; it is only effective from the next bar.
+            continue
+
+    status = "PATH_NOT_EXITED" if activated else ("TP1_FILLED_PATH_NOT_EXITED" if tp1_realized else "MFE_NOT_REACHED")
+    out = dict(base)
+    out.update({
+        "status": status,
+        "exit": None,
+        "mfe_activation_ts": activation_ts.isoformat() if activation_ts is not None else None,
+        "tp1_fill_ts": tp1_fill_ts.isoformat() if tp1_fill_ts is not None else None,
+        "pnl_pct": None,
+    })
+    return out
+
+
 def prepare_counterfactual_bars(bars: pd.DataFrame) -> pd.DataFrame:
     """Normalize one symbol's bars once for repeated counterfactual calculations.
 
@@ -883,6 +1080,19 @@ def calculate_counterfactual_outcomes(
             out["experiments"][f"CF_TRAIL_CURRENT_{str(atr_mult).replace('.', '_')}ATR"] = _simulate_management_only(
                 x, future, direction=direction, entry=entry, production_stop=production_stop,
                 production_tp1=production_tp1, production_tp2=production_tp2, mode="TRAIL_ATR", parameter=atr_mult,
+            )
+        for locked_profit_pct in MFE_PROTECTION_LOCK_LEVELS_PCT:
+            token = (
+                "MINUS_1_0" if locked_profit_pct == -1.0
+                else "0_0" if locked_profit_pct == 0.0
+                else "PLUS_0_5" if locked_profit_pct == 0.5
+                else str(locked_profit_pct).replace("-", "MINUS_").replace("+", "PLUS_").replace(".", "_")
+            )
+            out["experiments"][f"CF_MFE_PLUS_2_LOCK_{token}"] = _simulate_mfe_protection(
+                future, direction=direction, entry=entry, production_stop=production_stop,
+                production_tp1=production_tp1, production_tp2=production_tp2,
+                activation_mfe_pct=MFE_PROTECTION_ACTIVATION_PCT,
+                locked_profit_pct=locked_profit_pct,
             )
 
     filter_specs = {
