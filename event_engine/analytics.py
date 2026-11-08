@@ -115,12 +115,14 @@ def _atomic_json(path: Path, payload: Any) -> None:
 def _line(row: dict[str, Any]) -> str:
     symbol = str(row.get("symbol") or "").upper().replace("-", "")
     return (
-        f"Монета={symbol} | Цена={row.get('current_price')} | "
-        f"Положение={row.get('price_position')} | Сигнал={row.get('fresh_signal', '—')} | "
+        f"Монета={symbol} | 1h_close={row.get('price_position_reference_price', row.get('current_price'))} "
+        f"at={row.get('price_position_reference_timestamp', 'unknown')} | "
+        f"Положение_1h_engine_zones={row.get('price_position')} | "
+        f"Сигнал_5m={row.get('fresh_signal', '—')} | trigger_status={row.get('trigger_status', 'UNKNOWN')} | "
         f"DEMAND={row.get('active_demand', 0)} | SUPPLY={row.get('active_supply', 0)} | "
         f"Source={row.get('market_source', 'binance_spot')} | "
-        f"Binance={row.get('binance_price')} | BingX={row.get('bingx_price')} | "
-        f"Spread={row.get('market_spread_pct')}% | Asset={row.get('asset_class', 'UNKNOWN')}"
+        f"BingX_quote={row.get('bingx_price')} | cross_venue_deviation={row.get('market_spread_pct')}% | "
+        f"Asset={row.get('asset_class', 'UNKNOWN')}"
     )
 
 

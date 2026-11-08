@@ -70,6 +70,29 @@ def _safe_pct_change(current: float, previous: float) -> float | None:
     return (current - previous) / previous * 100.0
 
 
+def _history_cadence(df: pd.DataFrame, expected_interval_ms: int) -> dict[str, Any]:
+    """Describe missing intervals without compressing elapsed time into bar count.
+
+    Trend EMAs and BTC 1h/4h returns are bar-based calculations. If source bars
+    are missing, a nominal 200-bar EMA or 4-bar return no longer represents the
+    configured market interval. Callers must keep those diagnostics UNKNOWN.
+    """
+    if expected_interval_ms <= 0:
+        raise ValueError("expected_interval_ms must be positive")
+    if len(df) < 2:
+        return {"status": "INSUFFICIENT", "gap_count": 0, "max_gap_ms": 0}
+    times = pd.to_numeric(df["close_time"], errors="coerce")
+    deltas = times.diff().dropna()
+    gaps = deltas[deltas != int(expected_interval_ms)]
+    if gaps.empty:
+        return {"status": "CONTIGUOUS", "gap_count": 0, "max_gap_ms": 0}
+    return {
+        "status": "GAPPED",
+        "gap_count": int(len(gaps)),
+        "max_gap_ms": int(gaps.max()),
+    }
+
+
 def _snapshot_frame(df: pd.DataFrame, *, ema_periods: tuple[int, ...], slope_lookback: int, return_lookback: int) -> dict[str, Any]:
     out: dict[str, Any] = {
         "bars": int(len(df)),
@@ -163,8 +186,16 @@ def _classify_btc(df: pd.DataFrame, decision_ts_ms: int | float | None) -> dict[
         "bar_close_ts": int(work["close_time"].iloc[-1]) if not work.empty else None,
         "chg_1h_pct": None,
         "chg_4h_pct": None,
+        "history_status": "INSUFFICIENT",
+        "history_gap_count": 0,
     }
     if len(work) < 5:
+        return out
+    cadence = _history_cadence(work, 3_600_000)
+    out["history_status"] = cadence["status"]
+    out["history_gap_count"] = cadence["gap_count"]
+    out["history_max_gap_ms"] = cadence["max_gap_ms"]
+    if cadence["status"] != "CONTIGUOUS":
         return out
     close = pd.to_numeric(work["close"], errors="coerce")
     last = float(close.iloc[-1])
@@ -241,6 +272,8 @@ def evaluate_trend_filter(
         "btc_bar_close_ts": None,
         "btc_chg_1h_pct": None,
         "btc_chg_4h_pct": None,
+        "btc_history_status": "INSUFFICIENT",
+        "btc_history_gap_count": 0,
         "btc_context_veto": False,
         "require_persistence": bool(require_persistence),
         "min_bars_1h": int(min_bars_1h),
@@ -258,6 +291,8 @@ def evaluate_trend_filter(
         "btc_bar_close_ts": btc["bar_close_ts"],
         "btc_chg_1h_pct": btc["chg_1h_pct"],
         "btc_chg_4h_pct": btc["chg_4h_pct"],
+        "btc_history_status": btc["history_status"],
+        "btc_history_gap_count": btc["history_gap_count"],
         "btc_bars": btc["bars"],
     })
 
@@ -270,10 +305,25 @@ def evaluate_trend_filter(
 
     h1 = _clean_closed_frame(df_1h, decision_ts)
     h4 = _clean_closed_frame(df_4h, decision_ts)
+    cadence_1h = _history_cadence(h1, 3_600_000)
+    cadence_4h = _history_cadence(h4, 14_400_000)
     base["trend_1h_bars"] = int(len(h1))
     base["trend_4h_bars"] = int(len(h4))
-    base["structure_1h"] = _structure_snapshot(h1) if not h1.empty else {}
-    base["structure_4h"] = _structure_snapshot(h4) if not h4.empty else {}
+    base["trend_1h_history_status"] = cadence_1h["status"]
+    base["trend_1h_history_gap_count"] = cadence_1h["gap_count"]
+    base["trend_4h_history_status"] = cadence_4h["status"]
+    base["trend_4h_history_gap_count"] = cadence_4h["gap_count"]
+    base["structure_1h"] = _structure_snapshot(h1) if not h1.empty and cadence_1h["status"] == "CONTIGUOUS" else {"status": "unavailable", "reason": "gapped_history"}
+    base["structure_4h"] = _structure_snapshot(h4) if not h4.empty and cadence_4h["status"] == "CONTIGUOUS" else {"status": "unavailable", "reason": "gapped_history"}
+
+    # A gap invalidates bar-count-based EMAs and persistence returns. Do not
+    # compress elapsed time and publish the result as a contiguous 1h/4h trend.
+    if cadence_4h["status"] == "GAPPED":
+        base["trend_reject_reason"] = "TREND_4H_HISTORY_GAP"
+        return base
+    if cadence_1h["status"] == "GAPPED":
+        base["trend_reject_reason"] = "TREND_1H_HISTORY_GAP"
+        return base
 
     s4: dict[str, Any] | None = None
     s1: dict[str, Any] | None = None

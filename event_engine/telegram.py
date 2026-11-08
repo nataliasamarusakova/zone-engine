@@ -32,7 +32,7 @@ def send(text: str) -> bool:
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     ok_all = True
-    for chat_id in ids:
+    for target_index, chat_id in enumerate(ids, start=1):
         try:
             response = requests.post(
                 url,
@@ -46,7 +46,12 @@ def send(text: str) -> bool:
                 print(f"[TELEGRAM] rejected: {payload.get('description', 'unknown')}")
         except Exception as exc:
             ok_all = False
-            print(f"[TELEGRAM] send failed chat_id={chat_id}: {exc}")
+            # requests exceptions may embed the full request URL, which contains
+            # the Telegram bot token. Never log exception text or chat IDs.
+            print(
+                f"[TELEGRAM] send failed target_index={target_index} "
+                f"error={type(exc).__name__}"
+            )
     return ok_all
 
 

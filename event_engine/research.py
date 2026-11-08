@@ -1197,11 +1197,44 @@ def _closed_market_frame(df: pd.DataFrame | None, decision_ts: Any, timeframe: s
     return x.reset_index(drop=True)
 
 
+def _contiguous_history_suffix(df: pd.DataFrame, interval: pd.Timedelta) -> pd.DataFrame:
+    """Return the latest uninterrupted candle sequence, preserving source columns."""
+    if df is None or df.empty or "timestamp" not in df.columns:
+        return pd.DataFrame(columns=df.columns if isinstance(df, pd.DataFrame) else None)
+    x = df.sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True)
+    if len(x) <= 1:
+        return x
+    timestamps = pd.to_datetime(x["timestamp"], utc=True, errors="coerce")
+    valid = timestamps.notna()
+    x = x.loc[valid].reset_index(drop=True)
+    timestamps = timestamps.loc[valid].reset_index(drop=True)
+    if len(x) <= 1:
+        return x
+    interval_ns = int(interval.value)
+    ts_ns = timestamps.astype("int64").to_numpy()
+    # Exchange kline opens are expected to be aligned to their timeframe grid.
+    breaks = [
+        (int(ts_ns[i]) - int(ts_ns[i - 1])) != interval_ns
+        or (int(ts_ns[i]) % interval_ns) != 0
+        or (int(ts_ns[i - 1]) % interval_ns) != 0
+        for i in range(1, len(ts_ns))
+    ]
+    break_positions = [i for i, has_break in enumerate(breaks) if has_break]
+    start = int(break_positions[-1] + 1) if break_positions else 0
+    return x.iloc[start:].reset_index(drop=True)
+
+
 def _simple_atr(df: pd.DataFrame, period: int = 14) -> float | None:
     if len(df) < period or not all(c in df.columns for c in ("high", "low", "close")):
         return None
-    prev = df["close"].shift(1)
-    tr = pd.concat([df["high"] - df["low"], (df["high"] - prev).abs(), (df["low"] - prev).abs()], axis=1).max(axis=1)
+    # ATR is a sequential-bar statistic. Do not compress missing 5m candles.
+    tail = df.tail(period).copy()
+    if "timestamp" in tail.columns and len(tail) > 1:
+        timestamps = pd.to_datetime(tail["timestamp"], utc=True, errors="coerce")
+        if timestamps.isna().any() or not timestamps.diff().dropna().eq(pd.Timedelta(minutes=5)).all():
+            return None
+    prev = tail["close"].shift(1)
+    tr = pd.concat([tail["high"] - tail["low"], (tail["high"] - prev).abs(), (tail["low"] - prev).abs()], axis=1).max(axis=1)
     value = tr.tail(period).mean()
     return float(value) if pd.notna(value) and math.isfinite(float(value)) else None
 
@@ -1236,8 +1269,11 @@ def _derive_time_series_features(*, direction: str, df_5m: pd.DataFrame | None, 
         "htf4h_return_4h_pct": None, "htf4h_ema50_distance_pct": None, "htf4h_ema200_distance_pct": None,
         "htf4h_trend": None,
         "btc_return_5m_pct": None, "btc_return_1h_pct": None,
-        "btc_ema50_distance_pct": None, "btc_ema200_distance_pct": None,
+        "btc_return_5m_status": "NOT_CAPTURED", "btc_return_1h_status": "NOT_CAPTURED",
+        "btc_ema50_distance_pct": None, "btc_ema200_distance_pct": None, "btc_ema50_status": "NOT_CAPTURED",
         "5m_history_bars_available": 0, "5m_history_start_ts": None, "5m_history_end_ts": None,
+        "5m_atr14_status": "NOT_CAPTURED", "5m_ema20_status": "NOT_CAPTURED", "5m_ema50_status": "NOT_CAPTURED",
+        "5m_return_volatility_20_status": "NOT_CAPTURED", "structure_20_status": "NOT_CAPTURED", "fvg_5m_status": "NOT_CAPTURED",
         "5m_return_5m_status": "NOT_CAPTURED", "5m_return_15m_status": "NOT_CAPTURED",
         "5m_return_30m_status": "NOT_CAPTURED", "5m_return_1h_status": "NOT_CAPTURED",
         "5m_return_3h_status": "NOT_CAPTURED", "5m_return_6h_status": "NOT_CAPTURED",
@@ -1286,34 +1322,63 @@ def _derive_time_series_features(*, direction: str, df_5m: pd.DataFrame | None, 
                     out[key] = raw if str(direction).upper() == "LONG" else -raw
                     out[status_key] = "AVAILABLE"
         atr = _simple_atr(x5, 14)
-        out["5m_atr14"] = atr
+        atr_tail = _contiguous_history_suffix(x5, pd.Timedelta(minutes=5))
+        if atr is not None:
+            out["5m_atr14_status"] = "AVAILABLE"
+            out["5m_atr14"] = atr
+        elif len(x5) >= 14 and len(atr_tail) < 14:
+            out["5m_atr14_status"] = "GAPPED_HISTORY"
+        else:
+            out["5m_atr14_status"] = "INSUFFICIENT_HISTORY"
         if atr and current:
             out["5m_range_atr"] = float((float(x5["high"].iloc[-1]) - float(x5["low"].iloc[-1])) / atr)
             out["5m_atr_pct"] = float(atr / current * 100.0)
-        for span, key, slope_key in ((20, "5m_ema20_distance_pct", "5m_ema20_slope_5m_pct"), (50, "5m_ema50_distance_pct", "5m_ema50_slope_5m_pct")):
-            ema_series = x5["close"].ewm(span=span, adjust=False, min_periods=span).mean()
+
+        contiguous_5m = atr_tail
+        for span, key, slope_key, status_key in (
+            (20, "5m_ema20_distance_pct", "5m_ema20_slope_5m_pct", "5m_ema20_status"),
+            (50, "5m_ema50_distance_pct", "5m_ema50_slope_5m_pct", "5m_ema50_status"),
+        ):
+            if len(contiguous_5m) < span:
+                out[status_key] = "GAPPED_HISTORY" if len(x5) >= span else "INSUFFICIENT_HISTORY"
+                continue
+            ema_series = contiguous_5m["close"].ewm(span=span, adjust=False, min_periods=span).mean()
             ema = ema_series.iloc[-1]
+            out[status_key] = "AVAILABLE" if len(contiguous_5m) == len(x5) else "AVAILABLE_CONTIGUOUS_SUFFIX"
             if current and pd.notna(ema) and float(ema) > 0:
                 out[key] = float((current / float(ema) - 1.0) * 100.0)
                 if len(ema_series) >= 2 and pd.notna(ema_series.iloc[-2]) and float(ema_series.iloc[-2]) > 0:
                     out[slope_key] = float((float(ema) / float(ema_series.iloc[-2]) - 1.0) * 100.0)
+
         if len(x5) >= 21:
-            rets = x5["close"].pct_change().tail(20).dropna()
-            if len(rets) >= 10:
-                out["5m_return_volatility_20"] = float(rets.std(ddof=1))
-            ema20 = x5["close"].ewm(span=20, adjust=False, min_periods=20).mean().iloc[-1]
-            ema50 = x5["close"].ewm(span=50, adjust=False, min_periods=50).mean().iloc[-1]
-            if pd.notna(ema20) and pd.notna(ema50) and current and current > 0:
-                dist20 = abs(current / float(ema20) - 1.0) * 100.0 if float(ema20) > 0 else 0.0
-                dist50 = abs(current / float(ema50) - 1.0) * 100.0 if float(ema50) > 0 else 0.0
-                if float(ema20) > float(ema50) and current > float(ema20):
-                    out["market_regime"] = "TREND_UP"
-                elif float(ema20) < float(ema50) and current < float(ema20):
-                    out["market_regime"] = "TREND_DOWN"
-                elif max(dist20, dist50) < 1.0:
-                    out["market_regime"] = "RANGE_NEAR_EMAS"
-                else:
-                    out["market_regime"] = "TRANSITION"
+            tail21 = x5.tail(21)
+            tail21_ts = pd.to_datetime(tail21["timestamp"], utc=True, errors="coerce")
+            contiguous21 = (
+                not tail21_ts.isna().any()
+                and tail21_ts.diff().dropna().eq(pd.Timedelta(minutes=5)).all()
+            )
+            if contiguous21:
+                rets = tail21["close"].pct_change().dropna()
+                if len(rets) == 20:
+                    out["5m_return_volatility_20"] = float(rets.std(ddof=1))
+                    out["5m_return_volatility_20_status"] = "AVAILABLE"
+            else:
+                out["5m_return_volatility_20_status"] = "GAPPED_HISTORY"
+            if len(contiguous_5m) >= 50:
+                ema20 = contiguous_5m["close"].ewm(span=20, adjust=False, min_periods=20).mean().iloc[-1]
+                ema50 = contiguous_5m["close"].ewm(span=50, adjust=False, min_periods=50).mean().iloc[-1]
+                if pd.notna(ema20) and pd.notna(ema50) and current and current > 0:
+                    dist20 = abs(current / float(ema20) - 1.0) * 100.0 if float(ema20) > 0 else 0.0
+                    dist50 = abs(current / float(ema50) - 1.0) * 100.0 if float(ema50) > 0 else 0.0
+                    if float(ema20) > float(ema50) and current > float(ema20):
+                        out["market_regime"] = "TREND_UP"
+                    elif float(ema20) < float(ema50) and current < float(ema20):
+                        out["market_regime"] = "TREND_DOWN"
+                    elif max(dist20, dist50) < 1.0:
+                        out["market_regime"] = "RANGE_NEAR_EMAS"
+                    else:
+                        out["market_regime"] = "TRANSITION"
+
         dts = _parse_timestamp(decision_ts)
         day_start = dts.normalize() if dts is not None else x5["timestamp"].iloc[-1].normalize()
         day = x5.loc[x5["timestamp"] >= day_start].copy()
@@ -1355,21 +1420,38 @@ def _derive_time_series_features(*, direction: str, df_5m: pd.DataFrame | None, 
                     else "PARTIAL"
                 )
         if len(x5) >= 21:
-            prior20 = x5.iloc[:-1].tail(20)
-            ph, pl = float(prior20["high"].max()), float(prior20["low"].min())
-            out["structure_high_20"], out["structure_low_20"] = ph, pl
-            if current:
-                out["distance_to_structure_high_pct"] = float((ph / current - 1.0) * 100.0)
-                out["distance_to_structure_low_pct"] = float((current / pl - 1.0) * 100.0)
-            latest = x5.iloc[-1]
-            out["break_above_prior_20"] = bool(float(latest["close"]) > ph)
-            out["break_below_prior_20"] = bool(float(latest["close"]) < pl)
-            out["liquidity_sweep_bullish_20"] = bool(float(latest["low"]) < pl and float(latest["close"]) > pl)
-            out["liquidity_sweep_bearish_20"] = bool(float(latest["high"]) > ph and float(latest["close"]) < ph)
+            prior_plus_trigger = x5.tail(21)
+            seq_ts = pd.to_datetime(prior_plus_trigger["timestamp"], utc=True, errors="coerce")
+            contiguous_structure = not seq_ts.isna().any() and seq_ts.diff().dropna().eq(pd.Timedelta(minutes=5)).all()
+            if contiguous_structure:
+                prior20 = prior_plus_trigger.iloc[:-1]
+                ph, pl = float(prior20["high"].max()), float(prior20["low"].min())
+                out["structure_20_status"] = "AVAILABLE"
+                out["structure_high_20"], out["structure_low_20"] = ph, pl
+                if current:
+                    out["distance_to_structure_high_pct"] = float((ph / current - 1.0) * 100.0)
+                    out["distance_to_structure_low_pct"] = float((current / pl - 1.0) * 100.0)
+                latest = x5.iloc[-1]
+                out["break_above_prior_20"] = bool(float(latest["close"]) > ph)
+                out["break_below_prior_20"] = bool(float(latest["close"]) < pl)
+                out["liquidity_sweep_bullish_20"] = bool(float(latest["low"]) < pl and float(latest["close"]) > pl)
+                out["liquidity_sweep_bearish_20"] = bool(float(latest["high"]) > ph and float(latest["close"]) < ph)
+            else:
+                out["structure_20_status"] = "GAPPED_HISTORY"
+        else:
+            out["structure_20_status"] = "INSUFFICIENT_HISTORY"
         if len(x5) >= 3:
-            a, c = x5.iloc[-3], x5.iloc[-1]
-            out["fvg_bullish_5m"] = bool(float(c["low"]) > float(a["high"]))
-            out["fvg_bearish_5m"] = bool(float(c["high"]) < float(a["low"]))
+            last3 = x5.tail(3)
+            seq_ts = pd.to_datetime(last3["timestamp"], utc=True, errors="coerce")
+            if not seq_ts.isna().any() and seq_ts.diff().dropna().eq(pd.Timedelta(minutes=5)).all():
+                a, c = last3.iloc[0], last3.iloc[-1]
+                out["fvg_5m_status"] = "AVAILABLE"
+                out["fvg_bullish_5m"] = bool(float(c["low"]) > float(a["high"]))
+                out["fvg_bearish_5m"] = bool(float(c["high"]) < float(a["low"]))
+            else:
+                out["fvg_5m_status"] = "GAPPED_HISTORY"
+        else:
+            out["fvg_5m_status"] = "INSUFFICIENT_HISTORY"
     # Derive a closed 4H context from 1H bars without requiring another API call.
     if df_1h is not None and not df_1h.empty:
         try:
@@ -1379,48 +1461,88 @@ def _derive_time_series_features(*, direction: str, df_5m: pd.DataFrame | None, 
                 out["htf4h_ema200_status"] = "INSUFFICIENT_HISTORY"
                 out["1h_history_start_ts"] = h1["timestamp"].iloc[0].isoformat()
                 out["1h_history_end_ts"] = h1["timestamp"].iloc[-1].isoformat()
-                h1 = h1.set_index("timestamp")
-                agg = h1.resample("4h", label="left", closed="left").agg(
+                indexed_h1 = h1.set_index("timestamp")
+                raw_agg = indexed_h1.resample("4h", label="left", closed="left").agg(
                     open=("open", "first"), high=("high", "max"), low=("low", "min"), close=("close", "last"),
                     volume=("volume", "sum"), bar_count=("close", "count"),
-                ).dropna(subset=["open","high","low","close"])
-                # Only use complete 4H candles; a currently-forming 4H bucket built
-                # from one to three closed 1H bars is still an incomplete HTF candle.
-                agg = agg.loc[agg["bar_count"] == 4].copy()
+                ).dropna(subset=["open", "high", "low", "close"])
+                # A four-row bucket is not necessarily a complete 4h candle if
+                # timestamps are malformed/off-grid. Verify the exact four opens.
+                complete_buckets = []
+                for bucket_start, group in indexed_h1.groupby(indexed_h1.index.floor("4h")):
+                    expected = pd.date_range(bucket_start, periods=4, freq="1h", tz="UTC")
+                    if len(group) == 4 and group.index.equals(expected):
+                        complete_buckets.append(bucket_start)
+                agg = raw_agg.loc[raw_agg.index.isin(complete_buckets)].copy()
                 out["4h_complete_bars_available"] = int(len(agg))
-                if len(agg) >= 200:
-                    out["htf4h_ema200_status"] = "AVAILABLE"
+                agg_for_calc = agg.reset_index(names="timestamp")
+                contiguous_4h = _contiguous_history_suffix(agg_for_calc, pd.Timedelta(hours=4))
+                if len(contiguous_4h) >= 200:
+                    out["htf4h_ema200_status"] = "AVAILABLE" if len(contiguous_4h) == len(agg) else "AVAILABLE_CONTIGUOUS_SUFFIX"
+                elif len(agg) >= 200:
+                    out["htf4h_ema200_status"] = "GAPPED_OR_INCOMPLETE_HISTORY"
                 elif len(h1) >= 804:
                     out["htf4h_ema200_status"] = "GAPPED_OR_INCOMPLETE_HISTORY"
-                if len(agg) >= 3:
-                    c4 = float(agg["close"].iloc[-1])
-                    out["htf4h_return_4h_pct"] = float((c4 / float(agg["close"].iloc[-2]) - 1.0) * 100.0) if float(agg["close"].iloc[-2]) > 0 else None
-                    ema50_4h = agg["close"].ewm(span=50, adjust=False, min_periods=50).mean().iloc[-1]
-                    ema200_4h = agg["close"].ewm(span=200, adjust=False, min_periods=200).mean().iloc[-1]
+                if len(contiguous_4h) >= 2:
+                    c4 = float(contiguous_4h["close"].iloc[-1])
+                    previous_c4 = float(contiguous_4h["close"].iloc[-2])
+                    out["htf4h_return_4h_pct"] = (c4 / previous_c4 - 1.0) * 100.0 if previous_c4 > 0 else None
+                if len(contiguous_4h) >= 50:
+                    c4 = float(contiguous_4h["close"].iloc[-1])
+                    ema50_4h = contiguous_4h["close"].ewm(span=50, adjust=False, min_periods=50).mean().iloc[-1]
                     out["htf4h_ema50_distance_pct"] = float((c4 / float(ema50_4h) - 1.0) * 100.0) if pd.notna(ema50_4h) and float(ema50_4h) > 0 else None
-                    out["htf4h_ema200_distance_pct"] = float((c4 / float(ema200_4h) - 1.0) * 100.0) if pd.notna(ema200_4h) and float(ema200_4h) > 0 else None
                     if pd.notna(ema50_4h):
                         out["htf4h_trend"] = "UP" if c4 > float(ema50_4h) else "DOWN"
+                if len(contiguous_4h) >= 200:
+                    c4 = float(contiguous_4h["close"].iloc[-1])
+                    ema200_4h = contiguous_4h["close"].ewm(span=200, adjust=False, min_periods=200).mean().iloc[-1]
+                    out["htf4h_ema200_distance_pct"] = float((c4 / float(ema200_4h) - 1.0) * 100.0) if pd.notna(ema200_4h) and float(ema200_4h) > 0 else None
         except Exception:
-            pass
+            out["htf4h_ema200_status"] = "CALCULATION_ERROR"
 
     bx5 = _closed_market_frame(btc_df_5m, decision_ts, "5m")
-    if len(bx5) >= 13:
-        bc = _safe_float(bx5["close"].iloc[-1]); p1 = _safe_float(bx5["close"].iloc[-2]); p12 = _safe_float(bx5["close"].iloc[-13])
-        if bc and p1 and p1 > 0: out["btc_return_5m_pct"] = (bc / p1 - 1.0) * 100.0
-        if bc and p12 and p12 > 0: out["btc_return_1h_pct"] = (bc / p12 - 1.0) * 100.0
+    btc5_suffix = _contiguous_history_suffix(bx5, pd.Timedelta(minutes=5))
+    if len(btc5_suffix) >= 2:
+        bc = _safe_float(btc5_suffix["close"].iloc[-1]); p1 = _safe_float(btc5_suffix["close"].iloc[-2])
+        if bc and p1 and p1 > 0:
+            out["btc_return_5m_pct"] = (bc / p1 - 1.0) * 100.0
+            out["btc_return_5m_status"] = "AVAILABLE" if len(btc5_suffix) == len(bx5) else "AVAILABLE_CONTIGUOUS_SUFFIX"
+    elif len(bx5) >= 2:
+        out["btc_return_5m_status"] = "GAPPED_HISTORY"
+    else:
+        out["btc_return_5m_status"] = "INSUFFICIENT_HISTORY"
+    if len(btc5_suffix) >= 13:
+        bc = _safe_float(btc5_suffix["close"].iloc[-1]); p12 = _safe_float(btc5_suffix["close"].iloc[-13])
+        if bc and p12 and p12 > 0:
+            out["btc_return_1h_pct"] = (bc / p12 - 1.0) * 100.0
+            out["btc_return_1h_status"] = "AVAILABLE" if len(btc5_suffix) == len(bx5) else "AVAILABLE_CONTIGUOUS_SUFFIX"
+    elif len(bx5) >= 13:
+        out["btc_return_1h_status"] = "GAPPED_HISTORY"
+    else:
+        out["btc_return_1h_status"] = "INSUFFICIENT_HISTORY"
+
     bx1 = _closed_market_frame(btc_df_1h, decision_ts, "1h")
     out["btc_1h_history_bars_available"] = int(len(bx1))
+    btc1_suffix = _contiguous_history_suffix(bx1, pd.Timedelta(hours=1))
     if not bx1.empty:
         out["btc_ema200_status"] = "INSUFFICIENT_HISTORY"
-    if len(bx1) >= 200:
-        out["btc_ema200_status"] = "AVAILABLE"
-    if len(bx1) >= 50:
-        bc = _safe_float(bx1["close"].iloc[-1]); ema = bx1["close"].ewm(span=50, adjust=False, min_periods=50).mean().iloc[-1]
-        if bc and pd.notna(ema) and float(ema) > 0: out["btc_ema50_distance_pct"] = (bc / float(ema) - 1.0) * 100.0
-    if len(bx1) >= 200:
-        bc = _safe_float(bx1["close"].iloc[-1]); ema = bx1["close"].ewm(span=200, adjust=False, min_periods=200).mean().iloc[-1]
-        if bc and pd.notna(ema) and float(ema) > 0: out["btc_ema200_distance_pct"] = (bc / float(ema) - 1.0) * 100.0
+        out["btc_ema50_status"] = "INSUFFICIENT_HISTORY"
+    if len(btc1_suffix) >= 50:
+        bc = _safe_float(btc1_suffix["close"].iloc[-1])
+        ema = btc1_suffix["close"].ewm(span=50, adjust=False, min_periods=50).mean().iloc[-1]
+        if bc and pd.notna(ema) and float(ema) > 0:
+            out["btc_ema50_distance_pct"] = (bc / float(ema) - 1.0) * 100.0
+            out["btc_ema50_status"] = "AVAILABLE" if len(btc1_suffix) == len(bx1) else "AVAILABLE_CONTIGUOUS_SUFFIX"
+    elif len(bx1) >= 50:
+        out["btc_ema50_status"] = "GAPPED_HISTORY"
+    if len(btc1_suffix) >= 200:
+        bc = _safe_float(btc1_suffix["close"].iloc[-1])
+        ema = btc1_suffix["close"].ewm(span=200, adjust=False, min_periods=200).mean().iloc[-1]
+        if bc and pd.notna(ema) and float(ema) > 0:
+            out["btc_ema200_distance_pct"] = (bc / float(ema) - 1.0) * 100.0
+            out["btc_ema200_status"] = "AVAILABLE" if len(btc1_suffix) == len(bx1) else "AVAILABLE_CONTIGUOUS_SUFFIX"
+    elif len(bx1) >= 200:
+        out["btc_ema200_status"] = "GAPPED_HISTORY"
     return out
 
 def build_research_features(
@@ -1440,6 +1562,30 @@ def build_research_features(
     btc_df_1h: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """Compute shadow-only features known no later than the research decision time."""
+    # Callers normally pass the canonical decision boundary explicitly. For
+    # compatibility with direct/helper callers, infer the same boundary from
+    # the event bar when it is omitted; otherwise time-series helpers would
+    # receive None and include every later candle in the supplied frame.
+    parsed_decision_ts = _parse_timestamp(
+        decision_ts
+        or bar.get("decision_ts")
+        or bar.get("observation_ts")
+        or bar.get("close_time")
+    )
+    if parsed_decision_ts is None:
+        trigger_open_ts = _parse_timestamp(bar.get("timestamp"))
+        if trigger_open_ts is not None:
+            parsed_decision_ts = trigger_open_ts + pd.Timedelta(minutes=5)
+    decision_ts = parsed_decision_ts.isoformat() if parsed_decision_ts is not None else None
+    if parsed_decision_ts is None:
+        # Without a valid event/decision timestamp there is no safe as-of
+        # boundary. Keep bar-local geometry, but do not derive time-series
+        # features from an unbounded frame that may contain future candles.
+        df_1h = None
+        df_5m = None
+        btc_df_5m = None
+        btc_df_1h = None
+
     top = _safe_float(zone.get("top"))
     bottom = _safe_float(zone.get("btm"))
     poi = _safe_float(zone.get("poi"))
@@ -1458,6 +1604,10 @@ def build_research_features(
         "departure_impulse_atr": None,
         "departure_body_to_range": None,
         "departure_volume_ratio_20": None,
+        "departure_impulse_status": "NOT_CAPTURED",
+        "departure_volume_ratio_20_status": "NOT_CAPTURED",
+        "ema50_history_status": "NOT_CAPTURED",
+        "ema200_history_status": "NOT_CAPTURED",
         "market_context_id": (market_context or {}).get("context_id"),
         "market_context_status": (market_context or {}).get("status"),
         "market_context_persisted": (market_context or {}).get("persisted"),
@@ -1475,6 +1625,7 @@ def build_research_features(
         "close_location": ((close - low) / rng) if close is not None and low is not None and rng and rng > 0 else None,
         "range_pct": (rng / close * 100.0) if rng is not None and close and close > 0 else None,
         "volume": volume,
+        "volume_ratio_5m20_status": "NOT_CAPTURED",
         "touch_count_before_trigger": touch_count_before_trigger,
         "structure_room_R": structure_room_r,
         "directional_candle_ok_current": (close >= open_) if direction == "LONG" and close is not None and open_ is not None else (close <= open_ if direction == "SHORT" and close is not None and open_ is not None else None),
@@ -1541,16 +1692,38 @@ def build_research_features(
             x5 = df_5m.copy()
             x5["timestamp"] = x5["timestamp"].map(_parse_timestamp)
             x5["volume"] = pd.to_numeric(x5["volume"], errors="coerce")
-            x5 = x5.dropna(subset=["timestamp", "volume"]).sort_values("timestamp")
-            prior = x5.loc[x5["timestamp"] < trigger_ts, "volume"].tail(20) if trigger_ts is not None else x5["volume"].iloc[0:0]
-            avg = float(prior.mean()) if len(prior) == 20 else float("nan")
-            if math.isfinite(avg) and avg > 0:
-                vr = volume / avg
+            x5 = x5.dropna(subset=["timestamp", "volume"]).sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+            prior = x5.loc[x5["timestamp"] < trigger_ts].tail(20) if trigger_ts is not None else x5.iloc[0:0]
+            if trigger_ts is None:
+                features["volume_ratio_5m20_status"] = "INVALID_TRIGGER_TIMESTAMP"
+            elif len(prior) < 20:
+                features["volume_ratio_5m20_status"] = "INSUFFICIENT_HISTORY"
+            else:
+                prior_ts = prior["timestamp"]
+                contiguous = (
+                    prior_ts.diff().dropna().eq(pd.Timedelta(minutes=5)).all()
+                    and prior_ts.iloc[-1] + pd.Timedelta(minutes=5) == trigger_ts
+                )
+                if not contiguous:
+                    features["volume_ratio_5m20_status"] = "GAPPED_HISTORY"
+                else:
+                    avg = float(prior["volume"].mean())
+                    if math.isfinite(avg) and avg > 0:
+                        vr = volume / avg
+                        features["volume_ratio_5m20_status"] = "AVAILABLE"
+                    else:
+                        features["volume_ratio_5m20_status"] = "INVALID_BASELINE"
         except Exception:
             vr = None
+            features["volume_ratio_5m20_status"] = "CALCULATION_ERROR"
     features["volume_ratio_5m20"] = vr
+    # Preserve the pre-existing source vocabulary for downstream readers; the
+    # precise reason for an unavailable value is exposed independently in
+    # volume_ratio_5m20_status.
     features["volume_ratio_5m20_source"] = (
-        "5M_PREVIOUS_20_CLOSED_BARS" if vr is not None else "UNAVAILABLE_TRIGGER_TIMESTAMP_OR_20_BAR_BASELINE"
+        "5M_PREVIOUS_20_CONSECUTIVE_CLOSED_BARS"
+        if vr is not None
+        else "UNAVAILABLE_TRIGGER_TIMESTAMP_OR_20_BAR_BASELINE"
     )
 
     # Match the forensic candle geometry from the trigger boundary, but keep it
@@ -1582,6 +1755,10 @@ def build_research_features(
                     approach_close = _safe_float(pre["close"].iloc[-1])
                     for n, key in ((1, "approach_return_5m_pct"), (3, "approach_return_15m_pct"), (6, "approach_return_30m_pct"), (12, "approach_return_1h_pct")):
                         if len(pre) > n and approach_close and approach_close > 0:
+                            current_ts = _parse_timestamp(pre["timestamp"].iloc[-1])
+                            previous_ts = _parse_timestamp(pre["timestamp"].iloc[-1-n])
+                            if current_ts is None or previous_ts is None or current_ts - previous_ts != pd.Timedelta(minutes=5*n):
+                                continue
                             prev = _safe_float(pre["close"].iloc[-1-n])
                             if prev and prev > 0:
                                 raw = (approach_close / prev - 1.0) * 100.0
@@ -1601,6 +1778,10 @@ def build_research_features(
                     streak = 0
                     desired_positive = direction == "LONG"
                     for i in range(len(pre) - 1, 0, -1):
+                        previous_ts = _parse_timestamp(pre["timestamp"].iloc[i - 1])
+                        current_ts = _parse_timestamp(pre["timestamp"].iloc[i])
+                        if previous_ts is None or current_ts is None or current_ts - previous_ts != pd.Timedelta(minutes=5):
+                            break
                         prev_close = _safe_float(pre["close"].iloc[i - 1]); curr_close = _safe_float(pre["close"].iloc[i])
                         if prev_close is None or curr_close is None or curr_close == prev_close:
                             break
@@ -1658,27 +1839,49 @@ def build_research_features(
             x1 = df_1h.copy()
             x1["timestamp"] = x1["timestamp"].map(_parse_timestamp)
             x1["close"] = pd.to_numeric(x1["close"], errors="coerce")
-            x1 = x1.dropna(subset=["timestamp", "close"]).sort_values("timestamp")
+            x1 = x1.dropna(subset=["timestamp", "close"]).sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True)
             if asof_ts is not None:
-                x1 = x1.loc[x1["timestamp"] + pd.Timedelta(hours=1) <= asof_ts]
+                x1 = x1.loc[x1["timestamp"] + pd.Timedelta(hours=1) <= asof_ts].reset_index(drop=True)
             closes = x1["close"]
+            features["ema50_history_status"] = "INSUFFICIENT_HISTORY"
+            features["ema200_history_status"] = "INSUFFICIENT_HISTORY"
             if len(closes) >= 2:
                 current = float(closes.iloc[-1])
                 for label, bars_back in (("1h",1),("3h",3),("6h",6),("12h",12),("24h",24)):
                     if len(closes) > bars_back and current > 0:
+                        elapsed = x1["timestamp"].iloc[-1] - x1["timestamp"].iloc[-1-bars_back]
+                        if elapsed != pd.Timedelta(hours=bars_back):
+                            continue
                         prior = float(closes.iloc[-1-bars_back])
                         if math.isfinite(prior) and prior > 0:
                             features[f"return_{label}_pct"] = (current / prior - 1.0) * 100.0
-                ema50_series = closes.ewm(span=50, adjust=False, min_periods=50).mean()
-                ema200_series = closes.ewm(span=200, adjust=False, min_periods=200).mean()
+
+            contiguous_1h = _contiguous_history_suffix(x1, pd.Timedelta(hours=1))
+            gap_exists = len(contiguous_1h) < len(x1)
+            if len(contiguous_1h) >= 50:
+                ema50_series = contiguous_1h["close"].ewm(span=50, adjust=False, min_periods=50).mean()
                 ema50 = ema50_series.iloc[-1]
+                if current > 0 and pd.notna(ema50) and float(ema50) > 0:
+                    features["ema50_distance_pct"] = (current / float(ema50) - 1.0) * 100.0
+                if len(ema50_series) > 1 and pd.notna(ema50) and pd.notna(ema50_series.iloc[-2]):
+                    features["ema50_trend_up"] = bool(ema50 > ema50_series.iloc[-2])
+                features["ema50_history_status"] = "AVAILABLE_CONTIGUOUS_SUFFIX" if gap_exists else "AVAILABLE"
+            elif len(x1) >= 50:
+                features["ema50_history_status"] = "GAPPED_HISTORY"
+
+            if len(contiguous_1h) >= 200:
+                ema200_series = contiguous_1h["close"].ewm(span=200, adjust=False, min_periods=200).mean()
                 ema200 = ema200_series.iloc[-1]
-                features["ema50_distance_pct"] = (current / float(ema50) - 1.0) * 100.0 if pd.notna(ema50) and float(ema50) > 0 else None
-                features["ema200_distance_pct"] = (current / float(ema200) - 1.0) * 100.0 if pd.notna(ema200) and float(ema200) > 0 else None
-                features["ema200_trend_up"] = bool(ema200 > ema200_series.iloc[-2]) if len(ema200_series) > 1 and pd.notna(ema200) and pd.notna(ema200_series.iloc[-2]) else None
-                features["ema50_trend_up"] = bool(ema50 > ema50_series.iloc[-2]) if len(ema50_series) > 1 and pd.notna(ema50) and pd.notna(ema50_series.iloc[-2]) else None
+                if current > 0 and pd.notna(ema200) and float(ema200) > 0:
+                    features["ema200_distance_pct"] = (current / float(ema200) - 1.0) * 100.0
+                if len(ema200_series) > 1 and pd.notna(ema200) and pd.notna(ema200_series.iloc[-2]):
+                    features["ema200_trend_up"] = bool(ema200 > ema200_series.iloc[-2])
+                features["ema200_history_status"] = "AVAILABLE_CONTIGUOUS_SUFFIX" if gap_exists else "AVAILABLE"
+            elif len(x1) >= 200:
+                features["ema200_history_status"] = "GAPPED_HISTORY"
         except Exception:
-            pass
+            features["ema50_history_status"] = "CALCULATION_ERROR"
+            features["ema200_history_status"] = "CALCULATION_ERROR"
     features.update(_derive_time_series_features(
         direction=direction, df_5m=df_5m, df_1h=df_1h, decision_ts=decision_ts,
         btc_df_5m=btc_df_5m, btc_df_1h=btc_df_1h,
@@ -1783,19 +1986,45 @@ def build_research_features(
             if src in trades: features[dst] = trades.get(src)
     # Zone-departure measurements from the existing origin; these never gate production.
     if df_1h is not None and not df_1h.empty and zone.get("start") is not None:
+        features["departure_impulse_status"] = "INSUFFICIENT_HISTORY"
+        features["departure_volume_ratio_20_status"] = "INSUFFICIENT_HISTORY"
         try:
             x1 = _closed_market_frame(df_1h, decision_ts, "1h")
             start = int(zone.get("start"))
             if 0 <= start < len(x1):
-                move = min(start + 6, len(x1)-1)
-                base = _safe_float(x1.iloc[start].get("close")); endc = _safe_float(x1.iloc[move].get("close")); atr = _safe_float(x1.iloc[start].get("atr50")) if "atr50" in x1.columns else None
-                if base and endc and atr and atr > 0: features["departure_impulse_atr"] = abs(endc-base)/atr
-                o=_safe_float(x1.iloc[start].get("open")); h=_safe_float(x1.iloc[start].get("high")); l=_safe_float(x1.iloc[start].get("low")); c=_safe_float(x1.iloc[start].get("close")); v=_safe_float(x1.iloc[start].get("volume"))
-                if o is not None and h is not None and l is not None and c is not None and h>l: features["departure_body_to_range"] = abs(c-o)/(h-l)
+                base_row = x1.iloc[start]
+                o=_safe_float(base_row.get("open")); h=_safe_float(base_row.get("high")); l=_safe_float(base_row.get("low")); c=_safe_float(base_row.get("close")); v=_safe_float(base_row.get("volume"))
+                if o is not None and h is not None and l is not None and c is not None and h>l:
+                    features["departure_body_to_range"] = abs(c-o)/(h-l)
+                if start + 6 < len(x1):
+                    impulse_window = x1.iloc[start:start+7]
+                    impulse_ts = pd.to_datetime(impulse_window["timestamp"], utc=True, errors="coerce")
+                    if not impulse_ts.isna().any() and impulse_ts.diff().dropna().eq(pd.Timedelta(hours=1)).all():
+                        base = _safe_float(impulse_window.iloc[0].get("close"))
+                        endc = _safe_float(impulse_window.iloc[-1].get("close"))
+                        atr = _safe_float(impulse_window.iloc[0].get("atr50")) if "atr50" in impulse_window.columns else None
+                        if base is not None and endc is not None and atr is not None and atr > 0:
+                            features["departure_impulse_atr"] = abs(endc-base)/atr
+                            features["departure_impulse_status"] = "AVAILABLE"
+                        else:
+                            features["departure_impulse_status"] = "INVALID_BASELINE"
+                    else:
+                        features["departure_impulse_status"] = "GAPPED_HISTORY"
                 if v is not None and start >= 20:
-                    pv=pd.to_numeric(x1.iloc[start-20:start]["volume"],errors="coerce").dropna()
-                    if len(pv)==20 and float(pv.mean())>0: features["departure_volume_ratio_20"] = v/float(pv.mean())
-        except Exception: pass
+                    baseline_window = x1.iloc[start-20:start+1]
+                    baseline_ts = pd.to_datetime(baseline_window["timestamp"], utc=True, errors="coerce")
+                    if not baseline_ts.isna().any() and baseline_ts.diff().dropna().eq(pd.Timedelta(hours=1)).all():
+                        pv=pd.to_numeric(baseline_window.iloc[:-1]["volume"],errors="coerce").dropna()
+                        if len(pv)==20 and float(pv.mean())>0:
+                            features["departure_volume_ratio_20"] = v/float(pv.mean())
+                            features["departure_volume_ratio_20_status"] = "AVAILABLE"
+                        else:
+                            features["departure_volume_ratio_20_status"] = "INVALID_BASELINE"
+                    else:
+                        features["departure_volume_ratio_20_status"] = "GAPPED_HISTORY"
+        except Exception:
+            features["departure_impulse_status"] = "CALCULATION_ERROR"
+            features["departure_volume_ratio_20_status"] = "CALCULATION_ERROR"
     return sanitize(features)
 
 

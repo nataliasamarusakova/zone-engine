@@ -166,7 +166,9 @@ def instrument_scan_symbol(function: Callable[..., Any]) -> Callable[..., Any]:
             with symbol_context(str(symbol)):
                 with phase("scan_symbol"):
                     result = function(symbol, *args, **kwargs)
-            outcome = str(result.get("price_position") or "unknown").lower() if isinstance(result, dict) else "unknown"
+            # A zone-position label describes market location, not whether the
+            # scan operation succeeded. Keep timing outcomes machine-actionable.
+            outcome = "ok" if isinstance(result, dict) else "no_result"
             return result
         finally:
             record_operation(

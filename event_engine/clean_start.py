@@ -65,12 +65,22 @@ def verify_vst_account_is_flat() -> None:
 
 def initialize_empty_runtime(data_dir: Path) -> None:
     """Create the minimum complete, schema-safe runtime inventory for run one."""
-    data_dir = Path(data_dir)
-    # Check the path before resolving it; resolve() would hide a symlink and could
-    # otherwise make a clean start delete a directory outside the checkout.
-    if data_dir.is_symlink():
-        raise RuntimeError(f"Refusing to replace symlinked runtime data directory: {data_dir}")
-    data_dir = data_dir.resolve()
+    data_dir = Path(data_dir).expanduser()
+    # Check every path component before touching the filesystem. Checking only
+    # the leaf misses paths such as `symlink-parent/runtime`; resolve() would
+    # then hide the symlink and rmtree() could delete data outside the checkout.
+    if ".." in data_dir.parts:
+        raise RuntimeError(f"Refusing runtime data path containing parent traversal: {data_dir}")
+    if not data_dir.is_absolute():
+        data_dir = Path.cwd() / data_dir
+    data_dir = Path(os.path.abspath(os.fspath(data_dir)))
+    cursor = Path(data_dir.anchor)
+    for component in data_dir.parts[1:]:
+        cursor = cursor / component
+        if cursor.is_symlink():
+            if cursor == data_dir:
+                raise RuntimeError(f"Refusing to replace symlinked runtime data directory: {data_dir}")
+            raise RuntimeError(f"Refusing runtime data path with symlink component: {cursor}")
     # This is intentionally destructive and is called only after the VST account
     # has been proven flat. Do not mix a clean bootstrap with tracked legacy state.
     if data_dir.exists():

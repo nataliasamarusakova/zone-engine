@@ -88,6 +88,37 @@ def _paths_overlap(left: Path, right: Path) -> bool:
     return left == right or left in right.parents or right in left.parents
 
 
+def _safe_absolute_path(value: Path, label: str) -> Path:
+    """Normalize a path only after rejecting symlinks in every existing component.
+
+    Checking only the leaf and then calling resolve() follows a symlinked parent;
+    destructive bundle create/restore operations could then affect an unrelated
+    directory outside the intended checkout.
+    """
+    path = Path(value).expanduser()
+    if ".." in path.parts:
+        raise RuntimeError(f"Refusing {label} path containing parent traversal: {path}")
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    path = Path(os.path.abspath(os.fspath(path)))
+    cursor = Path(path.anchor)
+    for component in path.parts[1:]:
+        cursor = cursor / component
+        if cursor.is_symlink():
+            if cursor == path:
+                if label == "runtime restore target":
+                    raise RuntimeError("Runtime bundle and restore target paths must not be symlinks")
+                if label == "runtime-state bundle":
+                    raise RuntimeError(f"Refusing symlinked runtime-state bundle directory: {cursor}")
+                if label == "runtime data snapshot":
+                    raise RuntimeError(f"Refusing symlinked runtime data directory in snapshot: {cursor}")
+                if label == "runtime data":
+                    raise RuntimeError("Runtime data and bundle output paths must not be symlinks")
+                raise RuntimeError(f"Refusing symlinked {label} path: {cursor}")
+            raise RuntimeError(f"Refusing {label} path with symlink component: {cursor}")
+    return path.resolve(strict=False)
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -128,12 +159,8 @@ def create_bundle(
     *, data_dir: Path, output_dir: Path,
     source_commit: str = "", run_id: str = "",
 ) -> dict[str, Any]:
-    data_dir = Path(data_dir)
-    output_dir = Path(output_dir)
-    if data_dir.is_symlink() or output_dir.is_symlink():
-        raise RuntimeError("Runtime data and bundle output paths must not be symlinks")
-    data_dir = data_dir.resolve()
-    output_dir = output_dir.resolve()
+    data_dir = _safe_absolute_path(Path(data_dir), "runtime data")
+    output_dir = _safe_absolute_path(Path(output_dir), "bundle output")
     if _paths_overlap(output_dir, data_dir):
         raise RuntimeError("Bundle output must be outside runtime data")
 
@@ -223,10 +250,7 @@ def _validate_critical_json_state(data_dir: Path) -> None:
 
 
 def verify_bundle(bundle_dir: Path) -> dict[str, Any]:
-    bundle_dir = Path(bundle_dir)
-    if bundle_dir.is_symlink():
-        raise RuntimeError(f"Refusing symlinked runtime-state bundle directory: {bundle_dir}")
-    bundle_dir = bundle_dir.resolve()
+    bundle_dir = _safe_absolute_path(Path(bundle_dir), "runtime-state bundle")
     manifest_path = bundle_dir / MANIFEST_NAME
     if not manifest_path.is_file() or manifest_path.is_symlink():
         raise RuntimeError(f"Runtime-state manifest is missing: {manifest_path}")
@@ -300,12 +324,8 @@ def verify_bundle(bundle_dir: Path) -> dict[str, Any]:
 
 
 def restore_bundle(*, bundle_dir: Path, data_dir: Path) -> None:
-    bundle_dir = Path(bundle_dir)
-    data_dir = Path(data_dir)
-    if bundle_dir.is_symlink() or data_dir.is_symlink():
-        raise RuntimeError("Runtime bundle and restore target paths must not be symlinks")
-    bundle_dir = bundle_dir.resolve()
-    data_dir = data_dir.resolve()
+    bundle_dir = _safe_absolute_path(Path(bundle_dir), "runtime-state bundle")
+    data_dir = _safe_absolute_path(Path(data_dir), "runtime restore target")
     verify_bundle(bundle_dir)
     if _paths_overlap(bundle_dir, data_dir):
         raise RuntimeError("Bundle path must not overlap restore target")
@@ -346,9 +366,7 @@ def _snapshot_excluded(relative: Path) -> bool:
 
 
 def data_snapshot(data_dir: Path) -> dict[str, dict[str, Any]]:
-    data_dir = Path(data_dir)
-    if data_dir.is_symlink():
-        raise RuntimeError(f"Refusing symlinked runtime data directory in snapshot: {data_dir}")
+    data_dir = _safe_absolute_path(Path(data_dir), "runtime data snapshot")
     if not data_dir.is_dir():
         raise RuntimeError(f"Runtime data directory is missing: {data_dir}")
     inventory: dict[str, dict[str, Any]] = {}
@@ -368,6 +386,7 @@ def data_snapshot(data_dir: Path) -> dict[str, dict[str, Any]]:
 
 def write_data_snapshot(*, data_dir: Path, output_path: Path) -> None:
     payload = {"schema_version": 1, "files": data_snapshot(data_dir)}
+    output_path = _safe_absolute_path(Path(output_path), "runtime data snapshot output")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8", newline="\n") as handle:
         json.dump(payload, handle, sort_keys=True)

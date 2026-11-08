@@ -155,8 +155,44 @@ def _closed_1h(df: pd.DataFrame | None, entry_ts: pd.Timestamp) -> pd.DataFrame:
     return x.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
 
 
+def _has_contiguous_tail(df: pd.DataFrame, count: int, interval: pd.Timedelta) -> bool:
+    if df is None or len(df) < count or "timestamp" not in df.columns:
+        return False
+    timestamps = _timestamp_series_to_utc(df["timestamp"].tail(count))
+    if timestamps.isna().any():
+        return False
+    if len(timestamps) > 1 and not timestamps.diff().dropna().eq(interval).all():
+        return False
+    interval_ns = int(interval.value)
+    return bool((timestamps.astype("int64") % interval_ns == 0).all())
+
+
+def _contiguous_suffix(df: pd.DataFrame, interval: pd.Timedelta) -> pd.DataFrame:
+    if df is None or df.empty or "timestamp" not in df.columns:
+        return pd.DataFrame(columns=df.columns if isinstance(df, pd.DataFrame) else None)
+    x = df.sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True)
+    timestamps = _timestamp_series_to_utc(x["timestamp"])
+    valid = timestamps.notna()
+    x = x.loc[valid].reset_index(drop=True)
+    timestamps = timestamps.loc[valid].reset_index(drop=True)
+    if len(x) <= 1:
+        return x
+    interval_ns = int(interval.value)
+    ts_ns = timestamps.astype("int64").to_numpy()
+    breaks = [
+        (int(ts_ns[i]) - int(ts_ns[i - 1])) != interval_ns
+        or (int(ts_ns[i]) % interval_ns) != 0
+        or (int(ts_ns[i - 1]) % interval_ns) != 0
+        for i in range(1, len(ts_ns))
+    ]
+    last_break = max((i for i, value in enumerate(breaks) if value), default=-1)
+    return x.iloc[last_break + 1:].reset_index(drop=True)
+
+
 def _atr14_5m(x: pd.DataFrame) -> float | None:
-    if len(x) < 2:
+    # Fourteen true-range values need their preceding close as well; all
+    # fifteen candle opens must be consecutive 5m intervals.
+    if len(x) < 15 or not _has_contiguous_tail(x, 15, pd.Timedelta(minutes=5)):
         return None
     prev = x["close"].shift(1)
     tr = pd.concat(
@@ -242,19 +278,48 @@ def build_entry_snapshot(
     # between trigger open and trigger close is included when it was knowable.
     x5 = _closed_5m(df_5m, entry_ts)
     x1 = _closed_1h(df_1h, decision_ts_parsed)
-    trigger_bar = x5.iloc[-1] if not x5.empty else None
-    prev5 = x5.iloc[:-1].tail(20) if len(x5) >= 21 else pd.DataFrame()
+    trigger_rows = x5.loc[x5["timestamp"] == entry_ts] if not x5.empty else pd.DataFrame()
+    trigger_bar = trigger_rows.iloc[-1] if not trigger_rows.empty else None
+    prior5 = x5.loc[x5["timestamp"] < entry_ts] if not x5.empty else pd.DataFrame()
+    prev5 = prior5.tail(20)
     vol5 = _finite(trigger_bar["volume"]) if trigger_bar is not None else None
-    baseline5 = _finite(prev5["volume"].mean()) if not prev5.empty else None
+    if trigger_bar is None:
+        volume_5m_status = "MISSING_TRIGGER_BAR"
+        baseline5 = None
+    elif len(prev5) < 20:
+        volume_5m_status = "INSUFFICIENT_HISTORY"
+        baseline5 = None
+    elif not _has_contiguous_tail(prev5, 20, pd.Timedelta(minutes=5)) or prior5.empty or prior5["timestamp"].iloc[-1] + pd.Timedelta(minutes=5) != entry_ts:
+        volume_5m_status = "GAPPED_HISTORY"
+        baseline5 = None
+    else:
+        baseline5 = _finite(prev5["volume"].mean())
+        volume_5m_status = "AVAILABLE" if baseline5 is not None and baseline5 > 0 and vol5 is not None else "INVALID_BASELINE"
     volume_5m_ratio = _ratio(vol5, baseline5)
 
     last1h = x1.iloc[-1] if not x1.empty else None
     prev1h = x1.iloc[:-1].tail(20) if len(x1) >= 21 else pd.DataFrame()
     vol1h = _finite(last1h["volume"]) if last1h is not None else None
-    baseline1h = _finite(prev1h["volume"].mean()) if not prev1h.empty else None
+    if last1h is None or len(prev1h) < 20:
+        volume_1h_status = "INSUFFICIENT_HISTORY"
+        baseline1h = None
+    elif not _has_contiguous_tail(prev1h, 20, pd.Timedelta(hours=1)) or prev1h["timestamp"].iloc[-1] + pd.Timedelta(hours=1) != last1h["timestamp"]:
+        volume_1h_status = "GAPPED_HISTORY"
+        baseline1h = None
+    else:
+        baseline1h = _finite(prev1h["volume"].mean())
+        volume_1h_status = "AVAILABLE" if baseline1h is not None and baseline1h > 0 and vol1h is not None else "INVALID_BASELINE"
     volume_1h_ratio = _ratio(vol1h, baseline1h)
 
-    atr5 = _atr14_5m(x5)
+    atr5 = _atr14_5m(x5) if trigger_bar is not None else None
+    if trigger_bar is None:
+        atr5_status = "MISSING_TRIGGER_BAR"
+    elif atr5 is not None:
+        atr5_status = "AVAILABLE"
+    elif len(x5) >= 15:
+        atr5_status = "GAPPED_HISTORY"
+    else:
+        atr5_status = "INSUFFICIENT_HISTORY"
     atr5_pct = (atr5 / entry * 100.0) if atr5 is not None and entry > 0 else None
     delta = _finite(trigger_bar.get("bar_delta_usdt")) if trigger_bar is not None and hasattr(trigger_bar, "get") else None
     delta_confirmed = None if delta is None else (delta > 0 if direction == "LONG" else delta < 0)
@@ -262,14 +327,18 @@ def build_entry_snapshot(
     ema200 = None
     ema200_distance_pct = None
     ema200_trend_up = None
-    if len(x1) >= 200:
-        closes = x1["close"]
+    contiguous_1h = _contiguous_suffix(x1, pd.Timedelta(hours=1))
+    if len(contiguous_1h) >= 200:
+        closes = contiguous_1h["close"]
         ema_series = closes.ewm(span=200, adjust=False, min_periods=200).mean()
         ema200 = _finite(ema_series.iloc[-1])
         if ema200 is not None:
             ema200_distance_pct = (entry / ema200 - 1.0) * 100.0
             if len(ema_series) >= 2 and pd.notna(ema_series.iloc[-2]):
                 ema200_trend_up = bool(float(ema_series.iloc[-1]) > float(ema_series.iloc[-2]))
+        ema200_status = "AVAILABLE_CONTIGUOUS_SUFFIX" if len(contiguous_1h) < len(x1) else "AVAILABLE"
+    else:
+        ema200_status = "GAPPED_HISTORY" if len(x1) >= 200 else "INSUFFICIENT_HISTORY"
     macro_alignment = None if ema200 is None else (entry > ema200 if direction == "LONG" else entry < ema200)
 
     far_edge = bottom if direction == "LONG" else top
@@ -317,7 +386,7 @@ def build_entry_snapshot(
     invalidation_ts = None
     if top is not None and bottom is not None and not x5.empty:
         origin_ts = _parse_ts(zone.get("origin_ts_ms"))
-        prior_bars = x5.iloc[:-1]
+        prior_bars = x5.loc[x5["timestamp"] < entry_ts].copy()
         if origin_ts is not None:
             prior_bars = prior_bars.loc[prior_bars["timestamp"] >= origin_ts]
         for _, row in prior_bars.iterrows():
@@ -396,6 +465,7 @@ def build_entry_snapshot(
                 "trigger_volume": vol5,
                 "baseline_sma20_previous_bars": baseline5,
                 "ratio": volume_5m_ratio,
+                "status": volume_5m_status,
                 "threshold_grid": _grid(volume_5m_ratio, VOLUME_5M_THRESHOLDS),
             },
             "CF_VOLUME_1H": {
@@ -403,6 +473,7 @@ def build_entry_snapshot(
                 "current_closed_1h_volume": vol1h,
                 "baseline_sma20_previous_bars": baseline1h,
                 "ratio": volume_1h_ratio,
+                "status": volume_1h_status,
                 "threshold_grid": _grid(volume_1h_ratio, VOLUME_1H_THRESHOLDS),
             },
             "CF_DELTA_CONFIRM": {
@@ -416,6 +487,7 @@ def build_entry_snapshot(
                 "ema200_1h": ema200,
                 "distance_pct": ema200_distance_pct,
                 "ema200_trend_up": ema200_trend_up,
+                "status": ema200_status,
                 "rule": "LONG price>EMA200 / SHORT price<EMA200",
                 "would_pass": macro_alignment,
             },
@@ -423,6 +495,7 @@ def build_entry_snapshot(
                 "version": 1,
                 "atr14_5m": atr5,
                 "atr_pct": atr5_pct,
+                "status": atr5_status,
                 "threshold_grid_pct": _grid(atr5_pct, ATR_5M_MIN_THRESHOLDS),
             },
             "CF_SESSION": {
@@ -612,17 +685,31 @@ def _precompute_atr_before_close(bars: pd.DataFrame) -> np.ndarray | None:
     atr14 = pd.Series(true_range).rolling(window=14, min_periods=14).mean().to_numpy(dtype=float)
 
     close_ns = close_time.astype("int64").to_numpy()
+    open_ns = bars["timestamp"].astype("int64").to_numpy()
     # Strictly exclude the current candle: the historical implementation used
     # close_time < current_close_time, not <=. searchsorted-left also handles
     # duplicate close times without allowing same-close candles into history.
     history_ends = np.searchsorted(close_ns, close_ns, side="left")
     result = np.full(len(bars), np.nan, dtype=float)
-    valid = history_ends >= 15
-    atr_indices = history_ends[valid] - 1
-    valid_positions = np.flatnonzero(valid)
-    values = atr14[atr_indices]
-    finite = np.isfinite(values)
-    result[valid_positions[finite]] = values[finite]
+    valid_positions = np.flatnonzero(history_ends >= 15)
+    interval_ns = int(pd.Timedelta(minutes=5).value)
+    for position in valid_positions:
+        end = int(history_ends[position])
+        start = end - 15
+        if start < 0:
+            continue
+        # ATR14 at this candle must be based on 14 consecutive true ranges,
+        # including the previous close for the first range, and the current
+        # candle must immediately follow that closed history.
+        cadence = np.concatenate((open_ns[start:end], open_ns[position:position + 1]))
+        if len(cadence) != 16 or not np.all(np.diff(cadence) == interval_ns):
+            continue
+        if np.any(cadence % interval_ns != 0):
+            continue
+        atr_index = end - 1
+        value = atr14[atr_index]
+        if np.isfinite(value):
+            result[position] = value
     return result
 
 
@@ -751,7 +838,16 @@ def _simulate_management_only(
                 atr = _finite(future_atr[idx])
             else:
                 hist = all_bars.loc[all_bars["close_time"] < current_close_ts]
-                if len(hist) >= 15:
+                current_open_ts = current_close_ts - pd.Timedelta(minutes=5) if current_close_ts is not None else None
+                history_ts = _timestamp_series_to_utc(hist["timestamp"].tail(15)) if len(hist) >= 15 else pd.Series(dtype="datetime64[ns, UTC]")
+                cadence_ok = (
+                    current_open_ts is not None
+                    and len(history_ts) == 15
+                    and not history_ts.isna().any()
+                    and history_ts.diff().dropna().eq(pd.Timedelta(minutes=5)).all()
+                    and history_ts.iloc[-1] + pd.Timedelta(minutes=5) == current_open_ts
+                )
+                if cadence_ok:
                     prev = hist["close"].shift(1)
                     tr = pd.concat([
                         hist["high"] - hist["low"],
@@ -1007,7 +1103,17 @@ def prepare_counterfactual_bars(bars: pd.DataFrame) -> pd.DataFrame:
         x["close_time"] = _timestamp_series_to_utc(x["close_time"])
     for col in ("open", "high", "low", "close"):
         x[col] = pd.to_numeric(x[col], errors="coerce")
-    x = x.dropna(subset=["timestamp", "close_time", "open", "high", "low", "close"]).sort_values("timestamp").reset_index(drop=True)
+    x = x.dropna(subset=["timestamp", "close_time", "open", "high", "low", "close"]).copy()
+    # When persisted history and a freshly fetched overlap are concatenated,
+    # keep the last supplied version of each candle. Processing both would
+    # count one market bar twice and distort the simulated path.
+    x["_shadow_input_order"] = np.arange(len(x), dtype=np.int64)
+    x = (
+        x.sort_values(["timestamp", "_shadow_input_order"], kind="stable")
+        .drop_duplicates("timestamp", keep="last")
+        .drop(columns=["_shadow_input_order"])
+        .reset_index(drop=True)
+    )
     # Never trust a caller-supplied value for this internal acceleration field.
     x = x.drop(columns=[_SHADOW_ATR_BEFORE_CLOSE], errors="ignore")
     atr_before_close = _precompute_atr_before_close(x)

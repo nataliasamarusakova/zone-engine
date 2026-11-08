@@ -252,6 +252,11 @@ def _drop_incomplete_1h(df: pd.DataFrame, now: pd.Timestamp | None = None) -> pd
 
 
 def _aggregate_8h(df_1h: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate 1h bars and explicitly identify complete UTC 8h candles.
+
+    A missing entire 8h bucket must not be silently skipped before ALMA(2),
+    otherwise bars 16 hours apart are treated as adjacent HTF observations.
+    """
     x = _normalize_1h(df_1h)
     x["bucket"] = x["timestamp"].dt.floor("8h")
     g = x.groupby("bucket", sort=True, observed=True)
@@ -262,8 +267,15 @@ def _aggregate_8h(df_1h: pd.DataFrame) -> pd.DataFrame:
         close=("close", "last"),
         volume=("volume", "sum"),
         bars=("close", "size"),
+        first_ts=("timestamp", "first"),
         last_ts=("timestamp", "last"),
     ).reset_index()
+    complete = []
+    for row in tf.itertuples(index=False):
+        expected = [row.bucket + pd.Timedelta(hours=offset) for offset in range(8)]
+        actual = x.loc[x["bucket"] == row.bucket, "timestamp"].tolist()
+        complete.append(actual == expected)
+    tf["complete"] = complete
     return tf
 
 
@@ -438,55 +450,48 @@ def _attach_exact_alternate_series(df: pd.DataFrame, mode: Literal["historical",
     out["_bucket"] = out["timestamp"].dt.floor("8h")
 
     tf = _aggregate_8h(out)
-    tf["alma_close"] = calc_alma(tf["close"], ALMA_BASIS_LEN, ALMA_OFFSET, ALMA_SIGMA)
-    tf["alma_open"] = calc_alma(tf["open"], ALMA_BASIS_LEN, ALMA_OFFSET, ALMA_SIGMA)
     tf_idx = tf.set_index("bucket")
 
-    # Start from the exact historical lookahead_on mapping for every bar.
-    mapped = tf_idx[["alma_close", "alma_open"]]
-    out = out.join(mapped, on="_bucket")
-    out.rename(columns={"alma_close": "alma_close_alt", "alma_open": "alma_open_alt"}, inplace=True)
+    # ALMA(2) for an 8h bucket is valid only when this bucket and its immediately
+    # preceding UTC 8h bucket are both complete. Never compress a missing bucket.
+    hist_close: dict[pd.Timestamp, float] = {}
+    hist_open: dict[pd.Timestamp, float] = {}
+    for row in tf.itertuples(index=False):
+        previous = tf_idx.loc[row.bucket - pd.Timedelta(hours=8)] if row.bucket - pd.Timedelta(hours=8) in tf_idx.index else None
+        if not bool(row.complete) or previous is None or not bool(previous["complete"]):
+            continue
+        hist_close[row.bucket] = float(calc_alma(pd.Series([float(previous["close"]), float(row.close)]), ALMA_BASIS_LEN, ALMA_OFFSET, ALMA_SIGMA).iloc[-1])
+        hist_open[row.bucket] = float(calc_alma(pd.Series([float(previous["open"]), float(row.open)]), ALMA_BASIS_LEN, ALMA_OFFSET, ALMA_SIGMA).iloc[-1])
+
+    mapped_close = pd.Series(hist_close, dtype=float, name="alma_close_alt")
+    mapped_open = pd.Series(hist_open, dtype=float, name="alma_open_alt")
+    out = out.join(mapped_close, on="_bucket")
+    out = out.join(mapped_open, on="_bucket")
 
     if mode == "historical":
         out["alternate_mode"] = "historical_lookahead_on"
     else:
-        # Only the latest available 8H bucket is still developing.  Keep every
-        # prior bucket exactly as TradingView historical request.security() does.
+        # Rebuild only the latest developing 8h bucket. It must be a contiguous
+        # prefix from the UTC bucket open and must follow a complete prior bucket.
         latest_bucket = out["_bucket"].iloc[-1]
         mask = out["_bucket"].eq(latest_bucket)
-
-        m = ALMA_OFFSET * (ALMA_BASIS_LEN - 1)
-        sigma_scale = ALMA_BASIS_LEN / ALMA_SIGMA
-        weights = np.array(
-            [
-                math.exp(-((j - m) ** 2) / (2.0 * sigma_scale * sigma_scale))
-                for j in range(ALMA_BASIS_LEN)
-            ],
-            dtype=float,
-        )
-        weights /= weights.sum()
-
-        # The current 8H ALMA(length=2) uses the previous confirmed 8H value
-        # and the current developing 8H value.  For openSeries the current 8H
-        # open is fixed for the entire bucket; for closeSeries it is the most
-        # recent 1H close at each closed 1H bar.
-        buckets = out["_bucket"]
-        unique_buckets = list(tf_idx.index)
-        if len(unique_buckets) >= 2:
-            prev_bucket = unique_buckets[-2]
-            prev_row = tf_idx.loc[prev_bucket]
-            prev_close = float(prev_row["close"])
-            prev_open = float(prev_row["open"])
-
-            current_rows = out.loc[mask].copy()
+        current_rows = out.loc[mask].sort_values("timestamp")
+        previous_bucket = latest_bucket - pd.Timedelta(hours=8)
+        previous = tf_idx.loc[previous_bucket] if previous_bucket in tf_idx.index else None
+        current_expected = [latest_bucket + pd.Timedelta(hours=offset) for offset in range(len(current_rows))]
+        current_actual = current_rows["timestamp"].tolist()
+        current_prefix_complete = current_actual == current_expected
+        if previous is not None and bool(previous["complete"]) and current_prefix_complete and len(current_rows) > 0:
+            m = ALMA_OFFSET * (ALMA_BASIS_LEN - 1)
+            sigma_scale = ALMA_BASIS_LEN / ALMA_SIGMA
+            weights = np.array([math.exp(-((j - m) ** 2) / (2.0 * sigma_scale * sigma_scale)) for j in range(ALMA_BASIS_LEN)], dtype=float)
+            weights /= weights.sum()
+            prev_close = float(previous["close"])
+            prev_open = float(previous["open"])
             current_close = pd.to_numeric(current_rows["close"], errors="coerce").to_numpy(dtype=float)
             current_open = float(current_rows["open"].iloc[0])
-
-            live_close = weights[0] * prev_close + weights[1] * current_close
-            live_open = np.full(len(current_rows), weights[0] * prev_open + weights[1] * current_open, dtype=float)
-
-            out.loc[mask, "alma_close_alt"] = live_close
-            out.loc[mask, "alma_open_alt"] = live_open
+            out.loc[mask, "alma_close_alt"] = weights[0] * prev_close + weights[1] * current_close
+            out.loc[mask, "alma_open_alt"] = weights[0] * prev_open + weights[1] * current_open
 
         out["alternate_mode"] = "live_current_8h_developing"
 
