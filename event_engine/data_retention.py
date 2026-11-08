@@ -24,7 +24,7 @@ DATA_DIR = PROJECT_ROOT / "data"
 # Conservative operational retention. Archived rows are preserved outside the
 # repository, while the working data stays small enough for routine audit work.
 MARKET_5M_RETENTION_HOURS = max(24, int(os.environ.get("DATA_RETENTION_5M_HOURS", "36")))
-MARKET_1H_RETENTION_HOURS = max(72, int(os.environ.get("DATA_RETENTION_1H_HOURS", "168")))
+MARKET_1H_RETENTION_HOURS = max(804, int(os.environ.get("DATA_RETENTION_1H_HOURS", "1000")))
 NEAREST_APPROACH_RETENTION_HOURS = max(24, int(os.environ.get("DATA_RETENTION_NEAREST_HOURS", "36")))
 RESEARCH_OUTCOME_RETENTION_HOURS = max(24, int(os.environ.get("DATA_RETENTION_OUTCOME_HOURS", "2160")))  # 90d
 COUNTERFACTUAL_RETENTION_HOURS = max(24, int(os.environ.get("DATA_RETENTION_COUNTERFACTUAL_HOURS", "2160")))  # 90d
@@ -540,7 +540,11 @@ def _size_guard_plan(path: Path, *, now: datetime, pending_ids: set[str], pendin
         ))
         return policies
     if name == "market_bars_1h.jsonl":
-        hours = [168, 72, 48, 24, 12]
+        # Keep at least 804 hourly candles in the working journal so two
+        # hundred complete 4H candles (including EMA200 warm-up) remain
+        # independently reconstructable. If that floor is too large, fail
+        # the size guard rather than silently destroying feature provenance.
+        hours = [1000, 900, 850, 804]
         return [
             (f"keep_newer_than_{h}h", lambda row, h=h: (_parse_ts(row.get("timestamp")) is None or _parse_ts(row.get("timestamp")) >= now - timedelta(hours=h)))
             for h in hours

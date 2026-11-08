@@ -38,7 +38,7 @@ COUNTERFACTUAL_EXPERIMENTS_PATH = DATA_DIR / "counterfactual_experiments.jsonl"
 MARKET_CONTEXT_PATH = DATA_DIR / "market_context.jsonl"
 ACCOUNT_CONTEXT_PATH = DATA_DIR / "account_context.jsonl"
 
-INITIAL_1H_BARS = max(1, int(os.environ.get("RESEARCH_INITIAL_1H_BARS", "48")))
+INITIAL_1H_BARS = max(1, int(os.environ.get("RESEARCH_INITIAL_1H_BARS", "1000")))
 INITIAL_5M_BARS = max(1, int(os.environ.get("RESEARCH_INITIAL_5M_BARS", "24")))
 NEAREST_APPROACH_MAX_PCT = max(0.0, float(os.environ.get("RESEARCH_NEAREST_APPROACH_MAX_PCT", "1.0")))
 
@@ -214,6 +214,105 @@ def _market_bar_identity(row: dict[str, Any]) -> tuple[str, str, str, str]:
         str(row.get("provider", "")).lower(),
         str(row.get("timestamp", "")),
     )
+
+
+def market_bar_stream_key(symbol: str, timeframe: str, provider: str) -> tuple[str, str, str]:
+    """Return the canonical key used for one symbol/timeframe/provider bar stream."""
+    return (str(symbol).upper(), str(timeframe).lower(), str(provider).lower())
+
+
+def load_market_bar_streams(
+    stream_keys: Iterable[tuple[str, str, str]],
+) -> dict[tuple[str, str, str], list[dict[str, Any]]]:
+    """Load selected persisted bar streams in one pass over their JSONL journals.
+
+    This is intentionally a batch operation: deferred research may process dozens
+    of symbols, and opening/scanning the full journal once per symbol would turn
+    history reconstruction into avoidable O(symbols * file_size) I/O.
+    """
+    wanted = {market_bar_stream_key(*key) for key in stream_keys}
+    wanted = {key for key in wanted if key[1] in {"5m", "1h"}}
+    if not wanted:
+        return {}
+
+    paths = {
+        "5m": MARKET_BARS_5M_PATH,
+        "1h": MARKET_BARS_1H_PATH,
+    }
+    result: dict[tuple[str, str, str], dict[str, dict[str, Any]]] = {key: {} for key in wanted}
+    for timeframe, path in paths.items():
+        timeframe_keys = {key for key in wanted if key[1] == timeframe}
+        if not timeframe_keys or not path.exists():
+            continue
+        with _FileLock(path):
+            with path.open("r", encoding="utf-8") as fh:
+                for line_no, line in enumerate(fh, 1):
+                    text = line.strip()
+                    if not text:
+                        continue
+                    try:
+                        row = json.loads(text)
+                    except json.JSONDecodeError:
+                        log.warning("[RESEARCH_BAR_HISTORY] skipping malformed row path=%s line=%d", path.name, line_no)
+                        continue
+                    if not isinstance(row, dict):
+                        continue
+                    key = market_bar_stream_key(
+                        str(row.get("symbol") or ""),
+                        str(row.get("timeframe") or ""),
+                        str(row.get("provider") or ""),
+                    )
+                    if key not in timeframe_keys:
+                        continue
+                    ts = _parse_timestamp(row.get("timestamp"))
+                    if ts is None:
+                        log.warning("[RESEARCH_BAR_HISTORY] skipping row with invalid timestamp path=%s line=%d", path.name, line_no)
+                        continue
+                    normalized = dict(row)
+                    normalized["timestamp"] = ts.isoformat()
+                    result[key][ts.isoformat()] = normalized
+
+    return {
+        key: [rows[stamp] for stamp in sorted(rows, key=lambda value: _parse_timestamp(value))]
+        for key, rows in result.items()
+    }
+
+
+def merge_market_bar_history(
+    persisted_bars: Iterable[dict[str, Any]] | None,
+    current_bars: Iterable[dict[str, Any]] | None,
+    *,
+    timeframe: str,
+) -> list[dict[str, Any]]:
+    """Merge persisted and current exchange bars; current rows win on timestamp.
+
+    The merge is causal only when consumed through ``_closed_market_frame``,
+    which filters by each observation's decision boundary. Do not truncate the
+    result to the current REST response length.
+    """
+    tf = str(timeframe).lower()
+    if tf not in {"5m", "1h"}:
+        raise ValueError(f"unsupported market-bar timeframe: {timeframe}")
+    merged: dict[str, dict[str, Any]] = {}
+    for source in (persisted_bars or [], current_bars or []):
+        for raw in source:
+            if not isinstance(raw, dict):
+                continue
+            ts = _parse_timestamp(raw.get("timestamp"))
+            if ts is None:
+                continue
+            row = dict(raw)
+            row["timestamp"] = ts.isoformat()
+            existing = merged.get(ts.isoformat())
+            if existing is not None:
+                # Prefer every non-null field from the current exchange payload,
+                # but retain richer persisted fields when the current source omits
+                # them (for example, quote volume / taker-flow diagnostics).
+                combined = dict(existing)
+                combined.update({key: value for key, value in row.items() if value is not None})
+                row = combined
+            merged[ts.isoformat()] = row
+    return [merged[key] for key in sorted(merged, key=lambda value: _parse_timestamp(value))]
 
 
 def _market_bar_file_signature(path: Path) -> tuple[int, int, int, int, int] | None:
@@ -1129,7 +1228,7 @@ def _derive_time_series_features(*, direction: str, df_5m: pd.DataFrame | None, 
         "5m_ema20_distance_pct": None, "5m_ema50_distance_pct": None,
         "5m_ema20_slope_5m_pct": None, "5m_ema50_slope_5m_pct": None,
         "5m_atr_pct": None, "5m_return_volatility_20": None, "market_regime": None,
-        "session_vwap_approx": None, "session_vwap_kind": "UTC_DAY_TP_VWAP", "session_vwap_distance_pct": None, "session_cvd_proxy_quote": None,
+        "session_vwap_approx": None, "session_vwap_kind": "NOT_CAPTURED", "session_vwap_distance_pct": None, "session_cvd_proxy_quote": None,
         "structure_high_20": None, "structure_low_20": None, "distance_to_structure_high_pct": None, "distance_to_structure_low_pct": None,
         "break_above_prior_20": False, "break_below_prior_20": False,
         "liquidity_sweep_bullish_20": False, "liquidity_sweep_bearish_20": False,
@@ -1138,17 +1237,54 @@ def _derive_time_series_features(*, direction: str, df_5m: pd.DataFrame | None, 
         "htf4h_trend": None,
         "btc_return_5m_pct": None, "btc_return_1h_pct": None,
         "btc_ema50_distance_pct": None, "btc_ema200_distance_pct": None,
+        "5m_history_bars_available": 0, "5m_history_start_ts": None, "5m_history_end_ts": None,
+        "5m_return_5m_status": "NOT_CAPTURED", "5m_return_15m_status": "NOT_CAPTURED",
+        "5m_return_30m_status": "NOT_CAPTURED", "5m_return_1h_status": "NOT_CAPTURED",
+        "5m_return_3h_status": "NOT_CAPTURED", "5m_return_6h_status": "NOT_CAPTURED",
+        "5m_return_12h_status": "NOT_CAPTURED", "5m_return_24h_status": "NOT_CAPTURED",
+        "session_vwap_coverage": "NOT_CAPTURED", "session_vwap_available_bars": 0, "session_vwap_expected_bars": 0,
+        "session_cvd_coverage": "NOT_CAPTURED", "session_cvd_available_bars": 0, "session_cvd_expected_bars": 0,
+        "1h_history_bars_available": 0, "1h_history_start_ts": None, "1h_history_end_ts": None,
+        "4h_complete_bars_available": 0, "htf4h_ema200_status": "NOT_CAPTURED",
+        "btc_1h_history_bars_available": 0, "btc_ema200_status": "NOT_CAPTURED",
     }
     x5 = _closed_market_frame(df_5m, decision_ts, "5m")
+    out["5m_history_bars_available"] = int(len(x5))
+    if not x5.empty:
+        out["5m_history_start_ts"] = x5["timestamp"].iloc[0].isoformat()
+        out["5m_history_end_ts"] = x5["timestamp"].iloc[-1].isoformat()
+    if not x5.empty:
+        for status_key in (
+            "5m_return_5m_status", "5m_return_15m_status", "5m_return_30m_status",
+            "5m_return_1h_status", "5m_return_3h_status", "5m_return_6h_status",
+            "5m_return_12h_status", "5m_return_24h_status",
+        ):
+            out[status_key] = "INSUFFICIENT_HISTORY"
     if len(x5) >= 2:
         current = _safe_float(x5["close"].iloc[-1])
         if current:
-            for n, key in ((1, "5m_return_5m_pct"), (3, "5m_return_15m_pct"), (6, "5m_return_30m_pct"), (12, "5m_return_1h_pct"), (36, "5m_return_3h_pct"), (72, "5m_return_6h_pct"), (144, "5m_return_12h_pct"), (288, "5m_return_24h_pct")):
-                if len(x5) > n:
-                    prev = _safe_float(x5["close"].iloc[-1-n])
-                    if prev and prev > 0:
-                        raw = (current / prev - 1.0) * 100.0
-                        out[key] = raw if str(direction).upper() == "LONG" else -raw
+            for n, key, status_key in (
+                (1, "5m_return_5m_pct", "5m_return_5m_status"),
+                (3, "5m_return_15m_pct", "5m_return_15m_status"),
+                (6, "5m_return_30m_pct", "5m_return_30m_status"),
+                (12, "5m_return_1h_pct", "5m_return_1h_status"),
+                (36, "5m_return_3h_pct", "5m_return_3h_status"),
+                (72, "5m_return_6h_pct", "5m_return_6h_status"),
+                (144, "5m_return_12h_pct", "5m_return_12h_status"),
+                (288, "5m_return_24h_pct", "5m_return_24h_status"),
+            ):
+                if len(x5) <= n:
+                    continue
+                elapsed = x5["timestamp"].iloc[-1] - x5["timestamp"].iloc[-1-n]
+                expected_elapsed = pd.Timedelta(minutes=5 * n)
+                if elapsed != expected_elapsed:
+                    out[status_key] = "GAPPED_HISTORY"
+                    continue
+                prev = _safe_float(x5["close"].iloc[-1-n])
+                if prev and prev > 0:
+                    raw = (current / prev - 1.0) * 100.0
+                    out[key] = raw if str(direction).upper() == "LONG" else -raw
+                    out[status_key] = "AVAILABLE"
         atr = _simple_atr(x5, 14)
         out["5m_atr14"] = atr
         if atr and current:
@@ -1180,19 +1316,44 @@ def _derive_time_series_features(*, direction: str, df_5m: pd.DataFrame | None, 
                     out["market_regime"] = "TRANSITION"
         dts = _parse_timestamp(decision_ts)
         day_start = dts.normalize() if dts is not None else x5["timestamp"].iloc[-1].normalize()
-        day = x5.loc[x5["timestamp"] >= day_start]
+        day = x5.loc[x5["timestamp"] >= day_start].copy()
+        out["session_vwap_available_bars"] = int(len(day))
+        out["session_cvd_available_bars"] = int(len(day))
+        if dts is not None:
+            expected_day_bars = max(0, int((dts - day_start).total_seconds() // 300))
+        else:
+            expected_day_bars = int(len(day))
+        out["session_vwap_expected_bars"] = expected_day_bars
+        out["session_cvd_expected_bars"] = expected_day_bars
+        expected_timestamps = (
+            pd.date_range(day_start, periods=expected_day_bars, freq="5min")
+            if expected_day_bars > 0 else pd.DatetimeIndex([])
+        )
+        actual_timestamps = pd.DatetimeIndex(day["timestamp"].tolist()) if not day.empty else pd.DatetimeIndex([])
+        has_full_day_coverage = (
+            expected_day_bars > 0
+            and len(actual_timestamps) == expected_day_bars
+            and actual_timestamps.equals(expected_timestamps)
+        )
         if not day.empty and "volume" in day.columns:
             vol_sum = float(day["volume"].sum())
             if vol_sum > 0:
                 typical = (day["high"] + day["low"] + day["close"]) / 3.0
                 vwap = float((typical * day["volume"]).sum() / vol_sum)
                 out["session_vwap_approx"] = vwap
+                out["session_vwap_coverage"] = "FULL" if has_full_day_coverage else "PARTIAL"
+                out["session_vwap_kind"] = "UTC_DAY_TP_VWAP" if has_full_day_coverage else "PARTIAL_UTC_DAY_TP_VWAP"
                 if current:
                     out["session_vwap_distance_pct"] = float((current / vwap - 1.0) * 100.0)
         if "bar_delta_usdt" in day.columns:
-            delta = pd.to_numeric(day["bar_delta_usdt"], errors="coerce").dropna()
+            delta_all = pd.to_numeric(day["bar_delta_usdt"], errors="coerce")
+            delta = delta_all.dropna()
             if not delta.empty:
                 out["session_cvd_proxy_quote"] = float(delta.sum())
+                out["session_cvd_coverage"] = (
+                    "FULL" if has_full_day_coverage and len(delta_all) == expected_day_bars and delta_all.notna().all()
+                    else "PARTIAL"
+                )
         if len(x5) >= 21:
             prior20 = x5.iloc[:-1].tail(20)
             ph, pl = float(prior20["high"].max()), float(prior20["low"].min())
@@ -1213,7 +1374,11 @@ def _derive_time_series_features(*, direction: str, df_5m: pd.DataFrame | None, 
     if df_1h is not None and not df_1h.empty:
         try:
             h1 = _closed_market_frame(df_1h, decision_ts, "1h")
+            out["1h_history_bars_available"] = int(len(h1))
             if not h1.empty:
+                out["htf4h_ema200_status"] = "INSUFFICIENT_HISTORY"
+                out["1h_history_start_ts"] = h1["timestamp"].iloc[0].isoformat()
+                out["1h_history_end_ts"] = h1["timestamp"].iloc[-1].isoformat()
                 h1 = h1.set_index("timestamp")
                 agg = h1.resample("4h", label="left", closed="left").agg(
                     open=("open", "first"), high=("high", "max"), low=("low", "min"), close=("close", "last"),
@@ -1222,6 +1387,11 @@ def _derive_time_series_features(*, direction: str, df_5m: pd.DataFrame | None, 
                 # Only use complete 4H candles; a currently-forming 4H bucket built
                 # from one to three closed 1H bars is still an incomplete HTF candle.
                 agg = agg.loc[agg["bar_count"] == 4].copy()
+                out["4h_complete_bars_available"] = int(len(agg))
+                if len(agg) >= 200:
+                    out["htf4h_ema200_status"] = "AVAILABLE"
+                elif len(h1) >= 804:
+                    out["htf4h_ema200_status"] = "GAPPED_OR_INCOMPLETE_HISTORY"
                 if len(agg) >= 3:
                     c4 = float(agg["close"].iloc[-1])
                     out["htf4h_return_4h_pct"] = float((c4 / float(agg["close"].iloc[-2]) - 1.0) * 100.0) if float(agg["close"].iloc[-2]) > 0 else None
@@ -1240,6 +1410,11 @@ def _derive_time_series_features(*, direction: str, df_5m: pd.DataFrame | None, 
         if bc and p1 and p1 > 0: out["btc_return_5m_pct"] = (bc / p1 - 1.0) * 100.0
         if bc and p12 and p12 > 0: out["btc_return_1h_pct"] = (bc / p12 - 1.0) * 100.0
     bx1 = _closed_market_frame(btc_df_1h, decision_ts, "1h")
+    out["btc_1h_history_bars_available"] = int(len(bx1))
+    if not bx1.empty:
+        out["btc_ema200_status"] = "INSUFFICIENT_HISTORY"
+    if len(bx1) >= 200:
+        out["btc_ema200_status"] = "AVAILABLE"
     if len(bx1) >= 50:
         bc = _safe_float(bx1["close"].iloc[-1]); ema = bx1["close"].ewm(span=50, adjust=False, min_periods=50).mean().iloc[-1]
         if bc and pd.notna(ema) and float(ema) > 0: out["btc_ema50_distance_pct"] = (bc / float(ema) - 1.0) * 100.0

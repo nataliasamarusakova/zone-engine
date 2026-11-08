@@ -65,6 +65,7 @@ COMMISSION_RATE_PATH = "/openApi/swap/v2/user/commissionRate"
 INCOME_PATH = "/openApi/swap/v2/user/income"
 FORCE_ORDERS_PATH = "/openApi/swap/v2/trade/forceOrders"
 ALL_FILL_ORDERS_PATH = "/openApi/swap/v2/trade/allFillOrders"
+ALL_FILL_ORDERS_109500_RETRY_DELAY_SEC = 1.0
 ALL_ORDERS_MAX_LIMIT = 1000
 ALL_ORDERS_MAX_WINDOW_MS = 7 * 24 * 60 * 60 * 1000 - 1
 _ALL_ORDERS_MIN_REQUEST_INTERVAL_SEC = 0.21  # official endpoint limit: 5 requests/s
@@ -1160,6 +1161,35 @@ def get_order_by_identity(
     return fallback
 
 
+def _request_all_fill_orders(params: dict[str, Any], *, timeout_sec: float) -> dict[str, Any] | Any:
+    """Fetch fill history, retrying one documented transient BingX 109500 once.
+
+    The endpoint is read-only and idempotent. A single delayed retry is bounded
+    so a transient backend RPC timeout can recover without turning an unavailable
+    response into an empty fill window or creating unbounded API traffic.
+    """
+    response = _request(
+        "GET", ALL_FILL_ORDERS_PATH, params, signed=True,
+        timeout_sec=timeout_sec, retryable=False,
+    )
+    try:
+        response_code = int(response.get("code", -1)) if isinstance(response, dict) else -1
+    except (TypeError, ValueError):
+        response_code = -1
+    if response_code == 109500:
+        retry_delay_sec = ALL_FILL_ORDERS_109500_RETRY_DELAY_SEC
+        log.warning(
+            "[BINGX] allFillOrders returned 109500; retrying read-only request once after %.1fs",
+            retry_delay_sec,
+        )
+        time.sleep(retry_delay_sec)
+        response = _request(
+            "GET", ALL_FILL_ORDERS_PATH, params, signed=True,
+            timeout_sec=timeout_sec, retryable=False,
+        )
+    return response
+
+
 def get_fill_orders(
     symbol: str,
     start_time_ms: int,
@@ -1197,20 +1227,14 @@ def get_fill_orders(
     }
     if order_id not in (None, ""):
         params["orderId"] = str(order_id)
-    resp = _request(
-        "GET",
-        ALL_FILL_ORDERS_PATH,
-        params,
-        signed=True,
-        timeout_sec=min(
-            5.0,
-            max(0.2, float(
-                timeout_sec if timeout_sec is not None
-                else os.environ.get("FILL_HISTORY_TIMEOUT_SEC", "5")
-            )),
-        ),
-        retryable=False,
+    request_timeout = min(
+        5.0,
+        max(0.2, float(
+            timeout_sec if timeout_sec is not None
+            else os.environ.get("FILL_HISTORY_TIMEOUT_SEC", "5")
+        )),
     )
+    resp = _request_all_fill_orders(params, timeout_sec=request_timeout)
     if not isinstance(resp, dict):
         raise RuntimeError("allFillOrders returned invalid response")
     try:
@@ -3458,10 +3482,9 @@ def fetch_research_account_snapshot() -> dict[str, Any]:
     activity_start_ms = max(0, captured_ms - activity_lookback_min * 60 * 1000)
     activity_end_ms = captured_ms
     try:
-        fills = _request(
-            "GET", ALL_FILL_ORDERS_PATH,
+        fills = _request_all_fill_orders(
             {"tradingUnit": "COIN", "startTs": activity_start_ms, "endTs": activity_end_ms, "currency": "USDT"},
-            signed=True, timeout_sec=min(5.0, float(os.environ.get("RESEARCH_ACCOUNT_TIMEOUT_SEC", "5"))), retryable=False,
+            timeout_sec=min(5.0, float(os.environ.get("RESEARCH_ACCOUNT_TIMEOUT_SEC", "5"))),
         )
         if isinstance(fills, dict) and int(fills.get("code", -1)) == 0:
             raw_data = fills.get("data")
