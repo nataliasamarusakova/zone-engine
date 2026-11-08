@@ -87,8 +87,10 @@ jobs:
       RESEARCH_ACCOUNT_ACTIVITY_LOOKBACK_MINUTES: "15"
       # Bounded read-only fetches run after trade decisions; research writes stay serial.
       RESEARCH_DEFERRED_BAR_FETCH_WORKERS: "4"
-      SCAN_WORKERS: "12"
-      SCAN_BATCH_SIZE: "48"
+      # Raise bounded public-market scan concurrency modestly; all symbols are
+      # still scanned and failures remain visible (no sampling or skipped work).
+      SCAN_WORKERS: "16"
+      SCAN_BATCH_SIZE: "64"
       SCAN_BATCH_PAUSE_SEC: "0.10"
       RECONCILIATION_HTTP_TIMEOUT_SEC: "5"
       RECONCILIATION_MAX_SECONDS: "45"
