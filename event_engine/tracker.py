@@ -1592,11 +1592,24 @@ def reconcile_pending_emergency_protection_cleanup(
         min_interval_ms = 30_000
     timestamp_ms = int(now_ms if now_ms is not None else time.time() * 1000)
 
-    processed_candidates = 0
+    # Give never-attempted/oldest-attempted events priority. Otherwise a small
+    # retry budget can repeatedly revisit the first journal rows and starve newer
+    # pending events, especially when those first rows are rate-limited or deferred.
+    def _recovery_priority(item: tuple[tuple[str, str, str], dict[str, Any]]) -> tuple[int, int, str]:
+        event_key, event_state = item
+        cleanup_record = event_state.get("latest_cleanup") if isinstance(event_state.get("latest_cleanup"), dict) else {}
+        close_record = event_state.get("close") if isinstance(event_state.get("close"), dict) else {}
+        last_attempt_ts = int(_safe_float(cleanup_record.get("ts_ms"), 0.0))
+        close_ts = int(_safe_float(close_record.get("ts_ms"), 0.0))
+        return last_attempt_ts, close_ts, event_key[0]
+
+    pending.sort(key=_recovery_priority)
+    cleanup_attempts = 0
     for key, state in pending:
-        if processed_candidates >= limit:
+        # max_events bounds actual cleanup attempts, not events that are safely
+        # deferred by ownership, retry interval, or an open/unknown position.
+        if cleanup_attempts >= limit:
             break
-        processed_candidates += 1
         event_id, symbol, direction = key
         symbol_key = _position_snapshot_symbol_key(symbol).replace("_", "")
         if isinstance(active_trades, dict) and any(
@@ -1641,6 +1654,7 @@ def reconcile_pending_emergency_protection_cleanup(
             previous_cleanup = close_record.get("cleanup_after_flat_verified") if isinstance(close_record.get("cleanup_after_flat_verified"), dict) else {}
         remaining_ids = previous_cleanup.get("remaining_order_ids") if isinstance(previous_cleanup, dict) else None
         known_order_ids = {str(value) for value in remaining_ids if str(value)} if isinstance(remaining_ids, list) else set()
+        cleanup_attempts += 1
         try:
             cleanup_result = _cancel_engine_protection_before_emergency_close(
                 symbol, direction,
@@ -3981,10 +3995,11 @@ def _update_tp_reconciliation_state(
     expected = _safe_float(expected_qty, 0.0) if expected_qty is not None else _safe_float(tp_order.get("qty"), 0.0)
     qty_tolerance = max(1e-12, abs(expected) * 1e-6) if expected > 0 else 1e-12
     if status == "FILLED" and cumulative > 0:
-        if expected > 0 and cumulative + qty_tolerance < expected:
-            # A terminal FILLED label with less than the order's original quantity
-            # is internally inconsistent. Book the real cumulative execution, but
-            # do not call the TP leg complete or activate BE from this response.
+        if expected > 0 and abs(cumulative - expected) > qty_tolerance:
+            # A terminal FILLED label with executedQty materially below OR above
+            # origQty is internally inconsistent. Preserve the observed quantity
+            # for reconciliation/accounting, but do not complete the TP leg or
+            # activate BE from a contradictory order response.
             tp_order["reconciliation_state"] = "PARTIAL_FILL_TERMINAL"
             tp_order["partial_fill_terminal_status"] = "FILLED_QTY_MISMATCH"
         else:
@@ -4405,7 +4420,80 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                     if persisted_executed_qty > observed_executed_qty
                     else "CURRENT_ORDER_STATUS"
                 )
-                previous_qty = max(0.0, _safe_float(filled_by_leg.get(leg, 0.0)))
+                current_exchange_order_id = str(
+                    order_info.get("resolved_order_id") or order_info.get("order_id") or order_id
+                )
+                prior_leg_events = [
+                    event for event in (trade.get("tp_fill_events") or [])
+                    if isinstance(event, dict) and str(event.get("leg") or "").lower() == leg
+                ]
+                order_identity_aliases = {current_exchange_order_id} if current_exchange_order_id else set()
+                previous_exchange_order_id = str(tp.get("previous_exchange_order_id") or "").strip()
+                if previous_exchange_order_id:
+                    order_identity_aliases.add(previous_exchange_order_id)
+                prior_order_events = []
+                has_unidentified_prior_event = False
+                for prior_event in prior_leg_events:
+                    prior_order_id = str(
+                        prior_event.get("resolved_order_id") or prior_event.get("order_id") or ""
+                    ).strip()
+                    if not prior_order_id:
+                        has_unidentified_prior_event = True
+                    elif prior_order_id in order_identity_aliases:
+                        prior_order_events.append(prior_event)
+
+                # executedQty is cumulative per exchange orderId, whereas
+                # tp_filled_qty is cumulative across every order used for a TP leg.
+                # Only fills from this exact order may be subtracted from its
+                # cumulative quantity. Different historical order IDs must not
+                # suppress the first fills of a replacement order.
+                if has_unidentified_prior_event:
+                    log.error(
+                        "[TRACKER_TP] %s %s %s has prior fill events without order identity; "
+                        "cannot safely attribute the new cumulative quantity",
+                        symbol, direction, leg,
+                    )
+                    continue
+                if prior_order_events:
+                    prior_order_quantities = [
+                        _optional_float(event.get("delta_qty")) for event in prior_order_events
+                    ]
+                    if any(
+                        value is None or not math.isfinite(float(value)) or float(value) <= 0
+                        for value in prior_order_quantities
+                    ):
+                        log.error(
+                            "[TRACKER_TP] %s %s %s has incomplete prior per-order fill quantities; "
+                            "deferring cumulative reconciliation",
+                            symbol, direction, leg,
+                        )
+                        continue
+                    previous_qty = sum(float(value) for value in prior_order_quantities)
+                elif prior_leg_events:
+                    # Existing fills belong to other known order IDs. This order
+                    # has no previously booked fills, even though the leg total is
+                    # non-zero.
+                    previous_qty = 0.0
+                else:
+                    # Backward compatibility for older state that has an aggregate
+                    # leg quantity but no per-fill event history. This is safe only
+                    # while there is a single known exchange order for the leg.
+                    same_leg_order_ids = {
+                        str(item.get("order_id") or "").strip()
+                        for item in tp_orders_for_evidence
+                        if isinstance(item, dict)
+                        and str(item.get("leg") or "").lower() == leg
+                        and str(item.get("order_id") or "").strip()
+                    }
+                    if len(same_leg_order_ids) > 1 and _safe_float(filled_by_leg.get(leg, 0.0)) > 0:
+                        log.error(
+                            "[TRACKER_TP] %s %s %s has aggregate legacy fills across multiple order IDs "
+                            "without an attribution ledger; deferring reconciliation",
+                            symbol, direction, leg,
+                        )
+                        continue
+                    previous_qty = max(0.0, _safe_float(filled_by_leg.get(leg, 0.0)))
+
                 delta_qty = max(0.0, executed_qty - previous_qty)
                 qty_tolerance = max(1e-12, abs(expected_tp_qty) * 1e-6, abs(previous_qty) * 1e-9)
                 terminal_partial_fill = (
@@ -4451,13 +4539,6 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                     log.warning("[TRACKER_TP] %s %s %s has no actual cumulative avgPrice; deferring realized PnL", symbol, direction, leg)
                     continue
 
-                current_exchange_order_id = str(
-                    order_info.get("resolved_order_id") or order_info.get("order_id") or order_id
-                )
-                prior_leg_events = [
-                    event for event in (trade.get("tp_fill_events") or [])
-                    if isinstance(event, dict) and str(event.get("leg") or "").lower() == leg
-                ]
                 trusted_avg_sources = {
                     "ORDER_CUMULATIVE_AVG_FIRST_FILL",
                     "ORDER_CUMULATIVE_AVG_DIFFERENCED",
@@ -4465,7 +4546,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                 prior_event_qty = 0.0
                 prior_event_notional = 0.0
                 prior_events_fully_trusted = True
-                for prior_event in prior_leg_events:
+                for prior_event in prior_order_events:
                     try:
                         prior_delta = float(prior_event.get("delta_qty"))
                         prior_price = float(prior_event.get("avg_price"))
@@ -4477,7 +4558,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                         not math.isfinite(prior_delta) or prior_delta <= 0
                         or not math.isfinite(prior_price) or prior_price <= 0
                         or prior_event.get("avg_price_source") not in trusted_avg_sources
-                        or prior_order_id != current_exchange_order_id
+                        or prior_order_id not in order_identity_aliases
                     ):
                         prior_events_fully_trusted = False
                         break
@@ -4485,7 +4566,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
                     prior_event_notional += prior_delta * prior_price
                 if previous_qty <= qty_tolerance:
                     previous_accounted_notional = 0.0
-                    prior_events_fully_trusted = not prior_leg_events
+                    prior_events_fully_trusted = not prior_order_events
                 elif (
                     prior_events_fully_trusted
                     and abs(prior_event_qty - previous_qty) <= qty_tolerance
@@ -4561,7 +4642,7 @@ def update_active_trades(*, position_snapshot: list[dict] | None = None) -> None
 
                 realized_qty += delta_qty
                 realized_weighted += delta_qty * pnl_tp
-                filled_by_leg[leg] = executed_qty
+                filled_by_leg[leg] = max(0.0, _safe_float(filled_by_leg.get(leg, 0.0))) + delta_qty
                 if tp_fully_filled and not leg_already_hit:
                     # Execution status consumes the target for RR projections even
                     # if its fill is adverse. Keep `hit_legs` reserved for validated
