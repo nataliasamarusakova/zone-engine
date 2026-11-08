@@ -154,7 +154,8 @@ def test_zone_signal_schema():
         if s["sl"] is not None:
             assert s["sl"] > 0
             assert s["tp1"] > 0
-            assert s["tp2"] > 0
+            assert s["tp2"] > s["tp1"] if s["type"] == "LONG" else s["tp2"] < s["tp1"]
+            assert s["tp3"] > s["tp2"] if s["type"] == "LONG" else s["tp3"] < s["tp2"]
             assert s["risk_pct"] > 0
         assert s["event_id"].startswith("ZONE_")
         if s["zone"]:
@@ -165,26 +166,26 @@ def test_zone_signal_schema():
 
 def test_fixed_stop_is_exactly_10_percent_from_entry():
     import run_once
-    long_sl, long_tp1, long_tp2 = run_once._protection_geometry_from_fill("LONG", 100.0, 10.0)
-    short_sl, short_tp1, short_tp2 = run_once._protection_geometry_from_fill("SHORT", 100.0, 10.0)
+    long_sl, long_tp1, long_tp2, long_tp3 = run_once._protection_geometry_from_fill("LONG", 100.0, 10.0)
+    short_sl, short_tp1, short_tp2, short_tp3 = run_once._protection_geometry_from_fill("SHORT", 100.0, 10.0)
     assert long_sl == 90.0 and short_sl == 110.0
-    assert long_tp1 > 100.0 and long_tp2 > long_tp1
-    assert short_tp1 < 100.0 and short_tp2 < short_tp1
+    assert (long_tp1, long_tp2, long_tp3) == pytest.approx((103.0, 106.0, 109.0))
+    assert (short_tp1, short_tp2, short_tp3) == pytest.approx((97.0, 94.0, 91.0))
 
 
 
 
 def test_strategy_snapshot_contains_entry_context_and_exit_rules():
     from event_engine import signals as sig
-    assert sig.STRATEGY_VERSION == "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp3-tp6-be-on-tp1"
+    assert sig.STRATEGY_VERSION == "zone-midpoint-v4-5m-visit-no-zone-age-limit-stop10-tp3-tp6-tp9-be-on-tp1"
     import run_once
     setup = run_once._build_setup({
         "event_id": "ZONE_TEST", "symbol": "TEST-USDT", "type": "LONG",
-        "entry": 100.0, "sl": 90.0, "tp1": 103.0, "tp2": 106.0, "risk_pct": 10.0,
-        "tp1_rr": 0.3, "tp2_rr": 0.6, "score": 75.0,
+        "entry": 100.0, "sl": 90.0, "tp1": 103.0, "tp2": 106.0, "tp3": 109.0, "risk_pct": 10.0,
+        "tp1_rr": 0.3, "tp2_rr": 0.6, "tp3_rr": 0.9, "score": 75.0,
         "strategy": "Demand/Supply Zone First", "strategy_version": sig.STRATEGY_VERSION,
         "trigger": {"zone_entry_rule": "fresh_midpoint_touch", "zone_midpoint": 110.0},
-        "target": {"source": "fixed_entry_percentage", "tp1_pct": 3.0, "tp2_pct": 6.0, "be_rule": "after_tp1_filled"},
+        "target": {"source": "fixed_entry_percentage", "tp1_pct": 3.0, "tp2_pct": 6.0, "tp3_pct": 9.0, "tp1_close_fraction": 0.50, "tp2_close_fraction": 0.25, "tp3_close_fraction": 0.25, "be_rule": "after_tp1_filled"},
         "risk_model": {"sl_source": "fixed_percent_from_entry", "fixed_stop_pct": 10.0},
         "entry_bar": {"open": 99.0, "high": 111.0, "low": 98.0, "close": 100.0, "volume": 1000.0},
         "previous_bar": {"close": 120.0},
@@ -195,7 +196,14 @@ def test_strategy_snapshot_contains_entry_context_and_exit_rules():
     assert setup["signal_snapshot"]["trigger"]["zone_entry_rule"] == "fresh_midpoint_touch"
     assert setup["target"]["tp1_pct"] == 3.0
     assert setup["target"]["tp2_pct"] == 6.0
-    assert setup["target"]["be_rule"] == "after_tp1_filled"
+    assert setup["target"]["tp3_pct"] == 9.0
+    assert setup["tp_levels"] == [
+        {"leg": "tp1", "pnl_pct": 3.0, "close_fraction": 0.50, "price": 103.0},
+        {"leg": "tp2", "pnl_pct": 6.0, "close_fraction": 0.25, "price": 106.0},
+        {"leg": "tp3", "pnl_pct": 9.0, "close_fraction": 0.25, "price": 109.0},
+    ]
+    assert setup["planned_weighted_rr"] == pytest.approx(0.525)
+    assert setup["be_rule"] == "after_tp1_filled"
 
 
 def test_register_active_trade_blocks_second_local_owner(monkeypatch, tmp_path):
@@ -761,6 +769,7 @@ def test_execute_emergency_closes_when_protection_fails(monkeypatch, protection_
         "sl": 95.0,
         "tp1": 107.5,
         "tp2": 115.0,
+        "tp3": 125.0,
         "risk_pct": 1.0,
         "score": 90,
         "zone": {"kind": "DEMAND", "btm": 99.0, "top": 100.0},
@@ -927,10 +936,13 @@ def test_binance_parser_rejects_invalid_ohlc(monkeypatch):
     assert rows == []
 
 
-def test_tp_constants_are_one_and_two_r():
-    from event_engine.signals import TP1_FRACTION, TP2_FRACTION
-    assert TP1_FRACTION == 0.50
-    assert TP2_FRACTION == 0.50
+def test_tp_constants_are_three_target_50_25_25_plan():
+    from event_engine.signals import TP1_FRACTION, TP2_FRACTION, TP3_FRACTION, TP1_PCT, TP2_PCT, TP3_PCT
+    assert (TP1_PCT, TP2_PCT, TP3_PCT) == (3.0, 6.0, 9.0)
+    assert (TP1_FRACTION, TP2_FRACTION, TP3_FRACTION) == (0.50, 0.25, 0.25)
+    assert TP1_FRACTION + TP2_FRACTION + TP3_FRACTION == pytest.approx(1.0)
+    from event_engine.bingx import NEW_ENTRY_TP_CLOSE_FRACTIONS
+    assert NEW_ENTRY_TP_CLOSE_FRACTIONS == pytest.approx((TP1_FRACTION, TP2_FRACTION, TP3_FRACTION))
 
 
 def test_alma_parameters_match_ajay_r541_defaults():
@@ -966,10 +978,10 @@ def test_target_levels_stop_and_ordering_from_nearest_obstacle():
     long = _targets_from_nearest_obstacle("LONG", 100.0, 95.0, 2.0, {"price": 110.0, "source": "supply_zone"})
     short = _targets_from_nearest_obstacle("SHORT", 100.0, 105.0, 2.0, {"price": 90.0, "source": "demand_zone"})
     assert long is not None and short is not None
-    assert 100.0 < long["tp1"] < long["tp2"] < 110.0
-    assert 90.0 < short["tp2"] < short["tp1"] < 100.0
-    assert long["tp1_rr"] < long["tp2_rr"]
-    assert short["tp1_rr"] < short["tp2_rr"]
+    assert 100.0 < long["tp1"] < long["tp2"] < long["tp3"]
+    assert 90.0 < short["tp3"] < short["tp2"] < short["tp1"] < 100.0
+    assert long["tp1_rr"] < long["tp2_rr"] < long["tp3_rr"]
+    assert short["tp1_rr"] < short["tp2_rr"] < short["tp3_rr"]
 
 def test_zone_only_latest_bar_check_never_reads_pine_direction():
     import run_once
@@ -1009,15 +1021,17 @@ def test_telegram_uses_zone_only_label_and_dynamic_rr_values():
     from event_engine.telegram import format_signal
     msg = format_signal({
         "type": "LONG", "symbol": "TEST-USDT", "entry": 100.0, "sl": 95.0,
-        "tp1": 103.0, "tp2": 106.0, "tp1_rr": 0.3, "tp2_rr": 0.6, "risk_pct": 10.0,
+        "tp1": 103.0, "tp2": 106.0, "tp3": 109.0,
+        "tp1_rr": 0.3, "tp2_rr": 0.6, "tp3_rr": 0.9, "risk_pct": 10.0,
         "zone": {"kind": "DEMAND", "btm": 94.0, "top": 99.0, "poi": 96.5, "age_bars": 1, "impulse_atr": 2.0},
-        "target": {"tp1_pct": 3.0, "tp2_pct": 6.0},
+        "target": {"tp1_pct": 3.0, "tp2_pct": 6.0, "tp3_pct": 9.0, "tp1_close_fraction": 0.5, "tp2_close_fraction": 0.25, "tp3_close_fraction": 0.25},
         "confirmation": {},
     })
     assert "Demand/Supply Zone First" not in msg
     assert "Ajay R5.41 · ALMA" not in msg
     assert "(3% / 0.3R / 50%)" in msg
-    assert "(6% / 0.6R / 50%)" in msg
+    assert "(6% / 0.6R / 25%)" in msg
+    assert "TP3: <code>109 (9% / 0.9R / 25%)</code>" in msg
     assert "Candle body / ATR" not in msg
     assert "<b>ZONE</b>" not in msg
 
@@ -1026,10 +1040,11 @@ def test_telegram_formats_live_entry_with_compact_prices_and_zone_counts():
     from event_engine.telegram import format_signal
     msg = format_signal({
         "type": "SHORT", "symbol": "ONDO-USDT", "entry": 0.3537, "sl": 0.38907,
-        "tp1": 0.343089, "tp2": 0.332478, "tp1_rr": 0.3, "tp2_rr": 0.6, "risk_pct": 10.0,
+        "tp1": 0.343089, "tp2": 0.332478, "tp3": 0.321867,
+        "tp1_rr": 0.3, "tp2_rr": 0.6, "tp3_rr": 0.9, "risk_pct": 10.0,
         "zone": {"kind": "SUPPLY", "btm": 0.3547808259709935, "top": 0.3559, "poi": 0.35534041298549673, "age_bars": 10},
         "zone_counts": {"demand": 5, "supply": 1},
-        "target": {"tp1_pct": 3.0, "tp2_pct": 6.0},
+        "target": {"tp1_pct": 3.0, "tp2_pct": 6.0, "tp3_pct": 9.0, "tp1_close_fraction": 0.5, "tp2_close_fraction": 0.25, "tp3_close_fraction": 0.25},
         "confirmation": {"volume_ratio": 0.14405361643357992},
     })
     assert "ONDOUSDT" in msg
@@ -1039,7 +1054,8 @@ def test_telegram_formats_live_entry_with_compact_prices_and_zone_counts():
     assert "Bottom:" not in msg
     assert "POI:" not in msg
     assert "(3% / 0.3R / 50%)" in msg
-    assert "(6% / 0.6R / 50%)" in msg
+    assert "(6% / 0.6R / 25%)" in msg
+    assert "(9% / 0.9R / 25%)" in msg
     assert "Risk: <code>10%</code>" in msg
 
 
@@ -1073,7 +1089,7 @@ def test_entry_telegram_is_still_sent_when_optional_funding_lookup_raises(monkey
         {"status": "opened_protected", "order": {}, "protection": {"status": "PROTECTED"}},
     )
     assert len(sent) == 1
-    assert "Funding: <code>—</code>" in sent[0]
+    assert "Funding: <code>UNAVAILABLE</code>" in sent[0]
 
 
 def test_post_fill_risk_pct_remains_exactly_at_configured_limit():
@@ -1132,7 +1148,7 @@ def test_execute_rebases_protection_to_actual_fill_before_installing(monkeypatch
     monkeypatch.setattr(run_once, "MAX_ENTRY_SLIPPAGE_PCT", 99.0)
     signal = {
         "event_id": "ZONE_TEST_REBASE", "symbol": "TEST-USDT", "type": "SHORT",
-        "entry": 100.0, "sl": 105.0, "tp1": 99.0, "tp2": 98.0, "risk_pct": 1.0,
+        "entry": 100.0, "sl": 105.0, "tp1": 99.0, "tp2": 98.0, "tp3": 97.0, "risk_pct": 1.0,
         "score": 75, "atr": 2.0,
         "zone": {"kind": "SUPPLY", "btm": 99.0, "top": 104.0},
         "target": {"obstacle_price": 70.0, "source": "nearest_opposing_structure"},
@@ -1163,7 +1179,7 @@ def test_stale_signal_is_blocked_before_market(monkeypatch):
     import run_once
     signal = {
         "event_id": "ZONE_TEST_STALE", "symbol": "TEST-USDT", "type": "LONG",
-        "entry": 100.0, "sl": 95.0, "tp1": 102.5, "tp2": 105.0, "risk_pct": 1.0,
+        "entry": 100.0, "sl": 95.0, "tp1": 102.5, "tp2": 105.0, "tp3": 107.5, "risk_pct": 1.0,
         "score": 75, "atr": 2.0,
         "zone": {"kind": "DEMAND", "btm": 95.0, "top": 100.0},
         "target": {"obstacle_price": 112.0},
@@ -1184,7 +1200,7 @@ def test_execution_slippage_is_measured_from_pre_entry_quote(monkeypatch):
     import run_once
     signal = {
         "event_id": "ZONE_TEST_SLIP", "symbol": "TEST-USDT", "type": "LONG",
-        "entry": 100.0, "sl": 95.0, "tp1": 102.5, "tp2": 105.0, "risk_pct": 1.0,
+        "entry": 100.0, "sl": 95.0, "tp1": 102.5, "tp2": 105.0, "tp3": 107.5, "risk_pct": 1.0,
         "score": 75, "atr": 0.1,
         "zone": {"kind": "DEMAND", "btm": 99.5, "top": 100.0},
         "target": {"obstacle_price": 112.0},
@@ -1226,7 +1242,7 @@ def test_protection_endpoint_failure_blocks_market_entry(monkeypatch):
     import run_once
     signal = {
         "event_id": "ZONE_TEST_PREFLIGHT", "symbol": "ALGO-USDT", "type": "SHORT",
-        "entry": 100.0, "sl": 105.0, "tp1": 99.0, "tp2": 98.0, "risk_pct": 1.0,
+        "entry": 100.0, "sl": 105.0, "tp1": 99.0, "tp2": 98.0, "tp3": 97.0, "risk_pct": 1.0,
         "score": 75, "zone": {"kind": "SUPPLY", "btm": 99.0, "top": 104.0},
         "target": {"obstacle_price": 90.0},
     }
@@ -1387,7 +1403,7 @@ def test_zone_signal_uses_fixed_10pct_stop_and_small_tps(monkeypatch):
     assert latest["sl"] < 110.0
 
 
-def test_targets_are_fixed_3pct_and_6pct_from_entry():
+def test_targets_are_fixed_3pct_6pct_and_9pct_from_entry():
     from event_engine import signals as sig
 
     obstacle = {"price": 108.0, "source": "supply_zone"}
@@ -1397,21 +1413,24 @@ def test_targets_are_fixed_3pct_and_6pct_from_entry():
     assert out["obstacle_price"] == 108.0
     assert out["tp1"] == 103.0
     assert out["tp2"] == 106.0
+    assert out["tp3"] == 109.0
     assert out["tp1_rr"] == 0.3
     assert out["tp2_rr"] == 0.6
+    assert out["tp3_rr"] == 0.9
 
     obstacle = {"price": 92.0, "source": "demand_zone"}
     out = sig._targets_from_nearest_obstacle("SHORT", 100.0, 110.0, 1.0, obstacle)
     assert out is not None
     assert out["tp1"] == 97.0
     assert out["tp2"] == 94.0
+    assert out["tp3"] == 91.0
 
 
-def test_post_fill_targets_are_exact_3pct_and_6pct_from_actual_fill():
+def test_post_fill_targets_are_exact_3pct_6pct_and_9pct_from_actual_fill():
     import run_once
     signal = {
         "type": "LONG",
-        "entry": 100.0, "sl": 90.0, "tp1": 103.0, "tp2": 106.0, "risk_pct": 10.0,
+        "entry": 100.0, "sl": 90.0, "tp1": 103.0, "tp2": 106.0, "tp3": 109.0, "risk_pct": 10.0,
         "atr": 2.0,
         "zone": {"btm": 98.0, "top": 102.0},
         "target": {"obstacle_price": 103.0, "source": "nearest_opposing_structure"},
@@ -1421,8 +1440,10 @@ def test_post_fill_targets_are_exact_3pct_and_6pct_from_actual_fill():
     assert out["sl"] == 180.0
     assert out["tp1"] == 206.0
     assert out["tp2"] == 212.0
+    assert out["tp3"] == 218.0
     assert abs(out["tp1_rr"] - 0.3) < 1e-9
     assert abs(out["tp2_rr"] - 0.6) < 1e-9
+    assert abs(out["tp3_rr"] - 0.9) < 1e-9
 
 
 def test_latest_signal_selection_prefers_newest_bar_over_score():
@@ -1808,9 +1829,11 @@ def _base_signal(direction="LONG"):
     return {
         "symbol": "TEST-USDT", "type": direction, "entry": 100.0,
         "sl": 98.0 if direction == "LONG" else 102.0,
-        "tp1": 101.2 if direction == "LONG" else 98.8,
-        "tp2": 102.4 if direction == "LONG" else 97.6,
-        "risk_pct": 2.0,
+        "tp1": 103.0 if direction == "LONG" else 97.0,
+        "tp2": 106.0 if direction == "LONG" else 94.0,
+        "tp3": 109.0 if direction == "LONG" else 91.0,
+        "tp1_rr": 0.3, "tp2_rr": 0.6, "tp3_rr": 0.9,
+        "risk_pct": 10.0,
         "target": {"obstacle_price": 104.0 if direction == "LONG" else 96.0},
         "zone": {"kind": "DEMAND" if direction == "LONG" else "SUPPLY", "btm": 97.0, "top": 99.0, "start": 100, "age_bars": 5},
     }
@@ -1936,12 +1959,12 @@ def test_tracker_close_once_is_idempotent(tmp_path, monkeypatch):
     assert len(rows) == 1
 
 
-def test_open_market_blocks_two_tp_min_quantity_before_order(monkeypatch):
+def test_open_market_blocks_three_tp_min_quantity_before_order(monkeypatch):
     from event_engine import bingx
     # Set the sizing inputs explicitly to exercise the low-leverage/minimum-TP
     # guard independent of the workflow's production leverage setting.
-    monkeypatch.setenv("BINGX_MARGIN_USDT", "3.34")
-    monkeypatch.setattr(bingx, "MARGIN_USDT", 3.34)
+    monkeypatch.setenv("BINGX_MARGIN_USDT", "6.67")
+    monkeypatch.setattr(bingx, "MARGIN_USDT", 6.67)
     monkeypatch.setattr(bingx, "LEVERAGE", 3)
     monkeypatch.setattr(bingx, "MAX_LEVERAGE", 3)
     monkeypatch.setattr(bingx, "get_order", lambda *args, **kwargs: {"status": "not_found"})
@@ -1960,6 +1983,10 @@ def test_open_market_blocks_two_tp_min_quantity_before_order(monkeypatch):
     monkeypatch.setattr(bingx, "position_side_param", lambda *args, **kwargs: "LONG")
     out = bingx.open_market("BNB-USDT", "LONG", 1000.0, "EVT_TEST")
     assert out["status"] == "skipped_tp_min_qty"
+    assert out["qty"] == pytest.approx(0.02)  # enough for 2 x minQty, not for 3.
+    assert out["required_tp_leg_count"] == 3
+    assert out["required_tp_qty"] == pytest.approx(0.04)
+    assert out["reason"] == "tp_three_leg_min_quantity"
 
 
 
@@ -2237,6 +2264,7 @@ def test_execute_reconciles_position_after_fill_poll_timeout(monkeypatch):
         "sl": 99.0,
         "tp1": 101.0,
         "tp2": 102.0,
+        "tp3": 103.0,
         "risk_pct": 1.0,
         "score": 80,
         "atr": 2.0,
@@ -2254,8 +2282,8 @@ def test_execute_reconciles_position_after_fill_poll_timeout(monkeypatch):
     monkeypatch.setattr(run_once, "wait_for_position_fill_directional", lambda *a, **k: {"status": "timeout", "symbol": "TEST-USDT"})
     monkeypatch.setattr(run_once, "get_position_directional", lambda *a, **k: {"status": "found", "avgPrice": 100.5, "positionAmt": 1.0})
     monkeypatch.setattr(run_once, "_rebase_protection_after_fill", lambda s, avg: {
-        "sl": 98.5, "tp1": 101.25, "tp2": 102.5, "risk_abs": 2.0, "risk_pct": 1.99,
-        "tp1_rr": 0.5, "tp2_rr": 1.0, "target_source": "test", "obstacle_price": 104.0,
+        "sl": 98.5, "tp1": 101.25, "tp2": 102.5, "tp3": 103.75, "risk_abs": 2.0, "risk_pct": 1.99,
+        "tp1_rr": 0.5, "tp2_rr": 1.0, "tp3_rr": 1.5, "target_source": "test", "obstacle_price": 104.0,
     })
     monkeypatch.setenv("MAX_SIGNAL_RISK_PCT", "2.5")
     monkeypatch.setattr(run_once, "ensure_directional_protection", lambda *a, **k: {
@@ -2986,11 +3014,24 @@ def test_tracker_sends_and_records_close_notification(monkeypatch, tmp_path):
     monkeypatch.setattr(tracker, "send_tg", lambda text: sent.append(text) or True)
     tracker.update_active_trades()
     assert sent and "сделка закрыта" in sent[0]
+    assert "Направление: <b>LONG</b>\nВход " in sent[0]
     assert "+2.00%" in sent[0]
     actions = [json.loads(x) for x in (tmp_path / "actions.jsonl").read_text(encoding="utf-8").splitlines()]
     assert actions[-1]["action"] == "TRADE_CLOSE"
     assert actions[-1]["telegram_ok"] is True
 
+
+
+def test_trade_closed_message_shows_short_direction_before_entry_exit():
+    from event_engine.tracker import format_trade_closed_message
+    message = format_trade_closed_message(
+        name="XRP", symbol="XRP-USDT", direction="SHORT",
+        entry_price=1.1554, exit_price=1.1595, pnl_pct=-0.35,
+        realized_rr=-0.035, planned_rr=0.525, duration_min=149.5,
+        peak_pnl=0.57, max_drawdown=-0.93,
+        exit_reason="MANUAL_CLOSE_RECONCILED", event_type="ZONE_TOUCH_5M", timeframe="5m",
+    )
+    assert "Направление: <b>SHORT</b>\nВход <code>1.1554</code> → Выход <code>1.1595</code>" in message
 
 
 def test_tracker_sends_negative_close_notification(monkeypatch, tmp_path):
@@ -3978,7 +4019,7 @@ def test_validate_trade_geometry_uses_module_structure_obstacle_default(monkeypa
     import run_once
 
     signal = {
-        "type": "LONG", "entry": 100.0, "sl": 90.0, "tp1": 103.0, "tp2": 106.0,
+        "type": "LONG", "entry": 100.0, "sl": 90.0, "tp1": 103.0, "tp2": 106.0, "tp3": 109.0,
         "risk_pct": 10.0, "target": {},
     }
     monkeypatch.setattr(run_once, "REQUIRE_STRUCTURE_OBSTACLE", False)
@@ -4753,7 +4794,7 @@ def test_execute_new_position_persists_protection_timings_in_registered_snapshot
     signal = {
         "event_id": "ZONE_TEST_PROTECTION_TIMING",
         "symbol": "TEST-USDT", "type": "LONG", "entry": 100.0,
-        "sl": 99.0, "tp1": 101.0, "tp2": 102.0, "risk_pct": 1.0,
+        "sl": 99.0, "tp1": 101.0, "tp2": 102.0, "tp3": 103.0, "risk_pct": 1.0,
         "score": 80.0, "atr": 2.0,
         "zone": {"kind": "DEMAND", "btm": 98.0, "top": 100.0},
         "target": {"obstacle_price": 104.0},
@@ -4768,11 +4809,21 @@ def test_execute_new_position_persists_protection_timings_in_registered_snapshot
     })
     monkeypatch.setattr(run_once, "wait_for_position_fill_directional", lambda *a, **k: {"status": "found", "avgPrice": 100.0, "positionAmt": 1.0})
     monkeypatch.setattr(run_once, "_rebase_protection_after_fill", lambda s, avg: {
-        "sl": 90.0, "tp1": 103.0, "tp2": 106.0, "risk_abs": 10.0, "risk_pct": 10.0,
-        "tp1_rr": 0.3, "tp2_rr": 0.6, "target_source": "test", "obstacle_price": 110.0,
+        "sl": 90.0, "tp1": 103.0, "tp2": 106.0, "tp3": 109.0, "risk_abs": 10.0, "risk_pct": 10.0,
+        "tp1_rr": 0.3, "tp2_rr": 0.6, "tp3_rr": 0.9, "target_source": "test", "obstacle_price": 110.0,
     })
     monkeypatch.setattr(run_once, "ensure_directional_protection", lambda *a, **k: {
-        "status": "PROTECTED", "tp_orders": [{"leg": "tp1", "order_id": "TP1"}, {"leg": "tp2", "order_id": "TP2"}],
+        "status": "PROTECTED", "tp_orders": [
+            {"leg": "tp1", "order_id": "TP1"},
+            {"leg": "tp2", "order_id": "TP2"},
+            {"leg": "tp3", "order_id": "TP3"},
+        ],
+        "effective_tp_levels": [
+            {"leg": "tp1", "qty": 0.5, "close_fraction": 0.5},
+            {"leg": "tp2", "qty": 0.25, "close_fraction": 0.25},
+            {"leg": "tp3", "qty": 0.25, "close_fraction": 0.25},
+        ],
+        "effective_weighted_rr": 0.525,
         "sl_result": {"status": "created", "order_id": "SL1", "stop_price": 90.0},
     })
     registered = {}
@@ -4786,6 +4837,10 @@ def test_execute_new_position_persists_protection_timings_in_registered_snapshot
     assert snapshot["protection_started_ts"]
     assert snapshot["protection_finished_ts"]
     assert snapshot["protection_seconds"] is not None
+    persisted_levels = registered["setup"]["tp_levels"]
+    assert [x["leg"] for x in persisted_levels] == ["tp1", "tp2", "tp3"]
+    assert [x["close_fraction"] for x in persisted_levels] == pytest.approx([0.50, 0.25, 0.25])
+    assert registered["setup"]["planned_weighted_rr"] == pytest.approx(0.525)
 
 
 def test_get_fill_orders_raises_on_exchange_error(monkeypatch):
@@ -4892,6 +4947,7 @@ def test_registration_failure_after_protected_entry_rolls_back_and_verifies_clos
         "sl": 90.0,
         "tp1": 103.0,
         "tp2": 106.0,
+        "tp3": 109.0,
         "risk_pct": 10.0,
         "score": 80.0,
         "atr": 2.0,
@@ -4912,13 +4968,13 @@ def test_registration_failure_after_protected_entry_rolls_back_and_verifies_clos
         "zone": {"kind": "DEMAND"}, "tp_levels": [], "planned_weighted_rr": 0.45,
     })
     monkeypatch.setattr(run_once, "_rebase_protection_after_fill", lambda *a, **k: {
-        "entry": 100.0, "sl": 90.0, "tp1": 103.0, "tp2": 106.0,
-        "risk_abs": 10.0, "risk_pct": 10.0, "tp1_rr": 0.3, "tp2_rr": 0.6,
+        "entry": 100.0, "sl": 90.0, "tp1": 103.0, "tp2": 106.0, "tp3": 109.0,
+        "risk_abs": 10.0, "risk_pct": 10.0, "tp1_rr": 0.3, "tp2_rr": 0.6, "tp3_rr": 0.9,
         "target_source": "test", "obstacle_price": 110.0,
     })
     monkeypatch.setattr(run_once, "_build_actual_signal_from_rebase", lambda signal, rebased: {
-        **signal, "entry": 100.0, "sl": 90.0, "tp1": 103.0, "tp2": 106.0,
-        "risk_pct": 10.0, "tp1_rr": 0.3, "tp2_rr": 0.6,
+        **signal, "entry": 100.0, "sl": 90.0, "tp1": 103.0, "tp2": 106.0, "tp3": 109.0,
+        "risk_pct": 10.0, "tp1_rr": 0.3, "tp2_rr": 0.6, "tp3_rr": 0.9,
     })
     monkeypatch.setattr(run_once, "_validate_exchange_price_distinctness", lambda *a, **k: (True, "ok"))
     monkeypatch.setattr(run_once, "open_market", lambda *a, **k: {
@@ -4932,7 +4988,7 @@ def test_registration_failure_after_protected_entry_rolls_back_and_verifies_clos
     protection = {
         "status": "PROTECTED",
         "sl_result": {"status": "created", "order_id": "SL1"},
-        "tp_orders": [{"leg": "tp1", "order_id": "TP1"}, {"leg": "tp2", "order_id": "TP2"}],
+        "tp_orders": [{"leg": "tp1", "order_id": "TP1"}, {"leg": "tp2", "order_id": "TP2"}, {"leg": "tp3", "order_id": "TP3"}],
     }
     monkeypatch.setattr(run_once, "ensure_directional_protection", lambda *a, **k: protection)
     monkeypatch.setattr(run_once, "register_active_trade", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("state save failed")))
@@ -4945,7 +5001,7 @@ def test_registration_failure_after_protected_entry_rolls_back_and_verifies_clos
     calls = []
     def fake_cleanup(symbol, direction, known_order_ids=None):
         calls.append(("cleanup", set(known_order_ids or [])))
-        return {"status": "ok", "cancelled": ["SL1", "TP1", "TP2"], "errors": []}
+        return {"status": "ok", "cancelled": ["SL1", "TP1", "TP2", "TP3"], "errors": []}
     def fake_close(symbol, direction, qty, trade_id, **kwargs):
         calls.append(("close", qty, trade_id, kwargs))
         return {"status": "closed_verified"}
@@ -4957,7 +5013,7 @@ def test_registration_failure_after_protected_entry_rolls_back_and_verifies_clos
     assert calls[0][:3] == ("close", 1.0, "EVT_REG_ROLLBACK")
     assert calls[0][3]["reason"].startswith("active_trade_registration_exception:")
     assert calls[0][3]["attempt_id"] == "ATT_REG_ROLLBACK"
-    assert calls[1] == ("cleanup", {"SL1", "TP1", "TP2"})
+    assert calls[1] == ("cleanup", {"SL1", "TP1", "TP2", "TP3"})
     assert out["rollback_verified"] is True
 
 
@@ -5340,18 +5396,28 @@ def test_protection_creation_does_not_mark_open_order_as_execution_fill(monkeypa
     monkeypatch.setattr(bingx, "_request", fake_request)
     def fake_verify_open_order(symbol, direction, *, client_order_id, order_kind, expected_price, expected_qty, price_precision, max_attempts=3):
         return {"status": "verified", "order": {
-            "orderId": "ORDER_" + str(order_kind), "clientOrderId": client_order_id, "type": order_kind,
+            "orderId": "ORDER_" + str(client_order_id), "clientOrderId": client_order_id, "type": order_kind,
             "stopPrice": str(expected_price), "origQty": str(expected_qty),
             "side": "SELL" if direction == "LONG" else "BUY",
             "positionSide": "LONG" if direction == "LONG" else "SHORT",
         }}
     monkeypatch.setattr(bingx, "_verify_open_order", fake_verify_open_order)
-    result = bingx.ensure_directional_protection("AAA-USDT", "LONG", 100.0, 1.0, 10.0, [{"leg": "tp1", "pnl_pct": 3.0, "close_fraction": 0.5}, {"leg": "tp2", "pnl_pct": 6.0, "close_fraction": 0.5}], trade_id="EVT_TEST")
-    assert result["status"] in {"PROTECTED", "SL_ONLY"}
+    result = bingx.ensure_directional_protection("AAA-USDT", "LONG", 100.0, 1.0, 10.0, [
+        {"leg": "tp1", "pnl_pct": 3.0, "close_fraction": 0.50},
+        {"leg": "tp2", "pnl_pct": 6.0, "close_fraction": 0.25},
+        {"leg": "tp3", "pnl_pct": 9.0, "close_fraction": 0.25},
+    ], trade_id="EVT_TEST")
+    assert result["status"] == "PROTECTED"
     successful = [x for x in result.get("tp_orders", []) if x.get("status") in {"created", "already_exists", "reconciled_after_post_error"}]
-    assert successful
+    assert [x["leg"] for x in successful] == ["tp1", "tp2", "tp3"]
     assert all(x.get("protection_order_verified") is True for x in successful)
     assert all(x.get("execution_verified") is None for x in successful if x.get("fill_evidence_status") != "CONFIRMED")
+    tp_posts = [x for x in post_calls if x.get("type") == "TAKE_PROFIT_MARKET"]
+    assert [float(x["stopPrice"]) for x in tp_posts] == pytest.approx([103.0, 106.0, 109.0])
+    assert [float(x["quantity"]) for x in tp_posts] == pytest.approx([0.5, 0.25, 0.25])
+    assert result["protection_validation"]["tp_qty_valid"] is True
+    assert sum(x["qty"] for x in result["effective_tp_levels"]) == pytest.approx(1.0)
+    assert result["effective_weighted_rr"] == pytest.approx(0.525)
 
 
 def test_quote_provenance_distinguishes_exchange_timestamp_from_local_observation(monkeypatch):
@@ -5754,6 +5820,7 @@ def test_execute_new_position_state_race_during_owner_check_blocks_before_order(
         "sl": 90.0,
         "tp1": 103.0,
         "tp2": 106.0,
+        "tp3": 109.0,
         "risk_pct": 10.0,
     }
     monkeypatch.setattr(run_once, "_live_state_preflight", lambda *a, **k: (True, "ok"))
@@ -5768,7 +5835,7 @@ def test_post_fill_geometry_does_not_reapply_pre_entry_structure_room_filter(mon
     import run_once
     signal = {
         "type": "LONG", "entry": 100.0, "sl": 99.0,
-        "tp1": 101.0, "tp2": 102.0, "risk_pct": 1.0,
+        "tp1": 101.0, "tp2": 102.0, "tp3": 103.0, "risk_pct": 1.0,
         "target": {"obstacle_price": 101.19},
     }
     # The structural room is 1.19R: it must fail admission, but it does not
@@ -6700,6 +6767,60 @@ def test_historical_be_close_keeps_be_order_as_canonical_and_computes_rr(monkeyp
     assert record["fill_accounting"]["status"] in {"VERIFIED", "VERIFIED_ORDER_EXECUTION"}
 
 
+def test_three_tp_plan_weighted_rr_and_remaining_allocations():
+    from event_engine import tracker
+    import run_once
+
+    trade = {
+        "initial_qty": 1.0,
+        "remaining_qty": 1.0,
+        "planned_risk_pct": 10.0,
+        "realized_pnl_qty": 0.0,
+        "realized_pnl_weighted_sum": 0.0,
+        "hit_legs": [],
+        "completed_tp_legs": [],
+        "tp_levels": [
+            {"leg": "tp1", "pnl_pct": 3.0, "close_fraction": 0.50},
+            {"leg": "tp2", "pnl_pct": 6.0, "close_fraction": 0.25},
+            {"leg": "tp3", "pnl_pct": 9.0, "close_fraction": 0.25},
+        ],
+    }
+    assert tracker._weighted_rr_snapshot(trade) == pytest.approx((0.525, 0.0, 0.525))
+
+    original_orders = [
+        {"leg": "tp1", "qty": 0.50},
+        {"leg": "tp2", "qty": 0.25},
+        {"leg": "tp3", "qty": 0.25},
+    ]
+    remaining, error = run_once._remaining_tp_levels_after_partial_fills(
+        trade["tp_levels"], original_orders, {"tp1": 0.20}, set(), 0.80,
+    )
+    assert error is None
+    assert {x["leg"]: x["close_fraction"] for x in remaining} == pytest.approx({"tp1": 0.30, "tp2": 0.25, "tp3": 0.25})
+
+    remaining, error = run_once._remaining_tp_levels_after_partial_fills(
+        trade["tp_levels"], original_orders, {"tp1": 0.50}, {"tp1"}, 0.50,
+    )
+    assert error is None
+    assert {x["leg"]: x["close_fraction"] for x in remaining} == pytest.approx({"tp2": 0.25, "tp3": 0.25})
+
+
+def test_tp1_partial_or_mismatched_fill_never_reaches_filled_confirmed():
+    from event_engine.tracker import _update_tp_reconciliation_state
+
+    order = {"qty": 0.50}
+    state = _update_tp_reconciliation_state(
+        order, "PARTIALLY_FILLED", 0.30, 1000, expected_qty=0.50, avg_price=103.0,
+    )
+    assert state == "PENDING_PARTIAL_FILL"
+    assert order["last_exchange_executed_qty"] == pytest.approx(0.30)
+
+    state = _update_tp_reconciliation_state(
+        order, "FILLED", 0.45, 2000, expected_qty=0.50, avg_price=103.0,
+    )
+    assert state == "PARTIAL_FILL_TERMINAL"
+
+
 def test_reconcile_partial_tp_fill_preserves_original_per_leg_remaining_quantities(monkeypatch):
     """A partial TP1 fill must reduce TP1's target, not redistribute it to TP2."""
     import run_once
@@ -6958,3 +7079,169 @@ def test_reconcile_sl_restarts_from_persisted_active_trade_state_without_duplica
     assert cancelled == ["OLD_SL"], "restart replay must not cancel the valid replacement"
     assert len(exchange_orders) == 2, "one valid SL and one valid TP should remain"
     assert len(persisted_updates) == 2
+
+
+def test_reconcile_partial_three_tp_fill_preserves_all_original_leg_allocations(monkeypatch):
+    """A partial TP1 fill keeps TP1/TP2/TP3 on their original absolute quantities."""
+    import run_once
+
+    protection_calls = []
+    levels = [
+        {"leg": "tp1", "pnl_pct": 3.0, "close_fraction": 0.50},
+        {"leg": "tp2", "pnl_pct": 6.0, "close_fraction": 0.25},
+        {"leg": "tp3", "pnl_pct": 9.0, "close_fraction": 0.25},
+    ]
+    original_orders = [
+        {"leg": "tp1", "order_id": "TP1_ORIGINAL", "client_order_id": "CID_TP1", "qty": 0.5, "pnl_pct": 3.0},
+        {"leg": "tp2", "order_id": "TP2_ORIGINAL", "client_order_id": "CID_TP2", "qty": 0.25, "pnl_pct": 6.0},
+        {"leg": "tp3", "order_id": "TP3_ORIGINAL", "client_order_id": "CID_TP3", "qty": 0.25, "pnl_pct": 9.0},
+    ]
+    trade = {
+        "event_id": "EVT_PARTIAL_THREE_TP_ALLOCATION",
+        "symbol": "AAA-USDT", "direction": "LONG", "closed": False,
+        "initial_qty": 1.0, "remaining_qty": 0.8, "planned_risk_pct": 10.0,
+        "hit_legs": [], "tp_filled_qty": {"tp1": 0.2},
+        "tp_orders": [
+            {**original_orders[0], "status": "PARTIAL_FILL_TERMINAL", "executed_qty": 0.2},
+            {**original_orders[1], "status": "NEW", "executed_qty": 0.0},
+            {**original_orders[2], "status": "NEW", "executed_qty": 0.0},
+        ],
+        "setup": {"risk_pct": 10.0, "tp_levels": levels,
+                  "protection_result": {"tp_orders": original_orders}},
+    }
+    monkeypatch.setattr(run_once, "_load_active_trades_file", lambda: {trade["event_id"]: trade})
+    monkeypatch.setattr(run_once, "get_positions", lambda **kwargs: [
+        {"symbol": "AAA-USDT", "positionSide": "LONG", "positionAmt": "0.8", "avgPrice": "100"},
+    ])
+    monkeypatch.setattr(run_once, "ensure_directional_protection", lambda symbol, side, avg, qty, risk, new_levels, trade_id=None: (
+        protection_calls.append({"qty": qty, "levels": new_levels}) or
+        {"status": "PROTECTED", "tp_orders": [], "sl_result": {"order_id": "SL_OK"}, "effective_tp_levels": []}
+    ))
+    monkeypatch.setattr(run_once, "update_active_trade_protection", lambda *args, **kwargs: True)
+    monkeypatch.setattr(run_once.telemetry, "record_position_reconciliation", lambda **kwargs: None)
+    monkeypatch.setattr(run_once.telemetry, "record_state_conflict", lambda **kwargs: None)
+    monkeypatch.setattr(run_once, "_append_execution_ledger", lambda *args, **kwargs: None)
+
+    assert run_once.reconcile_all_open_positions() is True
+    assert len(protection_calls) == 1
+    assert protection_calls[0]["qty"] == pytest.approx(0.8)
+    remaining = {item["leg"]: item["close_fraction"] for item in protection_calls[0]["levels"]}
+    assert remaining == pytest.approx({"tp1": 0.3, "tp2": 0.25, "tp3": 0.25})
+
+
+def test_shadow_delayed_be_simulates_all_three_production_tp_legs():
+    import pandas as pd
+    from event_engine.shadow import _simulate_management_only
+
+    all_bars = pd.DataFrame([{
+        "timestamp": "2026-11-08T10:00:00Z", "close_time": "2026-11-08T10:05:00Z",
+        "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0,
+    }])
+    future = pd.DataFrame([{
+        "timestamp": "2026-11-08T10:05:00Z", "close_time": "2026-11-08T10:10:00Z",
+        "open": 100.0, "high": 110.0, "low": 100.0, "close": 109.5,
+    }])
+    result = _simulate_management_only(
+        all_bars, future, direction="LONG", entry=100.0, production_stop=90.0,
+        production_tp1=103.0, production_tp2=106.0, production_tp3=109.0,
+        mode="DELAYED_BE", parameter=0,
+    )
+    assert result["status"] == "ALL_TP_LEGS_REACHED"
+    assert result["realized_target_legs"] == ["tp1", "tp2", "tp3"]
+    assert result["realized_target_fraction"] == pytest.approx(1.0)
+    assert result["residual_fraction"] == pytest.approx(0.0)
+    assert result["pnl_pct"] == pytest.approx(5.25)
+
+
+def test_open_market_uses_quantity_precision_step_when_min_qty_is_missing(monkeypatch):
+    from event_engine import bingx
+    monkeypatch.setenv("BINGX_MARGIN_USDT", "6.67")
+    monkeypatch.setattr(bingx, "MARGIN_USDT", 6.67)
+    monkeypatch.setattr(bingx, "LEVERAGE", 3)
+    monkeypatch.setattr(bingx, "MAX_LEVERAGE", 3)
+    monkeypatch.setattr(bingx, "get_order", lambda *args, **kwargs: {"status": "not_found"})
+    monkeypatch.setattr(bingx, "_set_leverage", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("leverage must not change for a precheck skip")))
+    monkeypatch.setattr(bingx, "get_contract", lambda symbol: {
+        "symbol": "BNB-USDT", "quantityPrecision": 2,
+        "multiplier": 1, "maxLeverage": 10,
+    })
+    monkeypatch.setattr(bingx, "contract_exists", lambda symbol: True)
+    monkeypatch.setattr(bingx, "_current_close_price", lambda symbol: 1000.0)
+    monkeypatch.setattr(bingx, "get_execution_quote", lambda symbol, **kwargs: {
+        "status": "ok", "symbol": symbol, "bid": 1000.0, "ask": 1000.0, "spread_pct": 0.0,
+        "quote_observed_at_ms": int(time.time() * 1000), "quote_exchange_time_ms": int(time.time() * 1000),
+    })
+    monkeypatch.setattr(bingx, "has_position_conflict_for_open", lambda *args, **kwargs: False)
+    monkeypatch.setattr(bingx, "position_side_param", lambda *args, **kwargs: "LONG")
+    result = bingx.open_market("BNB-USDT", "LONG", 1000.0, "EVT_TEST_NO_MIN_QTY")
+    assert result["status"] == "skipped_tp_min_qty"
+    assert result["min_tp_leg_qty"] == pytest.approx(0.01)
+    assert result["required_tp_qty"] == pytest.approx(0.04)
+
+
+def test_entry_order_lifecycle_distinguishes_three_tp_precheck_from_exchange_rejection():
+    import run_once
+    assert run_once._entry_order_lifecycle_status("opened") == "ACKNOWLEDGED"
+    assert run_once._entry_order_lifecycle_status("entry_pending") == "ACKNOWLEDGED"
+    assert run_once._entry_order_lifecycle_status("skipped_tp_min_qty") == "NOT_SUBMITTED"
+    assert run_once._entry_order_lifecycle_status("skipped_min_qty") == "NOT_SUBMITTED"
+    assert run_once._entry_order_lifecycle_status("skipped_stale_signal") == "NOT_SUBMITTED"
+    assert run_once._entry_order_lifecycle_status("rejected") == "REJECTED"
+
+
+def test_three_tp_minimum_quantity_is_rounded_up_and_preserves_50_25_25_weights():
+    from event_engine.bingx import _allocate_tp_quantities, _minimum_executable_qty, _minimum_position_qty_for_tp_plan
+    minimum = _minimum_executable_qty(0.015, 2)
+    assert float(minimum) == pytest.approx(0.02)
+    assert float(_minimum_position_qty_for_tp_plan(0.015, 2, [0.50, 0.25, 0.25])) == pytest.approx(0.08)
+    with pytest.raises(ValueError, match="minimum total quantity=0.08"):
+        _allocate_tp_quantities(0.06, 2, 0.015, [0.50, 0.25, 0.25])
+    quantities = _allocate_tp_quantities(0.08, 2, 0.015, [0.50, 0.25, 0.25])
+    assert quantities == pytest.approx([0.04, 0.02, 0.02])
+    assert sum(quantities) == pytest.approx(0.08)
+    assert all(q >= float(minimum) for q in quantities)
+
+
+def test_weighted_rr_uses_residual_per_leg_qty_after_partial_tp_fill():
+    """A live partial TP fill must not proportionally shrink every remaining leg."""
+    from event_engine import tracker
+
+    trade = {
+        "initial_qty": 1.0,
+        "remaining_qty": 0.8,
+        "planned_risk_pct": 10.0,
+        "realized_pnl_qty": 0.2,
+        "realized_pnl_weighted_sum": 0.2 * 3.0,
+        "tp_filled_qty": {"tp1": 0.2},
+        "hit_legs": [],
+        "completed_tp_legs": [],
+        "tp_levels": [
+            {"leg": "tp1", "pnl_pct": 3.0, "close_fraction": 0.50},
+            {"leg": "tp2", "pnl_pct": 6.0, "close_fraction": 0.25},
+            {"leg": "tp3", "pnl_pct": 9.0, "close_fraction": 0.25},
+        ],
+        # These are the original exchange-confirmed allocations before the
+        # partial TP1 fill. The remaining TP1 quantity is 0.30, not 0.40.
+        "effective_tp_levels": [
+            {"leg": "tp1", "pnl_pct": 3.0, "close_fraction": 0.50, "qty": 0.50},
+            {"leg": "tp2", "pnl_pct": 6.0, "close_fraction": 0.25, "qty": 0.25},
+            {"leg": "tp3", "pnl_pct": 9.0, "close_fraction": 0.25, "qty": 0.25},
+        ],
+    }
+
+    effective, realized, remaining = tracker._weighted_rr_snapshot(trade)
+    assert effective == pytest.approx(0.525)
+    assert realized == pytest.approx(0.06)
+    assert remaining == pytest.approx(0.58125)
+
+    # After a protection rebuild, effective quantities are already residual.
+    # The cumulative TP fill ledger must not be subtracted for a second time.
+    trade["effective_tp_levels"] = [
+        {"leg": "tp1", "pnl_pct": 3.0, "close_fraction": 0.375, "qty": 0.30},
+        {"leg": "tp2", "pnl_pct": 6.0, "close_fraction": 0.3125, "qty": 0.25},
+        {"leg": "tp3", "pnl_pct": 9.0, "close_fraction": 0.3125, "qty": 0.25},
+    ]
+    effective, realized, remaining = tracker._weighted_rr_snapshot(trade)
+    assert effective == pytest.approx(0.525)
+    assert realized == pytest.approx(0.06)
+    assert remaining == pytest.approx(0.58125)

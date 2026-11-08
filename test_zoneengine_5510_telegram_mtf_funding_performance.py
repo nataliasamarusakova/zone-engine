@@ -72,7 +72,6 @@ def test_telegram_compact_format_uses_requested_layout_and_zone_proximity():
         "Status: <code>opened_protected</code>",
         "Order: <code>2116810510872612864</code>",
         "Protection: <code>PROTECTED</code>",
-        "Error: <code>—</code>",
     ])
     assert msg == expected
     assert "1H / 3H zones:" not in msg
@@ -140,23 +139,24 @@ def test_telegram_price_formatting_preserves_exchange_precision_without_scientif
     message = format_signal({
         "type": "LONG", "symbol": "TINY-USDT", "entry": 0.000123456789,
         "sl": 0.000111111119, "tp1": 0.000127160493,
-        "tp2": 0.000130864197, "risk_pct": 10.0,
-        "tp1_rr": 0.3, "tp2_rr": 0.6,
+        "tp2": 0.000130864197, "tp3": 0.000134567876, "risk_pct": 10.0,
+        "tp1_rr": 0.3, "tp2_rr": 0.6, "tp3_rr": 0.9,
         "zone": {"kind": "DEMAND"},
-        "target": {"tp1_pct": 3.0, "tp2_pct": 6.0},
+        "target": {"tp1_pct": 3.0, "tp2_pct": 6.0, "tp3_pct": 9.0, "tp1_close_fraction": 0.5, "tp2_close_fraction": 0.25, "tp3_close_fraction": 0.25},
         "confirmation": {},
     })
     assert "Entry reference: <code>0.000123456789</code>" in message
     assert "SL: <code>0.000111111119</code>" in message
     assert "TP1: <code>0.000127160493 (3% / 0.3R / 50%)</code>" in message
-    assert "TP2: <code>0.000130864197 (6% / 0.6R / 50%)</code>" in message
+    assert "TP2: <code>0.000130864197 (6% / 0.6R / 25%)</code>" in message
+    assert "TP3: <code>0.000134567876 (9% / 0.9R / 25%)</code>" in message
 
 
 def test_telegram_never_displays_stale_or_unavailable_funding_as_a_rate():
     from event_engine.telegram import _fmt_funding
 
-    assert _fmt_funding({"status": "stale", "funding_rate_pct": 0.02}) == "—"
-    assert _fmt_funding({"status": "unavailable", "funding_rate_pct": 0.02}) == "—"
+    assert _fmt_funding({"status": "stale", "funding_rate_pct": 0.02}) == "STALE"
+    assert _fmt_funding({"status": "unavailable", "funding_rate_pct": 0.02}) == "UNAVAILABLE"
     assert _fmt_funding({"status": "ok", "funding_rate_pct": -0.01234}) == "-0.0123%"
 
 

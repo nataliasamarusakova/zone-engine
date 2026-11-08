@@ -49,7 +49,7 @@ from event_engine.bingx import (
     open_market,
     wait_for_position_fill_directional,
 )
-from event_engine.signals import STRATEGY_VERSION, SWING_LEN, MIN_BARS as SIGNALS_MIN_BARS, TP1_PCT, TP2_PCT, generate_zone_signals, score_zone_signal, add_3h_zone_confluence, _nearest_opposing_level, _signal_forensics
+from event_engine.signals import STRATEGY_VERSION, SWING_LEN, MIN_BARS as SIGNALS_MIN_BARS, TP1_PCT, TP2_PCT, TP3_PCT, TP1_FRACTION, TP2_FRACTION, TP3_FRACTION, generate_zone_signals, score_zone_signal, add_3h_zone_confluence, _nearest_opposing_level, _signal_forensics
 from event_engine.version import ENGINE_VERSION
 from event_engine.state_validation import validate_active_trade_record
 from event_engine.fundamental_assets import FUNDAMENTAL_ASSET_SYMBOLS
@@ -128,8 +128,8 @@ EXECUTION_MAX_SIGNAL_AGE_BARS = int(os.environ.get("EXECUTION_MAX_SIGNAL_AGE_BAR
 DIAGNOSTICS_MODE = os.environ.get("DIAGNOSTICS_MODE", "historical").strip().lower()
 if DIAGNOSTICS_MODE not in {"historical", "live"}:
     raise ValueError("DIAGNOSTICS_MODE must be historical or live")
-SCAN_WORKERS = max(1, int(os.environ.get("SCAN_WORKERS", "12")))
-SCAN_BATCH_SIZE = max(SCAN_WORKERS, int(os.environ.get("SCAN_BATCH_SIZE", "48")))
+SCAN_WORKERS = max(1, int(os.environ.get("SCAN_WORKERS", "16")))
+SCAN_BATCH_SIZE = max(SCAN_WORKERS, int(os.environ.get("SCAN_BATCH_SIZE", "64")))
 SCAN_BATCH_PAUSE_SEC = max(0.0, float(os.environ.get("SCAN_BATCH_PAUSE_SEC", "0.10")))
 BINANCE_ASSET_CLASSES = {x.strip().upper() for x in os.environ.get("BINANCE_ASSET_CLASSES", "CRYPTO,EQUITY").split(",") if x.strip()}
 MAX_MARKET_SPREAD_PCT = float(os.environ.get("MAX_MARKET_SPREAD_PCT", "1.50"))
@@ -1099,6 +1099,7 @@ def _build_5m_zone_signal(
 
     tp1 = entry * (1.0 + TP1_PCT / 100.0) if direction == "LONG" else entry * (1.0 - TP1_PCT / 100.0)
     tp2 = entry * (1.0 + TP2_PCT / 100.0) if direction == "LONG" else entry * (1.0 - TP2_PCT / 100.0)
+    tp3 = entry * (1.0 + TP3_PCT / 100.0) if direction == "LONG" else entry * (1.0 - TP3_PCT / 100.0)
     trigger_ts_ms = int(ts.timestamp() * 1000)
     zone_copy = {**zone, "kind": "DEMAND" if direction == "LONG" else "SUPPLY"}
     prev_ts = _coerce_utc_timestamp(prev_bar.get("timestamp")) if prev_bar is not None and hasattr(prev_bar, "get") else None
@@ -1135,6 +1136,29 @@ def _build_5m_zone_signal(
     if REQUIRE_DIRECTIONAL_CANDLE and not directional_ok:
         raise ValueError("directional_candle_required")
     entry_bar = {k: (ts.isoformat() if k == "timestamp" else float(bar[k])) for k in ["timestamp", "open", "high", "low", "close", "volume"]}
+    # Preserve exchange-provided flow diagnostics on the canonical trigger bar.
+    # Shadow/research snapshots can then reproduce volume/delta features even
+    # when their separately loaded history frame misses the newest candle.
+    flow_valid_raw = bar.get("taker_flow_valid") if hasattr(bar, "get") else None
+    flow_valid = None if flow_valid_raw is None else bool(flow_valid_raw)
+    for field in ("quote_volume", "taker_buy_base", "taker_buy_quote", "bar_delta_usdt"):
+        if field == "bar_delta_usdt" and flow_valid is False:
+            continue
+        value = bar.get(field) if hasattr(bar, "get") else None
+        try:
+            numeric = float(value) if value is not None else None
+        except (TypeError, ValueError, OverflowError):
+            numeric = None
+        if numeric is not None and math.isfinite(numeric):
+            entry_bar[field] = numeric
+    if flow_valid is not None:
+        entry_bar["taker_flow_valid"] = bool(flow_valid)
+    trade_count = bar.get("trade_count") if hasattr(bar, "get") else None
+    if trade_count is not None:
+        try:
+            entry_bar["trade_count"] = int(trade_count)
+        except (TypeError, ValueError, OverflowError):
+            pass
     setup_zone = {**zone_copy, "age_bars": zone_age_bars}
     signal_forensics = _signal_forensics(direction, float(bar["open"]), float(bar["high"]), float(bar["low"]), float(bar["close"]), max(atr_1h, 1e-12), setup_zone)
     return {
@@ -1153,11 +1177,13 @@ def _build_5m_zone_signal(
         "sl": stop,
         "tp1": tp1,
         "tp2": tp2,
+        "tp3": tp3,
         "risk_pct": fixed_stop_pct,
         "risk_abs": risk,
         "atr": atr_1h,
         "tp1_rr": TP1_PCT / fixed_stop_pct,
         "tp2_rr": TP2_PCT / fixed_stop_pct,
+        "tp3_rr": TP3_PCT / fixed_stop_pct,
         "strategy": "Demand/Supply Zone First",
         "strategy_version": _effective_strategy_version(),
         "entry_bar": entry_bar,
@@ -1186,8 +1212,10 @@ def _build_5m_zone_signal(
             "obstacle_price": float(obstacle["price"]) if obstacle else None,
             "tp1_pct": TP1_PCT,
             "tp2_pct": TP2_PCT,
-            "tp1_close_fraction": 0.50,
-            "tp2_close_fraction": 0.50,
+            "tp3_pct": TP3_PCT,
+            "tp1_close_fraction": TP1_FRACTION,
+            "tp2_close_fraction": TP2_FRACTION,
+            "tp3_close_fraction": TP3_FRACTION,
             "be_rule": "after_tp1_filled",
         },
         "risk_model": {
@@ -2962,13 +2990,18 @@ def _build_setup(signal: dict[str, Any]) -> dict[str, Any]:
         "entry_reference": float(signal["entry"]),
         "invalidation_price": float(signal["sl"]),
         "risk_pct": risk_pct,
-        "target_rr": float(signal.get("tp2_rr", TP2_PCT / FIXED_STOP_PCT)),
-        "planned_weighted_rr": float(signal.get("tp1_rr", TP1_PCT / FIXED_STOP_PCT)) * 0.50 + float(signal.get("tp2_rr", TP2_PCT / FIXED_STOP_PCT)) * 0.50,
+        "target_rr": float(signal.get("tp3_rr", TP3_PCT / FIXED_STOP_PCT)),
+        "planned_weighted_rr": (
+            float(signal.get("tp1_rr", TP1_PCT / FIXED_STOP_PCT)) * TP1_FRACTION
+            + float(signal.get("tp2_rr", TP2_PCT / FIXED_STOP_PCT)) * TP2_FRACTION
+            + float(signal.get("tp3_rr", TP3_PCT / FIXED_STOP_PCT)) * TP3_FRACTION
+        ),
         "tp_levels": [
-            {"leg": "tp1", "pnl_pct": TP1_PCT, "close_fraction": 0.50, "price": float(signal["tp1"])},
-            {"leg": "tp2", "pnl_pct": TP2_PCT, "close_fraction": 0.50, "price": float(signal["tp2"])},
+            {"leg": "tp1", "pnl_pct": TP1_PCT, "close_fraction": TP1_FRACTION, "price": float(signal["tp1"])},
+            {"leg": "tp2", "pnl_pct": TP2_PCT, "close_fraction": TP2_FRACTION, "price": float(signal["tp2"])},
+            {"leg": "tp3", "pnl_pct": TP3_PCT, "close_fraction": TP3_FRACTION, "price": float(signal["tp3"])},
         ],
-        "target_price": float(signal["tp2"]),
+        "target_price": float(signal["tp3"]),
         "zone": signal.get("zone", {}),
         "zone_counts": dict(signal.get("zone_counts", {})) if isinstance(signal.get("zone_counts"), dict) else {},
         "confirmation": signal.get("confirmation", {}),
@@ -2990,13 +3023,14 @@ def _validate_trade_geometry(
         sl = float(signal["sl"])
         tp1 = float(signal["tp1"])
         tp2 = float(signal["tp2"])
+        tp3 = float(signal["tp3"])
         risk_pct = float(signal["risk_pct"])
     except (KeyError, TypeError, ValueError) as exc:
         return False, f"invalid_numeric_setup: {exc}"
-    values = {"entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "risk_pct": risk_pct}
+    values = {"entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3, "risk_pct": risk_pct}
     if any(not math.isfinite(v) for v in values.values()):
         return False, "non_finite_setup"
-    if min(entry, sl, tp1, tp2) <= 0:
+    if min(entry, sl, tp1, tp2, tp3) <= 0:
         return False, "non_positive_price"
     if risk_pct <= 0:
         return False, f"non_positive_risk_pct={risk_pct}"
@@ -3020,25 +3054,35 @@ def _validate_trade_geometry(
     if direction == "LONG":
         if not sl < entry:
             return False, f"LONG invalid SL: sl={sl} entry={entry}"
-        if not (tp1 > entry and tp2 > tp1):
-            return False, f"LONG invalid TP geometry: entry={entry} tp1={tp1} tp2={tp2}"
+        if not (tp1 > entry and tp2 > tp1 and tp3 > tp2):
+            return False, f"LONG invalid TP geometry: entry={entry} tp1={tp1} tp2={tp2} tp3={tp3}"
     elif direction == "SHORT":
         if not sl > entry:
             return False, f"SHORT invalid SL: sl={sl} entry={entry}"
-        if not (tp1 < entry and tp2 < tp1):
-            return False, f"SHORT invalid TP geometry: entry={entry} tp1={tp1} tp2={tp2}"
+        if not (tp1 < entry and tp2 < tp1 and tp3 < tp2):
+            return False, f"SHORT invalid TP geometry: entry={entry} tp1={tp1} tp2={tp2} tp3={tp3}"
     else:
         return False, f"invalid_direction={direction}"
     return True, "ok"
 
 
-def _protection_geometry_from_fill(direction: str, avg_price: float, risk_pct: float) -> tuple[float, float, float]:
+def _protection_geometry_from_fill(direction: str, avg_price: float, risk_pct: float) -> tuple[float, float, float, float]:
     # Kept as a small geometry helper for tests/diagnostics. Production uses the
     # same fixed stop percentage through _rebase_protection_after_fill().
     risk = avg_price * risk_pct / 100.0
     if direction == "LONG":
-        return avg_price - risk, avg_price * (1.0 + TP1_PCT / 100.0), avg_price * (1.0 + TP2_PCT / 100.0)
-    return avg_price + risk, avg_price * (1.0 - TP1_PCT / 100.0), avg_price * (1.0 - TP2_PCT / 100.0)
+        return (
+            avg_price - risk,
+            avg_price * (1.0 + TP1_PCT / 100.0),
+            avg_price * (1.0 + TP2_PCT / 100.0),
+            avg_price * (1.0 + TP3_PCT / 100.0),
+        )
+    return (
+        avg_price + risk,
+        avg_price * (1.0 - TP1_PCT / 100.0),
+        avg_price * (1.0 - TP2_PCT / 100.0),
+        avg_price * (1.0 - TP3_PCT / 100.0),
+    )
 
 
 def _cleanup_engine_protection(symbol: str, direction: str) -> dict[str, Any]:
@@ -3108,12 +3152,15 @@ def _rebase_protection_after_fill(signal: dict[str, Any], avg_price: float) -> d
     # only as metadata/diagnostic context; it no longer compresses TP distance.
     tp1_distance = entry * TP1_PCT / 100.0
     tp2_distance = entry * TP2_PCT / 100.0
+    tp3_distance = entry * TP3_PCT / 100.0
     if direction == "LONG":
         tp1 = entry + tp1_distance
         tp2 = entry + tp2_distance
+        tp3 = entry + tp3_distance
     else:
         tp1 = entry - tp1_distance
         tp2 = entry - tp2_distance
+        tp3 = entry - tp3_distance
     target_source = "fixed_entry_percentage_after_fill"
 
     return {
@@ -3121,10 +3168,12 @@ def _rebase_protection_after_fill(signal: dict[str, Any], avg_price: float) -> d
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
+        "tp3": tp3,
         "risk_abs": risk,
         "risk_pct": fixed_stop_pct,
         "tp1_rr": abs(tp1 - entry) / risk,
         "tp2_rr": abs(tp2 - entry) / risk,
+        "tp3_rr": abs(tp3 - entry) / risk,
         "target_source": target_source,
         "obstacle_price": obstacle,
     }
@@ -3543,10 +3592,12 @@ def _build_actual_signal_from_rebase(signal: dict[str, Any], rebased: dict[str, 
         "sl": float(rebased["sl"]),
         "tp1": float(rebased["tp1"]),
         "tp2": float(rebased["tp2"]),
+        "tp3": float(rebased["tp3"]),
         "risk_pct": float(rebased["risk_pct"]),
         "risk_abs": float(rebased["risk_abs"]),
         "tp1_rr": float(rebased["tp1_rr"]),
         "tp2_rr": float(rebased["tp2_rr"]),
+        "tp3_rr": float(rebased["tp3_rr"]),
         "target": {
             **(signal.get("target") if isinstance(signal.get("target"), dict) else {}),
             "source": rebased["target_source"],
@@ -3562,15 +3613,19 @@ def _validate_exchange_price_distinctness(signal: dict[str, Any]) -> tuple[bool,
         contract = get_contract(signal["symbol"]) or {}
         price_precision = int(contract.get("pricePrecision") or 0)
         fmt = lambda x: f"{float(x):.{price_precision}f}"
-        entry, sl, tp1, tp2 = (float(signal[k]) for k in ("entry", "sl", "tp1", "tp2"))
+        entry, sl, tp1, tp2, tp3 = (float(signal[k]) for k in ("entry", "sl", "tp1", "tp2", "tp3"))
     except (KeyError, TypeError, ValueError) as exc:
         return False, f"price_precision_validation_failed: {exc}"
     if fmt(entry) == fmt(sl):
         return False, f"SL collapses to entry at pricePrecision={price_precision}: entry={fmt(entry)} sl={fmt(sl)}"
     if fmt(entry) == fmt(tp1):
         return False, f"TP1 collapses to entry at pricePrecision={price_precision}: entry={fmt(entry)} tp1={fmt(tp1)}"
-    if fmt(entry) == fmt(tp2) or fmt(tp1) == fmt(tp2):
-        return False, f"TP levels collapse at pricePrecision={price_precision}: entry={fmt(entry)} tp1={fmt(tp1)} tp2={fmt(tp2)}"
+    rounded_targets = [fmt(tp1), fmt(tp2), fmt(tp3)]
+    if fmt(entry) in rounded_targets or len(set(rounded_targets)) != 3:
+        return False, (
+            f"TP levels collapse at pricePrecision={price_precision}: "
+            f"entry={fmt(entry)} tp1={fmt(tp1)} tp2={fmt(tp2)} tp3={fmt(tp3)}"
+        )
     return True, "ok"
 
 
@@ -3601,6 +3656,16 @@ def _is_protected_execution_status(execution: dict[str, Any]) -> bool:
     position requiring reconciliation, not a failed signal eligible for replay.
     """
     return str(execution.get("status", "")).strip().lower() in PROTECTED_EXECUTION_STATUSES
+
+
+def _entry_order_lifecycle_status(order_status: str) -> str:
+    """Distinguish local pre-submit skips from exchange-rejected MARKET orders."""
+    normalized = str(order_status or "").strip().lower()
+    if normalized in {"opened", "entry_pending"}:
+        return "ACKNOWLEDGED"
+    if normalized in {"skipped_stale_signal", "skipped_min_qty", "skipped_tp_min_qty"}:
+        return "NOT_SUBMITTED"
+    return "REJECTED"
 
 
 def _is_terminal_execution_failure(execution: dict[str, Any]) -> bool:
@@ -4251,7 +4316,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         symbol=symbol,
         direction=direction,
         leg="ENTRY",
-        status=("ACKNOWLEDGED" if order_status in {"opened", "entry_pending"} else "REJECTED"),
+        status=_entry_order_lifecycle_status(order_status),
         order_type="MARKET",
         result_status=order.get("status") if isinstance(order, dict) else None,
         exchange_code=response.get("code"),
@@ -4290,6 +4355,19 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
                 "order_submitted": False,
                 "order": order,
             }
+
+    if order.get("status") == "skipped_tp_min_qty":
+        _append_execution_ledger(event_id, signal.get("attempt_id"), "ORDER_NOT_SUBMITTED_PRECHECK", {
+            "status": order.get("status"),
+            "reason": order.get("reason"),
+            "qty": order.get("qty"),
+            "required_tp_qty": order.get("required_tp_qty"),
+            "required_tp_leg_count": order.get("required_tp_leg_count"),
+            "required_margin_usdt": order.get("required_margin_usdt"),
+            "configured_margin_usdt": order.get("configured_margin_usdt"),
+            "error": order.get("error"),
+        })
+        return order
 
     if order.get("status") == "skipped_min_qty":
         _append_execution_ledger(event_id, signal.get("attempt_id"), "ORDER_REJECTED", {"status": order.get("status"), "error": order.get("error")})
@@ -4565,10 +4643,12 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     sl_price = float(rebased["sl"])
     tp1_price = float(rebased["tp1"])
     tp2_price = float(rebased["tp2"])
+    tp3_price = float(rebased["tp3"])
     actual_risk_abs = float(rebased["risk_abs"])
     actual_risk_pct = float(rebased["risk_pct"])
     tp1_pnl_pct = (abs(tp1_price - avg_price) / avg_price) * 100.0
     tp2_pnl_pct = (abs(tp2_price - avg_price) / avg_price) * 100.0
+    tp3_pnl_pct = (abs(tp3_price - avg_price) / avg_price) * 100.0
     actual_signal = _build_actual_signal_from_rebase(signal, rebased)
     distinct, precision_reason = _validate_exchange_price_distinctness(actual_signal)
     if not distinct:
@@ -4593,13 +4673,18 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     setup["execution_slippage_pct"] = execution_slippage_pct
     setup["invalidation_price"] = sl_price
     setup["risk_pct"] = actual_risk_pct
-    setup["target_rr"] = actual_signal["tp2_rr"]
-    setup["planned_weighted_rr"] = actual_signal["tp1_rr"] * 0.50 + actual_signal["tp2_rr"] * 0.50
+    setup["target_rr"] = actual_signal["tp3_rr"]
+    setup["planned_weighted_rr"] = (
+        actual_signal["tp1_rr"] * TP1_FRACTION
+        + actual_signal["tp2_rr"] * TP2_FRACTION
+        + actual_signal["tp3_rr"] * TP3_FRACTION
+    )
     setup["tp_levels"] = [
-        {"leg": "tp1", "pnl_pct": tp1_pnl_pct, "close_fraction": 0.50, "price": tp1_price},
-        {"leg": "tp2", "pnl_pct": tp2_pnl_pct, "close_fraction": 0.50, "price": tp2_price},
+        {"leg": "tp1", "pnl_pct": tp1_pnl_pct, "close_fraction": TP1_FRACTION, "price": tp1_price},
+        {"leg": "tp2", "pnl_pct": tp2_pnl_pct, "close_fraction": TP2_FRACTION, "price": tp2_price},
+        {"leg": "tp3", "pnl_pct": tp3_pnl_pct, "close_fraction": TP3_FRACTION, "price": tp3_price},
     ]
-    setup["target_price"] = tp2_price
+    setup["target_price"] = tp3_price
     setup["entry_order"] = order if isinstance(order, dict) else {}
     setup["entry_order_reconciliation"] = dict(entry_settlement)
     setup["entry_remainder_unverified"] = entry_settlement.get("status") != "settled"
@@ -4623,11 +4708,14 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
         "sl_price": sl_price,
         "tp1_price": tp1_price,
         "tp2_price": tp2_price,
+        "tp3_price": tp3_price,
         "stop_pct": actual_risk_pct,
         "tp1_pct": tp1_pnl_pct,
         "tp2_pct": tp2_pnl_pct,
-        "tp1_fraction": 0.50,
-        "tp2_fraction": 0.50,
+        "tp3_pct": tp3_pnl_pct,
+        "tp1_fraction": TP1_FRACTION,
+        "tp2_fraction": TP2_FRACTION,
+        "tp3_fraction": TP3_FRACTION,
         "be_rule": "after_tp1_filled",
         "quote_source": execution_quote.get("quote_source"),
         "execution_reference_quality": execution_quote.get("execution_reference_quality"),
@@ -4647,9 +4735,9 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     setup["code_commit_sha"] = CODE_COMMIT_SHA
 
     log.info(
-        "[EXEC_POST_FILL_REBASED] %s %s | fill=%s sl=%s tp1=%s tp2=%s tp1_rr=%.3f tp2_rr=%.3f target_source=%s",
-        symbol, direction, avg_price, sl_price, tp1_price, tp2_price,
-        actual_signal["tp1_rr"], actual_signal["tp2_rr"], rebased["target_source"],
+        "[EXEC_POST_FILL_REBASED] %s %s | fill=%s sl=%s tp1=%s tp2=%s tp3=%s tp1_rr=%.3f tp2_rr=%.3f tp3_rr=%.3f target_source=%s",
+        symbol, direction, avg_price, sl_price, tp1_price, tp2_price, tp3_price,
+        actual_signal["tp1_rr"], actual_signal["tp2_rr"], actual_signal["tp3_rr"], rebased["target_source"],
     )
 
     protection_started_ts = pd.Timestamp.now(tz="UTC")
@@ -4789,7 +4877,7 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
     if protection.get("status") != "PROTECTED":
         log.critical("[SAFETY_CLOSE] %s %s | mandatory protection incomplete | %s", symbol, direction, protection)
         # Mandatory rule: never leave a newly-opened position live without BOTH
-        # a verified SL and both TP legs. Attempt an immediate market rollback.
+        # a verified SL and every configured TP leg. Attempt an immediate market rollback.
         close_result, cleanup = _emergency_close_preserving_protection(symbol, direction, qty, event_id, reason="MANDATORY_PROTECTION_INCOMPLETE", attempt_id=signal.get("attempt_id"))
         try:
             time.sleep(0.25)
@@ -4808,7 +4896,12 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
             "executed_signal": actual_signal,
         }
 
-    _append_execution_ledger(event_id, signal.get("attempt_id"), "PROTECTED_POSITION", {"fill_price": avg_price, "sl_price": sl_price, "tp1_price": tp1_price, "tp2_price": tp2_price, "risk_pct": actual_risk_pct, "planned_weighted_rr": setup["planned_weighted_rr"]})
+    _append_execution_ledger(event_id, signal.get("attempt_id"), "PROTECTED_POSITION", {
+        "fill_price": avg_price, "sl_price": sl_price,
+        "tp1_price": tp1_price, "tp2_price": tp2_price, "tp3_price": tp3_price,
+        "risk_pct": actual_risk_pct, "planned_weighted_rr": setup["planned_weighted_rr"],
+        "tp_levels": setup["tp_levels"],
+    })
 
     registration_reason = "active_trade_registration_failed"
     registration_setup = _setup_with_protection_result(setup, protection)
@@ -4881,8 +4974,10 @@ def execute_new_position(signal: dict[str, Any]) -> dict[str, Any]:
             "stop_pct": actual_risk_pct,
             "tp1_pct": tp1_pnl_pct,
             "tp2_pct": tp2_pnl_pct,
-            "tp1_fraction": 0.50,
-            "tp2_fraction": 0.50,
+            "tp3_pct": tp3_pnl_pct,
+            "tp1_fraction": TP1_FRACTION,
+            "tp2_fraction": TP2_FRACTION,
+            "tp3_fraction": TP3_FRACTION,
             "be_rule": "after_tp1_filled",
             "quote_source": execution_quote.get("quote_source"),
             "quote_sources_attempted": execution_quote.get("quote_sources_attempted"),
@@ -5300,8 +5395,8 @@ def main() -> None:
     scan_id = f"SCAN_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8].upper()}"
     _init_diagnostic_log()
     log.info(
-        "[RUN_DIAGNOSTIC] scan_id=%s strategy=%s | universe=%s | trigger=5m_%s | zone_tf=1h | stop=%.2f%% | tp1=%.2f%% | tp2=%.2f%% | be=after_tp1_filled | max_5m_age_min=%.1f | structure_min=%.2fR | data_stale_hours=%.2f",
-        scan_id, (STRATEGY_VERSION if ZONE_TRIGGER_MODE == "midpoint" else f"{STRATEGY_VERSION}-zone-touch-test"), ("150" if FUNDAMENTAL_WHITELIST_ENABLED else "ALL_ACTIVE_BINGX"), ZONE_TRIGGER_MODE, FIXED_STOP_PCT, TP1_PCT, TP2_PCT,
+        "[RUN_DIAGNOSTIC] scan_id=%s strategy=%s | universe=%s | trigger=5m_%s | zone_tf=1h | stop=%.2f%% | tp1=%.2f%% | tp2=%.2f%% | tp3=%.2f%% | be=after_tp1_filled | max_5m_age_min=%.1f | structure_min=%.2fR | data_stale_hours=%.2f",
+        scan_id, (STRATEGY_VERSION if ZONE_TRIGGER_MODE == "midpoint" else f"{STRATEGY_VERSION}-zone-touch-test"), ("150" if FUNDAMENTAL_WHITELIST_ENABLED else "ALL_ACTIVE_BINGX"), ZONE_TRIGGER_MODE, FIXED_STOP_PCT, TP1_PCT, TP2_PCT, TP3_PCT,
         MAX_5M_TRIGGER_AGE_MINUTES, MIN_STRUCTURE_ROOM_R, MAX_DATA_STALENESS_HOURS,
     )
     research.update_manifest_run(
@@ -5309,7 +5404,9 @@ def main() -> None:
         effective_config={
             "execution_enabled": EXECUTION_ENABLED, "fundamental_whitelist_enabled": FUNDAMENTAL_WHITELIST_ENABLED,
             "zone_trigger_mode": ZONE_TRIGGER_MODE, "fixed_stop_pct": FIXED_STOP_PCT,
-            "tp1_pct": TP1_PCT, "tp2_pct": TP2_PCT, "min_structure_room_r": MIN_STRUCTURE_ROOM_R,
+            "tp1_pct": TP1_PCT, "tp2_pct": TP2_PCT, "tp3_pct": TP3_PCT,
+            "tp1_close_fraction": TP1_FRACTION, "tp2_close_fraction": TP2_FRACTION, "tp3_close_fraction": TP3_FRACTION,
+            "min_structure_room_r": MIN_STRUCTURE_ROOM_R,
             "require_directional_candle": REQUIRE_DIRECTIONAL_CANDLE, "require_structure_obstacle": REQUIRE_STRUCTURE_OBSTACLE,
             "open_position_cap_enabled": False, "trades_per_cycle_cap_enabled": False, "max_entry_slippage_pct": MAX_ENTRY_SLIPPAGE_PCT, "max_entry_signal_displacement_pct": MAX_ENTRY_SIGNAL_DISPLACEMENT_PCT,
             "execution_quote_max_age_sec": EXECUTION_QUOTE_MAX_AGE_SEC,
@@ -6292,7 +6389,7 @@ def main() -> None:
             continue
         log.info(
             "[EXEC_SIGNAL] symbol=%s direction=%s signal_idx=%s signal_time=%s age_bars=%s "
-            "zone=%s zone_low=%s zone_high=%s target_source=%s obstacle=%s tp1=%s tp2=%s event_id=%s",
+            "zone=%s zone_low=%s zone_high=%s target_source=%s obstacle=%s tp1=%s tp2=%s tp3=%s event_id=%s",
             signal.get("symbol"), signal.get("type"), signal.get("idx"), signal.get("time"),
             signal.get("execution_age_bars", 0),
             (signal.get("zone") or {}).get("kind"),
@@ -6300,7 +6397,7 @@ def main() -> None:
             (signal.get("zone") or {}).get("top"),
             (signal.get("target") or {}).get("source"),
             (signal.get("target") or {}).get("obstacle_price"),
-            signal.get("tp1"), signal.get("tp2"), signal.get("event_id"),
+            signal.get("tp1"), signal.get("tp2"), signal.get("tp3"), signal.get("event_id"),
         )
         if not private_ready:
             blocked = _blocked_private_execution_result()
@@ -6529,6 +6626,7 @@ def main() -> None:
                 "stop_pct": (signal.get("risk_model") or {}).get("fixed_stop_pct"),
                 "tp1_pct": (signal.get("target") or {}).get("tp1_pct"),
                 "tp2_pct": (signal.get("target") or {}).get("tp2_pct"),
+                "tp3_pct": (signal.get("target") or {}).get("tp3_pct"),
                 "execution_age_minutes": signal.get("execution_age_minutes"),
                 "trigger_to_execution_gate_minutes": signal.get("trigger_to_execution_gate_minutes"),
                 "trigger_to_execution_finish_minutes": execution.get("trigger_to_execution_finish_minutes"),
