@@ -1844,7 +1844,8 @@ def test_pre_entry_utc_session_vwap_uses_only_closed_bars_at_decision_boundary()
     first_typical = (101.0 + 99.0 + 100.0) / 3.0
     second_typical = (103.0 + 99.0 + 102.0) / 3.0
     expected = (first_typical * 10.0 + second_typical * 20.0) / 30.0
-    assert features["session_vwap_kind"] == "UTC_DAY_TP_VWAP"
+    assert features["session_vwap_kind"] == "PARTIAL_UTC_DAY_TP_VWAP"
+    assert features["session_vwap_coverage"] == "PARTIAL"
     assert features["session_vwap_approx"] == pytest.approx(expected)
     assert features["btc_return_1h_pct"] is None
 

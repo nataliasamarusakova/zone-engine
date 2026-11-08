@@ -4973,6 +4973,37 @@ def _prefer_longer_research_5m_history(
     return prefetched if len(prefetched) > len(existing) else existing
 
 
+def _prepare_pre_entry_research_5m_bars(
+    symbol: str,
+    provider: str,
+    current_bars: list[dict] | None,
+) -> list[dict]:
+    """Reuse persisted 5m history for causal pre-entry shadow context, without API calls."""
+    stream_key = research.market_bar_stream_key(symbol, "5m", provider)
+    persisted = research.load_market_bar_streams([stream_key]).get(stream_key, [])
+    return research.merge_market_bar_history(persisted, current_bars, timeframe="5m")
+
+
+def _prepare_deferred_research_5m_bars(
+    history_by_stream: dict[tuple[str, str, str], list[dict]],
+    payload: dict[str, Any],
+    prefetched_bars: list[dict] | None,
+) -> list[dict]:
+    """Combine persisted research history with the freshest per-scan 5m bars."""
+    stream_key = research.market_bar_stream_key(
+        payload.get("symbol", ""), "5m", payload.get("provider", "binance"),
+    )
+    current_bars = _prefer_longer_research_5m_history(payload.get("bars_5m"), prefetched_bars)
+    merged = research.merge_market_bar_history(
+        history_by_stream.get(stream_key, []), current_bars, timeframe="5m",
+    )
+    # The map is local to one serialized research flush. Carry the merged rows
+    # forward so later batches do not regress to the short REST response after
+    # the one-time seed fetch has been marked complete.
+    history_by_stream[stream_key] = merged
+    return merged
+
+
 def _setup_with_protection_result(
     setup: dict[str, Any], protection: dict[str, Any]
 ) -> dict[str, Any]:
@@ -5711,6 +5742,17 @@ def main() -> None:
                 trigger_text = None
 
             recent = zone_signals
+            pre_entry_bars_5m = list(trigger_bars_raw or [])
+            if recent and trigger_bars_raw and research.RESEARCH_ENABLED:
+                try:
+                    pre_entry_bars_5m = _prepare_pre_entry_research_5m_bars(
+                        symbol, provider, trigger_bars_raw,
+                    )
+                except Exception as history_exc:
+                    log.warning(
+                        "[PRE_ENTRY_HISTORY] %s | persisted 5m history unavailable: %s",
+                        _display_symbol(symbol), type(history_exc).__name__,
+                    )
             mtf_zone_snapshot_cache: dict[str, dict[str, Any]] = {}
             for sig in recent:
                 sig["score"] = score_zone_signal(sig)
@@ -5774,7 +5816,7 @@ def main() -> None:
                     try:
                         causal_features = research._derive_time_series_features(
                             direction=str(sig.get("type", "")),
-                            df_5m=pd.DataFrame(trigger_bars_raw),
+                            df_5m=pd.DataFrame(pre_entry_bars_5m),
                             df_1h=df,
                             decision_ts=shadow_decision_ts,
                             btc_df_5m=btc_research_df_5m,
@@ -5793,6 +5835,9 @@ def main() -> None:
                             "session_utc": causal_features.get("session_utc"),
                             "as_of_decision_ts": shadow_decision_ts,
                             "source_timeframe": "5m_closed_bars",
+                            "coverage": causal_features.get("session_vwap_coverage"),
+                            "available_bars": causal_features.get("session_vwap_available_bars"),
+                            "expected_bars": causal_features.get("session_vwap_expected_bars"),
                         }
                     else:
                         sig["vwap_context"] = {"status": "NOT_CAPTURED", "reason": "insufficient_closed_session_volume"}
@@ -5818,7 +5863,7 @@ def main() -> None:
                         "feature_collection_mode": "LOCAL_NO_ADDITIONAL_MARKET_REQUESTS",
                     }
                     sig["shadow_experiments"] = shadow.build_entry_snapshot(
-                        sig, df_5m=pd.DataFrame(trigger_bars_raw), df_1h=df,
+                        sig, df_5m=pd.DataFrame(pre_entry_bars_5m), df_1h=df,
                         account_context=research_account_context, decision_ts=shadow_decision_ts
                     )
                 except Exception as shadow_exc:
@@ -6578,6 +6623,11 @@ def main() -> None:
         btc_df_1h = pd.DataFrame(btc_raw_1h) if btc_raw_1h else None
         deferred_rows = list(deferred_research_rows)
         research_batch_size = _research_persistence_batch_size()
+        research_5m_history = research.load_market_bar_streams(
+            (payload.get("symbol", ""), "5m", payload.get("provider", "binance"))
+            for payload in deferred_rows
+            if payload.get("symbol")
+        )
         queued_observation_count = 0
         queued_bar1h_count = 0
         queued_bar5m_count = 0
@@ -6605,7 +6655,9 @@ def main() -> None:
             )
             with research.batch_persistence() as persistence_result:
                 for payload in payload_batch:
-                    bars_5m = _prefer_longer_research_5m_history(payload.get("bars_5m"), prefetched_bars.get(id(payload)))
+                    bars_5m = _prepare_deferred_research_5m_bars(
+                        research_5m_history, payload, prefetched_bars.get(id(payload)),
+                    )
                     research_symbol_started = time.perf_counter()
                     research_symbol_outcome = "raised"
                     try:

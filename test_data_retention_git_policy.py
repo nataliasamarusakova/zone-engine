@@ -70,7 +70,7 @@ def test_git_policy_externalizes_engine_state_but_keeps_retention_archive_separa
     assert "data/retention_archive/" in lines
 
 
-def test_size_guard_archives_before_compaction(monkeypatch, tmp_path):
+def test_size_guard_refuses_to_prune_required_hourly_history_below_804h(monkeypatch, tmp_path):
     from event_engine import data_retention
     data_dir = tmp_path / "data"
     data_dir.mkdir()
@@ -90,9 +90,14 @@ def test_size_guard_archives_before_compaction(monkeypatch, tmp_path):
     monkeypatch.setattr(data_retention, "REPO_RETENTION_ARCHIVE_ROOT", data_dir / "retention_archive")
     monkeypatch.setattr(data_retention, "GITHUB_SIZE_GUARD_BYTES", 20_000)
     monkeypatch.setattr(data_retention, "GITHUB_SIZE_TARGET_BYTES", 10_000)
-    result = data_retention.apply_size_guard(now=now, archive_root=data_dir / "retention_archive")
-    assert result["files"]["market_bars_1h.jsonl"]["triggered"] is True
-    assert path.stat().st_size < 20_000
+    original_bytes = path.read_bytes()
+    try:
+        data_retention.apply_size_guard(now=now, archive_root=data_dir / "retention_archive")
+    except RuntimeError as exc:
+        assert "No commit should be created" in str(exc)
+    else:
+        raise AssertionError("size guard must fail closed rather than prune below the 804h feature-history floor")
+    assert path.read_bytes() == original_bytes
     snapshots = list((data_dir / "retention_archive").rglob("*.before.part-*.jsonl.gz"))
     assert snapshots
 

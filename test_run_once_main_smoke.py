@@ -195,7 +195,7 @@ def test_main_scans_one_symbol_and_applies_existing_safety_gates_before_dispatch
         assert dispatched[0]["portfolio_context"]["production_gate_applied"] is False
         assert dispatched[0]["open_positions_snapshot"]["positions"][0]["symbol"] == "BBB-USDT"
         assert dispatched[0]["vwap_context"]["status"] == "PRESENT"
-        assert dispatched[0]["vwap_context"]["kind"] == "UTC_DAY_TP_VWAP"
+        assert dispatched[0]["vwap_context"]["kind"] == "PARTIAL_UTC_DAY_TP_VWAP"
         assert dispatched[0]["market_snapshot"]["market_spread_metric"] == "cross_venue_price_deviation"
         assert len(sent_signals) == 1
         assert sent_signals[0][1]["status"] == "opened_protected"
