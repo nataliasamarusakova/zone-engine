@@ -867,6 +867,10 @@ jobs:
             echo "::error::Pre-compaction snapshot restoration failed; refusing to commit state."
             exit 1
           fi
+          if [ "$size_guard_outcome" = "failure" ] && [ "$rollback_restored" != "true" ]; then
+            echo "::error::Size guard failed without restoring a verified current-run snapshot; refusing to commit persistent state."
+            exit 1
+          fi
           if [ "$compaction_triggered" = "true" ]; then
             if [ "$rollback_outcome" = "success" ] && [ "$rollback_restored" = "true" ]; then
               echo "::warning::Retention archive upload did not complete; full pre-compaction journals were restored and will be committed only if every staged file is below GitHub's 100,000,000-byte hard limit."
