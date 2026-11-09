@@ -92,16 +92,17 @@ def test_workflow_explicitly_configures_1000_hourly_history_and_retention():
     assert 'DATA_RETENTION_1H_HOURS: "1000"' in workflow
 
 
-def test_size_guard_never_prunes_hourly_research_history_below_800_hours(tmp_path, monkeypatch):
+def test_hourly_size_guard_prefers_804h_before_lossless_archive_budget_fallback(tmp_path):
     now = datetime(2026, 11, 8, 12, 0, tzinfo=timezone.utc)
     path = tmp_path / "market_bars_1h.jsonl"
     policies = data_retention._size_guard_plan(
         path, now=now, pending_ids=set(), pending_bar_cutoffs={},
         protected_observation_ids=set(), protected_refs=set(),
     )
-    hours = [int(name.split("_")[3].removesuffix("h")) for name, _ in policies]
-    assert hours
-    assert min(hours) >= 804
+    age_policy_names = [name for name, _ in policies if name.startswith("keep_newer_than_")]
+    hours = [int(name.removeprefix("keep_newer_than_").removesuffix("h")) for name in age_policy_names]
+    assert hours == [1000, 900, 850, 804]
+    assert policies[-1][0] == "keep_newest_valid_1h_timestamp_groups_within_size_budget_archiving_other_rows"
 
 
 def test_deferred_research_pipeline_merges_persisted_5m_history_for_24h_features():

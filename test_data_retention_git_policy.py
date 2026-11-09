@@ -70,34 +70,124 @@ def test_git_policy_externalizes_engine_state_but_keeps_retention_archive_separa
     assert "data/retention_archive/" in lines
 
 
-def test_size_guard_refuses_to_prune_required_hourly_history_below_804h(monkeypatch, tmp_path):
+def test_size_guard_uses_lossless_hourly_budget_fallback_when_804h_floor_is_too_large(monkeypatch, tmp_path):
+    """Hourly age retention falls back to a complete, lossless timestamp window."""
+    import gzip
+    import json
+    from collections import Counter
     from event_engine import data_retention
+
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     path = data_dir / "market_bars_1h.jsonl"
     now = data_retention.datetime.now(data_retention.timezone.utc)
     rows = []
-    for i in range(400):
+    for hour_index in range(400):
+        timestamp = int((now - data_retention.timedelta(hours=200 + hour_index)).timestamp() * 1000)
         rows.append({
-            "timestamp": int((now - data_retention.timedelta(hours=200 + i)).timestamp() * 1000),
+            "timestamp": timestamp,
             "symbol": "TEST-USDT",
+            "timeframe": "1h",
+            "provider": "binance_spot",
             "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1,
+            "retention_test_id": f"hour-{hour_index:04d}",
             "payload": "x" * 80,
         })
-    path.write_text("".join(__import__("json").dumps(r) + "\n" for r in rows), encoding="utf-8")
+    original_bytes = "".join(json.dumps(row) + "\n" for row in rows).encode("utf-8")
+    path.write_bytes(original_bytes)
+    assert len(original_bytes) > 20_000
+
     monkeypatch.setattr(data_retention, "DATA_DIR", data_dir)
     monkeypatch.setattr(data_retention, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(data_retention, "REPO_RETENTION_ARCHIVE_ROOT", data_dir / "retention_archive")
     monkeypatch.setattr(data_retention, "GITHUB_SIZE_GUARD_BYTES", 20_000)
     monkeypatch.setattr(data_retention, "GITHUB_SIZE_TARGET_BYTES", 10_000)
-    original_bytes = path.read_bytes()
-    try:
-        data_retention.apply_size_guard(now=now, archive_root=data_dir / "retention_archive")
-    except RuntimeError as exc:
-        assert "No commit should be created" in str(exc)
-    else:
-        raise AssertionError("size guard must fail closed rather than prune below the 804h feature-history floor")
-    assert path.read_bytes() == original_bytes
+
+    result = data_retention.apply_size_guard(now=now, archive_root=data_dir / "retention_archive")
+    meta = result["files"]["market_bars_1h.jsonl"]
+    assert meta["bytes_after"] <= data_retention.GITHUB_SIZE_TARGET_BYTES
+    assert meta["bytes_after"] < data_retention.GITHUB_SIZE_GUARD_BYTES
+    assert meta["rows_after"] < meta["rows_before"]
+    assert meta["policies"][-1]["policy"] == "keep_newest_valid_1h_timestamp_groups_within_size_budget_archiving_other_rows"
+
+    live_rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    delta_files = list((data_dir / "retention_archive").rglob("market_bars_1h.jsonl.pruned*.jsonl.gz"))
+    assert delta_files
+    archived_rows = []
+    for delta in delta_files:
+        with gzip.open(delta, "rt", encoding="utf-8") as handle:
+            archived_rows.extend(json.loads(line) for line in handle if line.strip())
+
+    original_ids = [row["retention_test_id"] for row in rows]
+    live_ids = [row["retention_test_id"] for row in live_rows]
+    archived_ids = [row["retention_test_id"] for row in archived_rows]
+    assert Counter(live_ids + archived_ids) == Counter(original_ids)
+    assert set(live_ids).isdisjoint(archived_ids)
+
+    # The fallback retains the newest contiguous timestamp window, not an
+    # arbitrary set of individually small rows from across the history.
+    live_timestamps = sorted({row["timestamp"] for row in live_rows}, reverse=True)
+    assert live_timestamps
+    assert len(live_timestamps) == len(live_rows)  # one source row per timestamp in this fixture
+    expected = [row["timestamp"] for row in rows]
+    assert live_timestamps == expected[:len(live_timestamps)]
+
+    snapshot = meta["snapshot"]
+    restored = bytearray()
+    for chunk in snapshot["chunks"]:
+        with gzip.open(chunk["path"], "rb") as handle:
+            restored.extend(handle.read())
+    assert bytes(restored) == original_bytes
+
+    # The cumulative archive produced by the size guard is accepted by the
+    # same fingerprint/marker protocol used by the GitHub workflow.
+    from event_engine.retention_archive import decide_upload, mark_uploaded, verify_uploaded_state
+    marker = data_dir / "retention_archive_state.json"
+    decision = decide_upload(data_dir / "retention_archive", marker, now=now)
+    assert decision["archive_upload_required"] is True
+    assert decision["archive_upload_reason"] == "archive_state_missing"
+    mark_uploaded(
+        data_dir / "retention_archive", marker,
+        expected_sha256=decision["archive_sha256"], run_id="test-run-1", now=now,
+    )
+    verify_uploaded_state(
+        data_dir / "retention_archive", marker,
+        expected_sha256=decision["archive_sha256"], now=now,
+    )
+
+
+def test_size_guard_fails_closed_when_no_complete_hourly_group_fits_budget(monkeypatch, tmp_path):
+    """Never split or empty the most recent timestamp group to meet a byte cap."""
+    import json
+    from event_engine import data_retention
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    path = data_dir / "market_bars_1h.jsonl"
+    now = data_retention.datetime.now(data_retention.timezone.utc)
+    rows = [
+        {
+            "timestamp": int(now.timestamp() * 1000),
+            "symbol": f"TEST-{index:03d}-USDT",
+            "timeframe": "1h",
+            "provider": "binance_spot",
+            "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1,
+            "payload": "x" * 500,
+        }
+        for index in range(20)
+    ]
+    original = "".join(json.dumps(row) + "\n" for row in rows).encode("utf-8")
+    path.write_bytes(original)
+    monkeypatch.setattr(data_retention, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(data_retention, "GITHUB_SIZE_GUARD_BYTES", 2_000)
+    monkeypatch.setattr(data_retention, "GITHUB_SIZE_TARGET_BYTES", 500)
+
+    with pytest.raises(RuntimeError, match="cannot retain even the newest complete timestamp group"):
+        data_retention._apply_size_guard_to_file(
+            path, now=now, archive_root=data_dir / "retention_archive", pending_ids=set(),
+            pending_bar_cutoffs={}, protected_observation_ids=set(), protected_refs=set(),
+        )
+    assert path.read_bytes() == original
     snapshots = list((data_dir / "retention_archive").rglob("*.before.part-*.jsonl.gz"))
     assert snapshots
 
@@ -444,3 +534,99 @@ def test_data_placeholder_is_visible_but_never_migrated_as_runtime_state():
     assert "grep -vx 'data/.gitkeep'" in detect
     assert "touch data/.gitkeep" in externalize
     assert "git add -f data/.gitkeep" in externalize
+
+
+def test_size_guard_archives_hourly_history_to_target_without_losing_rows_when_804h_floor_is_too_large(monkeypatch, tmp_path):
+    """The 804h working window may be size-compacted only after a lossless archive delta exists."""
+    import gzip
+    import json
+    from collections import Counter
+    from event_engine import data_retention
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    path = data_dir / "market_bars_1h.jsonl"
+    now = data_retention.datetime(2026, 10, 19, 12, 0, tzinfo=data_retention.timezone.utc)
+    rows = []
+    for hour_index in range(120):
+        ts = now - data_retention.timedelta(hours=hour_index * 5)
+        for symbol_index in range(4):
+            rows.append({
+                "timestamp": int(ts.timestamp() * 1000),
+                "symbol": f"TEST{symbol_index}-USDT",
+                "provider": "binance_spot",
+                "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.0, "volume": 10.0,
+                "retention_test_id": f"{hour_index:03d}-{symbol_index}",
+                "payload": "x" * 120,
+            })
+    original_bytes = b"".join(
+        (json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        for row in rows
+    )
+    path.write_bytes(original_bytes)
+    assert len(original_bytes) > 20_000
+
+    monkeypatch.setattr(data_retention, "DATA_DIR", data_dir)
+    monkeypatch.setattr(data_retention, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(data_retention, "REPO_RETENTION_ARCHIVE_ROOT", data_dir / "retention_archive")
+    monkeypatch.setattr(data_retention, "GITHUB_SIZE_GUARD_BYTES", 20_000)
+    monkeypatch.setattr(data_retention, "GITHUB_SIZE_TARGET_BYTES", 10_000)
+
+    result = data_retention.apply_size_guard(now=now, archive_root=data_dir / "retention_archive")
+    meta = result["files"]["market_bars_1h.jsonl"]
+    assert meta["bytes_after"] <= data_retention.GITHUB_SIZE_TARGET_BYTES
+    assert meta["bytes_after"] < data_retention.GITHUB_SIZE_GUARD_BYTES
+    assert meta["rows_after"] < meta["rows_before"]
+    assert meta["policies"][-1]["policy"] == "keep_newest_valid_1h_timestamp_groups_within_size_budget_archiving_other_rows"
+
+    live_rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    live_ids = [row["retention_test_id"] for row in live_rows]
+    archived_ids = []
+    delta_files = list((data_dir / "retention_archive").rglob("market_bars_1h.jsonl.pruned*.jsonl.gz"))
+    assert delta_files
+    for delta in delta_files:
+        with gzip.open(delta, "rt", encoding="utf-8") as handle:
+            archived_ids.extend(json.loads(line)["retention_test_id"] for line in handle if line.strip())
+
+    original_ids = [row["retention_test_id"] for row in rows]
+    assert Counter(live_ids + archived_ids) == Counter(original_ids)
+    assert set(live_ids).isdisjoint(archived_ids)
+
+    # Timestamp groups are kept or archived atomically, avoiding a partial-hour
+    # window where some symbols have a bar and other symbols from that hour do not.
+    live_by_ts = Counter(row["timestamp"] for row in live_rows)
+    archived_by_ts = Counter(
+        json.loads(line)["timestamp"]
+        for delta in delta_files
+        for line in gzip.open(delta, "rt", encoding="utf-8")
+        if line.strip()
+    )
+    assert all(count == 4 for count in live_by_ts.values())
+    assert all(count == 4 for count in archived_by_ts.values())
+    assert set(live_by_ts).isdisjoint(archived_by_ts)
+
+    # Full snapshot remains a byte-exact rollback source until archive upload is verified.
+    snapshot = meta["snapshot"]
+    restored = bytearray()
+    for chunk in snapshot["chunks"]:
+        with gzip.open(chunk["path"], "rb") as handle:
+            restored.extend(handle.read())
+    assert bytes(restored) == original_bytes
+
+
+def test_hourly_budget_index_is_built_only_when_fallback_policy_is_invoked(monkeypatch, tmp_path):
+    """Normal age-based compaction must not pay for the fallback's extra full-file scan."""
+    from event_engine import data_retention
+
+    path = tmp_path / "market_bars_1h.jsonl"
+    def unexpected_scan(_path):
+        raise AssertionError("hourly byte-budget index should be lazy")
+
+    monkeypatch.setattr(data_retention, "_iter_jsonl", unexpected_scan)
+    policies = data_retention._size_guard_plan(
+        path,
+        now=data_retention.datetime(2026, 10, 19, 12, 0, tzinfo=data_retention.timezone.utc),
+        pending_ids=set(), pending_bar_cutoffs={},
+        protected_observation_ids=set(), protected_refs=set(),
+    )
+    assert policies[-1][0] == "keep_newest_valid_1h_timestamp_groups_within_size_budget_archiving_other_rows"

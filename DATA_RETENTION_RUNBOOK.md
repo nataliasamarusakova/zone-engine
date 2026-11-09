@@ -69,10 +69,19 @@ After a successful engine run and the quality/runtime-data gates, the pre-commit
 size guard runs only when the cumulative archive was safely restored and verified.
 The configured guard is 90,000,000 bytes and the target is 80,000,000 bytes. Before
 compacting eligible journal rows, the guard writes recoverable pre-compaction
-snapshots into the archive. The archive fingerprint is then checked, an upload is
-performed when content changed or the 45-day refresh is due, and the marker is
-updated only after the artifact upload succeeds. The marker update re-fingerprints
-the archive and refuses to commit a different byte set.
+snapshots into the archive. For the hourly market-bar journal it first prefers the
+1,000h, 900h, 850h and 804h working windows. If the 804h window still exceeds the
+size target, it keeps the newest contiguous complete timestamp groups that fit a
+bounded byte budget and writes all other rows to lossless pruned deltas. It never
+splits one timestamp group across symbols/providers; if even the newest complete
+group cannot fit, the operation fails and the pre-compaction snapshot is restored.
+The full original hourly journal remains reconstructable from the snapshot plus
+pruned deltas after the cumulative archive is uploaded and verified.
+
+The archive fingerprint is then checked, an upload is performed when content
+changed or the 45-day refresh is due, and the marker is updated only after the
+artifact upload succeeds. The marker update re-fingerprints the archive and refuses
+to commit a different byte set.
 
 If the archive upload or marker update cannot be completed, the workflow restores
 the pre-compaction journal snapshots and the commit gate refuses to commit a
