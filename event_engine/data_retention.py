@@ -461,9 +461,10 @@ def _zone_observation_refs(row: dict[str, Any]) -> set[str]:
 def _size_guard_plan(path: Path, *, now: datetime, pending_ids: set[str], pending_bar_cutoffs: dict[str, datetime], protected_observation_ids: set[str], protected_refs: set[str], replayable_observation_ids: set[str] | None = None) -> list[tuple[str, Callable[[dict[str, Any]], bool]]]:
     """Return progressively stronger *safe* size-reduction policies.
 
-    Policies only archive records that are already outside the audit-critical
-    working window. If a file still cannot be reduced below the guard without
-    touching protected semantics, the workflow fails instead of deleting data.
+    Policies retain the preferred working windows and may compact an oversized
+    market-bar journal to a bounded recent window only when every removed row is
+    preserved in immutable snapshot/pruned-delta files. If no safe complete group
+    fits, the workflow fails instead of silently deleting or splitting records.
     """
     name = path.name
     replayable_observation_ids = replayable_observation_ids or set()
@@ -540,15 +541,97 @@ def _size_guard_plan(path: Path, *, now: datetime, pending_ids: set[str], pendin
         ))
         return policies
     if name == "market_bars_1h.jsonl":
-        # Keep at least 804 hourly candles in the working journal so two
-        # hundred complete 4H candles (including EMA200 warm-up) remain
-        # independently reconstructable. If that floor is too large, fail
-        # the size guard rather than silently destroying feature provenance.
+        # Keep at least 804 hourly candles in the working journal during normal
+        # operation so two hundred complete 4H candles (including EMA200 warm-up)
+        # remain independently reconstructable. If that age window alone exceeds
+        # the GitHub file budget, retain the newest *complete timestamp groups*
+        # that fit a bounded byte budget and archive every other row losslessly.
+        # The workflow only commits this compaction after the cumulative archive
+        # has been uploaded and verified; a failed upload restores the snapshot.
         hours = [1000, 900, 850, 804]
-        return [
-            (f"keep_newer_than_{h}h", lambda row, h=h: (_parse_ts(row.get("timestamp")) is None or _parse_ts(row.get("timestamp")) >= now - timedelta(hours=h)))
+        policies: list[tuple[str, Callable[[dict[str, Any]], bool]]] = [
+            (
+                f"keep_newer_than_{h}h",
+                lambda row, h=h: (
+                    _parse_ts(row.get("timestamp")) is None
+                    or _parse_ts(row.get("timestamp")) >= now - timedelta(hours=h)
+                ),
+            )
             for h in hours
         ]
+
+        fallback_budget_bytes = max(
+            1,
+            min(GITHUB_SIZE_TARGET_BYTES - 1, int(GITHUB_SIZE_TARGET_BYTES * 0.90)),
+        )
+        cutoff = now - timedelta(hours=804)
+        latest_allowed = now + timedelta(minutes=5)
+        selection: dict[str, Any] | None = None
+
+        def build_hourly_budget_selection() -> dict[str, Any]:
+            # This second full-file pass is deliberately lazy: most guard runs
+            # are resolved by the age policies above and should not pay the cost
+            # of building a timestamp index unless the 804h window is still too
+            # large. At this point the live file has already been reduced by all
+            # earlier policies, so the index describes the exact rows to compact.
+            group_signatures: dict[datetime, Counter[str]] = {}
+            group_bytes: Counter[datetime] = Counter()
+            for _line_no, row in _iter_jsonl(path):
+                ts = _parse_ts(row.get("timestamp"))
+                if ts is None or ts < cutoff or ts > latest_allowed:
+                    continue
+                encoded = (
+                    json.dumps(row, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n"
+                ).encode("utf-8")
+                signature = hashlib.sha256(encoded).hexdigest()
+                group_signatures.setdefault(ts, Counter())[signature] += 1
+                group_bytes[ts] += len(encoded)
+
+            # Select a contiguous newest-first timestamp window. Do not skip a
+            # large timestamp group and then keep older groups: doing so would
+            # create holes in the shared hourly history across symbols/providers.
+            selected_signatures: Counter[str] = Counter()
+            selected_groups: list[datetime] = []
+            selected_bytes = 0
+            for ts in sorted(group_bytes, reverse=True):
+                next_group_bytes = int(group_bytes[ts])
+                if selected_bytes + next_group_bytes > fallback_budget_bytes:
+                    break
+                selected_groups.append(ts)
+                selected_signatures.update(group_signatures[ts])
+                selected_bytes += next_group_bytes
+
+            if not selected_groups:
+                raise RuntimeError(
+                    "hourly size-budget fallback cannot retain even the newest complete timestamp group "
+                    f"within {fallback_budget_bytes} bytes; refusing to empty the working history"
+                )
+            return {
+                "timestamp_set": set(selected_groups),
+                "signatures": selected_signatures,
+            }
+
+        seen_signatures: Counter[str] = Counter()
+
+        def keep_recent_1h_groups_within_budget(row: dict[str, Any]) -> bool:
+            nonlocal selection
+            if selection is None:
+                selection = build_hourly_budget_selection()
+            ts = _parse_ts(row.get("timestamp"))
+            if ts not in selection["timestamp_set"]:
+                return False
+            encoded = (
+                json.dumps(row, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n"
+            ).encode("utf-8")
+            signature = hashlib.sha256(encoded).hexdigest()
+            seen_signatures[signature] += 1
+            return seen_signatures[signature] <= selection["signatures"].get(signature, 0)
+
+        policies.append((
+            "keep_newest_valid_1h_timestamp_groups_within_size_budget_archiving_other_rows",
+            keep_recent_1h_groups_within_budget,
+        ))
+        return policies
     if name == "research_outcomes.jsonl":
         hours = [2160, 720, 336, 168, 72, 24]
         def keep_outcome(row: dict[str, Any], h: int) -> bool:
