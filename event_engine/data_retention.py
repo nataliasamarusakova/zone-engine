@@ -911,7 +911,17 @@ def apply_size_guard(*, now: datetime | None = None, archive_root: Path | None =
         DATA_DIR / "execution_quality.jsonl",
         DATA_DIR / "emergency_exits.jsonl",
     ]
-    results = {"schema_version": 1, "mode": "size_guard", "started_at": now.isoformat(), "files": {}}
+    results = {
+        "schema_version": 1,
+        "mode": "size_guard",
+        "started_at": now.isoformat(),
+        # Bind rollback material to one Actions run AND rerun attempt. If
+        # preparation fails before this manifest is written, a previous
+        # manifest must never be treated as this run's pre-compaction backup.
+        "workflow_run_id": os.environ.get("GITHUB_RUN_ID") or None,
+        "workflow_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT") or None,
+        "files": {},
+    }
     manifest_path = DATA_DIR / "data_retention_manifest.json"
     temp_manifest = manifest_path.with_name(manifest_path.name + ".tmp")
 
@@ -1523,6 +1533,8 @@ def restore_pre_compaction_snapshots(
     manifest_path: Path | None = None,
     archive_dir: Path | None = None,
     github_output: Path | None = None,
+    expected_workflow_run_id: str | None = None,
+    expected_workflow_run_attempt: str | None = None,
 ) -> dict[str, Any]:
     """Restore all size-guarded JSONL files from verified pre-compaction snapshots.
 
@@ -1567,6 +1579,30 @@ def restore_pre_compaction_snapshots(
         if not isinstance(manifest, dict) or manifest.get("mode") != "size_guard":
             result.update(status="manifest_invalid", error="manifest is not a size_guard result")
             raise RuntimeError(result["error"])
+        expected_run_id = str(expected_workflow_run_id or "").strip()
+        expected_run_attempt = str(expected_workflow_run_attempt or "").strip()
+        if expected_run_id:
+            manifest_run_id = str(manifest.get("workflow_run_id") or "").strip()
+            if manifest_run_id != expected_run_id:
+                result.update(
+                    status="manifest_run_mismatch",
+                    error=(
+                        "size-guard manifest does not belong to the current GitHub Actions run "
+                        f"(expected run_id={expected_run_id}, found={manifest_run_id or 'missing'})"
+                    ),
+                )
+                raise RuntimeError(result["error"])
+            if expected_run_attempt:
+                manifest_run_attempt = str(manifest.get("workflow_run_attempt") or "").strip()
+                if manifest_run_attempt != expected_run_attempt:
+                    result.update(
+                        status="manifest_attempt_mismatch",
+                        error=(
+                            "size-guard manifest does not belong to the current GitHub Actions run attempt "
+                            f"(expected attempt={expected_run_attempt}, found={manifest_run_attempt or 'missing'})"
+                        ),
+                    )
+                    raise RuntimeError(result["error"])
         files = manifest.get("files")
         if not isinstance(files, dict):
             result.update(status="manifest_invalid", error="size_guard manifest has no files map")
@@ -1755,6 +1791,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.restore_pre_compaction_snapshots:
         result = restore_pre_compaction_snapshots(
             manifest_path=args.manifest, archive_dir=args.archive_dir, github_output=args.github_output,
+            expected_workflow_run_id=os.environ.get("GITHUB_RUN_ID"),
+            expected_workflow_run_attempt=os.environ.get("GITHUB_RUN_ATTEMPT"),
         )
     elif args.check_staged:
         result = check_staged_size_guard(limit_bytes=args.limit_bytes)
