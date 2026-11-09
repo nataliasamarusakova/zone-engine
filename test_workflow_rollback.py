@@ -5,6 +5,9 @@ def test_workflow_restores_snapshots_on_retention_archive_upload_failure():
     workflow = (Path(__file__).parent / ".github" / "workflows" / "event-engine.yml").read_text(encoding="utf-8")
     assert "id: restore_pre_compaction_snapshots" in workflow
     assert "--restore-pre-compaction-snapshots" in workflow
+    retention_source = (Path(__file__).parent / "event_engine" / "data_retention.py").read_text(encoding="utf-8")
+    assert 'expected_workflow_run_id=os.environ.get("GITHUB_RUN_ID")' in retention_source
+    assert 'expected_workflow_run_attempt=os.environ.get("GITHUB_RUN_ATTEMPT")' in retention_source
     assert "steps.upload_retention_archive.outcome != 'success'" in workflow
     assert 'steps.restore_pre_compaction_snapshots.outputs.restored_any' in workflow
     assert "Upload durable runtime-state artifact" in workflow
@@ -264,3 +267,48 @@ def test_failed_engine_run_cannot_advance_runtime_state_or_retention_archive():
         )
     restore = by_id["restore_runtime_state"]["run"]
     assert '.conclusion == "success"' in restore
+
+
+def test_commit_gate_blocks_failed_size_guard_without_current_run_rollback(tmp_path):
+    import json
+    import subprocess
+
+    import yaml
+
+    workflow_path = Path(__file__).parent / ".github" / "workflows" / "event-engine.yml"
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    steps = workflow["jobs"]["run"]["steps"]
+    gate = next(step for step in steps if step.get("id") == "retention_archive_commit_gate")
+    script = gate["run"]
+    substitutions = {
+        "${{ steps.quality_gate.outcome }}": "success",
+        "${{ steps.verify_tests_data.outcome }}": "success",
+        "${{ steps.run_engine.outcome }}": "success",
+        "${{ steps.restore_pre_compaction_snapshots.outcome }}": "success",
+        "${{ steps.restore_pre_compaction_snapshots.outputs.restored_any }}": "false",
+        "${{ steps.size_guard.outcome }}": "failure",
+        "${{ steps.retention_archive_restore_verification.outcome }}": "success",
+        "${{ steps.restore_retention_archive.outputs.recovery_safe }}": "true",
+        "${{ steps.retention_archive_upload_decision.outcome }}": "skipped",
+        "${{ steps.retention_archive_upload_decision.outputs.archive_upload_required }}": "false",
+        "${{ steps.upload_retention_archive.outcome }}": "skipped",
+        "${{ steps.mark_retention_archive.outcome }}": "skipped",
+        "${{ steps.retention_archive_upload_decision.outputs.archive_sha256 }}": "",
+    }
+    for source, target in substitutions.items():
+        script = script.replace(source, target)
+
+    data_dir = tmp_path / "data"
+    (data_dir / "retention_archive").mkdir(parents=True)
+    (data_dir / "data_retention_manifest.json").write_text(json.dumps({
+        "mode": "size_guard",
+        "status": "failed",
+        "files": {"market_bars_5m.jsonl": {"triggered": False, "failed": True}},
+    }), encoding="utf-8")
+
+    result = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", script], cwd=tmp_path,
+        text=True, capture_output=True, check=False,
+    )
+    assert result.returncode != 0
+    assert "Size guard failed without restoring a verified current-run snapshot" in result.stdout + result.stderr

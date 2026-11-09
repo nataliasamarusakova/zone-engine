@@ -45,6 +45,8 @@ def test_restore_pre_compaction_snapshots_restores_exact_bytes_and_records_audit
     manifest_path.write_text(json.dumps({
         "schema_version": 1,
         "mode": "size_guard",
+        "workflow_run_id": "current-run-id",
+        "workflow_run_attempt": "4",
         "files": {
             "market_bars_5m.jsonl": {
                 "path": "data/market_bars_5m.jsonl",
@@ -63,6 +65,8 @@ def test_restore_pre_compaction_snapshots_restores_exact_bytes_and_records_audit
 
     result = retention.restore_pre_compaction_snapshots(
         manifest_path=manifest_path, archive_dir=archive, github_output=github_output,
+        expected_workflow_run_id="current-run-id",
+        expected_workflow_run_attempt="4",
     )
 
     assert target.read_bytes() == original
@@ -158,3 +162,84 @@ def test_staged_guard_hard_limit_is_strictly_less_than_100m(monkeypatch):
     monkeypatch.setattr(subprocess, "check_output", lambda *args, **kwargs: "100000000")
     with pytest.raises(RuntimeError, match="100000000 bytes"):
         retention.check_staged_size_guard(limit_bytes=100_000_000)
+
+
+@pytest.mark.parametrize(
+    ("previous_run_id", "previous_run_attempt"),
+    [("previous-run-id", "1"), ("current-run-id", "1")],
+)
+def test_preparation_failure_never_reuses_previous_workflow_attempt_snapshot(
+    monkeypatch, tmp_path, previous_run_id, previous_run_attempt,
+):
+    """A failed new size-guard pass must not roll back with an older run's manifest."""
+    from datetime import datetime, timezone
+
+    project, data, archive = _setup(monkeypatch, tmp_path)
+    live = data / "market_bars_5m.jsonl"
+    current_payload = b'{"version":"CURRENT_RUN"}\n'
+    previous_payload = b'{"version":"PREVIOUS_RUN"}\n'
+    live.write_bytes(current_payload)
+    snapshot = _write_snapshot(archive, "previous-run", previous_payload)
+    manifest_path = data / "data_retention_manifest.json"
+    manifest_path.write_text(json.dumps({
+        "schema_version": 1,
+        "mode": "size_guard",
+        "status": "complete",
+        "workflow_run_id": previous_run_id,
+        "workflow_run_attempt": previous_run_attempt,
+        "files": {
+            "market_bars_5m.jsonl": {
+                "path": "data/market_bars_5m.jsonl",
+                "triggered": True,
+                "snapshot": snapshot,
+            },
+        },
+    }), encoding="utf-8")
+
+    monkeypatch.setenv("GITHUB_RUN_ID", "current-run-id")
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
+    monkeypatch.setattr(retention, "_validate_state_before", lambda: {})
+
+    def fail_preparation():
+        raise ValueError("corrupt research_outcome_state.json")
+
+    monkeypatch.setattr(retention, "_pending_observations", fail_preparation)
+    with pytest.raises(ValueError, match="corrupt research_outcome_state"):
+        retention.apply_size_guard(
+            now=datetime(2026, 11, 9, tzinfo=timezone.utc),
+            archive_root=archive,
+        )
+
+    # This is the same rollback call the workflow makes after a size-guard failure.
+    with pytest.raises(RuntimeError, match="manifest.*current GitHub Actions run"):
+        retention.restore_pre_compaction_snapshots(
+            manifest_path=manifest_path, archive_dir=archive,
+            expected_workflow_run_id="current-run-id",
+            expected_workflow_run_attempt="2",
+        )
+    assert live.read_bytes() == current_payload
+
+
+def test_size_guard_manifest_records_current_workflow_run_and_attempt(monkeypatch, tmp_path):
+    from datetime import datetime, timezone
+
+    project, data, archive = _setup(monkeypatch, tmp_path)
+    (data / "market_bars_5m.jsonl").write_text("original\n", encoding="utf-8")
+    monkeypatch.setenv("GITHUB_RUN_ID", "current-run-id")
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "3")
+    monkeypatch.setattr(retention, "_validate_state_before", lambda: {})
+    monkeypatch.setattr(retention, "_validate_state_unchanged", lambda before: None)
+    monkeypatch.setattr(retention, "_pending_observations", lambda: [])
+    monkeypatch.setattr(retention, "_pending_bar_cutoffs", lambda **kwargs: {})
+    monkeypatch.setattr(retention, "_protected_audit_refs", lambda **kwargs: (set(), set()))
+    monkeypatch.setattr(
+        retention, "_apply_size_guard_to_file",
+        lambda path, **kwargs: {"path": f"data/{path.name}", "triggered": False, "failed": False},
+    )
+
+    retention.apply_size_guard(
+        now=datetime(2026, 11, 9, tzinfo=timezone.utc), archive_root=archive,
+    )
+    manifest = json.loads((data / "data_retention_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["workflow_run_id"] == "current-run-id"
+    assert manifest["workflow_run_attempt"] == "3"
