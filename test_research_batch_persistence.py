@@ -314,3 +314,240 @@ def test_tracker_snapshot_wrapper_supports_legacy_zero_arg_callable(monkeypatch)
     run_once._update_active_trades_with_snapshot()
 
     assert calls == ["legacy_call"]
+
+
+def test_load_market_bar_streams_normalizes_then_orders_by_utc_timestamp_key(tmp_path, monkeypatch):
+    _isolate_paths(tmp_path, monkeypatch)
+    rows = [
+        {
+            "symbol": "AAA-USDT", "timeframe": "5m", "provider": "binance",
+            "timestamp": "2026-01-01T00:30:00+02:00", "open": 1, "high": 2,
+            "low": 0.5, "close": 1.5, "volume": 10,
+        },
+        {
+            "symbol": "AAA-USDT", "timeframe": "5m", "provider": "binance",
+            "timestamp": "2025-12-31T23:00:00Z", "open": 1, "high": 2,
+            "low": 0.5, "close": 1.6, "volume": 10,
+        },
+        {
+            "symbol": "AAA-USDT", "timeframe": "5m", "provider": "binance",
+            "timestamp": "2026-01-01T02:00:00+03:00", "open": 1, "high": 2,
+            "low": 0.5, "close": 1.7, "volume": 10,
+        },
+        {
+            "symbol": "AAA-USDT", "timeframe": "5m", "provider": "binance",
+            "timestamp": "2026-01-01T03:00:00Z", "open": 1, "high": 2,
+            "low": 0.5, "close": 1.8, "volume": 10,
+        },
+    ]
+    research.MARKET_BARS_5M_PATH.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8",
+    )
+
+    loaded = research.load_market_bar_streams([("AAA-USDT", "5m", "binance")])
+    stream = loaded[("AAA-USDT", "5m", "binance")]
+
+    assert [row["timestamp"] for row in stream] == [
+        "2025-12-31T22:30:00+00:00",
+        "2025-12-31T23:00:00+00:00",
+        "2026-01-01T03:00:00+00:00",
+    ]
+    # Two source representations identify the same UTC instant; the last row wins.
+    assert [row["close"] for row in stream] == [1.5, 1.7, 1.8]
+
+
+def test_merge_market_bar_history_normalizes_offsets_and_current_values_win():
+    persisted = [
+        {"timestamp": "2026-01-01T00:00:00+02:00", "close": 100.0, "quote_volume": 50.0},
+        {"timestamp": "2026-01-01T03:00:00Z", "close": 103.0},
+    ]
+    current = [
+        {"timestamp": "2025-12-31T22:00:00Z", "close": 101.0, "volume": 5.0},
+        {"timestamp": "2026-01-01T04:00:00+00:00", "close": 104.0},
+    ]
+
+    merged = research.merge_market_bar_history(persisted, current, timeframe="5m")
+
+    assert [row["timestamp"] for row in merged] == [
+        "2025-12-31T22:00:00+00:00",
+        "2026-01-01T03:00:00+00:00",
+        "2026-01-01T04:00:00+00:00",
+    ]
+    assert merged[0]["close"] == 101.0
+    assert merged[0]["quote_volume"] == 50.0
+    assert merged[0]["volume"] == 5.0
+
+
+def test_research_observation_predicate_distinguishes_bar_only_rows():
+    assert research.requires_observation_build([], {"touch_events": [], "rearm_events": [], "zones": {}}) is False
+    assert research.requires_observation_build([], {"touch_events": [{"reason": "signal_created"}], "rearm_events": [], "zones": {}}) is False
+    assert research.requires_observation_build([], {"touch_events": [{"reason": "directional_candle_required"}]}) is True
+    assert research.requires_observation_build([{"event_id": "EVT_1"}], {}) is True
+    assert research.requires_observation_build([], {"rearm_events": [{"timestamp": "2026-01-01T00:00:00Z"}]}) is True
+    assert research.requires_observation_build([], {
+        "zones": {"DEMAND:Z1": {
+            "closest_midpoint_bar": {"timestamp": "2026-01-01T00:00:00Z"},
+            "closest_midpoint_distance_pct": 1.0,
+        }}
+    }) is True
+    assert research.requires_observation_build([], {
+        "zones": {"DEMAND:Z1": {
+            "closest_midpoint_bar": {"timestamp": "2026-01-01T00:00:00Z"},
+            "closest_midpoint_distance_pct": 1.01,
+        }}
+    }) is False
+
+
+def test_bar_only_deferred_payload_does_not_merge_persisted_history():
+    import run_once
+
+    current_bars = [{"timestamp": 1794400000000 + i * 300000} for i in range(144)]
+    persisted_bars = [{"timestamp": f"2026-01-01T00:{i:02d}:00+00:00"} for i in range(30)]
+    payload = {
+        "symbol": "AAA-USDT", "provider": "binance", "bars_5m": current_bars,
+        "persist_bars_for_forward": True, "signals": [],
+        "diagnostics": {"touch_events": [], "rearm_events": [], "zones": {}},
+    }
+    history = {("AAA-USDT", "5m", "binance"): persisted_bars}
+
+    prepared = run_once._prepare_deferred_research_5m_bars(history, payload, None)
+
+    assert prepared == current_bars
+    assert len(prepared) == 144
+
+
+def test_deferred_history_streams_include_only_payloads_that_build_observations():
+    import run_once
+
+    payloads = [
+        {"symbol": "AAA-USDT", "provider": "binance", "signals": [], "diagnostics": {"zones": {}}},
+        {"symbol": "BBB-USDT", "provider": "bingx", "signals": [{"event_id": "E1"}], "diagnostics": {}},
+        {"symbol": "CCC-USDT", "provider": "binance", "signals": [], "diagnostics": {"rearm_events": [{"timestamp": "2026-01-01T00:00:00Z"}]}},
+    ]
+
+    assert list(run_once._deferred_research_history_stream_keys(payloads)) == [
+        ("BBB-USDT", "5m", "bingx"),
+        ("CCC-USDT", "5m", "binance"),
+    ]
+
+
+def test_persist_market_bars_skips_reparsing_valid_bars_at_or_before_cursor(tmp_path, monkeypatch):
+    _isolate_paths(tmp_path, monkeypatch)
+    now = pd.Timestamp.now(tz="UTC").floor("5min")
+    cursor_ts = now - pd.Timedelta(minutes=15)
+    key = "AAA-USDT|5m|binance"
+    (tmp_path / "research_bar_cursors.json").write_text(json.dumps({
+        key: {"last_timestamp": cursor_ts.isoformat(), "last_bar_id": "CURSOR"},
+    }), encoding="utf-8")
+    bars = []
+    for index in range(60):
+        ts = cursor_ts - pd.Timedelta(minutes=5 * (59 - index))
+        bars.append({
+            "timestamp": int(ts.timestamp() * 1000),
+            "close_time": int((ts + pd.Timedelta(minutes=5)).timestamp() * 1000),
+            "open": 100.0, "high": 102.0, "low": 99.0, "close": 101.0, "volume": 10.0,
+        })
+
+    original_parse = research._parse_timestamp
+    parse_calls = []
+
+    def counted_parse(value):
+        parse_calls.append(value)
+        return original_parse(value)
+
+    monkeypatch.setattr(research, "_parse_timestamp", counted_parse)
+    result = research.persist_market_bars(
+        "AAA-USDT", "5m", bars, provider="binance", source="test", scan_id="S_NOOP",
+    )
+
+    assert result == 0
+    assert len(parse_calls) == 1  # Only the saved cursor is parsed, not every old bar.
+    assert not (tmp_path / "market_bars_5m.jsonl").exists()
+    saved_cursor = json.loads((tmp_path / "research_bar_cursors.json").read_text())[key]
+    assert saved_cursor["last_timestamp"] == cursor_ts.isoformat()
+
+
+def test_persist_market_bars_fast_path_keeps_only_new_rows_even_when_input_is_unsorted(tmp_path, monkeypatch):
+    _isolate_paths(tmp_path, monkeypatch)
+    now = pd.Timestamp.now(tz="UTC").floor("5min")
+    cursor_ts = now - pd.Timedelta(minutes=15)
+    key = "AAA-USDT|5m|binance"
+    (tmp_path / "research_bar_cursors.json").write_text(json.dumps({
+        key: {"last_timestamp": cursor_ts.isoformat(), "last_bar_id": "CURSOR"},
+    }), encoding="utf-8")
+
+    def row(ts):
+        return {
+            "timestamp": int(ts.timestamp() * 1000),
+            "close_time": int((ts + pd.Timedelta(minutes=5)).timestamp() * 1000),
+            "open": 100.0, "high": 102.0, "low": 99.0, "close": 101.0, "volume": 10.0,
+        }
+
+    old_1 = row(cursor_ts - pd.Timedelta(minutes=10))
+    old_2 = row(cursor_ts - pd.Timedelta(minutes=5))
+    new_1 = row(cursor_ts + pd.Timedelta(minutes=5))
+    new_2 = row(cursor_ts + pd.Timedelta(minutes=10))
+    result = research.persist_market_bars(
+        "AAA-USDT", "5m", [old_2, new_2, old_1, new_1],
+        provider="binance", source="test", scan_id="S_PARTIAL",
+    )
+
+    stored = [json.loads(line) for line in (tmp_path / "market_bars_5m.jsonl").read_text().splitlines()]
+    assert result == 2
+    assert [row["timestamp"] for row in stored] == [
+        (cursor_ts + pd.Timedelta(minutes=5)).isoformat(),
+        (cursor_ts + pd.Timedelta(minutes=10)).isoformat(),
+    ]
+    cursors = json.loads((tmp_path / "research_bar_cursors.json").read_text())
+    assert cursors[key]["last_timestamp"] == (cursor_ts + pd.Timedelta(minutes=10)).isoformat()
+
+
+def test_persist_market_bars_fast_path_falls_back_for_invalid_old_rows(tmp_path, monkeypatch):
+    _isolate_paths(tmp_path, monkeypatch)
+    now = pd.Timestamp.now(tz="UTC").floor("5min")
+    cursor_ts = now - pd.Timedelta(minutes=15)
+    key = "AAA-USDT|5m|binance"
+    (tmp_path / "research_bar_cursors.json").write_text(json.dumps({
+        key: {"last_timestamp": cursor_ts.isoformat(), "last_bar_id": "CURSOR"},
+    }), encoding="utf-8")
+    invalid_old = {
+        "timestamp": int((cursor_ts - pd.Timedelta(minutes=5)).timestamp() * 1000),
+        "close_time": int(cursor_ts.timestamp() * 1000),
+        "open": 100.0, "high": 98.0, "low": 99.0, "close": 101.0, "volume": 10.0,
+    }
+
+    assert research.persist_market_bars(
+        "AAA-USDT", "5m", [invalid_old], provider="binance", source="test", scan_id="S_INVALID",
+    ) == 0
+    manifest = json.loads((tmp_path / "research_manifest.json").read_text())
+    assert manifest["market_bars_invalid"] == 1
+    assert not (tmp_path / "market_bars_5m.jsonl").exists()
+
+
+def test_persist_market_bars_seed_history_bypasses_cursor_fast_path(tmp_path, monkeypatch):
+    _isolate_paths(tmp_path, monkeypatch)
+    now = pd.Timestamp.now(tz="UTC").floor("5min")
+    cursor_ts = now - pd.Timedelta(minutes=10)
+    key = "AAA-USDT|5m|binance"
+    (tmp_path / "research_bar_cursors.json").write_text(json.dumps({
+        key: {"last_timestamp": cursor_ts.isoformat(), "last_bar_id": "CURSOR"},
+    }), encoding="utf-8")
+    bars = []
+    for index in range(3):
+        ts = cursor_ts - pd.Timedelta(minutes=5 * (2 - index))
+        bars.append({
+            "timestamp": int(ts.timestamp() * 1000),
+            "close_time": int((ts + pd.Timedelta(minutes=5)).timestamp() * 1000),
+            "open": 100.0, "high": 102.0, "low": 99.0, "close": 101.0, "volume": 10.0,
+        })
+
+    assert research.persist_market_bars(
+        "AAA-USDT", "5m", bars, provider="binance", source="test", scan_id="S_SEED",
+        seed_history=True,
+    ) == 3
+    stored = [json.loads(line) for line in (tmp_path / "market_bars_5m.jsonl").read_text().splitlines()]
+    assert len(stored) == 3
+    saved_cursor = json.loads((tmp_path / "research_bar_cursors.json").read_text())[key]
+    assert saved_cursor["history_seeded"] is True
+    assert saved_cursor["history_seeded_count"] == 3
+

@@ -5084,16 +5084,49 @@ def _prepare_pre_entry_research_5m_bars(
     return research.merge_market_bar_history(persisted, current_bars, timeframe="5m")
 
 
+def _deferred_research_history_stream_keys(
+    deferred_rows: list[dict[str, Any]],
+):
+    """Select persisted 5m history only for rows that build observations.
+
+    Bar-only rows still append current candles for pending forward outcomes, but
+    the recorder returns before consuming historical bars for those rows.
+    Loading their full persisted streams would therefore be redundant work.
+    """
+    for payload in deferred_rows:
+        if not isinstance(payload, dict):
+            continue
+        if not research.requires_observation_build(
+            payload.get("signals"), payload.get("diagnostics"),
+        ):
+            continue
+        symbol = str(payload.get("symbol") or "").strip()
+        if not symbol:
+            continue
+        yield research.market_bar_stream_key(
+            symbol, "5m", str(payload.get("provider") or "binance"),
+        )
+
+
 def _prepare_deferred_research_5m_bars(
     history_by_stream: dict[tuple[str, str, str], list[dict]],
     payload: dict[str, Any],
     prefetched_bars: list[dict] | None,
 ) -> list[dict]:
-    """Combine persisted research history with the freshest per-scan 5m bars."""
+    """Combine history only when an observation builder will consume it."""
+    current_bars = _prefer_longer_research_5m_history(payload.get("bars_5m"), prefetched_bars)
+    if not research.requires_observation_build(
+        payload.get("signals"), payload.get("diagnostics"),
+    ):
+        # record_scan_symbol's bar-only path persists current/prefetched bars and
+        # returns before constructing any feature frames. Previously merging
+        # persisted history here did not affect output, but reparsed and sorted
+        # hundreds of historical timestamps for every such symbol.
+        return current_bars
+
     stream_key = research.market_bar_stream_key(
         payload.get("symbol", ""), "5m", payload.get("provider", "binance"),
     )
-    current_bars = _prefer_longer_research_5m_history(payload.get("bars_5m"), prefetched_bars)
     merged = research.merge_market_bar_history(
         history_by_stream.get(stream_key, []), current_bars, timeframe="5m",
     )
@@ -6733,9 +6766,7 @@ def main() -> None:
         deferred_rows = list(deferred_research_rows)
         research_batch_size = _research_persistence_batch_size()
         research_5m_history = research.load_market_bar_streams(
-            (payload.get("symbol", ""), "5m", payload.get("provider", "binance"))
-            for payload in deferred_rows
-            if payload.get("symbol")
+            _deferred_research_history_stream_keys(deferred_rows)
         )
         queued_observation_count = 0
         queued_bar1h_count = 0

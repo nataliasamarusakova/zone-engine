@@ -118,7 +118,11 @@ def test_deferred_research_pipeline_merges_persisted_5m_history_for_24h_features
         for i in range(156, 301)
     ]
     history = {("BTC-USDT", "5m", "binance"): persisted}
-    payload = {"symbol": "BTC-USDT", "provider": "binance", "bars_5m": current}
+    payload = {
+        "symbol": "BTC-USDT", "provider": "binance", "bars_5m": current,
+        # A real payload that builds features carries an observation boundary.
+        "signals": [{"event_id": "EVT_HISTORY_FEATURES"}], "diagnostics": {},
+    }
 
     merged = _prepare_deferred_research_5m_bars(history, payload, None)
     features = research._derive_time_series_features(
