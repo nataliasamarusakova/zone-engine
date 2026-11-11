@@ -272,8 +272,12 @@ def load_market_bar_streams(
                     normalized["timestamp"] = ts.isoformat()
                     result[key][ts.isoformat()] = normalized
 
+    # Every dictionary key above is already a normalized UTC ISO-8601 string
+    # produced by ``Timestamp.isoformat()``. Lexicographic ordering therefore
+    # preserves chronological ordering and avoids parsing every timestamp a
+    # second time merely to sort the stream.
     return {
-        key: [rows[stamp] for stamp in sorted(rows, key=lambda value: _parse_timestamp(value))]
+        key: [rows[stamp] for stamp in sorted(rows)]
         for key, rows in result.items()
     }
 
@@ -312,7 +316,42 @@ def merge_market_bar_history(
                 combined.update({key: value for key, value in row.items() if value is not None})
                 row = combined
             merged[ts.isoformat()] = row
-    return [merged[key] for key in sorted(merged, key=lambda value: _parse_timestamp(value))]
+    # Keys are normalized UTC ISO-8601 timestamps, so string ordering is
+    # chronological. Do not repeat pandas timestamp parsing during sorting.
+    return [merged[key] for key in sorted(merged)]
+
+
+def requires_observation_build(
+    signals: Iterable[dict[str, Any]] | None,
+    diagnostics: dict[str, Any] | None,
+) -> bool:
+    """Whether a scan payload creates research observations, not only bars.
+
+    Bar-only payloads still persist current candles for pending forward
+    outcomes, but they do not consume the previously persisted 5m history.
+    Keep this predicate shared by the recorder and deferred-history loader so
+    the optimization cannot silently skip data needed by an observation.
+    """
+    if signals:
+        return True
+    diag = diagnostics if isinstance(diagnostics, dict) else {}
+    if any(
+        isinstance(event, dict) and str(event.get("reason", "")) != "signal_created"
+        for event in (diag.get("touch_events") or [])
+    ):
+        return True
+    if diag.get("rearm_events"):
+        return True
+    for zone_diag in (diag.get("zones") or {}).values():
+        if not isinstance(zone_diag, dict) or not isinstance(zone_diag.get("closest_midpoint_bar"), dict):
+            continue
+        try:
+            distance = float(zone_diag.get("closest_midpoint_distance_pct"))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(distance) and 0.0 < distance <= NEAREST_APPROACH_MAX_PCT:
+            return True
+    return False
 
 
 def _market_bar_file_signature(path: Path) -> tuple[int, int, int, int, int] | None:
@@ -986,6 +1025,65 @@ def _update_cursor(key: str, value: dict[str, Any]) -> None:
                 pass
 
 
+def _filter_epoch_ms_bars_after_cursor(
+    bars: list[dict[str, Any]],
+    previous_timestamp: str,
+) -> list[dict[str, Any]] | None:
+    """Return only newer, structurally valid epoch-ms bars when safe.
+
+    The Binance and BingX kline adapters emit integer epoch milliseconds.
+    When that contract and the OHLCV validity checks hold, old rows can be
+    excluded with integer comparisons instead of converting every historical
+    timestamp through pandas. ``None`` asks the caller to use the full
+    validator so malformed legacy rows retain their existing diagnostics.
+    """
+    cursor_ts = _parse_timestamp(previous_timestamp)
+    if cursor_ts is None:
+        return None
+    cursor_ns = int(cursor_ts.value)
+    newer: list[dict[str, Any]] = []
+
+    for raw in bars:
+        if not isinstance(raw, dict):
+            return None
+        raw_timestamp = raw.get("timestamp")
+        if isinstance(raw_timestamp, bool) or not isinstance(raw_timestamp, (int, float)):
+            return None
+        try:
+            timestamp_number = float(raw_timestamp)
+            if not math.isfinite(timestamp_number) or not timestamp_number.is_integer():
+                return None
+            timestamp_ms = int(timestamp_number)
+            # Restrict the shortcut to contemporary epoch milliseconds.
+            # Seconds, microseconds, nanoseconds and string formats fall back.
+            if not 100_000_000_000 <= timestamp_ms < 100_000_000_000_000:
+                return None
+            open_price = float(raw.get("open"))
+            high = float(raw.get("high"))
+            low = float(raw.get("low"))
+            close = float(raw.get("close"))
+            volume = float(raw.get("volume"))
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+        values = (open_price, high, low, close, volume)
+        if (
+            not all(math.isfinite(value) for value in values)
+            or min(open_price, high, low, close) <= 0
+            or volume < 0
+            or high < low
+            or high < max(open_price, close)
+            or low > min(open_price, close)
+        ):
+            # Let the full validator count and report malformed rows.
+            return None
+
+        if timestamp_ms * 1_000_000 > cursor_ns:
+            newer.append(raw)
+
+    return newer
+
+
 def persist_market_bars(
     symbol: str,
     timeframe: str,
@@ -1006,6 +1104,17 @@ def persist_market_bars(
         iterable = bars.to_dict("records") if isinstance(bars, pd.DataFrame) else list(bars)
         if not iterable:
             return 0
+        key = _cursor_key(symbol, tf, provider)
+        cursors = _load_cursors()
+        previous_cursor = cursors.get(key) if isinstance(cursors.get(key), dict) else {}
+        previous = str(previous_cursor.get("last_timestamp", ""))
+        if not seed_history and previous:
+            fast_rows = _filter_epoch_ms_bars_after_cursor(iterable, previous)
+            if fast_rows is not None:
+                if not fast_rows:
+                    return 0
+                iterable = fast_rows
+
         delta = pd.Timedelta(hours=1) if tf == "1h" else pd.Timedelta(minutes=5)
         now = pd.Timestamp.now(tz="UTC")
         normalized: list[dict[str, Any]] = []
@@ -1052,10 +1161,6 @@ def persist_market_bars(
         for row in normalized:
             unique_by_timestamp[str(row["timestamp"])] = row
         normalized = list(unique_by_timestamp.values())
-        key = _cursor_key(symbol, tf, provider)
-        cursors = _load_cursors()
-        previous_cursor = cursors.get(key) if isinstance(cursors.get(key), dict) else {}
-        previous = str(previous_cursor.get("last_timestamp", ""))
         if seed_history and tf == "5m":
             # A scan cursor may already point at the newest 5m candle even though
             # the older part of a requested 300-bar history was never archived.
@@ -2550,26 +2655,7 @@ def record_scan_symbol(
     # existing durable/idempotent writer. This is research-only and cannot alter
     # signal generation, execution, or the observation population.
     diag = diagnostics if isinstance(diagnostics, dict) else {}
-    has_signal_observation = bool(signals)
-    has_touch_observation = any(
-        isinstance(event, dict) and str(event.get("reason", "")) != "signal_created"
-        for event in (diag.get("touch_events") or [])
-    )
-    has_rearm_observation = bool(diag.get("rearm_events") or [])
-    has_nearest_approach_observation = False
-    if not (has_signal_observation or has_touch_observation or has_rearm_observation):
-        for zone_diag in (diag.get("zones") or {}).values():
-            if not isinstance(zone_diag, dict) or not isinstance(zone_diag.get("closest_midpoint_bar"), dict):
-                continue
-            try:
-                distance = float(zone_diag.get("closest_midpoint_distance_pct"))
-            except (TypeError, ValueError, OverflowError):
-                continue
-            if math.isfinite(distance) and 0.0 < distance <= NEAREST_APPROACH_MAX_PCT:
-                has_nearest_approach_observation = True
-                break
-
-    if not (has_signal_observation or has_touch_observation or has_rearm_observation or has_nearest_approach_observation):
+    if not requires_observation_build(signals, diag):
         if persist_bars_for_forward:
             counts["bars_1h"] = persist_market_bars(
                 symbol, "1h", bars_1h, provider=provider, source=source, scan_id=scan_id, code_commit_sha=code_commit_sha
